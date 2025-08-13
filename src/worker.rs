@@ -25,8 +25,8 @@ impl Worker {
                 Message::Quit => {
                     return;
                 }
-                Message::Process(mut track) => {
-                    track.process();
+                Message::Process(track) => {
+                    unsafe {(*track).process()};
                 }
                 _ => {}
             }

@@ -10,7 +10,7 @@ pub enum Message {
     Add,
     Quit,
     Ready(usize),
-    Process(Track),
+    Process(*mut Track),
 }
 
 #[derive(Debug)]
