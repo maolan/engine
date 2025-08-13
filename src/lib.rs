@@ -13,6 +13,7 @@ pub enum Message {
     Play,
     Ready(usize),
     Process(Arc<Mutex<Track>>),
+    Finished(usize),
 }
 
 #[derive(Debug)]
@@ -46,6 +47,7 @@ pub struct Engine {
     rx: Receiver<Message>,
     tx: Sender<Message>,
     workers: Vec<WorkerData>,
+    track_counter: usize,
 }
 
 impl Engine {
@@ -55,6 +57,7 @@ impl Engine {
             rx,
             tx,
             workers: vec![],
+            track_counter: 0,
         }
     }
 
@@ -91,7 +94,9 @@ impl Engine {
                     ready_workers.push(id);
                 }
                 Message::Add => {
-                    self.state.audio.tracks.push(Arc::new(Mutex::new(Track::new())));
+                    let id = self.track_counter;
+                    self.state.audio.tracks.push(Arc::new(Mutex::new(Track::new(id))));
+                    self.track_counter += 1;
                 }
                 _ => {}
             }

@@ -19,7 +19,7 @@ impl Worker {
         let _ = self.tx.send(message);
     }
 
-    pub fn work(self) {
+    pub fn work(&self) {
         for message in &self.rx {
             match message {
                 Message::Quit => {
@@ -27,7 +27,10 @@ impl Worker {
                 }
                 Message::Process(track) => {
                     match track.lock() {
-                        Ok(mut t) => {t.process();}
+                        Ok(mut t) => {
+                            t.process();
+                            let _ = self.tx.send(Message::Finished(self.id));
+                        }
                         Err(e) => {println!("Track invalid: {}", e);}
                     }
                 }
