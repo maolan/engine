@@ -4,13 +4,15 @@ mod worker;
 
 use self::audio::track::Track;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 pub enum Message {
     Add,
     Quit,
+    Play,
     Ready(usize),
-    Process(*mut Track),
+    Process(Arc<Mutex<Track>>),
 }
 
 #[derive(Debug)]
@@ -73,6 +75,10 @@ impl Engine {
         let mut ready_workers: Vec<usize> = vec![];
         for message in &self.rx {
             match message {
+                Message::Play => {
+                    let track = self.state.audio.tracks[0].clone();
+                    let _ = self.workers[0].tx.send(Message::Process(track));
+                }
                 Message::Quit => {
                     while self.workers.len() > 0 {
                         let worker = self.workers.remove(0);
@@ -85,7 +91,7 @@ impl Engine {
                     ready_workers.push(id);
                 }
                 Message::Add => {
-                    self.state.audio.tracks.push(Track::new());
+                    self.state.audio.tracks.push(Arc::new(Mutex::new(Track::new())));
                 }
                 _ => {}
             }

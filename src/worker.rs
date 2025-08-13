@@ -26,7 +26,10 @@ impl Worker {
                     return;
                 }
                 Message::Process(track) => {
-                    unsafe {(*track).process()};
+                    match track.lock() {
+                        Ok(mut t) => {t.process();}
+                        Err(e) => {println!("Track invalid: {}", e);}
+                    }
                 }
                 _ => {}
             }

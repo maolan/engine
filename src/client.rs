@@ -26,4 +26,8 @@ impl Client {
     pub fn add(&self) {
         self.send(Message::Add);
     }
+
+    pub fn play(&self) {
+        self.send(Message::Play);
+    }
 }

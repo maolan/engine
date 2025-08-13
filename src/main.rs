@@ -5,6 +5,8 @@ fn main() {
     let client = init();
     println!("before add");
     client.add();
+    println!("before play");
+    client.play();
     println!("before quit");
     client.quit();
     println!("end");
