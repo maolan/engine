@@ -1,9 +1,8 @@
 pub mod track;
-use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct State {
-    pub tracks: Vec<Arc<Mutex<track::Track>>>,
+    pub tracks: Vec<track::Track>,
 }
 
 impl State {
