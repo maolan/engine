@@ -1,16 +1,22 @@
-use super::Message;
+use super::{Message, TrackData};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 #[derive(Debug)]
 pub struct Client {
     tx: Sender<Message>,
+    tracks: Arc<Mutex<Vec<TrackData>>>,
     thread: JoinHandle<()>,
 }
 
 impl Client {
-    pub fn new(tx: Sender<Message>, thread: JoinHandle<()>) -> Self {
-        Self { tx, thread }
+    pub fn new(
+        tx: Sender<Message>,
+        tracks: Arc<Mutex<Vec<TrackData>>>,
+        thread: JoinHandle<()>,
+    ) -> Self {
+        Self { tx, tracks, thread }
     }
 
     pub fn send(&self, message: Message) {
@@ -28,5 +34,9 @@ impl Client {
 
     pub fn play(&self) {
         self.send(Message::Play);
+    }
+
+    pub fn state(&self) -> (Arc<Mutex<Vec<TrackData>>>,) {
+        return (self.tracks.clone(),);
     }
 }

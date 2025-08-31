@@ -42,12 +42,24 @@ impl WorkerData {
 }
 
 #[derive(Debug)]
+pub struct TrackData {
+    id: usize,
+}
+
+impl TrackData {
+    pub fn new(id: usize) -> Self {
+        Self { id }
+    }
+}
+
+#[derive(Debug)]
 pub struct Engine {
     state: State,
     rx: Receiver<Message>,
     tx: Sender<Message>,
     workers: Vec<WorkerData>,
     track_counter: usize,
+    tracks: Arc<Mutex<Vec<TrackData>>>,
 }
 
 impl Engine {
@@ -58,6 +70,7 @@ impl Engine {
             tx,
             workers: vec![],
             track_counter: 0,
+            tracks: Arc::new(Mutex::new(vec![])),
         }
     }
 
@@ -82,9 +95,11 @@ impl Engine {
                     let track = self.state.audio.tracks[&0].clone();
                     match self.workers[0].tx.send(Message::Process(track)) {
                         Ok(_) => {}
-                        Err(e) => {println!("Error occured while sending PLAY: {}", e)}
+                        Err(e) => {
+                            println!("Error occured while sending PLAY: {e}")
+                        }
                     }
-                },
+                }
                 Message::Quit => {
                     while self.workers.len() > 0 {
                         let worker = self.workers.remove(0);
@@ -97,8 +112,21 @@ impl Engine {
                     ready_workers.push(id);
                 }
                 Message::Add => {
-                    let id = self.track_counter;
-                    self.state.audio.tracks.insert(id, Arc::new(Mutex::new(Track::new(id))));
+                    let id = self.track_counter.clone();
+                    // This should go to queue and be actualized only before start of processing
+                    // of new buffer
+                    self.state
+                        .audio
+                        .tracks
+                        .insert(id, Arc::new(Mutex::new(Track::new(id))));
+                    match self.tracks.lock() {
+                        Ok(mut tracks) => {
+                            tracks.push(TrackData::new(id));
+                        }
+                        Err(e) => {
+                            println!("Error locking tracks when trying to add: {e}")
+                        }
+                    }
                     self.track_counter += 1;
                 }
                 Message::Finished(_workid, _trackid) => {}
@@ -106,15 +134,20 @@ impl Engine {
             }
         }
     }
+
+    pub fn state(&self) -> (Arc<Mutex<Vec<TrackData>>>,) {
+        return (self.tracks.clone(),);
+    }
 }
 
 pub fn init() -> client::Client {
     let (tx, rx) = channel::<Message>();
     let mut engine = Engine::new(rx, tx.clone());
+    let (tracks,) = engine.state();
     let handle = thread::spawn(move || {
         engine.init();
         engine.work();
     });
-    let client = client::Client::new(tx.clone(), handle);
+    let client = client::Client::new(tx.clone(), tracks, handle);
     client
 }
