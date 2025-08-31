@@ -12,8 +12,8 @@ pub enum Message {
     Quit,
     Play,
     Ready(usize),
-    Process(usize),
-    Finished(usize),
+    Process(Arc<Mutex<Track>>),
+    Finished(usize, usize),
 }
 
 #[derive(Debug)]
@@ -43,7 +43,7 @@ impl WorkerData {
 
 #[derive(Debug)]
 pub struct Engine {
-    state: Arc<Mutex<State>>,
+    state: State,
     rx: Receiver<Message>,
     tx: Sender<Message>,
     workers: Vec<WorkerData>,
@@ -53,7 +53,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(rx: Receiver<Message>, tx: Sender<Message>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::new())),
+            state: State::new(),
             rx,
             tx,
             workers: vec![],
@@ -66,9 +66,8 @@ impl Engine {
         for id in 0..max_threads {
             let (tx, rx) = channel::<Message>();
             let tx_thread = self.tx.clone();
-            let state = self.state.clone();
             let handler = thread::spawn(move || {
-                let wrk = worker::Worker::new(id, rx, tx_thread, state);
+                let wrk = worker::Worker::new(id, rx, tx_thread);
                 wrk.work();
             });
             self.workers.push(WorkerData::new(tx.clone(), handler));
@@ -79,18 +78,11 @@ impl Engine {
         let mut ready_workers: Vec<usize> = vec![];
         for message in &self.rx {
             match message {
-                Message::Play => match self.state.lock() {
-                    Ok(_state) => {
-                        // Find track ID to be processed
-                        match self.workers[0].tx.send(Message::Process(0)) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("Error sending track id: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("Error sending track to be processed: {e}");
+                Message::Play => {
+                    let track = self.state.audio.tracks[&0].clone();
+                    match self.workers[0].tx.send(Message::Process(track)) {
+                        Ok(_) => {}
+                        Err(e) => {println!("Error occured while sending PLAY: {}", e)}
                     }
                 },
                 Message::Quit => {
@@ -106,34 +98,23 @@ impl Engine {
                 }
                 Message::Add => {
                     let id = self.track_counter;
-                    match self.state.lock() {
-                        Ok(mut state) => {
-                            state.audio.tracks.push(Track::new(id));
-                        }
-                        Err(e) => {
-                            println!("Error while adding track: {e}");
-                        }
-                    }
+                    self.state.audio.tracks.insert(id, Arc::new(Mutex::new(Track::new(id))));
                     self.track_counter += 1;
                 }
+                Message::Finished(_workid, _trackid) => {}
                 _ => {}
             }
         }
-    }
-
-    pub fn state(&self) -> Arc<Mutex<State>> {
-        self.state.clone()
     }
 }
 
 pub fn init() -> client::Client {
     let (tx, rx) = channel::<Message>();
     let mut engine = Engine::new(rx, tx.clone());
-    let state = engine.state();
     let handle = thread::spawn(move || {
         engine.init();
         engine.work();
     });
-    let client = client::Client::new(tx.clone(), handle, state);
+    let client = client::Client::new(tx.clone(), handle);
     client
 }

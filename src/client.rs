@@ -1,18 +1,16 @@
-use super::{Message, State};
+use super::Message;
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
-use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct Client {
     tx: Sender<Message>,
     thread: JoinHandle<()>,
-    state: Arc<Mutex<State>>,
 }
 
 impl Client {
-    pub fn new(tx: Sender<Message>, thread: JoinHandle<()>, state: Arc<Mutex<State>>) -> Self {
-        Self { tx, thread, state }
+    pub fn new(tx: Sender<Message>, thread: JoinHandle<()>) -> Self {
+        Self { tx, thread }
     }
 
     pub fn send(&self, message: Message) {
