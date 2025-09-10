@@ -1,14 +1,19 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 pub mod track;
 
 #[derive(Debug)]
 pub struct State {
-    pub tracks: HashMap<usize, Arc<Mutex<track::Track>>>,
+    pub tracks: HashMap<usize, Arc<RwLock<track::Track>>>,
 }
 
 impl State {
     pub fn new() -> Self {
-        State { tracks: HashMap::new() }
+        State {
+            tracks: HashMap::new(),
+        }
     }
 }

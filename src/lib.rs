@@ -4,7 +4,7 @@ mod worker;
 
 use self::audio::track::Track;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
 pub enum Message {
@@ -12,7 +12,7 @@ pub enum Message {
     Quit,
     Play,
     Ready(usize),
-    Process(Arc<Mutex<Track>>),
+    Process(Arc<RwLock<Track>>),
     Finished(usize, usize),
 }
 
@@ -42,35 +42,22 @@ impl WorkerData {
 }
 
 #[derive(Debug)]
-pub struct TrackData {
-    id: usize,
-}
-
-impl TrackData {
-    pub fn new(id: usize) -> Self {
-        Self { id }
-    }
-}
-
-#[derive(Debug)]
 pub struct Engine {
-    state: State,
+    state: Arc<RwLock<State>>,
     rx: Receiver<Message>,
     tx: Sender<Message>,
     workers: Vec<WorkerData>,
     track_counter: usize,
-    tracks: Arc<Mutex<Vec<TrackData>>>,
 }
 
 impl Engine {
     pub fn new(rx: Receiver<Message>, tx: Sender<Message>) -> Self {
         Self {
-            state: State::new(),
+            state: Arc::new(RwLock::new(State::new())),
             rx,
             tx,
             workers: vec![],
             track_counter: 0,
-            tracks: Arc::new(Mutex::new(vec![])),
         }
     }
 
@@ -92,7 +79,10 @@ impl Engine {
         for message in &self.rx {
             match message {
                 Message::Play => {
-                    let track = self.state.audio.tracks[&0].clone();
+                    let track;
+                    {
+                        track = self.state.write().unwrap().audio.tracks[&0].clone();
+                    }
                     match self.workers[0].tx.send(Message::Process(track)) {
                         Ok(_) => {}
                         Err(e) => {
@@ -116,17 +106,11 @@ impl Engine {
                     // This should go to queue and be actualized only before start of processing
                     // of new buffer
                     self.state
+                        .write()
+                        .unwrap()
                         .audio
                         .tracks
-                        .insert(id, Arc::new(Mutex::new(Track::new(id))));
-                    match self.tracks.lock() {
-                        Ok(mut tracks) => {
-                            tracks.push(TrackData::new(id));
-                        }
-                        Err(e) => {
-                            println!("Error locking tracks when trying to add: {e}")
-                        }
-                    }
+                        .insert(id, Arc::new(RwLock::new(Track::new(id))));
                     self.track_counter += 1;
                 }
                 Message::Finished(_workid, _trackid) => {}
@@ -135,19 +119,19 @@ impl Engine {
         }
     }
 
-    pub fn state(&self) -> (Arc<Mutex<Vec<TrackData>>>,) {
-        return (self.tracks.clone(),);
+    pub fn state(&self) -> Arc<RwLock<State>> {
+        self.state.clone()
     }
 }
 
 pub fn init() -> client::Client {
     let (tx, rx) = channel::<Message>();
     let mut engine = Engine::new(rx, tx.clone());
-    let (tracks,) = engine.state();
+    let state = engine.state();
     let handle = thread::spawn(move || {
         engine.init();
         engine.work();
     });
-    let client = client::Client::new(tx.clone(), tracks, handle);
+    let client = client::Client::new(tx.clone(), state, handle);
     client
 }
