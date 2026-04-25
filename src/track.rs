@@ -1723,11 +1723,19 @@ impl Track {
                     {
                         let mut processor =
                             Lv2Processor::new(self.sample_rate, buffer_size.max(1), uri)?;
-                        if let Some(base_dir) = &self.lv2_state_base_dir {
-                            processor.set_state_base_dir(base_dir.clone());
-                        }
                         let instance_id = next_plugin_instance_id;
                         next_plugin_instance_id = next_plugin_instance_id.saturating_add(1);
+                        if let Some(base_dir) = &self.lv2_state_base_dir {
+                            let clip_dir = base_dir.join(format!(
+                                "{}_{}_{}_{}_{}",
+                                Self::sanitize_name(&self.name),
+                                Self::sanitize_name(&clip.name),
+                                clip.start,
+                                clip.end,
+                                clip.offset
+                            ));
+                            processor.set_state_base_dir(clip_dir.join(instance_id.to_string()));
+                        }
                         runtime.lv2_processors.push(Lv2Instance {
                             id: instance_id,
                             processor,
@@ -2662,10 +2670,11 @@ impl Track {
             .unwrap_or(0);
         let processor = Lv2Processor::new(self.sample_rate, buffer_size, uri)?;
         let mut processor = processor;
-        if let Some(base_dir) = &self.lv2_state_base_dir {
-            processor.set_state_base_dir(base_dir.clone());
-        }
         let id = self.alloc_plugin_instance_id();
+        if let Some(base_dir) = &self.lv2_state_base_dir {
+            let plugin_dir = base_dir.join(format!("{}_{}", Self::sanitize_name(&self.name), id));
+            processor.set_state_base_dir(plugin_dir);
+        }
         self.next_lv2_instance_id = self.next_lv2_instance_id.max(id.saturating_add(1));
         self.lv2_processors.push(Lv2Instance { id, processor });
         self.invalidate_audio_route_cache();
@@ -2912,8 +2921,29 @@ impl Track {
         self.lv2_state_base_dir = base_dir.clone();
         if let Some(path) = base_dir {
             for instance in &mut self.lv2_processors {
-                instance.processor.set_state_base_dir(path.clone());
+                let plugin_dir = path.join(format!(
+                    "{}_{}",
+                    Self::sanitize_name(&self.name),
+                    instance.id
+                ));
+                instance.processor.set_state_base_dir(plugin_dir);
             }
+        }
+    }
+
+    fn sanitize_name(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                out.push(c);
+            } else {
+                out.push('_');
+            }
+        }
+        if out.is_empty() {
+            "track".to_string()
+        } else {
+            out
         }
     }
 
