@@ -101,8 +101,10 @@ pub struct ClapPluginCapabilities {
     pub supports_floating: bool,
     pub has_params: bool,
     pub has_state: bool,
-    pub has_audio_ports: bool,
-    pub has_note_ports: bool,
+    pub audio_inputs: usize,
+    pub audio_outputs: usize,
+    pub midi_inputs: usize,
+    pub midi_outputs: usize,
 }
 
 #[derive(Clone)]
@@ -166,24 +168,22 @@ impl ClapProcessor {
             sample_rate,
             buffer_size as u32,
         )?);
-        let (input_port_channels, output_port_channels) = plugin_handle.audio_port_channels();
-        let discovered_inputs =
-            (!input_port_channels.is_empty()).then_some(input_port_channels.len());
-        let discovered_outputs =
-            (!output_port_channels.is_empty()).then_some(output_port_channels.len());
+        let (input_layout_opt, output_layout_opt) = plugin_handle.audio_port_channels();
+        let input_port_channels_opt = input_layout_opt.as_ref().map(|(c, _)| c.clone());
+        let output_port_channels_opt = output_layout_opt.as_ref().map(|(c, _)| c.clone());
+        let discovered_inputs = input_layout_opt.as_ref().map(|(c, _)| c.len());
+        let discovered_outputs = output_layout_opt.as_ref().map(|(c, _)| c.len());
         let (discovered_midi_inputs, discovered_midi_outputs) = plugin_handle.note_port_layout();
-        let resolved_inputs = discovered_inputs.unwrap_or(input_count).max(1);
-        let resolved_outputs = discovered_outputs.unwrap_or(output_count).max(1);
-        let main_audio_inputs = if discovered_inputs.is_some() {
-            usize::from(resolved_inputs > 0)
-        } else {
-            input_count.max(1)
-        };
-        let main_audio_outputs = if discovered_outputs.is_some() {
-            usize::from(resolved_outputs > 0)
-        } else {
-            output_count.max(1)
-        };
+        let resolved_inputs = discovered_inputs.unwrap_or(input_count);
+        let resolved_outputs = discovered_outputs.unwrap_or(output_count);
+        let main_audio_inputs = input_layout_opt
+            .as_ref()
+            .map(|(_, main)| *main)
+            .unwrap_or(input_count);
+        let main_audio_outputs = output_layout_opt
+            .as_ref()
+            .map(|(_, main)| *main)
+            .unwrap_or(output_count);
         let audio_inputs = (0..resolved_inputs)
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect();
@@ -200,18 +200,12 @@ impl ClapProcessor {
             sample_rate,
             audio_inputs,
             audio_outputs,
-            input_port_channels: if input_port_channels.is_empty() {
-                vec![1; resolved_inputs]
-            } else {
-                input_port_channels
-            },
-            output_port_channels: if output_port_channels.is_empty() {
-                vec![1; resolved_outputs]
-            } else {
-                output_port_channels
-            },
-            midi_input_ports: discovered_midi_inputs.unwrap_or(1).max(1),
-            midi_output_ports: discovered_midi_outputs.unwrap_or(1).max(1),
+            input_port_channels: input_port_channels_opt
+                .unwrap_or_else(|| vec![1; resolved_inputs]),
+            output_port_channels: output_port_channels_opt
+                .unwrap_or_else(|| vec![1; resolved_outputs]),
+            midi_input_ports: discovered_midi_inputs.unwrap_or(0),
+            midi_output_ports: discovered_midi_outputs.unwrap_or(0),
             main_audio_inputs,
             main_audio_outputs,
             host_runtime,
@@ -1517,21 +1511,24 @@ impl PluginHandle {
         Ok(())
     }
 
-    fn audio_port_channels(&self) -> (Vec<usize>, Vec<usize>) {
+    const CLAP_AUDIO_PORT_IS_MAIN: u32 = 1;
+
+    fn audio_port_channels(&self) -> (Option<(Vec<usize>, usize)>, Option<(Vec<usize>, usize)>) {
         let Some(ext) = self.audio_ports_ext() else {
-            return (Vec::new(), Vec::new());
+            return (None, None);
         };
         let Some(count_fn) = ext.count else {
-            return (Vec::new(), Vec::new());
+            return (None, None);
         };
         let Some(get_fn) = ext.get else {
-            return (Vec::new(), Vec::new());
+            return (None, None);
         };
 
-        let read_channels = |is_input: bool| -> Vec<usize> {
-            let mut out = Vec::new();
+        let read_ports = |is_input: bool| -> (Vec<usize>, usize) {
+            let mut channels = Vec::new();
+            let mut main_count = 0;
             let count = unsafe { count_fn(self.plugin, is_input) } as usize;
-            out.reserve(count);
+            channels.reserve(count);
             for idx in 0..count {
                 let mut info = ClapAudioPortInfoRaw {
                     id: 0,
@@ -1542,12 +1539,15 @@ impl PluginHandle {
                     in_place_pair: u32::MAX,
                 };
                 if unsafe { get_fn(self.plugin, idx as u32, is_input, &mut info as *mut _) } {
-                    out.push((info.channel_count as usize).max(1));
+                    channels.push((info.channel_count as usize).max(1));
+                    if info.flags & Self::CLAP_AUDIO_PORT_IS_MAIN != 0 {
+                        main_count += 1;
+                    }
                 }
             }
-            out
+            (channels, main_count)
         };
-        (read_channels(true), read_channels(false))
+        (Some(read_ports(true)), Some(read_ports(false)))
     }
 
     fn note_port_layout(&self) -> (Option<usize>, Option<usize>) {
@@ -1561,7 +1561,7 @@ impl PluginHandle {
         let in_count = unsafe { count_fn(self.plugin, true) } as usize;
         // SAFETY: function pointer comes from plugin extension table.
         let out_count = unsafe { count_fn(self.plugin, false) } as usize;
-        (Some(in_count.max(1)), Some(out_count.max(1)))
+        (Some(in_count), Some(out_count))
     }
 
     fn gui_ext(&self) -> Option<&ClapPluginGui> {
@@ -2472,8 +2472,10 @@ fn scan_plugin_capabilities(
         supports_floating: false,
         has_params: false,
         has_state: false,
-        has_audio_ports: false,
-        has_note_ports: false,
+        audio_inputs: 0,
+        audio_outputs: 0,
+        midi_inputs: 0,
+        midi_outputs: 0,
     };
 
     // Check for extensions
@@ -2526,13 +2528,31 @@ fn scan_plugin_capabilities(
         let audio_ports_ext_id = c"clap.audio-ports";
         // SAFETY: extension id is valid static C string.
         let audio_ports_ptr = unsafe { get_extension(plugin, audio_ports_ext_id.as_ptr()) };
-        capabilities.has_audio_ports = !audio_ports_ptr.is_null();
+        if !audio_ports_ptr.is_null() {
+            // SAFETY: CLAP guarantees extension pointer layout for requested extension id.
+            let audio_ports = unsafe { &*(audio_ports_ptr as *const ClapPluginAudioPorts) };
+            if let Some(count_fn) = audio_ports.count {
+                // SAFETY: function pointer comes from plugin extension table.
+                capabilities.audio_inputs = unsafe { count_fn(plugin, true) } as usize;
+                // SAFETY: function pointer comes from plugin extension table.
+                capabilities.audio_outputs = unsafe { count_fn(plugin, false) } as usize;
+            }
+        }
 
         // Check note-ports extension
         let note_ports_ext_id = c"clap.note-ports";
         // SAFETY: extension id is valid static C string.
         let note_ports_ptr = unsafe { get_extension(plugin, note_ports_ext_id.as_ptr()) };
-        capabilities.has_note_ports = !note_ports_ptr.is_null();
+        if !note_ports_ptr.is_null() {
+            // SAFETY: CLAP guarantees extension pointer layout for requested extension id.
+            let note_ports = unsafe { &*(note_ports_ptr as *const ClapPluginNotePorts) };
+            if let Some(count_fn) = note_ports.count {
+                // SAFETY: function pointer comes from plugin extension table.
+                capabilities.midi_inputs = unsafe { count_fn(plugin, true) } as usize;
+                // SAFETY: function pointer comes from plugin extension table.
+                capabilities.midi_outputs = unsafe { count_fn(plugin, false) } as usize;
+            }
+        }
     }
 
     // Clean up plugin instance
