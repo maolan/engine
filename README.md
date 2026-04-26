@@ -1,5 +1,7 @@
 # maolan-engine
 
+[![crates.io](https://img.shields.io/crates/v/maolan-engine.svg)](https://crates.io/crates/maolan-engine)
+
 `maolan-engine` is the Rust audio engine that powers Maolan.
 
 It provides:

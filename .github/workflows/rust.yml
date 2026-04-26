@@ -1,0 +1,73 @@
+name: Rust
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-cache
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/rust.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Restore apt cache
+        run: |
+          sudo mkdir -p /var/cache/apt/archives
+          sudo cp -r ~/apt-cache/. /var/cache/apt/archives/ 2>/dev/null || true
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:rncbc/libs-noble
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            jackd2 \
+            libjack-jackd2-dev \
+            libasound2-dev \
+            liblilv-dev \
+            libsuil-dev \
+            libgtk2.0-dev \
+            librubberband-dev \
+            rubberband-cli \
+            llvm-dev \
+            libclang-dev
+
+      - name: Save apt cache
+        run: |
+          mkdir -p ~/apt-cache
+          cp /var/cache/apt/archives/*.deb ~/apt-cache/ 2>/dev/null || true
+
+      - name: Set LIBCLANG_PATH
+        run: echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets
