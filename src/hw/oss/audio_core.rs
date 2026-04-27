@@ -24,10 +24,6 @@ impl Buffer {
         self.data.len()
     }
 
-    pub(super) fn progress(&self) -> usize {
-        self.pos
-    }
-
     pub(super) fn remaining(&self) -> usize {
         self.data.len().saturating_sub(self.pos)
     }
@@ -465,13 +461,6 @@ impl DoubleBufferedChannel {
         match &self.kind {
             ChannelKind::Read(read) => read.st.balance,
             ChannelKind::Write(write) => write.st.balance,
-        }
-    }
-
-    pub(super) fn set_balance(&mut self, balance: i64) {
-        match &mut self.kind {
-            ChannelKind::Read(read) => read.st.balance = balance,
-            ChannelKind::Write(write) => write.st.balance = balance,
         }
     }
 }

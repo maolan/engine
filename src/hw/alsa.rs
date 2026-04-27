@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::common;
 use super::convert_policy;
 use super::error_fmt;

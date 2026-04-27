@@ -34,6 +34,8 @@ pub struct ClapPluginState {
     pub bytes: Vec<u8>,
 }
 
+type AudioPortLayout = (Vec<usize>, usize);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClapMidiOutputEvent {
     pub port: usize,
@@ -1513,7 +1515,7 @@ impl PluginHandle {
 
     const CLAP_AUDIO_PORT_IS_MAIN: u32 = 1;
 
-    fn audio_port_channels(&self) -> (Option<(Vec<usize>, usize)>, Option<(Vec<usize>, usize)>) {
+    fn audio_port_channels(&self) -> (Option<AudioPortLayout>, Option<AudioPortLayout>) {
         let Some(ext) = self.audio_ports_ext() else {
             return (None, None);
         };
@@ -1524,7 +1526,7 @@ impl PluginHandle {
             return (None, None);
         };
 
-        let read_ports = |is_input: bool| -> (Vec<usize>, usize) {
+        let read_ports = |is_input: bool| -> AudioPortLayout {
             let mut channels = Vec::new();
             let mut main_count = 0;
             let count = unsafe { count_fn(self.plugin, is_input) } as usize;

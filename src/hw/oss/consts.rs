@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const AFMT_QUERY: u32 = 0x00000000;
 pub const AFMT_MU_LAW: u32 = 0x00000001;
 pub const AFMT_A_LAW: u32 = 0x00000002;

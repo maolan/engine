@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::audio::io::AudioIO;
 use crate::hw::convert_policy;
 use nix::libc;
@@ -31,7 +29,7 @@ use self::audio_core::DoubleBufferedChannel;
 use self::convert::*;
 use self::io_util::*;
 use self::ioctl::*;
-use self::sync::{Correction, DuplexSync, FrameClock, get_or_create_duplex_sync};
+use self::sync::{DuplexSync, FrameClock, get_or_create_duplex_sync};
 
 #[cfg(target_endian = "little")]
 const AFMT_S16_FOREIGN: u32 = AFMT_S16_BE;
@@ -55,10 +53,8 @@ pub struct Audio {
     pub output_balance: f32,
     pub rate: i32,
     pub format: u32,
-    pub samples: usize,
     pub chsamples: usize,
     buffer: Samples<i32>,
-    pub audio_info: AudioInfo,
     pub buffer_info: BufferInfo,
     frame_size_bytes: usize,
     buffer_frames_cached: i64,
@@ -69,12 +65,8 @@ pub struct Audio {
     last_published_balance: i64,
     frame_clock: FrameClock,
     frame_stamp: i64,
-    sync_path: String,
     duplex_sync: Arc<Mutex<DuplexSync>>,
-    correction: Correction,
     channel: DoubleBufferedChannel,
-
-    last_cycle_time_nanos: i64,
     last_underrun_count: i32,
     last_overrun_count: i32,
     xrun_count: u64,
@@ -269,7 +261,6 @@ impl Audio {
             }
         }
 
-        let samples = (buffer_info.bytes as usize) / bytes_per_sample;
         let requested_period = options.period_frames.max(1);
         let hw_chsamples = if frame_size > 0 && buffer_info.fragsize > 0 {
             (buffer_info.fragsize as usize) / frame_size
@@ -334,8 +325,6 @@ impl Audio {
             }
         }
 
-        let correction = Correction::default();
-
         let buffer_frames_cached = (buffer_info.bytes as usize / frame_size) as i64;
 
         let mut initial_audio = Audio {
@@ -346,10 +335,8 @@ impl Audio {
             output_balance: 0.0,
             rate: effective_rate,
             format,
-            samples,
             chsamples,
             buffer: Samples::new(vec![0_i32; chsamples * (channels as usize)].into_boxed_slice()),
-            audio_info,
             buffer_info,
             frame_size_bytes: frame_size,
             buffer_frames_cached,
@@ -360,12 +347,8 @@ impl Audio {
             last_published_balance: i64::MIN,
             frame_clock,
             frame_stamp: 0,
-            sync_path: sync_key.to_string(),
             duplex_sync,
-            correction,
             channel,
-
-            last_cycle_time_nanos: 0,
             last_underrun_count: 0,
             last_overrun_count: 0,
             xrun_count: 0,
@@ -507,64 +490,6 @@ impl Audio {
         if rc.is_ok() { err.rec_overruns } else { 0 }
     }
 
-    fn check_time_and_run(&mut self) -> std::io::Result<()> {
-        self.frame_stamp = self
-            .frame_clock
-            .now()
-            .ok_or_else(|| std::io::Error::other("failed to read frame clock"))?;
-        let now = self.frame_stamp;
-        let wake = self.channel.wakeup_time(self, now);
-        let mut processed = false;
-        if now >= wake && !self.channel.total_finished(now) {
-            let mut chan = std::mem::replace(
-                &mut self.channel,
-                if self.input {
-                    DoubleBufferedChannel::new_empty_read()
-                } else {
-                    DoubleBufferedChannel::new_empty_write()
-                },
-            );
-            let res = chan.process(self, now);
-            self.channel = chan;
-            res?;
-            processed = true;
-        }
-        if processed {
-            self.publish_balance(self.channel.balance());
-        }
-        Ok(())
-    }
-
-    fn sleep(&self) -> bool {
-        let wakeup = self.channel.wakeup_time(self, self.frame_stamp);
-        if wakeup > self.frame_stamp {
-            return self.frame_clock.sleep_until_frame(wakeup);
-        }
-        true
-    }
-
-    fn xrun_gap(&mut self) -> i64 {
-        let enhanced_gap = self.detect_xrun_enhanced();
-
-        let max_end = self.channel.total_end();
-        let buffer_gap = if max_end < self.frame_stamp {
-            self.frame_stamp - max_end
-        } else {
-            0
-        };
-
-        let gap = enhanced_gap.max(buffer_gap);
-
-        if gap > 0 && enhanced_gap == 0 && buffer_gap > 0 {
-            tracing::debug!(
-                "OSS buffer-position xrun detected (gap {} frames)",
-                buffer_gap
-            );
-        }
-
-        gap
-    }
-
     pub(super) fn detect_xrun_enhanced(&mut self) -> i64 {
         let current_underruns = if self.input {
             0
@@ -601,91 +526,6 @@ impl Audio {
         self.last_overrun_count = current_overruns;
 
         0
-    }
-
-    pub fn read(&mut self) -> std::io::Result<()> {
-        if !self.input {
-            return Ok(());
-        }
-
-        let mut cycle_end = self.shared_cycle_end_add(self.chsamples as i64);
-        self.check_time_and_run()?;
-
-        let xrun = self.xrun_gap();
-        if xrun > 0 {
-            let skip = xrun + self.chsamples as i64;
-            cycle_end = self.shared_cycle_end_add(skip);
-            self.channel
-                .reset_buffers(self.channel.end_frames() + skip, self.frame_size());
-        }
-
-        while !self.channel.finished(self.frame_stamp) {
-            if !(self.sleep() && self.check_time_and_run().is_ok()) {
-                return Err(std::io::Error::other("capture wait failed"));
-            }
-        }
-
-        let mut buf = self.channel.take_buffer();
-        if self
-            .channels
-            .iter()
-            .any(crate::hw::ports::has_audio_connections)
-        {
-            convert_in_to_i32_connected(
-                self.format,
-                self.chsamples,
-                buf.as_slice(),
-                self.buffer.as_mut(),
-                &self.channels,
-            );
-        }
-        buf.reset();
-        let end = cycle_end + self.chsamples as i64;
-        if !self.channel.set_buffer(buf, end) {
-            return Err(std::io::Error::other("failed to requeue capture buffer"));
-        }
-
-        self.check_time_and_run()?;
-        Ok(())
-    }
-
-    pub fn write(&mut self) -> std::io::Result<()> {
-        if self.input {
-            return Ok(());
-        }
-
-        self.check_time_and_run()?;
-        let xrun = self.xrun_gap();
-        if xrun > 0 {
-            let skip = xrun + self.chsamples as i64;
-            self.channel
-                .reset_buffers(self.channel.end_frames() + skip, self.frame_size());
-        }
-
-        while !self.channel.finished(self.frame_stamp) {
-            if !(self.sleep() && self.check_time_and_run().is_ok()) {
-                return Err(std::io::Error::other("playback wait failed"));
-            }
-        }
-
-        let mut buf = self.channel.take_buffer();
-        convert_out_from_i32_interleaved(
-            self.format,
-            self.channels.len(),
-            self.chsamples,
-            self.buffer.as_mut(),
-            buf.as_mut_slice(),
-        );
-
-        let mut end = self.shared_cycle_end_get() + self.chsamples as i64;
-        end += self.playback_prefill_frames();
-        end += self.playback_correction();
-        if !self.channel.set_buffer(buf, end) {
-            return Err(std::io::Error::other("failed to requeue playback buffer"));
-        }
-
-        self.check_time_and_run()?;
-        Ok(())
     }
 
     pub fn process(&mut self) {

@@ -36,14 +36,6 @@ impl Correction {
         self.loss_max = min.max(max);
     }
 
-    pub(super) fn clear(&mut self) {
-        self.correction = 0;
-    }
-
-    pub(super) fn correction(&self) -> i64 {
-        self.correction
-    }
-
     pub(super) fn correct(&mut self, balance: i64, target: i64) -> i64 {
         let corrected = balance - target + self.correction;
         if corrected > self.loss_max {

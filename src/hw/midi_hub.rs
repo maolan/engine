@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::message::HwMidiEvent;
 use crate::midi::io::MidiEvent;
 use nix::libc;
