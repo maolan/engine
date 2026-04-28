@@ -1438,19 +1438,15 @@ impl PluginHandle {
     fn get_note_names(&self) -> std::collections::HashMap<u8, String> {
         let mut result = std::collections::HashMap::new();
         let Some(ext) = self.note_name_ext() else {
-            eprintln!("[engine] note_name_ext null");
             return result;
         };
         let Some(count_fn) = ext.count else {
-            eprintln!("[engine] note_name_ext.count null");
             return result;
         };
         let Some(get_fn) = ext.get else {
-            eprintln!("[engine] note_name_ext.get null");
             return result;
         };
         let count = unsafe { count_fn(self.plugin) };
-        eprintln!("[engine] note_name_count={count}");
         for i in 0..count {
             let mut nn = ClapNoteName {
                 name: [0; 256],
