@@ -2916,6 +2916,16 @@ impl Track {
         std::collections::HashMap::new()
     }
 
+    pub fn get_clap_note_names(&self) -> std::collections::HashMap<u8, String> {
+        let mut result = std::collections::HashMap::new();
+        for instance in &self.clap_plugins {
+            for (note, name) in instance.processor.note_names() {
+                result.insert(note, name);
+            }
+        }
+        result
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     pub fn set_lv2_state_base_dir(&mut self, base_dir: Option<PathBuf>) {
         self.lv2_state_base_dir = base_dir.clone();
@@ -3210,6 +3220,35 @@ impl Track {
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
         let state = instance.processor.snapshot_state()?;
         Ok((instance.processor.path().to_string(), state))
+    }
+
+    pub fn clap_plugin_processor(&self, instance_id: usize) -> Result<Arc<ClapProcessor>, String> {
+        let instance = self
+            .clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Track '{}' does not have CLAP instance id: {}",
+                    self.name, instance_id
+                )
+            })?;
+        Ok(instance.processor.clone())
+    }
+
+    pub fn clip_clap_plugin_processor(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Arc<ClapProcessor>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
+        Ok(instance.processor.clone())
     }
 
     pub fn clap_restore_state(

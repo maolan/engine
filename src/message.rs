@@ -566,6 +566,13 @@ pub enum Action {
         track_name: String,
         note_names: std::collections::HashMap<u8, String>,
     },
+    TrackGetClapNoteNames {
+        track_name: String,
+    },
+    TrackClapNoteNames {
+        track_name: String,
+        note_names: std::collections::HashMap<u8, String>,
+    },
     #[cfg(all(unix, not(target_os = "macos")))]
     TrackSetLv2ControlValue {
         track_name: String,
@@ -696,6 +703,26 @@ pub enum Action {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
+    },
+    TrackGetClapProcessor {
+        track_name: String,
+        instance_id: usize,
+    },
+    ClipGetClapProcessor {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    TrackClapProcessor {
+        track_name: String,
+        instance_id: usize,
+        processor: Arc<crate::clap::ClapProcessor>,
+    },
+    ClipClapProcessor {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        processor: Arc<crate::clap::ClapProcessor>,
     },
     TrackClapStateSnapshot {
         track_name: String,

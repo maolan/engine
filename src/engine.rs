@@ -4598,6 +4598,21 @@ impl Engine {
                 }))
                 .await;
             }
+            Action::TrackGetClapNoteNames { ref track_name } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let note_names = track.lock().get_clap_note_names();
+                self.notify_clients(Ok(Action::TrackClapNoteNames {
+                    track_name: track_name.clone(),
+                    note_names,
+                }))
+                .await;
+            }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::TrackGetLv2PluginControls {
                 ref track_name,
@@ -5183,6 +5198,53 @@ impl Engine {
                             instance_id,
                             plugin_path,
                             state,
+                        }))
+                        .await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                },
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Action::TrackGetClapProcessor {
+                ref track_name,
+                instance_id,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => match track.lock().clap_plugin_processor(instance_id) {
+                    Ok(processor) => {
+                        self.notify_clients(Ok(Action::TrackClapProcessor {
+                            track_name: track_name.clone(),
+                            instance_id,
+                            processor,
+                        }))
+                        .await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                },
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Action::ClipGetClapProcessor {
+                ref track_name,
+                clip_idx,
+                instance_id,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => match track
+                    .lock()
+                    .clip_clap_plugin_processor(clip_idx, instance_id)
+                {
+                    Ok(processor) => {
+                        self.notify_clients(Ok(Action::ClipClapProcessor {
+                            track_name: track_name.clone(),
+                            clip_idx,
+                            instance_id,
+                            processor,
                         }))
                         .await;
                     }
@@ -6422,11 +6484,14 @@ impl Engine {
             Action::ClipLv2StateSnapshot { .. } => {}
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::TrackLv2Midnam { .. } => {}
+            Action::TrackClapNoteNames { .. } => {}
             Action::SessionDiagnosticsReport { .. } => {}
             Action::MidiLearnMappingsReport { .. } => {}
             Action::HWInfo { .. } => {}
             Action::Undo => {} // Already handled at the beginning
             Action::Redo => {} // Already handled at the beginning
+            Action::TrackClapProcessor { .. } => {}
+            Action::ClipClapProcessor { .. } => {}
         }
 
         // Record action in history after successful processing

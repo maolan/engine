@@ -485,6 +485,10 @@ impl ClapProcessor {
         self.plugin_handle.gui_on_timer(timer_id);
     }
 
+    pub fn note_names(&self) -> std::collections::HashMap<u8, String> {
+        self.plugin_handle.get_note_names()
+    }
+
     pub fn run_host_callbacks_main_thread(&self) {
         let host_flags = self.host_runtime.take_callback_flags();
         if host_flags.restart {
@@ -582,8 +586,13 @@ impl ClapProcessor {
         }
 
         let pending_params = std::mem::take(self.pending_param_events.lock());
-        let (in_events, in_ctx) =
-            input_events_from(midi_in, &pending_params, self.sample_rate, transport);
+        let (in_events, in_ctx) = input_events_from(
+            midi_in,
+            &pending_params,
+            self.sample_rate,
+            transport,
+            self.midi_input_ports > 0,
+        );
         let out_cap = midi_in
             .len()
             .saturating_add(self.midi_output_ports.saturating_mul(64));
@@ -745,6 +754,8 @@ struct ClapEventHeader {
 }
 
 const CLAP_CORE_EVENT_SPACE_ID: u16 = 0;
+const CLAP_EVENT_NOTE_ON: u16 = 0;
+const CLAP_EVENT_NOTE_OFF: u16 = 1;
 const CLAP_EVENT_MIDI: u16 = 10;
 const CLAP_EVENT_PARAM_VALUE: u16 = 5;
 const CLAP_EVENT_PARAM_GESTURE_BEGIN: u16 = 6;
@@ -764,6 +775,16 @@ struct ClapEventMidi {
     header: ClapEventHeader,
     port_index: u16,
     data: [u8; 3],
+}
+
+#[repr(C)]
+struct ClapEventNote {
+    header: ClapEventHeader,
+    note_id: i32,
+    port_index: i16,
+    channel: i16,
+    key: i16,
+    velocity: f64,
 }
 
 #[repr(C)]
@@ -950,6 +971,25 @@ struct ClapHostState {
 }
 
 #[repr(C)]
+struct ClapNoteName {
+    name: [c_char; 256],
+    port: i16,
+    key: i16,
+    channel: i16,
+}
+
+#[repr(C)]
+struct ClapPluginNoteName {
+    count: Option<unsafe extern "C" fn(*const ClapPlugin) -> u32>,
+    get: Option<unsafe extern "C" fn(*const ClapPlugin, u32, *mut ClapNoteName) -> bool>,
+}
+
+#[repr(C)]
+struct ClapHostNoteName {
+    changed: Option<unsafe extern "C" fn(*const ClapHost)>,
+}
+
+#[repr(C)]
 struct ClapOStream {
     ctx: *mut c_void,
     write: Option<unsafe extern "C" fn(*const ClapOStream, *const c_void, u64) -> i64>,
@@ -984,6 +1024,7 @@ struct ClapProcess {
 }
 
 enum ClapInputEvent {
+    Note(ClapEventNote),
     Midi(ClapEventMidi),
     ParamValue(ClapEventParamValue),
     ParamGesture(ClapEventParamGesture),
@@ -993,6 +1034,7 @@ enum ClapInputEvent {
 impl ClapInputEvent {
     fn header_ptr(&self) -> *const ClapEventHeader {
         match self {
+            Self::Note(e) => &e.header as *const ClapEventHeader,
             Self::Midi(e) => &e.header as *const ClapEventHeader,
             Self::ParamValue(e) => &e.header as *const ClapEventHeader,
             Self::ParamGesture(e) => &e.header as *const ClapEventHeader,
@@ -1036,6 +1078,7 @@ struct HostRuntimeState {
     ui_active: AtomicU32,
     param_flush_requested: AtomicU32,
     state_dirty_requested: AtomicU32,
+    note_names_dirty: AtomicU32,
 }
 
 thread_local! {
@@ -1092,6 +1135,7 @@ impl HostRuntime {
             ui_active: AtomicU32::new(0),
             param_flush_requested: AtomicU32::new(0),
             state_dirty_requested: AtomicU32::new(0),
+            note_names_dirty: AtomicU32::new(0),
         });
         let host = ClapHost {
             clap_version: CLAP_VERSION,
@@ -1378,6 +1422,54 @@ impl PluginHandle {
         }
         // SAFETY: extension pointer layout follows clap.note-ports ABI.
         Some(unsafe { &*(ext_ptr as *const ClapPluginNotePorts) })
+    }
+
+    fn note_name_ext(&self) -> Option<&ClapPluginNoteName> {
+        let ext_id = c"clap.note-name";
+        let plugin = unsafe { &*self.plugin };
+        let get_extension = plugin.get_extension?;
+        let ext_ptr = unsafe { get_extension(self.plugin, ext_id.as_ptr()) };
+        if ext_ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { &*(ext_ptr as *const ClapPluginNoteName) })
+    }
+
+    fn get_note_names(&self) -> std::collections::HashMap<u8, String> {
+        let mut result = std::collections::HashMap::new();
+        let Some(ext) = self.note_name_ext() else {
+            eprintln!("[engine] note_name_ext null");
+            return result;
+        };
+        let Some(count_fn) = ext.count else {
+            eprintln!("[engine] note_name_ext.count null");
+            return result;
+        };
+        let Some(get_fn) = ext.get else {
+            eprintln!("[engine] note_name_ext.get null");
+            return result;
+        };
+        let count = unsafe { count_fn(self.plugin) };
+        eprintln!("[engine] note_name_count={count}");
+        for i in 0..count {
+            let mut nn = ClapNoteName {
+                name: [0; 256],
+                port: -1,
+                key: -1,
+                channel: -1,
+            };
+            if unsafe { get_fn(self.plugin, i, &mut nn) } {
+                let name = unsafe {
+                    std::ffi::CStr::from_ptr(nn.name.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                if nn.key >= 0 && nn.key <= 127 && !name.is_empty() {
+                    result.insert(nn.key as u8, name);
+                }
+            }
+        }
+        result
     }
 
     fn parameter_infos(&self) -> Vec<ClapParameterInfo> {
@@ -1751,6 +1843,9 @@ static HOST_PARAMS_EXT: ClapHostParams = ClapHostParams {
 static HOST_STATE_EXT: ClapHostState = ClapHostState {
     mark_dirty: Some(host_state_mark_dirty),
 };
+static HOST_NOTE_NAME_EXT: ClapHostNoteName = ClapHostNoteName {
+    changed: Some(host_note_name_changed),
+};
 static NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1);
 
 fn host_runtime_state(host: *const ClapHost) -> Option<&'static HostRuntimeState> {
@@ -1794,6 +1889,7 @@ unsafe extern "C" fn host_get_extension(
             .filter(|state| state.ui_active.load(Ordering::Acquire) != 0)
             .map(|_| (&HOST_STATE_EXT as *const ClapHostState).cast::<c_void>())
             .unwrap_or(std::ptr::null()),
+        "clap.host.note-name" => (&HOST_NOTE_NAME_EXT as *const ClapHostNoteName).cast::<c_void>(),
         _ => std::ptr::null(),
     }
 }
@@ -1813,6 +1909,12 @@ unsafe extern "C" fn host_request_callback(_host: *const ClapHost) {
 unsafe extern "C" fn host_request_restart(_host: *const ClapHost) {
     if let Some(state) = host_runtime_state(_host) {
         state.callback_flags.lock().restart = true;
+    }
+}
+
+unsafe extern "C" fn host_note_name_changed(_host: *const ClapHost) {
+    if let Some(state) = host_runtime_state(_host) {
+        state.note_names_dirty.store(1, Ordering::Release);
     }
 }
 
@@ -2000,6 +2102,7 @@ fn input_events_from(
     param_events: &[PendingParamEvent],
     sample_rate: f64,
     transport: ClapTransportInfo,
+    has_note_ports: bool,
 ) -> (ClapInputEvents, Box<ClapInputEventsCtx>) {
     let mut events = Vec::with_capacity(midi_events.len() + param_events.len() + 1);
     let bpm = transport.bpm.max(1.0);
@@ -2073,17 +2176,64 @@ fn input_events_from(
         let mut data = [0_u8; 3];
         let bytes = event.data.len().min(3);
         data[..bytes].copy_from_slice(&event.data[..bytes]);
-        events.push(ClapInputEvent::Midi(ClapEventMidi {
-            header: ClapEventHeader {
-                size: std::mem::size_of::<ClapEventMidi>() as u32,
-                time: event.frame,
-                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                type_: CLAP_EVENT_MIDI,
-                flags: 0,
-            },
-            port_index: 0,
-            data,
-        }));
+        let status = data[0];
+        let is_note_on = (0x90..=0x9F).contains(&status);
+        let is_note_off = (0x80..=0x8F).contains(&status);
+        if has_note_ports && (is_note_on || is_note_off) {
+            let channel = (status & 0x0F) as i16;
+            let key = data.get(1).copied().unwrap_or(0).min(127) as i16;
+            let velocity_byte = data.get(2).copied().unwrap_or(0);
+            let velocity = if is_note_on && velocity_byte == 0 {
+                // Note-on with velocity 0 is conventionally note-off.
+                events.push(ClapInputEvent::Note(ClapEventNote {
+                    header: ClapEventHeader {
+                        size: std::mem::size_of::<ClapEventNote>() as u32,
+                        time: event.frame,
+                        space_id: CLAP_CORE_EVENT_SPACE_ID,
+                        type_: CLAP_EVENT_NOTE_OFF,
+                        flags: 0,
+                    },
+                    note_id: -1,
+                    port_index: 0,
+                    channel,
+                    key,
+                    velocity: 0.0,
+                }));
+                continue;
+            } else {
+                (velocity_byte as f64 / 127.0).clamp(0.0, 1.0)
+            };
+            events.push(ClapInputEvent::Note(ClapEventNote {
+                header: ClapEventHeader {
+                    size: std::mem::size_of::<ClapEventNote>() as u32,
+                    time: event.frame,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: if is_note_on {
+                        CLAP_EVENT_NOTE_ON
+                    } else {
+                        CLAP_EVENT_NOTE_OFF
+                    },
+                    flags: 0,
+                },
+                note_id: -1,
+                port_index: 0,
+                channel,
+                key,
+                velocity,
+            }));
+        } else {
+            events.push(ClapInputEvent::Midi(ClapEventMidi {
+                header: ClapEventHeader {
+                    size: std::mem::size_of::<ClapEventMidi>() as u32,
+                    time: event.frame,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_MIDI,
+                    flags: 0,
+                },
+                port_index: 0,
+                data,
+            }));
+        }
     }
     for param in param_events {
         match *param {
@@ -2134,6 +2284,7 @@ fn input_events_from(
         }
     }
     events.sort_by_key(|event| match event {
+        ClapInputEvent::Note(e) => e.header.time,
         ClapInputEvent::Midi(e) => e.header.time,
         ClapInputEvent::ParamValue(e) => e.header.time,
         ClapInputEvent::ParamGesture(e) => e.header.time,
@@ -2201,6 +2352,7 @@ fn param_input_events_from(
         }
     }
     events.sort_by_key(|event| match event {
+        ClapInputEvent::Note(e) => e.header.time,
         ClapInputEvent::Midi(e) => e.header.time,
         ClapInputEvent::ParamValue(e) => e.header.time,
         ClapInputEvent::ParamGesture(e) => e.header.time,
