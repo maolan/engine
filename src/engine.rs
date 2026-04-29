@@ -428,6 +428,7 @@ impl Engine {
     fn parse_midi_clip_for_edit(
         path: &Path,
         sample_rate: f64,
+        clip_start: usize,
     ) -> Result<MidiEditParseResult, String> {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let smf = Smf::parse(&bytes).map_err(|e| e.to_string())?;
@@ -595,6 +596,27 @@ impl Engine {
         notes.sort_by_key(|n| (n.start_sample, n.pitch));
         controllers.sort_by_key(|c| (c.sample, c.controller));
         passthrough_events.sort_by_key(|(sample, _)| *sample);
+
+        // Normalize absolute timeline timestamps to clip-relative coordinates.
+        let min_sample = notes
+            .iter()
+            .map(|n| n.start_sample)
+            .chain(controllers.iter().map(|c| c.sample))
+            .chain(passthrough_events.iter().map(|(s, _)| *s as usize))
+            .min()
+            .unwrap_or(0);
+        if min_sample >= clip_start && clip_start > 0 {
+            for note in &mut notes {
+                note.start_sample = note.start_sample.saturating_sub(clip_start);
+            }
+            for ctrl in &mut controllers {
+                ctrl.sample = ctrl.sample.saturating_sub(clip_start);
+            }
+            for (sample, _) in &mut passthrough_events {
+                *sample = sample.saturating_sub(clip_start as u64);
+            }
+        }
+
         Ok((notes, controllers, passthrough_events))
     }
 
@@ -697,20 +719,21 @@ impl Engine {
             .get(track_name)
             .cloned()
             .ok_or_else(|| format!("Track not found: {track_name}"))?;
-        let (clip_name, clip_path, sample_rate) = {
+        let (clip_name, clip_path, sample_rate, clip_start) = {
             let track = track_handle.lock();
             if clip_index >= track.midi.clips.len() {
                 return Err(format!(
                     "Invalid MIDI clip index {clip_index} for '{track_name}'"
                 ));
             }
-            let clip_name = track.midi.clips[clip_index].name.clone();
+            let clip = &track.midi.clips[clip_index];
+            let clip_name = clip.name.clone();
             let clip_path = track.resolve_clip_path(&clip_name);
-            (clip_name, clip_path, track.sample_rate)
+            (clip_name, clip_path, track.sample_rate, clip.start)
         };
 
         let (mut notes, mut controllers, mut passthrough_events) =
-            Self::parse_midi_clip_for_edit(&clip_path, sample_rate)?;
+            Self::parse_midi_clip_for_edit(&clip_path, sample_rate, clip_start)?;
 
         match action {
             Action::ModifyMidiNotes {
@@ -2544,6 +2567,16 @@ impl Engine {
             return;
         }
         rec.events.sort_by_key(|(sample, _)| *sample);
+        let clip_rel_name = format!("midi/{}", rec.file_name);
+        let clip_len_samples = rec
+            .events
+            .last()
+            .map(|(s, _)| s.saturating_sub(rec.start_sample as u64) as usize + 1)
+            .unwrap_or(1);
+        // Normalize to clip-relative coordinates so the file starts at sample 0.
+        for (sample, _) in &mut rec.events {
+            *sample = sample.saturating_sub(rec.start_sample as u64);
+        }
         let path = midi_dir.join(&rec.file_name);
         if let Err(e) = Self::write_midi_file(&path, sample_rate, &rec.events) {
             self.notify_clients(Err(format!(
@@ -2554,12 +2587,6 @@ impl Engine {
             .await;
             return;
         }
-        let clip_rel_name = format!("midi/{}", rec.file_name);
-        let clip_len_samples = rec
-            .events
-            .last()
-            .map(|(s, _)| s.saturating_sub(rec.start_sample as u64) as usize + 1)
-            .unwrap_or(1);
         let mut clip = MIDIClip::new(clip_rel_name.clone(), rec.start_sample, clip_len_samples);
         clip.offset = 0;
         if let Some(track) = self.state.lock().tracks.get(&track_name) {
