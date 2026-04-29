@@ -122,6 +122,7 @@ pub fn should_record(action: &Action) -> bool {
             | Action::TrackBalance(_, _)
             | Action::TrackToggleArm(_)
             | Action::TrackToggleMute(_)
+            | Action::TrackTogglePhase(_)
             | Action::TrackToggleSolo(_)
             | Action::TrackToggleInputMonitor(_)
             | Action::TrackToggleDiskMonitor(_)
@@ -209,6 +210,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
 
         Action::TrackToggleArm(name) => Some(Action::TrackToggleArm(name.clone())),
         Action::TrackToggleMute(name) => Some(Action::TrackToggleMute(name.clone())),
+        Action::TrackTogglePhase(name) => Some(Action::TrackTogglePhase(name.clone())),
         Action::TrackToggleSolo(name) => Some(Action::TrackToggleSolo(name.clone())),
         Action::TrackToggleInputMonitor(name) => {
             Some(Action::TrackToggleInputMonitor(name.clone()))

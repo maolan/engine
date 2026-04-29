@@ -446,6 +446,7 @@ pub struct Track {
     pub balance: f32,
     pub armed: bool,
     pub muted: bool,
+    pub phase_inverted: bool,
     pub soloed: bool,
     pub input_monitor: bool,
     pub disk_monitor: bool,
@@ -525,6 +526,7 @@ impl Track {
             balance: 0.0,
             armed: false,
             muted: false,
+            phase_inverted: false,
             soloed: false,
             input_monitor: false,
             disk_monitor: true,
@@ -1183,6 +1185,7 @@ impl Track {
         self.dispatch_track_output_midi_to_connected_inputs();
         self.clear_local_midi_inputs();
         let linear_gain = 10.0_f32.powf(self.level / 20.0);
+        let phase_multiplier = if self.phase_inverted { -1.0 } else { 1.0 };
         let (left_balance, right_balance) = if self.audio.outs.len() == 2 {
             let b = self.balance.clamp(-1.0, 1.0);
             ((1.0 - b).clamp(0.0, 1.0), (1.0 + b).clamp(0.0, 1.0))
@@ -1220,7 +1223,7 @@ impl Track {
             } else {
                 1.0
             };
-            let output_gain = linear_gain * balance_gain;
+            let output_gain = linear_gain * balance_gain * phase_multiplier;
             let unity_output_gain = (output_gain - 1.0).abs() <= f32::EPSILON;
             let sources = self.internal_output_routes_cache.get(out_idx);
             let has_sources = sources.is_some_and(|s| !s.is_empty());
@@ -1365,6 +1368,12 @@ impl Track {
     }
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
+    }
+    pub fn invert_phase(&mut self) {
+        self.phase_inverted = !self.phase_inverted;
+    }
+    pub fn set_phase_inverted(&mut self, phase_inverted: bool) {
+        self.phase_inverted = phase_inverted;
     }
     pub fn solo(&mut self) {
         self.soloed = !self.soloed;

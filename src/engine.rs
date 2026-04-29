@@ -2113,6 +2113,13 @@ impl Engine {
                             .await;
                     }
                 }
+                Action::TrackTogglePhase(ref track_name) => {
+                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                        track.lock().invert_phase();
+                        self.notify_clients(Ok(Action::TrackTogglePhase(track_name.clone())))
+                            .await;
+                    }
+                }
                 Action::TrackToggleSolo(ref track_name) => {
                     if let Some(track) = self.state.lock().tracks.get(track_name) {
                         track.lock().solo();
@@ -4219,6 +4226,11 @@ impl Engine {
                                 .await;
                         }
                     }
+                }
+            }
+            Action::TrackTogglePhase(ref name) => {
+                if let Some(track) = self.state.lock().tracks.get(name) {
+                    track.lock().invert_phase();
                 }
             }
             Action::TrackToggleSolo(ref name) => {

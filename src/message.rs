@@ -407,6 +407,7 @@ pub enum Action {
     },
     TrackToggleArm(String),
     TrackToggleMute(String),
+    TrackTogglePhase(String),
     TrackToggleSolo(String),
     TrackToggleInputMonitor(String),
     TrackToggleDiskMonitor(String),
