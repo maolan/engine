@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "alsa",
  "byteorder",

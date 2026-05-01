@@ -160,10 +160,6 @@ impl ClapProcessor {
     ) -> Result<Self, String> {
         let _thread_scope = HostThreadScope::enter_main();
         let (plugin_path, plugin_id) = split_plugin_spec(plugin_spec);
-        let name = Path::new(plugin_path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| plugin_spec.to_string());
         let host_runtime = Arc::new(HostRuntime::new()?);
         let plugin_handle = Arc::new(PluginHandle::load(
             plugin_path,
@@ -201,7 +197,7 @@ impl ClapProcessor {
         Ok(Self {
             path: plugin_spec.to_string(),
             plugin_id: plugin_handle.plugin_id().to_string(),
-            name,
+            name: plugin_handle.plugin_name().to_string(),
             sample_rate,
             audio_inputs,
             audio_outputs,
@@ -1220,6 +1216,7 @@ struct PluginHandle {
     entry: *const ClapPluginEntry,
     plugin: *const ClapPlugin,
     plugin_id: String,
+    plugin_name: String,
 }
 
 // SAFETY: PluginHandle only stores pointers/libraries managed by the CLAP ABI.
@@ -1286,6 +1283,7 @@ impl PluginHandle {
             return Err("CLAP factory returned zero plugins".to_string());
         }
         let mut selected_id = None::<CString>;
+        let mut selected_name = None::<String>;
         for i in 0..count {
             // SAFETY: i < count.
             let desc = unsafe { get_desc(factory, i) };
@@ -1300,10 +1298,19 @@ impl PluginHandle {
             // SAFETY: descriptor id is NUL-terminated per CLAP ABI.
             let id = unsafe { CStr::from_ptr(desc.id) };
             let id_str = id.to_string_lossy();
+            let name_str = if desc.name.is_null() {
+                String::new()
+            } else {
+                // SAFETY: descriptor name is NUL-terminated per CLAP ABI.
+                unsafe { CStr::from_ptr(desc.name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
             if plugin_id.is_none() || plugin_id == Some(id_str.as_ref()) {
                 selected_id = Some(
                     CString::new(id_str.as_ref()).map_err(|e| format!("Invalid plugin id: {e}"))?,
                 );
+                selected_name = Some(name_str);
                 break;
             }
         }
@@ -1314,6 +1321,12 @@ impl PluginHandle {
                 "CLAP descriptor not found".to_string()
             }
         })?;
+        let plugin_name = selected_name.unwrap_or_else(|| {
+            Path::new(plugin_path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| plugin_path.to_string())
+        });
         // SAFETY: valid host pointer and plugin id.
         let plugin = unsafe { create(factory, &host_runtime.host, selected_id.as_ptr()) };
         if plugin.is_null() {
@@ -1346,11 +1359,16 @@ impl PluginHandle {
             entry: entry_ptr,
             plugin,
             plugin_id: plugin_id_str,
+            plugin_name,
         })
     }
 
     fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    fn plugin_name(&self) -> &str {
+        &self.plugin_name
     }
 
     fn process(&self, process: &mut ClapProcess) -> Result<bool, String> {
