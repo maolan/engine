@@ -2779,7 +2779,7 @@ impl Track {
                     instance_id: instance.id,
                     format: "LV2".to_string(),
                     uri: instance.processor.uri().to_string(),
-                    plugin_id: String::new(),
+                    plugin_id: instance.processor.uri().to_string(),
                     name: instance.processor.name().to_string(),
                     main_audio_inputs: instance.processor.main_audio_input_count(),
                     main_audio_outputs: instance.processor.main_audio_output_count(),
@@ -2819,7 +2819,7 @@ impl Track {
                     instance_id: instance.id,
                     format: "CLAP".to_string(),
                     uri: instance.processor.path().to_string(),
-                    plugin_id: String::new(),
+                    plugin_id: instance.processor.plugin_id().to_string(),
                     name: instance.processor.name().to_string(),
                     main_audio_inputs: instance.processor.main_audio_input_count(),
                     main_audio_outputs: instance.processor.main_audio_output_count(),
@@ -3000,10 +3000,7 @@ impl Track {
         if !path.exists() {
             return Err(format!("CLAP plugin not found: {plugin_path}"));
         }
-        if !path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("clap"))
-        {
+        if !crate::clap::is_supported_clap_binary(path) {
             return Err(format!("Not a CLAP plugin path: {plugin_path}"));
         }
         if self

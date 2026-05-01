@@ -112,6 +112,7 @@ pub struct ClapPluginCapabilities {
 #[derive(Clone)]
 pub struct ClapProcessor {
     path: String,
+    plugin_id: String,
     name: String,
     sample_rate: f64,
     audio_inputs: Vec<Arc<AudioIO>>,
@@ -135,6 +136,7 @@ impl fmt::Debug for ClapProcessor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClapProcessor")
             .field("path", &self.path)
+            .field("plugin_id", &self.plugin_id)
             .field("name", &self.name)
             .field("audio_inputs", &self.audio_inputs.len())
             .field("audio_outputs", &self.audio_outputs.len())
@@ -198,6 +200,7 @@ impl ClapProcessor {
         ));
         Ok(Self {
             path: plugin_spec.to_string(),
+            plugin_id: plugin_handle.plugin_id().to_string(),
             name,
             sample_rate,
             audio_inputs,
@@ -388,6 +391,10 @@ impl ClapProcessor {
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
     }
 
     pub fn name(&self) -> &str {
@@ -1212,6 +1219,7 @@ struct PluginHandle {
     _library: Library,
     entry: *const ClapPluginEntry,
     plugin: *const ClapPlugin,
+    plugin_id: String,
 }
 
 // SAFETY: PluginHandle only stores pointers/libraries managed by the CLAP ABI.
@@ -1332,11 +1340,17 @@ impl PluginHandle {
                 return Err("CLAP plugin start_processing() failed".to_string());
             }
         }
+        let plugin_id_str = selected_id.to_string_lossy().into_owned();
         Ok(Self {
             _library: library,
             entry: entry_ptr,
             plugin,
+            plugin_id: plugin_id_str,
         })
+    }
+
+    fn plugin_id(&self) -> &str {
+        &self.plugin_id
     }
 
     fn process(&self, process: &mut ClapProcess) -> Result<bool, String> {
@@ -2447,6 +2461,15 @@ pub fn list_plugins() -> Vec<ClapPluginInfo> {
     list_plugins_with_capabilities(false)
 }
 
+pub fn is_supported_clap_binary(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("clap")
+            || ext.eq_ignore_ascii_case("so")
+            || ext.eq_ignore_ascii_case("dylib")
+            || ext.eq_ignore_ascii_case("dll")
+    })
+}
+
 pub fn list_plugins_with_capabilities(scan_capabilities: bool) -> Vec<ClapPluginInfo> {
     let mut roots = default_clap_search_roots();
 
@@ -2478,14 +2501,23 @@ fn collect_clap_plugins(root: &Path, out: &mut Vec<ClapPluginInfo>, scan_capabil
             continue;
         };
         if ft.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "deps" | "build" | "incremental" | ".fingerprint" | "examples"
+                    )
+                })
+            {
+                continue;
+            }
             collect_clap_plugins(&path, out, scan_capabilities);
             continue;
         }
 
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("clap"))
-        {
+        if is_supported_clap_binary(&path) {
             let infos = scan_bundle_descriptors(&path, scan_capabilities);
             if infos.is_empty() {
                 let name = path
