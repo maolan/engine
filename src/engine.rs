@@ -5529,7 +5529,10 @@ impl Engine {
                 clip_idx,
                 instance_id,
             } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().clip_vst3_plugin_processor(clip_idx, instance_id) {
+                Ok(track) => match track
+                    .lock()
+                    .clip_vst3_plugin_processor(clip_idx, instance_id)
+                {
                     Ok(processor) => {
                         self.notify_clients(Ok(Action::ClipVst3Processor {
                             track_name: track_name.clone(),

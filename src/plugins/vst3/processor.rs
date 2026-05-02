@@ -9,12 +9,12 @@ use std::fmt;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use vst3::ComPtr;
 use vst3::ComWrapper;
 use vst3::Steinberg::Vst::ProcessModes_::kRealtime;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
-use vst3::Steinberg::{FIDString, IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk};
 use vst3::Steinberg::Vst::{IEditControllerTrait, ViewType};
-use vst3::ComPtr;
+use vst3::Steinberg::{FIDString, IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk};
 
 pub struct Vst3Processor {
     // Plugin identity
@@ -105,15 +105,16 @@ impl Vst3Processor {
         // Find the first Audio Module class, matching rust-vst3-host behavior
         let mut class_info = None;
         for i in 0..class_count {
-            if let Some(info) = factory.get_class_info(i) {
-                if info.category.contains("Audio Module") {
-                    class_info = Some(info);
-                    break;
-                }
+            if let Some(info) = factory.get_class_info(i)
+                && info.category.contains("Audio Module")
+            {
+                class_info = Some(info);
+                break;
             }
         }
         // Fallback to first class if no Audio Module found
-        let class_info = class_info.or_else(|| factory.get_class_info(0))
+        let class_info = class_info
+            .or_else(|| factory.get_class_info(0))
             .ok_or("Failed to get class info")?;
 
         let mut instance = factory.create_instance(&class_info.cid)?;
@@ -192,10 +193,10 @@ impl Vst3Processor {
         // catch_unwind lets us fall back to an empty list.
         let parameters = protected_call(|| instance.query_parameters()).unwrap_or_default();
         let scalar_values = Arc::new(Mutex::new(
-            parameters.iter().map(|p| p.default_value as f32).collect()
+            parameters.iter().map(|p| p.default_value as f32).collect(),
         ));
         let previous_values = Arc::new(Mutex::new(
-            parameters.iter().map(|p| p.default_value as f32).collect()
+            parameters.iter().map(|p| p.default_value as f32).collect(),
         ));
         let plugin_id = format!("{:02X?}", class_info.cid);
 
@@ -499,11 +500,7 @@ impl Vst3Processor {
         Some(self.scalar_values.lock().unwrap()[idx])
     }
 
-    pub fn set_parameter_value(
-        &self,
-        param_id: u32,
-        normalized_value: f32,
-    ) -> Result<(), String> {
+    pub fn set_parameter_value(&self, param_id: u32, normalized_value: f32) -> Result<(), String> {
         let idx = self
             .parameters
             .iter()
@@ -644,12 +641,13 @@ impl Vst3Processor {
         if view.is_null() {
             return Err("Plugin does not provide an editor view".to_string());
         }
-        let view = unsafe { ComPtr::<IPlugView>::from_raw(view) }
-            .ok_or("Failed to wrap IPlugView")?;
+        let view =
+            unsafe { ComPtr::<IPlugView>::from_raw(view) }.ok_or("Failed to wrap IPlugView")?;
 
         let platform_cstr =
             CString::new(platform_type).map_err(|e| format!("Invalid platform type: {e}"))?;
-        let supported = unsafe { view.isPlatformTypeSupported(platform_cstr.as_ptr() as FIDString) };
+        let supported =
+            unsafe { view.isPlatformTypeSupported(platform_cstr.as_ptr() as FIDString) };
         if supported != kResultOk {
             return Err(format!("Platform type '{}' not supported", platform_type));
         }
@@ -688,12 +686,8 @@ impl Vst3Processor {
 
         let platform_cstr =
             CString::new(platform_type).map_err(|e| format!("Invalid platform type: {e}"))?;
-        let result = unsafe {
-            view.attached(
-                window as *mut c_void,
-                platform_cstr.as_ptr() as FIDString,
-            )
-        };
+        let result =
+            unsafe { view.attached(window as *mut c_void, platform_cstr.as_ptr() as FIDString) };
         if result != kResultOk {
             return Err(format!("Failed to attach GUI view: {:#x}", result));
         }
@@ -727,11 +721,11 @@ impl Vst3Processor {
     }
 
     pub fn gui_hide(&self) {
-        if let Ok(session) = self.gui_session.lock() {
-            if let Some(view) = session.view.as_ref() {
-                unsafe {
-                    let _ = view.onFocus(0);
-                }
+        if let Ok(session) = self.gui_session.lock()
+            && let Some(view) = session.view.as_ref()
+        {
+            unsafe {
+                let _ = view.onFocus(0);
             }
         }
     }
@@ -777,14 +771,12 @@ impl Vst3Processor {
     }
 
     pub fn gui_check_resize(&self) -> Option<(i32, i32)> {
-        if let Ok(session) = self.gui_session.lock() {
-            if let Some(ref frame) = session.plug_frame {
-                if frame.resize_requested.swap(false, Ordering::Relaxed) {
-                    if let Ok(size) = frame.requested_size.lock() {
-                        return *size;
-                    }
-                }
-            }
+        if let Ok(session) = self.gui_session.lock()
+            && let Some(ref frame) = session.plug_frame
+            && frame.resize_requested.swap(false, Ordering::Relaxed)
+            && let Ok(size) = frame.requested_size.lock()
+        {
+            return *size;
         }
         None
     }
@@ -808,4 +800,3 @@ impl Drop for Vst3Processor {
 pub fn list_plugins() -> Vec<super::host::Vst3PluginInfo> {
     super::host::list_plugins()
 }
-

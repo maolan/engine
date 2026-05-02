@@ -313,12 +313,18 @@ pub struct HostPlugFrame {
     pub requested_size: Mutex<Option<(i32, i32)>>,
 }
 
-impl HostPlugFrame {
-    pub fn new() -> Self {
+impl Default for HostPlugFrame {
+    fn default() -> Self {
         Self {
             resize_requested: AtomicBool::new(false),
             requested_size: Mutex::new(None),
         }
+    }
+}
+
+impl HostPlugFrame {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -1560,7 +1566,8 @@ fn get_module_path(bundle_path: &Path) -> Result<std::path::PathBuf, String> {
             for entry in entries.flatten() {
                 let file_path = entry.path();
                 if file_path.is_file()
-                    && file_path.extension()
+                    && file_path
+                        .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
                 {
                     return Ok(file_path);
@@ -1578,7 +1585,8 @@ fn get_module_path(bundle_path: &Path) -> Result<std::path::PathBuf, String> {
             for entry in entries.flatten() {
                 let file_path = entry.path();
                 if file_path.is_file()
-                    && file_path.extension()
+                    && file_path
+                        .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
                 {
                     return Ok(file_path);

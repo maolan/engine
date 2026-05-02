@@ -2986,7 +2986,10 @@ impl Track {
         )?;
         let id = self.alloc_plugin_instance_id();
         self.next_vst3_instance_id = self.next_vst3_instance_id.max(id.saturating_add(1));
-        self.vst3_processors.push(Vst3Instance { id, processor: Arc::new(processor) });
+        self.vst3_processors.push(Vst3Instance {
+            id,
+            processor: Arc::new(processor),
+        });
         self.invalidate_audio_route_cache();
         Ok(())
     }
