@@ -5,14 +5,26 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use vst3::Steinberg::Vst::ProcessModes_::kRealtime;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{ComPtr, Interface};
+use vst3::{Class, ComPtr, ComWrapper, Interface};
+
+/// Wrap a potentially-panicking plugin call in `catch_unwind`.
+/// Returns the closure's result on success, or an error string if it panics.
+pub fn protected_call<T, F>(op: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(op) {
+        Ok(result) => Ok(result),
+        Err(_) => Err("Plugin call panicked".to_string()),
+    }
+}
 
 static HOST_RUN_LOOP_STATE: OnceLock<Mutex<HostRunLoopState>> = OnceLock::new();
 
@@ -202,6 +214,31 @@ impl PluginFactory {
         Ok(PluginInstance::new(component))
     }
 
+    /// Get factory information
+    pub fn get_factory_info(&self) -> Option<FactoryInfo> {
+        use vst3::Steinberg::IPluginFactoryTrait;
+
+        let mut info = PFactoryInfo {
+            vendor: [0; 64],
+            url: [0; 256],
+            email: [0; 128],
+            flags: 0,
+        };
+
+        let result = unsafe { self.factory.getFactoryInfo(&mut info) };
+
+        if result == kResultOk {
+            Some(FactoryInfo {
+                vendor: extract_cstring(&info.vendor),
+                url: extract_cstring(&info.url),
+                email: extract_cstring(&info.email),
+                flags: info.flags,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn create_edit_controller(
         &self,
         class_id: &[i8; 16],
@@ -254,13 +291,100 @@ pub struct ClassInfo {
     pub cid: [i8; 16],
 }
 
+/// Information about the plugin factory
+#[derive(Debug, Clone)]
+pub struct FactoryInfo {
+    pub vendor: String,
+    pub url: String,
+    pub email: String,
+    pub flags: i32,
+}
+
+/// GUI capability information for a VST3 plugin
+#[derive(Debug, Clone)]
+pub struct Vst3GuiInfo {
+    pub has_gui: bool,
+    pub size: Option<(i32, i32)>,
+}
+
+/// Host-side IPlugFrame implementation that tracks resize requests from the plugin
+pub struct HostPlugFrame {
+    pub resize_requested: AtomicBool,
+    pub requested_size: Mutex<Option<(i32, i32)>>,
+}
+
+impl HostPlugFrame {
+    pub fn new() -> Self {
+        Self {
+            resize_requested: AtomicBool::new(false),
+            requested_size: Mutex::new(None),
+        }
+    }
+}
+
+impl Class for HostPlugFrame {
+    type Interfaces = (IPlugFrame,);
+}
+
+impl IPlugFrameTrait for HostPlugFrame {
+    unsafe fn resizeView(&self, _view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
+        if !new_size.is_null() {
+            let rect = unsafe { *new_size };
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            if let Ok(mut size) = self.requested_size.lock() {
+                *size = Some((width, height));
+            }
+            self.resize_requested.store(true, Ordering::Relaxed);
+        }
+        kResultOk
+    }
+}
+
+/// Component handler that tracks parameter changes from the plugin GUI
+pub struct ComponentHandler {
+    pub parameter_changes: Arc<Mutex<Vec<(u32, f64)>>>,
+}
+
+impl ComponentHandler {
+    pub fn new(parameter_changes: Arc<Mutex<Vec<(u32, f64)>>>) -> Self {
+        Self { parameter_changes }
+    }
+}
+
+impl Class for ComponentHandler {
+    type Interfaces = (IComponentHandler,);
+}
+
+impl IComponentHandlerTrait for ComponentHandler {
+    unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
+        if let Ok(mut changes) = self.parameter_changes.lock() {
+            changes.push((id, value_normalized));
+        }
+        kResultOk
+    }
+
+    unsafe fn endEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn restartComponent(&self, _flags: i32) -> tresult {
+        kResultOk
+    }
+}
+
 /// Safe wrapper around a VST3 plugin instance
 pub struct PluginInstance {
     pub component: ComPtr<IComponent>,
     pub audio_processor: Option<ComPtr<IAudioProcessor>>,
     pub edit_controller: Option<ComPtr<IEditController>>,
     host_context: Box<HostApplicationContext>,
-    component_handler: Box<HostComponentHandlerContext>,
+    component_handler: Option<ComWrapper<ComponentHandler>>,
+    pub parameter_changes: Arc<Mutex<Vec<(u32, f64)>>>,
 }
 
 impl std::fmt::Debug for PluginInstance {
@@ -280,7 +404,8 @@ impl PluginInstance {
             audio_processor: None,
             edit_controller: None,
             host_context: Box::new(HostApplicationContext::new()),
-            component_handler: Box::new(HostComponentHandlerContext::new()),
+            component_handler: None,
+            parameter_changes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -427,12 +552,55 @@ impl PluginInstance {
         }
 
         if let Some(controller) = self.edit_controller.as_ref() {
-            let handler =
-                &mut self.component_handler.handler as *mut IComponentHandler as *mut FUnknown;
-            let _ = unsafe { controller.setComponentHandler(handler as *mut IComponentHandler) };
+            let handler = ComWrapper::new(ComponentHandler::new(self.parameter_changes.clone()));
+            if let Some(handler_ptr) = handler.to_com_ptr::<IComponentHandler>() {
+                let _ = unsafe { controller.setComponentHandler(handler_ptr.into_raw()) };
+            }
+            self.component_handler = Some(handler);
+        }
+
+        // Connect component and controller via IConnectionPoint when separate
+        if let Some(ref controller) = self.edit_controller {
+            let _ = connect_component_and_controller(&self.component, controller);
         }
 
         Ok(())
+    }
+
+    /// Query parameter metadata from the edit controller.
+    /// Wrapped in catch_unwind so that buggy plugins don't crash the host.
+    pub fn query_parameters(&self) -> Vec<super::port::ParameterInfo> {
+        let Some(controller) = self.edit_controller.as_ref() else {
+            return Vec::new();
+        };
+
+        let result = protected_call(|| unsafe {
+            use vst3::Steinberg::Vst::IEditControllerTrait;
+            let mut params = Vec::new();
+            let count = controller.getParameterCount();
+            for i in 0..count {
+                let mut info: ParameterInfo = std::mem::zeroed();
+                if controller.getParameterInfo(i, &mut info) != kResultOk {
+                    continue;
+                }
+                let title = extract_string128(&info.title);
+                let short_title = extract_string128(&info.shortTitle);
+                let units = extract_string128(&info.units);
+                let default_value = controller.getParamNormalized(info.id);
+                params.push(super::port::ParameterInfo {
+                    id: info.id,
+                    title,
+                    short_title,
+                    units,
+                    step_count: info.stepCount,
+                    default_value,
+                    flags: info.flags,
+                });
+            }
+            params
+        });
+
+        result.unwrap_or_default()
     }
 
     /// Set the component active/inactive
@@ -709,117 +877,30 @@ impl HostRunLoopContext {
     }
 }
 
-#[repr(C)]
-struct HostComponentHandlerContext {
-    handler: IComponentHandler,
-    ref_count: AtomicU32,
-}
+fn connect_component_and_controller(
+    component: &ComPtr<IComponent>,
+    controller: &ComPtr<IEditController>,
+) -> Result<(), String> {
+    let comp_cp = component.cast::<IConnectionPoint>();
+    let ctrl_cp = controller.cast::<IConnectionPoint>();
 
-impl HostComponentHandlerContext {
-    fn new() -> Self {
-        Self {
-            handler: IComponentHandler {
-                vtbl: &HOST_COMPONENT_HANDLER_VTBL,
-            },
-            ref_count: AtomicU32::new(1),
+    if let (Some(comp_cp), Some(ctrl_cp)) = (comp_cp, ctrl_cp) {
+        unsafe {
+            let result1 = comp_cp.connect(ctrl_cp.as_ptr());
+            let result2 = ctrl_cp.connect(comp_cp.as_ptr());
+            if result1 == kResultOk && result2 == kResultOk {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Connection failed: comp->ctrl={:#x}, ctrl->comp={:#x}",
+                    result1, result2
+                ))
+            }
         }
+    } else {
+        Ok(())
     }
 }
-
-unsafe extern "system" fn component_handler_query_interface(
-    this: *mut FUnknown,
-    iid: *const TUID,
-    obj: *mut *mut c_void,
-) -> tresult {
-    if this.is_null() || iid.is_null() {
-        if !obj.is_null() {
-            unsafe { *obj = std::ptr::null_mut() };
-        }
-        return kNoInterface;
-    }
-
-    let iid_bytes = unsafe { &*iid };
-    let requested_handler = iid_bytes
-        .iter()
-        .zip(IComponentHandler::IID.iter())
-        .all(|(a, b)| (*a as u8) == *b);
-    let requested_unknown = iid_bytes
-        .iter()
-        .zip(FUnknown::IID.iter())
-        .all(|(a, b)| (*a as u8) == *b);
-    if !(requested_handler || requested_unknown) {
-        if !obj.is_null() {
-            unsafe { *obj = std::ptr::null_mut() };
-        }
-        return kNoInterface;
-    }
-
-    let ctx = this as *mut HostComponentHandlerContext;
-    unsafe {
-        (*ctx).ref_count.fetch_add(1, Ordering::Relaxed);
-        if !obj.is_null() {
-            *obj = this.cast::<c_void>();
-        }
-    }
-    kResultOk
-}
-
-unsafe extern "system" fn component_handler_add_ref(this: *mut FUnknown) -> uint32 {
-    if this.is_null() {
-        return 0;
-    }
-    let ctx = this as *mut HostComponentHandlerContext;
-    unsafe { (*ctx).ref_count.fetch_add(1, Ordering::Relaxed) + 1 }
-}
-
-unsafe extern "system" fn component_handler_release(this: *mut FUnknown) -> uint32 {
-    if this.is_null() {
-        return 0;
-    }
-    let ctx = this as *mut HostComponentHandlerContext;
-    unsafe { (*ctx).ref_count.fetch_sub(1, Ordering::Relaxed) - 1 }
-}
-
-unsafe extern "system" fn component_handler_begin_edit(
-    _this: *mut IComponentHandler,
-    _id: ParamID,
-) -> tresult {
-    kResultOk
-}
-
-unsafe extern "system" fn component_handler_perform_edit(
-    _this: *mut IComponentHandler,
-    _id: ParamID,
-    _value_normalized: ParamValue,
-) -> tresult {
-    kResultOk
-}
-
-unsafe extern "system" fn component_handler_end_edit(
-    _this: *mut IComponentHandler,
-    _id: ParamID,
-) -> tresult {
-    kResultOk
-}
-
-unsafe extern "system" fn component_handler_restart_component(
-    _this: *mut IComponentHandler,
-    _flags: i32,
-) -> tresult {
-    kResultOk
-}
-
-static HOST_COMPONENT_HANDLER_VTBL: IComponentHandlerVtbl = IComponentHandlerVtbl {
-    base: FUnknownVtbl {
-        queryInterface: component_handler_query_interface,
-        addRef: component_handler_add_ref,
-        release: component_handler_release,
-    },
-    beginEdit: component_handler_begin_edit,
-    performEdit: component_handler_perform_edit,
-    endEdit: component_handler_end_edit,
-    restartComponent: component_handler_restart_component,
-};
 
 unsafe extern "system" fn host_query_interface(
     this: *mut FUnknown,
@@ -1466,26 +1547,42 @@ fn get_module_path(bundle_path: &Path) -> Result<std::path::PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
         // Windows: .vst3/Contents/{x86_64-win|x86-win}/plugin.vst3
-        let stem = bundle_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("plugin");
+        // Scan the architecture directory like rust-vst3-host does,
+        // since binary names don't always match the bundle name.
         let contents = bundle_path.join("Contents");
-        let candidates = if cfg!(target_arch = "x86_64") {
-            vec![
-                contents.join("x86_64-win").join(format!("{stem}.vst3")),
-                contents.join("x86-win").join(format!("{stem}.vst3")),
-            ]
+        let arch_dir = if cfg!(target_arch = "x86_64") {
+            contents.join("x86_64-win")
         } else {
-            vec![
-                contents.join("x86-win").join(format!("{stem}.vst3")),
-                contents.join("x86_64-win").join(format!("{stem}.vst3")),
-            ]
+            contents.join("x86-win")
         };
 
-        for module in candidates {
-            if module.exists() {
-                return Ok(module);
+        if let Ok(entries) = std::fs::read_dir(&arch_dir) {
+            for entry in entries.flatten() {
+                let file_path = entry.path();
+                if file_path.is_file()
+                    && file_path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
+                {
+                    return Ok(file_path);
+                }
+            }
+        }
+
+        // Fallback: try the other architecture directory
+        let fallback_dir = if cfg!(target_arch = "x86_64") {
+            contents.join("x86-win")
+        } else {
+            contents.join("x86_64-win")
+        };
+        if let Ok(entries) = std::fs::read_dir(&fallback_dir) {
+            for entry in entries.flatten() {
+                let file_path = entry.path();
+                if file_path.is_file()
+                    && file_path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
+                {
+                    return Ok(file_path);
+                }
             }
         }
 
@@ -1511,6 +1608,11 @@ fn extract_cstring(bytes: &[i8]) -> String {
     let len = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
     let u8_bytes: Vec<u8> = bytes[..len].iter().map(|&b| b as u8).collect();
     String::from_utf8_lossy(&u8_bytes).to_string()
+}
+
+fn extract_string128(s: &String128) -> String {
+    let len = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+    String::from_utf16_lossy(&s[..len])
 }
 
 #[cfg(test)]

@@ -1,15 +1,20 @@
-use super::interfaces::PluginInstance;
+use super::interfaces::{HostPlugFrame, PluginInstance, Vst3GuiInfo, protected_call};
 use super::midi::{EventBuffer, ParameterChanges};
 use super::port::{BusInfo, ParameterInfo};
 use super::state::{MemoryStream, Vst3PluginState, ibstream_ptr};
 use crate::audio::io::AudioIO;
 use crate::midi::io::MidiEvent;
+use std::ffi::{CString, c_void};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use vst3::ComWrapper;
 use vst3::Steinberg::Vst::ProcessModes_::kRealtime;
 use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
+use vst3::Steinberg::{FIDString, IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk};
+use vst3::Steinberg::Vst::{IEditControllerTrait, ViewType};
+use vst3::ComPtr;
 
 pub struct Vst3Processor {
     // Plugin identity
@@ -38,6 +43,17 @@ pub struct Vst3Processor {
     previous_values: Arc<Mutex<Vec<f32>>>,
     max_samples_per_block: usize,
     processing_started: bool,
+    sample_rate: f64,
+
+    // GUI session
+    gui_session: Arc<Mutex<Vst3GuiSession>>,
+}
+
+struct Vst3GuiSession {
+    view: Option<ComPtr<IPlugView>>,
+    plug_frame: Option<ComWrapper<HostPlugFrame>>,
+    ui_should_close: bool,
+    platform_type: Option<String>,
 }
 
 impl fmt::Debug for Vst3Processor {
@@ -86,9 +102,18 @@ impl Vst3Processor {
             return Err("No plugin classes found".to_string());
         }
 
-        // Get first class and create instance
-        let class_info = factory
-            .get_class_info(0)
+        // Find the first Audio Module class, matching rust-vst3-host behavior
+        let mut class_info = None;
+        for i in 0..class_count {
+            if let Some(info) = factory.get_class_info(i) {
+                if info.category.contains("Audio Module") {
+                    class_info = Some(info);
+                    break;
+                }
+            }
+        }
+        // Fallback to first class if no Audio Module found
+        let class_info = class_info.or_else(|| factory.get_class_info(0))
             .ok_or("Failed to get class info")?;
 
         let mut instance = factory.create_instance(&class_info.cid)?;
@@ -163,12 +188,23 @@ impl Vst3Processor {
 
         let processing_started = false;
 
-        // Temporary workaround: querying IEditController parameters crashes on
-        // some Linux VST3 plugins (e.g. lsp-plugins), so keep parameter list empty.
-        let parameters = Vec::new();
-        let scalar_values = Arc::new(Mutex::new(Vec::new()));
-        let previous_values = Arc::new(Mutex::new(Vec::new()));
+        // Query parameters safely; if the plugin panics during enumeration,
+        // catch_unwind lets us fall back to an empty list.
+        let parameters = protected_call(|| instance.query_parameters()).unwrap_or_default();
+        let scalar_values = Arc::new(Mutex::new(
+            parameters.iter().map(|p| p.default_value as f32).collect()
+        ));
+        let previous_values = Arc::new(Mutex::new(
+            parameters.iter().map(|p| p.default_value as f32).collect()
+        ));
         let plugin_id = format!("{:02X?}", class_info.cid);
+
+        let gui_session = Arc::new(Mutex::new(Vst3GuiSession {
+            view: None,
+            plug_frame: None,
+            ui_should_close: false,
+            platform_type: None,
+        }));
 
         Ok(Self {
             path: plugin_path.to_string(),
@@ -189,6 +225,8 @@ impl Vst3Processor {
             previous_values,
             max_samples_per_block: buffer_size,
             processing_started,
+            sample_rate,
+            gui_session,
         })
     }
 
@@ -356,6 +394,15 @@ impl Vst3Processor {
 
         // Create ProcessData
         let mut process_context: ProcessContext = unsafe { std::mem::zeroed() };
+        process_context.sampleRate = self.sample_rate;
+        process_context.tempo = 120.0;
+        process_context.timeSigNumerator = 4;
+        process_context.timeSigDenominator = 4;
+        process_context.state = ProcessContext_::StatesAndFlags_::kPlaying
+            | ProcessContext_::StatesAndFlags_::kTempoValid
+            | ProcessContext_::StatesAndFlags_::kTimeSigValid
+            | ProcessContext_::StatesAndFlags_::kContTimeValid
+            | ProcessContext_::StatesAndFlags_::kSystemTimeValid;
         let input_event_list = if self.midi_input_ports > 0 {
             Some(ComWrapper::new(EventBuffer::from_midi_events(
                 input_events,
@@ -409,11 +456,19 @@ impl Vst3Processor {
             processContext: &mut process_context,
         };
 
-        // Call VST3 process
-        let result = unsafe { processor.process(&mut process_data) };
+        // Call VST3 process with crash protection
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            processor.process(&mut process_data)
+        }));
 
-        if result != vst3::Steinberg::kResultOk {
-            return Err(format!("VST3 process failed with result: {}", result));
+        match result {
+            Ok(vst3::Steinberg::kResultOk) => {}
+            Ok(err_code) => {
+                return Err(format!("VST3 process failed with result: {}", err_code));
+            }
+            Err(_) => {
+                return Err("VST3 process panicked".to_string());
+            }
         }
 
         // Mark outputs as finished
@@ -445,7 +500,7 @@ impl Vst3Processor {
     }
 
     pub fn set_parameter_value(
-        &mut self,
+        &self,
         param_id: u32,
         normalized_value: f32,
     ) -> Result<(), String> {
@@ -501,7 +556,7 @@ impl Vst3Processor {
     }
 
     /// Restore plugin state from a snapshot
-    pub fn restore_state(&mut self, state: &Vst3PluginState) -> Result<(), String> {
+    pub fn restore_state(&self, state: &Vst3PluginState) -> Result<(), String> {
         use vst3::Steinberg::Vst::{IComponentTrait, IEditControllerTrait};
 
         if state.plugin_id != self.plugin_id {
@@ -547,6 +602,196 @@ impl Vst3Processor {
 
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // GUI abstraction (mirrors ClapProcessor pattern)
+    // ------------------------------------------------------------------
+
+    pub fn gui_info(&self) -> Result<Vst3GuiInfo, String> {
+        let controller = self
+            .instance
+            .edit_controller
+            .as_ref()
+            .ok_or("No edit controller available")?;
+        let view = unsafe { controller.createView(ViewType::kEditor) };
+        if view.is_null() {
+            return Ok(Vst3GuiInfo {
+                has_gui: false,
+                size: None,
+            });
+        }
+        // Release the probe view without calling removed() — it was never attached.
+        unsafe {
+            let _ = ComPtr::<IPlugView>::from_raw(view);
+        }
+        Ok(Vst3GuiInfo {
+            has_gui: true,
+            size: None,
+        })
+    }
+
+    pub fn gui_create(&self, platform_type: &str) -> Result<(), String> {
+        let mut session = self.gui_session.lock().unwrap();
+        if session.view.is_some() {
+            return Ok(());
+        }
+        let controller = self
+            .instance
+            .edit_controller
+            .as_ref()
+            .ok_or("No edit controller available")?;
+        let view = unsafe { controller.createView(ViewType::kEditor) };
+        if view.is_null() {
+            return Err("Plugin does not provide an editor view".to_string());
+        }
+        let view = unsafe { ComPtr::<IPlugView>::from_raw(view) }
+            .ok_or("Failed to wrap IPlugView")?;
+
+        let platform_cstr =
+            CString::new(platform_type).map_err(|e| format!("Invalid platform type: {e}"))?;
+        let supported = unsafe { view.isPlatformTypeSupported(platform_cstr.as_ptr() as FIDString) };
+        if supported != kResultOk {
+            return Err(format!("Platform type '{}' not supported", platform_type));
+        }
+
+        session.view = Some(view);
+        session.platform_type = Some(platform_type.to_string());
+        Ok(())
+    }
+
+    pub fn gui_get_size(&self) -> Result<(i32, i32), String> {
+        let session = self.gui_session.lock().unwrap();
+        let view = session.view.as_ref().ok_or("No GUI view created")?;
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let result = unsafe { view.getSize(&mut rect) };
+        if result != kResultOk {
+            return Err("Failed to get GUI size".to_string());
+        }
+        Ok((rect.right - rect.left, rect.bottom - rect.top))
+    }
+
+    pub fn gui_set_parent(&self, window: usize, platform_type: &str) -> Result<(), String> {
+        let mut session = self.gui_session.lock().unwrap();
+        let view = session.view.as_ref().ok_or("No GUI view created")?;
+
+        let plug_frame = ComWrapper::new(HostPlugFrame::new());
+        if let Some(frame_ptr) = plug_frame.to_com_ptr::<IPlugFrame>() {
+            unsafe {
+                let _ = view.setFrame(frame_ptr.into_raw());
+            }
+        }
+
+        let platform_cstr =
+            CString::new(platform_type).map_err(|e| format!("Invalid platform type: {e}"))?;
+        let result = unsafe {
+            view.attached(
+                window as *mut c_void,
+                platform_cstr.as_ptr() as FIDString,
+            )
+        };
+        if result != kResultOk {
+            return Err(format!("Failed to attach GUI view: {:#x}", result));
+        }
+
+        session.plug_frame = Some(plug_frame);
+        Ok(())
+    }
+
+    pub fn gui_on_size(&self, width: i32, height: i32) -> Result<(), String> {
+        let session = self.gui_session.lock().unwrap();
+        let view = session.view.as_ref().ok_or("No GUI view created")?;
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        unsafe {
+            let _ = view.onSize(&mut rect);
+        }
+        Ok(())
+    }
+
+    pub fn gui_show(&self) -> Result<(), String> {
+        let session = self.gui_session.lock().unwrap();
+        let view = session.view.as_ref().ok_or("No GUI view created")?;
+        unsafe {
+            let _ = view.onFocus(1);
+        }
+        Ok(())
+    }
+
+    pub fn gui_hide(&self) {
+        if let Ok(session) = self.gui_session.lock() {
+            if let Some(view) = session.view.as_ref() {
+                unsafe {
+                    let _ = view.onFocus(0);
+                }
+            }
+        }
+    }
+
+    pub fn gui_destroy(&self) {
+        if let Ok(mut session) = self.gui_session.lock() {
+            if let Some(view) = session.view.take() {
+                unsafe {
+                    let _ = view.setFrame(std::ptr::null_mut());
+                    let _ = view.removed();
+                }
+            }
+            session.plug_frame.take();
+            session.platform_type.take();
+        }
+    }
+
+    pub fn ui_begin_session(&self) {
+        if let Ok(mut session) = self.gui_session.lock() {
+            session.ui_should_close = false;
+        }
+    }
+
+    pub fn ui_end_session(&self) {
+        if let Ok(mut session) = self.gui_session.lock() {
+            session.ui_should_close = false;
+        }
+    }
+
+    pub fn ui_should_close(&self) -> bool {
+        if let Ok(session) = self.gui_session.lock() {
+            return session.ui_should_close;
+        }
+        false
+    }
+
+    pub fn ui_take_param_updates(&self) -> Vec<(u32, f64)> {
+        let mut changes = Vec::new();
+        if let Ok(mut param_changes) = self.instance.parameter_changes.lock() {
+            std::mem::swap(&mut changes, &mut *param_changes);
+        }
+        changes
+    }
+
+    pub fn gui_check_resize(&self) -> Option<(i32, i32)> {
+        if let Ok(session) = self.gui_session.lock() {
+            if let Some(ref frame) = session.plug_frame {
+                if frame.resize_requested.swap(false, Ordering::Relaxed) {
+                    if let Ok(size) = frame.requested_size.lock() {
+                        return *size;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn gui_on_main_thread(&self) {
+        super::interfaces::pump_host_run_loop();
+    }
 }
 
 impl Drop for Vst3Processor {
@@ -563,3 +808,4 @@ impl Drop for Vst3Processor {
 pub fn list_plugins() -> Vec<super::host::Vst3PluginInfo> {
     super::host::list_plugins()
 }
+

@@ -40,7 +40,7 @@ pub struct Lv2Instance {
 #[derive(Debug)]
 pub struct Vst3Instance {
     pub id: usize,
-    pub processor: Vst3Processor,
+    pub processor: Arc<Vst3Processor>,
 }
 
 #[derive(Debug, Clone)]
@@ -1824,7 +1824,7 @@ impl Track {
                     )?;
                     runtime.vst3_processors.push(Vst3Instance {
                         id: instance_id,
-                        processor,
+                        processor: Arc::new(processor),
                     });
                     runtime_nodes.push(PluginGraphNode::Vst3PluginInstance(instance_id));
                     if let Some(state) = plugin.get("state").cloned().and_then(|value| {
@@ -2986,7 +2986,7 @@ impl Track {
         )?;
         let id = self.alloc_plugin_instance_id();
         self.next_vst3_instance_id = self.next_vst3_instance_id.max(id.saturating_add(1));
-        self.vst3_processors.push(Vst3Instance { id, processor });
+        self.vst3_processors.push(Vst3Instance { id, processor: Arc::new(processor) });
         self.invalidate_audio_route_cache();
         Ok(())
     }
@@ -3254,6 +3254,38 @@ impl Track {
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
+        Ok(instance.processor.clone())
+    }
+
+    pub fn vst3_plugin_processor(
+        &self,
+        instance_id: usize,
+    ) -> Result<Arc<crate::vst3::Vst3Processor>, String> {
+        let instance = self
+            .vst3_processors
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Track '{}' does not have VST3 instance id: {}",
+                    self.name, instance_id
+                )
+            })?;
+        Ok(instance.processor.clone())
+    }
+
+    pub fn clip_vst3_plugin_processor(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Arc<crate::vst3::Vst3Processor>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .vst3_processors
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip VST3 instance {} not found", instance_id))?;
         Ok(instance.processor.clone())
     }
 

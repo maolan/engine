@@ -786,6 +786,26 @@ pub enum Action {
         instance_id: usize,
         parameters: Vec<crate::vst3::port::ParameterInfo>,
     },
+    TrackGetVst3Processor {
+        track_name: String,
+        instance_id: usize,
+    },
+    ClipGetVst3Processor {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    TrackVst3Processor {
+        track_name: String,
+        instance_id: usize,
+        processor: Arc<crate::vst3::Vst3Processor>,
+    },
+    ClipVst3Processor {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        processor: Arc<crate::vst3::Vst3Processor>,
+    },
     TrackVst3SnapshotState {
         track_name: String,
         instance_id: usize,

@@ -5503,6 +5503,56 @@ impl Engine {
             Action::TrackVst3Parameters { .. } => {
                 // Response action, no handling needed
             }
+            Action::TrackGetVst3Processor {
+                ref track_name,
+                instance_id,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => match track.lock().vst3_plugin_processor(instance_id) {
+                    Ok(processor) => {
+                        self.notify_clients(Ok(Action::TrackVst3Processor {
+                            track_name: track_name.clone(),
+                            instance_id,
+                            processor,
+                        }))
+                        .await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                },
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Action::ClipGetVst3Processor {
+                ref track_name,
+                clip_idx,
+                instance_id,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => match track.lock().clip_vst3_plugin_processor(clip_idx, instance_id) {
+                    Ok(processor) => {
+                        self.notify_clients(Ok(Action::ClipVst3Processor {
+                            track_name: track_name.clone(),
+                            clip_idx,
+                            instance_id,
+                            processor,
+                        }))
+                        .await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                },
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Action::TrackVst3Processor { .. } => {
+                // Response action, no handling needed
+            }
+            Action::ClipVst3Processor { .. } => {
+                // Response action, no handling needed
+            }
             Action::TrackVst3SnapshotState {
                 ref track_name,
                 instance_id,

@@ -105,46 +105,62 @@ fn scan_vst3_bundle(bundle_path: &Path) -> Option<Vst3PluginInfo> {
         return None;
     }
 
-    let mut fallback = None;
+    let factory_info = factory.get_factory_info();
+
+    // Prefer Audio Module classes, matching rust-vst3-host behavior
+    let mut audio_module_index = None;
+    let mut fallback_index = None;
     for index in 0..class_count {
         let Some(class_info) = factory.get_class_info(index) else {
             continue;
         };
-        if fallback.is_none() {
-            fallback = Some(class_info_to_plugin_info(&class_info, bundle_path, None));
+        if fallback_index.is_none() {
+            fallback_index = Some(index);
         }
+        if class_info.category.contains("Audio Module") {
+            audio_module_index = Some(index);
+            break;
+        }
+    }
 
-        let Ok(mut instance) = factory.create_instance(&class_info.cid) else {
-            continue;
-        };
-        let capabilities = match instance.initialize(&factory) {
-            Ok(()) => {
-                let (audio_inputs, audio_outputs) = instance.main_audio_channel_counts();
-                let (midi_inputs, midi_outputs) = instance.event_bus_counts();
-                let _ = instance.terminate();
-                Some((
-                    audio_inputs,
-                    audio_outputs,
-                    midi_inputs > 0,
-                    midi_outputs > 0,
-                ))
-            }
-            Err(_) => None,
-        };
+    let target_index = audio_module_index.or(fallback_index)?;
+    let class_info = factory.get_class_info(target_index)?;
+
+    let Ok(mut instance) = factory.create_instance(&class_info.cid) else {
         return Some(class_info_to_plugin_info(
             &class_info,
             bundle_path,
-            capabilities,
+            None,
+            factory_info.as_ref(),
         ));
-    }
-
-    fallback
+    };
+    let capabilities = match instance.initialize(&factory) {
+        Ok(()) => {
+            let (audio_inputs, audio_outputs) = instance.main_audio_channel_counts();
+            let (midi_inputs, midi_outputs) = instance.event_bus_counts();
+            let _ = instance.terminate();
+            Some((
+                audio_inputs,
+                audio_outputs,
+                midi_inputs > 0,
+                midi_outputs > 0,
+            ))
+        }
+        Err(_) => None,
+    };
+    Some(class_info_to_plugin_info(
+        &class_info,
+        bundle_path,
+        capabilities,
+        factory_info.as_ref(),
+    ))
 }
 
 fn class_info_to_plugin_info(
     class_info: &super::interfaces::ClassInfo,
     bundle_path: &Path,
     capabilities: Option<(usize, usize, bool, bool)>,
+    factory_info: Option<&super::interfaces::FactoryInfo>,
 ) -> Vst3PluginInfo {
     let (audio_inputs, audio_outputs, has_midi_input, has_midi_output) =
         capabilities.unwrap_or((0, 0, false, false));
@@ -152,7 +168,7 @@ fn class_info_to_plugin_info(
     Vst3PluginInfo {
         id: tuid_to_string(&class_info.cid),
         name: class_info.name.clone(),
-        vendor: String::new(),
+        vendor: factory_info.map(|f| f.vendor.clone()).unwrap_or_default(),
         path: bundle_path.to_string_lossy().to_string(),
         category: class_info.category.clone(),
         version: String::new(),
@@ -195,6 +211,7 @@ mod tests {
             &class_info,
             Path::new("/tmp/Test.vst3"),
             Some((2, 4, true, false)),
+            None,
         );
 
         assert_eq!(info.id, "12121212121212121212121212121212");
@@ -215,7 +232,7 @@ mod tests {
             cid: [0; 16],
         };
 
-        let info = class_info_to_plugin_info(&class_info, Path::new("/tmp/Fx.vst3"), None);
+        let info = class_info_to_plugin_info(&class_info, Path::new("/tmp/Fx.vst3"), None, None);
 
         assert_eq!(info.audio_inputs, 0);
         assert_eq!(info.audio_outputs, 0);
