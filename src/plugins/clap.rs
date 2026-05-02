@@ -2480,12 +2480,8 @@ pub fn list_plugins() -> Vec<ClapPluginInfo> {
 }
 
 pub fn is_supported_clap_binary(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| {
-        ext.eq_ignore_ascii_case("clap")
-            || ext.eq_ignore_ascii_case("so")
-            || ext.eq_ignore_ascii_case("dylib")
-            || ext.eq_ignore_ascii_case("dll")
-    })
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("clap"))
 }
 
 pub fn list_plugins_with_capabilities(scan_capabilities: bool) -> Vec<ClapPluginInfo> {
