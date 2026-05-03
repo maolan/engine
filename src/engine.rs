@@ -2774,6 +2774,7 @@ impl Engine {
                         request.pitch_correction_formant_compensation;
                     clip.plugin_graph_json = request.plugin_graph_json;
                     track.audio.clips.push(clip);
+                    #[cfg(unix)]
                     track.clip_pitch_shifters.clear();
                 }
                 Kind::MIDI => {
@@ -2849,7 +2850,8 @@ impl Engine {
                         let max_lane = track.audio.ins.len().saturating_sub(1);
                         clip.input_channel = clip.input_channel.min(max_lane);
                         track.audio.clips.push(clip);
-                        track.clip_pitch_shifters.clear();
+                        #[cfg(unix)]
+                    track.clip_pitch_shifters.clear();
                     }
                 }
                 Kind::MIDI => {
@@ -2876,6 +2878,7 @@ impl Engine {
                             track.audio.clips.remove(idx);
                         }
                     }
+                    #[cfg(unix)]
                     track.clip_pitch_shifters.clear();
                 }
                 Kind::MIDI => {
@@ -2998,6 +3001,7 @@ impl Engine {
                     clip.end = length.max(1);
                     clip.offset = offset;
                 }
+                #[cfg(unix)]
                 track.clip_pitch_shifters.clear();
             }
             Kind::MIDI => {
@@ -3055,6 +3059,7 @@ impl Engine {
                 clip.pitch_correction_inertia_ms = pitch_correction_inertia_ms;
                 clip.pitch_correction_formant_compensation = pitch_correction_formant_compensation;
             }
+            #[cfg(unix)]
             track.clip_pitch_shifters.clear();
         }
     }

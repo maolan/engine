@@ -18,8 +18,9 @@ use crate::vst3::Vst3Processor;
 use crate::{
     audio::io::AudioIO,
     midi::io::{MIDIIO, MidiEvent},
-    rubberband::LivePitchShifter,
 };
+#[cfg(unix)]
+use crate::rubberband::LivePitchShifter;
 #[cfg(unix)]
 use crate::{kind::Kind, routing};
 use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
@@ -64,6 +65,7 @@ struct AudioClipBuffer {
     samples: Vec<f32>,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct ClipPitchShifter {
     shifter: LivePitchShifter,
@@ -538,6 +540,7 @@ pub struct Track {
     record_tap_enabled: bool,
     audio_clip_cache: HashMap<String, Arc<AudioClipBuffer>>,
     clip_plugin_tracks: HashMap<String, ClipPluginRuntime>,
+    #[cfg(unix)]
     pub(crate) clip_pitch_shifters: HashMap<String, ClipPitchShifter>,
     midi_clip_cache: HashMap<String, MidiClipEvents>,
     internal_output_routes_cache: Vec<Vec<Arc<AudioIO>>>,
@@ -618,6 +621,7 @@ impl Track {
             record_tap_enabled: false,
             audio_clip_cache: HashMap::new(),
             clip_plugin_tracks: HashMap::new(),
+            #[cfg(unix)]
             clip_pitch_shifters: HashMap::new(),
             midi_clip_cache: HashMap::new(),
             internal_output_routes_cache: Vec::new(),
@@ -2112,6 +2116,7 @@ impl Track {
             ));
         }
 
+        #[cfg(unix)]
         if !clip.pitch_correction_points.is_empty() {
             let input_count = self.audio.ins.len().max(1);
             let effective_channels = if buffer.channels == 1 {

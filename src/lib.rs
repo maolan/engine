@@ -10,6 +10,7 @@ pub mod mutex;
 mod osc;
 pub mod plugins;
 mod routing;
+#[cfg(unix)]
 mod rubberband;
 pub mod state;
 mod track;
