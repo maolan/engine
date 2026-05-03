@@ -1,3 +1,7 @@
+// The vst3 crate uses platform-dependent types for enum constants, so explicit
+// casts are required for cross-platform compilation.
+#![allow(clippy::unnecessary_cast)]
+
 use super::interfaces::{HostPlugFrame, PluginInstance, Vst3GuiInfo, protected_call};
 use super::midi::{EventBuffer, ParameterChanges};
 use super::port::{BusInfo, ParameterInfo};
@@ -298,6 +302,7 @@ impl Vst3Processor {
     }
 
     /// Process audio with MIDI events
+    #[allow(clippy::unnecessary_cast)]
     pub fn process_with_midi(&self, frames: usize, input_events: &[MidiEvent]) -> Vec<MidiEvent> {
         // Process all input AudioIO ports
         for input in &self.audio_inputs {
@@ -399,11 +404,15 @@ impl Vst3Processor {
         process_context.tempo = 120.0;
         process_context.timeSigNumerator = 4;
         process_context.timeSigDenominator = 4;
-        process_context.state = ProcessContext_::StatesAndFlags_::kPlaying
-            | ProcessContext_::StatesAndFlags_::kTempoValid
-            | ProcessContext_::StatesAndFlags_::kTimeSigValid
-            | ProcessContext_::StatesAndFlags_::kContTimeValid
-            | ProcessContext_::StatesAndFlags_::kSystemTimeValid;
+        #[allow(clippy::unnecessary_cast)]
+        {
+            process_context.state = (ProcessContext_::StatesAndFlags_::kPlaying
+                | ProcessContext_::StatesAndFlags_::kTempoValid
+                | ProcessContext_::StatesAndFlags_::kTimeSigValid
+                | ProcessContext_::StatesAndFlags_::kContTimeValid
+                | ProcessContext_::StatesAndFlags_::kSystemTimeValid)
+                as u32;
+        }
         let input_event_list = if self.midi_input_ports > 0 {
             Some(ComWrapper::new(EventBuffer::from_midi_events(
                 input_events,

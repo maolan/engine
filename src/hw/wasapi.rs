@@ -512,6 +512,17 @@ impl MidiHub {
             }
         }
     }
+
+    pub fn write_events_blocking(&mut self, events: &[HwMidiEvent], _timeout: Duration) {
+        self.write_events(events);
+    }
+
+    pub fn output_devices(&self) -> Vec<String> {
+        self.outputs
+            .iter()
+            .map(|output| output.device.clone())
+            .collect()
+    }
 }
 
 impl Drop for HwDriver {

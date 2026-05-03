@@ -106,68 +106,70 @@ impl Default for History {
 
 /// Check if an action should be recorded in history
 pub fn should_record(action: &Action) -> bool {
-    matches!(
-        action,
+    match action {
         Action::SetTempo(_)
-            | Action::SetLoopEnabled(_)
-            | Action::SetLoopRange(_)
-            | Action::SetPunchEnabled(_)
-            | Action::SetPunchRange(_)
-            | Action::SetMetronomeEnabled(_)
-            | Action::SetTimeSignature { .. }
-            | Action::AddTrack { .. }
-            | Action::RemoveTrack(_)
-            | Action::RenameTrack { .. }
-            | Action::TrackLevel(_, _)
-            | Action::TrackBalance(_, _)
-            | Action::TrackToggleArm(_)
-            | Action::TrackToggleMute(_)
-            | Action::TrackTogglePhase(_)
-            | Action::TrackToggleSolo(_)
-            | Action::TrackToggleInputMonitor(_)
-            | Action::TrackToggleDiskMonitor(_)
-            | Action::TrackSetMidiLearnBinding { .. }
-            | Action::SetGlobalMidiLearnBinding { .. }
-            | Action::TrackSetVcaMaster { .. }
-            | Action::TrackSetFrozen { .. }
-            | Action::TrackAddAudioInput(_)
-            | Action::TrackAddAudioOutput(_)
-            | Action::TrackRemoveAudioInput(_)
-            | Action::TrackRemoveAudioOutput(_)
-            | Action::AddClip { .. }
-            | Action::AddGroupedClip { .. }
-            | Action::RemoveClip { .. }
-            | Action::RenameClip { .. }
-            | Action::ClipMove { .. }
-            | Action::SetClipFade { .. }
-            | Action::SetClipBounds { .. }
-            | Action::SetClipMuted { .. }
-            | Action::ClearAllMidiLearnBindings
-            | Action::Connect { .. }
-            | Action::Disconnect { .. }
-            | Action::TrackConnectVst3Audio { .. }
-            | Action::TrackDisconnectVst3Audio { .. }
-            | Action::TrackConnectPluginAudio { .. }
-            | Action::TrackDisconnectPluginAudio { .. }
-            | Action::TrackConnectPluginMidi { .. }
-            | Action::TrackDisconnectPluginMidi { .. }
-            | Action::TrackLoadClapPlugin { .. }
-            | Action::TrackUnloadClapPlugin { .. }
-            | Action::TrackLoadLv2Plugin { .. }
-            | Action::TrackUnloadLv2PluginInstance { .. }
-            | Action::TrackLoadVst3Plugin { .. }
-            | Action::TrackUnloadVst3PluginInstance { .. }
-            | Action::TrackSetLv2ControlValue { .. }
-            | Action::TrackSetClapParameter { .. }
-            | Action::TrackSetVst3Parameter { .. }
-            | Action::ModifyMidiNotes { .. }
-            | Action::ModifyMidiControllers { .. }
-            | Action::DeleteMidiControllers { .. }
-            | Action::InsertMidiControllers { .. }
-            | Action::DeleteMidiNotes { .. }
-            | Action::InsertMidiNotes { .. }
-            | Action::SetMidiSysExEvents { .. }
-    )
+        | Action::SetLoopEnabled(_)
+        | Action::SetLoopRange(_)
+        | Action::SetPunchEnabled(_)
+        | Action::SetPunchRange(_)
+        | Action::SetMetronomeEnabled(_)
+        | Action::SetTimeSignature { .. }
+        | Action::AddTrack { .. }
+        | Action::RemoveTrack(_)
+        | Action::RenameTrack { .. }
+        | Action::TrackLevel(_, _)
+        | Action::TrackBalance(_, _)
+        | Action::TrackToggleArm(_)
+        | Action::TrackToggleMute(_)
+        | Action::TrackTogglePhase(_)
+        | Action::TrackToggleSolo(_)
+        | Action::TrackToggleInputMonitor(_)
+        | Action::TrackToggleDiskMonitor(_)
+        | Action::TrackSetMidiLearnBinding { .. }
+        | Action::SetGlobalMidiLearnBinding { .. }
+        | Action::TrackSetVcaMaster { .. }
+        | Action::TrackSetFrozen { .. }
+        | Action::TrackAddAudioInput(_)
+        | Action::TrackAddAudioOutput(_)
+        | Action::TrackRemoveAudioInput(_)
+        | Action::TrackRemoveAudioOutput(_)
+        | Action::AddClip { .. }
+        | Action::AddGroupedClip { .. }
+        | Action::RemoveClip { .. }
+        | Action::RenameClip { .. }
+        | Action::ClipMove { .. }
+        | Action::SetClipFade { .. }
+        | Action::SetClipBounds { .. }
+        | Action::SetClipMuted { .. }
+        | Action::ClearAllMidiLearnBindings
+        | Action::Connect { .. }
+        | Action::Disconnect { .. }
+        | Action::TrackConnectVst3Audio { .. }
+        | Action::TrackDisconnectVst3Audio { .. }
+        | Action::TrackLoadClapPlugin { .. }
+        | Action::TrackUnloadClapPlugin { .. }
+        | Action::TrackLoadVst3Plugin { .. }
+        | Action::TrackUnloadVst3PluginInstance { .. }
+        | Action::TrackSetClapParameter { .. }
+        | Action::TrackSetVst3Parameter { .. }
+        | Action::ModifyMidiNotes { .. }
+        | Action::ModifyMidiControllers { .. }
+        | Action::DeleteMidiControllers { .. }
+        | Action::InsertMidiControllers { .. }
+        | Action::DeleteMidiNotes { .. }
+        | Action::InsertMidiNotes { .. }
+        | Action::SetMidiSysExEvents { .. } => true,
+        #[cfg(unix)]
+        Action::TrackConnectPluginAudio { .. }
+        | Action::TrackDisconnectPluginAudio { .. }
+        | Action::TrackConnectPluginMidi { .. }
+        | Action::TrackDisconnectPluginMidi { .. } => true,
+        #[cfg(all(unix, not(target_os = "macos")))]
+        Action::TrackLoadLv2Plugin { .. }
+        | Action::TrackUnloadLv2PluginInstance { .. }
+        | Action::TrackSetLv2ControlValue { .. } => true,
+        _ => false,
+    }
 }
 
 /// Create an inverse action that will undo the given action
@@ -644,6 +646,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
+        #[cfg(unix)]
         Action::TrackConnectPluginAudio {
             track_name,
             from_node,
@@ -657,6 +660,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
+        #[cfg(unix)]
         Action::TrackDisconnectPluginAudio {
             track_name,
             from_node,
@@ -670,6 +674,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
+        #[cfg(unix)]
         Action::TrackConnectPluginMidi {
             track_name,
             from_node,
@@ -683,6 +688,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
+        #[cfg(unix)]
         Action::TrackDisconnectPluginMidi {
             track_name,
             from_node,
@@ -712,6 +718,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             track_name: track_name.clone(),
             plugin_path: plugin_path.clone(),
         }),
+        #[cfg(all(unix, not(target_os = "macos")))]
         Action::TrackLoadLv2Plugin {
             track_name,
             plugin_uri: _,
@@ -723,6 +730,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 instance_id: track.next_lv2_instance_id,
             })
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
         Action::TrackUnloadLv2PluginInstance {
             track_name,
             instance_id,
@@ -794,6 +802,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 state: snapshot,
             })
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
         Action::TrackSetLv2ControlValue {
             track_name,
             instance_id,

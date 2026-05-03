@@ -3,6 +3,11 @@
 // This module provides safe Rust wrappers around VST3 COM interfaces
 // using the vst3 crate's trait-based API.
 
+// The vst3 crate uses platform-dependent types (c_int / DefaultEnumType) for
+// enum constants, so explicit casts are required for cross-platform compilation
+// even though they appear unnecessary on some platforms.
+#![allow(clippy::unnecessary_cast)]
+
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -493,6 +498,7 @@ impl PluginInstance {
     }
 
     /// Initialize the component
+    #[allow(clippy::unnecessary_cast)]
     pub fn initialize(&mut self, factory: &PluginFactory) -> Result<(), String> {
         use vst3::Steinberg::IPluginBaseTrait;
         use vst3::Steinberg::Vst::{IComponentTrait, IEditControllerTrait};
@@ -674,11 +680,14 @@ impl PluginInstance {
                     } else {
                         BusTypes_::kAux as i32
                     };
-                    info.flags = if idx == 0 {
-                        BusFlags::kDefaultActive
-                    } else {
-                        0
-                    };
+                    #[allow(clippy::unnecessary_cast)]
+                    {
+                        info.flags = if idx == 0 {
+                            BusFlags::kDefaultActive as u32
+                        } else {
+                            0
+                        };
+                    }
                 }
                 infos.push(info);
             }

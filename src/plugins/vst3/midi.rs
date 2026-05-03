@@ -1,3 +1,7 @@
+// The vst3 crate uses platform-dependent types for enum constants, so explicit
+// casts are required for cross-platform compilation.
+#![allow(clippy::unnecessary_cast)]
+
 use crate::midi::io::MidiEvent;
 use std::cell::UnsafeCell;
 use vst3::Steinberg::Vst::ControllerNumbers_::{kAfterTouch, kCtrlProgramChange, kPitchBend};
@@ -104,12 +108,13 @@ impl IEventListTrait for EventBuffer {
         kResultOk
     }
 
+    #[allow(clippy::unnecessary_cast)]
     unsafe fn addEvent(&self, e: *mut Event) -> i32 {
         if e.is_null() {
             return kInvalidArgument;
         }
         let event = unsafe { *e };
-        if event.r#type as u32 == EventTypes_::kDataEvent
+        if event.r#type == EventTypes_::kDataEvent as u16
             && let Some(bytes) = copy_sysex_event(&event)
         {
             self.sysex_data_mut().push(bytes);
@@ -118,7 +123,7 @@ impl IEventListTrait for EventBuffer {
                     __field0: Event__type0 {
                         data: DataEvent {
                             size: last.len().min(u32::MAX as usize) as u32,
-                            r#type: DataTypes_::kMidiSysEx,
+                            r#type: DataTypes_::kMidiSysEx as u32,
                             bytes: last.as_ptr(),
                         },
                     },
@@ -339,6 +344,7 @@ impl IParamValueQueueTrait for ParameterValueQueue {
     }
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn midi_to_vst3_event(
     midi_event: &MidiEvent,
     bus_index: i32,
@@ -429,7 +435,7 @@ fn midi_to_vst3_event(
                 __field0: Event__type0 {
                     data: DataEvent {
                         size: bytes.len().min(u32::MAX as usize) as u32,
-                        r#type: DataTypes_::kMidiSysEx,
+                        r#type: DataTypes_::kMidiSysEx as u32,
                         bytes: bytes.as_ptr(),
                     },
                 },
@@ -439,59 +445,53 @@ fn midi_to_vst3_event(
     }
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn vst3_event_to_midi(event: &Event) -> Option<MidiEvent> {
     let frame = event.sampleOffset.max(0) as u32;
-    match event.r#type as u32 {
-        EventTypes_::kNoteOnEvent => {
-            let note = unsafe { event.__field0.noteOn };
-            Some(MidiEvent::new(
-                frame,
-                vec![
-                    0x90 | (note.channel as u8 & 0x0f),
-                    note.pitch.clamp(0, 127) as u8,
-                    midi_byte(note.velocity),
-                ],
-            ))
-        }
-        EventTypes_::kNoteOffEvent => {
-            let note = unsafe { event.__field0.noteOff };
-            Some(MidiEvent::new(
-                frame,
-                vec![
-                    0x80 | (note.channel as u8 & 0x0f),
-                    note.pitch.clamp(0, 127) as u8,
-                    midi_byte(note.velocity),
-                ],
-            ))
-        }
-        EventTypes_::kPolyPressureEvent => {
-            let pressure = unsafe { event.__field0.polyPressure };
-            Some(MidiEvent::new(
-                frame,
-                vec![
-                    0xA0 | (pressure.channel as u8 & 0x0f),
-                    pressure.pitch.clamp(0, 127) as u8,
-                    midi_byte(pressure.pressure),
-                ],
-            ))
-        }
-        EventTypes_::kDataEvent => {
-            let data = unsafe { event.__field0.data };
-            (data.r#type == DataTypes_::kMidiSysEx && !data.bytes.is_null()).then(|| {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        data.bytes,
-                        data.size.min(usize::MAX as u32) as usize,
-                    )
-                };
-                MidiEvent::new(frame, bytes.to_vec())
-            })
-        }
-        EventTypes_::kLegacyMIDICCOutEvent => {
-            let cc = unsafe { event.__field0.midiCCOut };
-            legacy_cc_to_midi(frame, cc)
-        }
-        _ => None,
+    let event_type = event.r#type as u32;
+    if event_type == EventTypes_::kNoteOnEvent as u32 {
+        let note = unsafe { event.__field0.noteOn };
+        Some(MidiEvent::new(
+            frame,
+            vec![
+                0x90 | (note.channel as u8 & 0x0f),
+                note.pitch.clamp(0, 127) as u8,
+                midi_byte(note.velocity),
+            ],
+        ))
+    } else if event_type == EventTypes_::kNoteOffEvent as u32 {
+        let note = unsafe { event.__field0.noteOff };
+        Some(MidiEvent::new(
+            frame,
+            vec![
+                0x80 | (note.channel as u8 & 0x0f),
+                note.pitch.clamp(0, 127) as u8,
+                midi_byte(note.velocity),
+            ],
+        ))
+    } else if event_type == EventTypes_::kPolyPressureEvent as u32 {
+        let pressure = unsafe { event.__field0.polyPressure };
+        Some(MidiEvent::new(
+            frame,
+            vec![
+                0xA0 | (pressure.channel as u8 & 0x0f),
+                pressure.pitch.clamp(0, 127) as u8,
+                midi_byte(pressure.pressure),
+            ],
+        ))
+    } else if event_type == EventTypes_::kDataEvent as u32 {
+        let data = unsafe { event.__field0.data };
+        (data.r#type == DataTypes_::kMidiSysEx as u32 && !data.bytes.is_null()).then(|| {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(data.bytes, data.size.min(usize::MAX as u32) as usize)
+            };
+            MidiEvent::new(frame, bytes.to_vec())
+        })
+    } else if event_type == EventTypes_::kLegacyMIDICCOutEvent as u32 {
+        let cc = unsafe { event.__field0.midiCCOut };
+        legacy_cc_to_midi(frame, cc)
+    } else {
+        None
     }
 }
 
@@ -541,9 +541,10 @@ fn legacy_cc_to_midi(frame: u32, cc: LegacyMIDICCOutEvent) -> Option<MidiEvent> 
     Some(MidiEvent::new(frame, data))
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn copy_sysex_event(event: &Event) -> Option<Vec<u8>> {
     let data = unsafe { event.__field0.data };
-    (data.r#type == DataTypes_::kMidiSysEx && !data.bytes.is_null()).then(|| unsafe {
+    (data.r#type == DataTypes_::kMidiSysEx as u32 && !data.bytes.is_null()).then(|| unsafe {
         std::slice::from_raw_parts(data.bytes, data.size.min(usize::MAX as u32) as usize).to_vec()
     })
 }

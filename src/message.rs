@@ -143,7 +143,6 @@ pub struct ClipMoveTo {
     pub input_channel: usize,
 }
 
-#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PluginGraphNode {
     TrackInput,
@@ -153,7 +152,6 @@ pub enum PluginGraphNode {
     ClapPluginInstance(usize),
 }
 
-#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PluginGraphPlugin {
     pub node: PluginGraphNode,
@@ -204,7 +202,6 @@ pub struct Lv2ControlPortInfo {
     pub value: f32,
 }
 
-#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginGraphConnection {
     pub from_node: PluginGraphNode,
@@ -214,7 +211,6 @@ pub struct PluginGraphConnection {
     pub kind: Kind,
 }
 
-#[cfg(unix)]
 pub type PluginGraphSnapshot = (Vec<PluginGraphPlugin>, Vec<PluginGraphConnection>);
 
 // VST3 graph types

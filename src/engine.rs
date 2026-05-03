@@ -125,6 +125,7 @@ enum JackTransportPlaySync {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(unix)]
 struct AudioOpenRequest<'a> {
     device: &'a str,
     input_device: Option<&'a str>,
@@ -828,6 +829,7 @@ impl Engine {
 
     const METER_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
     const TRACK_PROCESS_TIMEOUT: Duration = Duration::from_millis(250);
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
     const HW_OUT_METER_LINEAR_EPSILON: f32 = 0.0025;
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -989,6 +991,11 @@ impl Engine {
         self.jack_runtime.as_ref().map(|j| j.lock().buffer_size)
     }
 
+    #[cfg(not(unix))]
+    fn jack_cycle_samples(&self) -> Option<usize> {
+        None
+    }
+
     fn current_cycle_samples(&self) -> usize {
         self.hw_driver_cycle_samples()
             .or_else(|| self.jack_cycle_samples())
@@ -1047,6 +1054,10 @@ impl Engine {
                     } else {
                         return;
                     }
+                }
+                #[cfg(not(unix))]
+                {
+                    return;
                 }
             };
         if output_channels == 0 {
@@ -1236,11 +1247,21 @@ impl Engine {
             .and_then(|j| j.lock().input_audio_port(from_port))
     }
 
+    #[cfg(not(unix))]
+    fn jack_input_audio_port(&self, _from_port: usize) -> Option<Arc<AudioIO>> {
+        None
+    }
+
     #[cfg(unix)]
     fn jack_output_audio_port(&self, to_port: usize) -> Option<Arc<AudioIO>> {
         self.jack_runtime
             .as_ref()
             .and_then(|j| j.lock().output_audio_port(to_port))
+    }
+
+    #[cfg(not(unix))]
+    fn jack_output_audio_port(&self, _to_port: usize) -> Option<Arc<AudioIO>> {
+        None
     }
 
     fn normalize_transport_sample(&self, sample: usize) -> usize {
@@ -1420,8 +1441,18 @@ impl Engine {
         .await;
     }
 
+    #[cfg(unix)]
+    fn jack_runtime_is_some(&self) -> bool {
+        self.jack_runtime.is_some()
+    }
+
+    #[cfg(not(unix))]
+    fn jack_runtime_is_some(&self) -> bool {
+        false
+    }
+
     fn can_schedule_hw_cycle(&self) -> bool {
-        self.hw_worker.is_some() || self.jack_runtime.is_some()
+        self.hw_worker.is_some() || self.jack_runtime_is_some()
     }
 
     async fn ensure_hw_worker_running(&mut self) {
@@ -1526,6 +1557,7 @@ impl Engine {
         Vec::new()
     }
 
+    #[cfg(unix)]
     fn audio_ports_connected(source: &Arc<AudioIO>, target: &Arc<AudioIO>) -> bool {
         source
             .connections
@@ -1592,6 +1624,7 @@ impl Engine {
         }
     }
 
+    #[cfg(unix)]
     fn disconnect_actions_for_removed_hw_input(
         &self,
         removed_port: usize,
@@ -1629,6 +1662,7 @@ impl Engine {
         actions
     }
 
+    #[cfg(unix)]
     fn disconnect_actions_for_removed_hw_output(
         &self,
         removed_port: usize,
@@ -1669,6 +1703,7 @@ impl Engine {
         actions
     }
 
+    #[cfg(unix)]
     fn reindex_notifications_for_removed_hw_input(&self, removed_port: usize) -> Vec<Action> {
         let mut actions = Vec::new();
         #[cfg(unix)]
@@ -1725,6 +1760,7 @@ impl Engine {
         actions
     }
 
+    #[cfg(unix)]
     fn reindex_notifications_for_removed_hw_output(&self, removed_port: usize) -> Vec<Action> {
         let mut actions = Vec::new();
         #[cfg(unix)]
@@ -3165,6 +3201,11 @@ impl Engine {
                 .extend_from_slice(peaks_linear);
             true
         }
+        #[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd")))]
+        {
+            let _ = peaks_linear;
+            false
+        }
     }
 
     async fn maybe_notify_hw_out_meter(&mut self, _meter_db: Vec<f32>) {
@@ -3192,6 +3233,7 @@ impl Engine {
                 return;
             }
         } else {
+            #[cfg(unix)]
             {
                 if let Some(jack) = self.jack_runtime.clone() {
                     jack.lock().set_output_gain_linear(gain);
@@ -3203,42 +3245,55 @@ impl Engine {
                     return;
                 }
             }
+            #[cfg(not(unix))]
+            {
+                return;
+            }
         }
         let peaks_linear = if let Some(oss) = self.hw_driver.clone() {
             oss.lock().output_meter_linear(gain, self.hw_out_balance)
-        } else if let Some(jack) = self.jack_runtime.clone() {
-            let outs = jack.lock().audio_outs();
-            let out_count = outs.len();
-            let b = if out_count == 2 {
-                self.hw_out_balance.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-            let mut meters_linear = Vec::with_capacity(out_count);
-            for (channel_idx, channel) in outs.iter().enumerate() {
-                let balance_gain = if out_count == 2 {
-                    if channel_idx == 0 {
-                        (1.0 - b).clamp(0.0, 1.0)
-                    } else {
-                        (1.0 + b).clamp(0.0, 1.0)
-                    }
-                } else {
-                    1.0
-                };
-                let buf = channel.buffer.lock();
-                let mut peak = 0.0_f32;
-                for &sample in buf.iter() {
-                    let v = if sample >= 0.0 { sample } else { -sample };
-                    if v > peak {
-                        peak = v;
-                    }
-                }
-                let peak = peak * gain * balance_gain;
-                meters_linear.push(peak);
-            }
-            meters_linear
         } else {
-            return;
+            #[cfg(unix)]
+            {
+                if let Some(jack) = self.jack_runtime.clone() {
+                    let outs = jack.lock().audio_outs();
+                    let out_count = outs.len();
+                    let b = if out_count == 2 {
+                        self.hw_out_balance.clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let mut meters_linear = Vec::with_capacity(out_count);
+                    for (channel_idx, channel) in outs.iter().enumerate() {
+                        let balance_gain = if out_count == 2 {
+                            if channel_idx == 0 {
+                                (1.0 - b).clamp(0.0, 1.0)
+                            } else {
+                                (1.0 + b).clamp(0.0, 1.0)
+                            }
+                        } else {
+                            1.0
+                        };
+                        let buf = channel.buffer.lock();
+                        let mut peak = 0.0_f32;
+                        for &sample in buf.iter() {
+                            let v = if sample >= 0.0 { sample } else { -sample };
+                            if v > peak {
+                                peak = v;
+                            }
+                        }
+                        let peak = peak * gain * balance_gain;
+                        meters_linear.push(peak);
+                    }
+                    meters_linear
+                } else {
+                    return;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return;
+            }
         };
         if self.hw_out_peak_hold_linear.len() != peaks_linear.len() {
             self.hw_out_peak_hold_linear.resize(peaks_linear.len(), 0.0);
@@ -3935,10 +3990,15 @@ impl Engine {
                 let maybe_hw = if let Some(oss) = &self.hw_driver {
                     let hw = oss.lock();
                     Some((hw.cycle_samples(), hw.sample_rate() as f64))
-                } else if let Some(jack) = &self.jack_runtime {
-                    let j = jack.lock();
-                    Some((j.buffer_size, j.sample_rate as f64))
                 } else {
+                    #[cfg(unix)]
+                    if let Some(jack) = &self.jack_runtime {
+                        let j = jack.lock();
+                        Some((j.buffer_size, j.sample_rate as f64))
+                    } else {
+                        None
+                    }
+                    #[cfg(not(unix))]
                     None
                 };
 
@@ -6179,18 +6239,21 @@ impl Engine {
                 nperiods,
                 sync_mode,
             } => {
-                let request = AudioOpenRequest {
-                    device,
-                    input_device: input_device.as_deref(),
-                    sample_rate_hz,
-                    bits,
-                    exclusive,
-                    period_frames,
-                    nperiods,
-                    sync_mode,
-                };
-                if self.maybe_open_jack_runtime(request).await.is_some() {
-                    return;
+                #[cfg(unix)]
+                {
+                    let request = AudioOpenRequest {
+                        device,
+                        input_device: input_device.as_deref(),
+                        sample_rate_hz,
+                        bits,
+                        exclusive,
+                        period_frames,
+                        nperiods,
+                        sync_mode,
+                    };
+                    if self.maybe_open_jack_runtime(request).await.is_some() {
+                        return;
+                    }
                 }
                 let hw_opts = Self::build_hw_options(exclusive, period_frames, nperiods, sync_mode);
                 let open_result = self
@@ -6245,9 +6308,10 @@ impl Engine {
                     .await;
                 }
             }
-            Action::JackRemoveAudioInputPort(removed_port) => {
+            Action::JackRemoveAudioInputPort(_removed_port) => {
                 #[cfg(unix)]
                 {
+                    let removed_port = _removed_port;
                     if let Some(jack) = self.jack_runtime.clone() {
                         let (removed_port, removed_io) = {
                             let jack = jack.lock();
@@ -6343,9 +6407,10 @@ impl Engine {
                     .await;
                 }
             }
-            Action::JackRemoveAudioOutputPort(removed_port) => {
+            Action::JackRemoveAudioOutputPort(_removed_port) => {
                 #[cfg(unix)]
                 {
+                    let removed_port = _removed_port;
                     if let Some(jack) = self.jack_runtime.clone() {
                         let (removed_port, removed_io) = {
                             let jack = jack.lock();
@@ -6478,10 +6543,15 @@ impl Engine {
                 let sample_rate_hz = if let Some(hw) = &self.hw_driver {
                     hw.lock().sample_rate() as usize
                 } else {
-                    self.jack_runtime
-                        .as_ref()
-                        .map(|j| j.lock().sample_rate)
-                        .unwrap_or(0)
+                    #[cfg(unix)]
+                    {
+                        self.jack_runtime
+                            .as_ref()
+                            .map(|j| j.lock().sample_rate)
+                            .unwrap_or(0)
+                    }
+                    #[cfg(not(unix))]
+                    0
                 };
                 let cycle_samples = self.current_cycle_samples();
                 self.notify_clients(Ok(Action::SessionDiagnosticsReport {
@@ -6749,7 +6819,7 @@ impl Engine {
                     let pending_hw_in_by_device = self.pending_hw_midi_events_by_device.clone();
                     for (track_name, track) in self.state.lock().tracks.iter() {
                         let track_lock = track.lock();
-                        if self.jack_runtime.is_some() {
+                        if self.jack_runtime_is_some() {
                             if !self.pending_hw_midi_events.is_empty() {
                                 track_lock.push_hw_midi_events(&self.pending_hw_midi_events);
                             }

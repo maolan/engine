@@ -1,15 +1,18 @@
 use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
-use crate::clap::{ClapProcessor, ClapTransportInfo};
+use crate::clap::ClapProcessor;
+#[cfg(unix)]
+use crate::clap::ClapTransportInfo;
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::lv2::{Lv2Processor, Lv2TransportInfo};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::message::Lv2ControlPortInfo;
+use crate::message::PluginGraphNode;
 #[cfg(unix)]
 use crate::message::{Lv2PluginState, Lv2StatePortValue, Lv2StateProperty};
 #[cfg(unix)]
-use crate::message::{PluginGraphConnection, PluginGraphNode, PluginGraphPlugin};
+use crate::message::{PluginGraphConnection, PluginGraphPlugin};
 use crate::mutex::UnsafeMutex;
 use crate::vst3::Vst3Processor;
 use crate::{
@@ -79,6 +82,7 @@ struct ClipPluginRuntime {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(all(unix, not(target_os = "macos")))]
 struct ClipRuntimeProcessContext {
     transport_sample: usize,
     loop_enabled: bool,
@@ -152,6 +156,10 @@ impl ClipPluginRuntime {
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip LV2 output port: {id}:{port}")),
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            PluginGraphNode::Lv2PluginInstance(_) => {
+                Err("LV2 plugins are not supported on this platform".to_string())
+            }
             PluginGraphNode::Vst3PluginInstance(id) => self
                 .vst3_processors
                 .iter()
@@ -182,6 +190,10 @@ impl ClipPluginRuntime {
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip LV2 input port: {id}:{port}")),
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            PluginGraphNode::Lv2PluginInstance(_) => {
+                Err("LV2 plugins are not supported on this platform".to_string())
+            }
             PluginGraphNode::Vst3PluginInstance(id) => self
                 .vst3_processors
                 .iter()
@@ -243,6 +255,35 @@ impl ClipPluginRuntime {
         per_port
     }
 
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn process(&mut self, input_blocks: &[Vec<f32>], request_len: usize) -> Vec<Vec<f32>> {
+        self.setup_ports();
+        for (source, samples) in self.input_sources.iter().zip(input_blocks.iter()) {
+            let buffer = source.buffer.lock();
+            buffer.fill(0.0);
+            for (dst, src) in buffer.iter_mut().zip(samples.iter().take(request_len)) {
+                *dst = *src;
+            }
+            *source.finished.lock() = true;
+        }
+        for source in self.input_sources.iter().skip(input_blocks.len()) {
+            source.buffer.lock().fill(0.0);
+            *source.finished.lock() = true;
+        }
+
+        let mut outputs = Vec::with_capacity(self.outputs.len());
+        for output in &self.outputs {
+            if output.ready() {
+                output.process();
+            }
+            let buf = output.buffer.lock();
+            outputs.push(buf.iter().copied().collect());
+            *output.finished.lock() = false;
+        }
+        outputs
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn process(
         &mut self,
         input_blocks: &[Vec<f32>],
@@ -263,7 +304,6 @@ impl ClipPluginRuntime {
             *source.finished.lock() = true;
         }
 
-        #[cfg(all(unix, not(target_os = "macos")))]
         {
             let track_input_midi_events = vec![Vec::<MidiEvent>::new(); self.input_sources.len()];
             let mut lv2_processed = vec![false; self.lv2_processors.len()];
@@ -1905,7 +1945,7 @@ impl Track {
         &mut self,
         clip: &crate::audio::clip::AudioClip,
         input_blocks: &[Vec<f32>],
-        absolute_start_sample: usize,
+        _absolute_start_sample: usize,
         request_len: usize,
     ) -> Result<Vec<Vec<f32>>, String> {
         if let Some(graph) = clip.plugin_graph_json.as_ref()
@@ -1929,18 +1969,25 @@ impl Track {
             .get_mut(&runtime_key)
             .ok_or_else(|| "Missing clip plugin runtime".to_string())?;
 
-        Ok(runtime.process(
-            input_blocks,
-            request_len,
-            ClipRuntimeProcessContext {
-                transport_sample: absolute_start_sample,
-                loop_enabled: self.loop_enabled,
-                loop_range_samples: self.loop_range_samples,
-                tempo_bpm: self.tempo_bpm,
-                tsig_num: self.tsig_num,
-                tsig_denom: self.tsig_denom,
-            },
-        ))
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Ok(runtime.process(
+                input_blocks,
+                request_len,
+                ClipRuntimeProcessContext {
+                    transport_sample: _absolute_start_sample,
+                    loop_enabled: self.loop_enabled,
+                    loop_range_samples: self.loop_range_samples,
+                    tempo_bpm: self.tempo_bpm,
+                    tsig_num: self.tsig_num,
+                    tsig_denom: self.tsig_denom,
+                },
+            ))
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            Ok(runtime.process(input_blocks, request_len))
+        }
     }
 
     fn apply_audio_clip_fades(
@@ -2950,6 +2997,7 @@ impl Track {
         }
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn sanitize_name(name: &str) -> String {
         let mut out = String::with_capacity(name.len());
         for c in name.chars() {
@@ -3066,6 +3114,7 @@ impl Track {
                 self.name, plugin_path
             ));
         };
+        #[cfg(unix)]
         let removed_id = self.clap_plugins[index].id;
         self.clap_plugins.remove(index);
         #[cfg(unix)]
@@ -4103,7 +4152,7 @@ impl Track {
         }
     }
 
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(all(unix, target_os = "macos"))]
     fn lv2_unsupported_error(instance_id: usize) -> String {
         format!("LV2 instance {instance_id} is not supported on this platform")
     }

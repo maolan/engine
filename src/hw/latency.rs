@@ -17,6 +17,7 @@ pub fn latency_ranges(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::latency_ranges;
 

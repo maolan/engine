@@ -56,6 +56,7 @@ pub fn write_interleaved_from_ports(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::audio::io::AudioIO;

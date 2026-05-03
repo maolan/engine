@@ -2761,26 +2761,38 @@ fn scan_plugin_capabilities(
 }
 
 fn default_clap_search_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
     #[cfg(target_os = "macos")]
     {
+        let mut roots = Vec::new();
         paths::push_macos_audio_plugin_roots(&mut roots, "CLAP");
+        roots
     }
-
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
     {
+        let mut roots = Vec::new();
         paths::push_unix_plugin_roots(&mut roots, "clap");
+        roots
     }
-
-    roots
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
+    {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::collect_clap_plugins;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
