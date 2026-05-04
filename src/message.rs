@@ -167,6 +167,7 @@ pub struct PluginGraphPlugin {
     pub midi_inputs: usize,
     pub midi_outputs: usize,
     pub state: Option<serde_json::Value>,
+    pub bypassed: bool,
 }
 
 #[cfg(unix)]
@@ -772,6 +773,12 @@ pub enum Action {
         instance_id: usize,
         param_id: u32,
         value: f32,
+    },
+    TrackSetPluginBypassed {
+        track_name: String,
+        instance_id: usize,
+        format: String,
+        bypassed: bool,
     },
     TrackGetVst3Parameters {
         track_name: String,

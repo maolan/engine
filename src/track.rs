@@ -14,13 +14,13 @@ use crate::message::{Lv2PluginState, Lv2StatePortValue, Lv2StateProperty};
 #[cfg(unix)]
 use crate::message::{PluginGraphConnection, PluginGraphPlugin};
 use crate::mutex::UnsafeMutex;
+#[cfg(unix)]
+use crate::rubberband::LivePitchShifter;
 use crate::vst3::Vst3Processor;
 use crate::{
     audio::io::AudioIO,
     midi::io::{MIDIIO, MidiEvent},
 };
-#[cfg(unix)]
-use crate::rubberband::LivePitchShifter;
 #[cfg(unix)]
 use crate::{kind::Kind, routing};
 use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
@@ -2840,6 +2840,7 @@ impl Track {
                     midi_inputs: instance.processor.midi_input_count(),
                     midi_outputs: instance.processor.midi_output_count(),
                     state: serde_json::to_value(instance.processor.snapshot_state()).ok(),
+                    bypassed: instance.processor.is_bypassed(),
                 },
             );
         }
@@ -2860,6 +2861,7 @@ impl Track {
                     midi_inputs: instance.processor.midi_input_count(),
                     midi_outputs: instance.processor.midi_output_count(),
                     state: None,
+                    bypassed: instance.processor.is_bypassed(),
                 },
             );
         }
@@ -2884,6 +2886,7 @@ impl Track {
                         .snapshot_state()
                         .ok()
                         .and_then(|state| serde_json::to_value(state).ok()),
+                    bypassed: instance.processor.is_bypassed(),
                 },
             );
         }
@@ -2931,6 +2934,25 @@ impl Track {
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn set_lv2_plugin_bypassed(
+        &self,
+        instance_id: usize,
+        bypassed: bool,
+    ) -> Result<(), String> {
+        let Some(instance) = self
+            .lv2_processors
+            .iter()
+            .find(|instance| instance.id == instance_id)
+        else {
+            return Err(format!(
+                "Track '{}' does not have LV2 instance id: {}",
+                self.name, instance_id
+            ));
+        };
+        instance.processor.set_bypassed(bypassed);
+        Ok(())
+    }
+
     pub fn set_lv2_control_value(
         &mut self,
         instance_id: usize,
@@ -3139,6 +3161,25 @@ impl Track {
                 )
             })
             .collect()
+    }
+
+    pub fn set_clap_plugin_bypassed(
+        &self,
+        instance_id: usize,
+        bypassed: bool,
+    ) -> Result<(), String> {
+        let instance = self
+            .clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Track '{}' does not have CLAP instance id: {}",
+                    self.name, instance_id
+                )
+            })?;
+        instance.processor.set_bypassed(bypassed);
+        Ok(())
     }
 
     pub fn set_clap_parameter(
@@ -3524,6 +3565,20 @@ impl Track {
         }
 
         None
+    }
+
+    pub fn set_vst3_plugin_bypassed(
+        &self,
+        instance_id: usize,
+        bypassed: bool,
+    ) -> Result<(), String> {
+        let instance = self
+            .vst3_processors
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
+        instance.processor.set_bypassed(bypassed);
+        Ok(())
     }
 
     pub fn set_vst3_parameter(

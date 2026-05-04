@@ -5,6 +5,7 @@ use std::{
     ffi::{CStr, CString, c_char, c_void},
     fmt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -151,6 +152,7 @@ pub struct Lv2Processor {
     has_worker_interface: bool,
     control_ports: Vec<ControlPortInfo>,
     midnam_note_names: UnsafeMutex<HashMap<u8, String>>,
+    bypassed: AtomicBool,
 }
 
 struct LoadedPlugin {
@@ -599,6 +601,7 @@ impl Lv2Processor {
             has_worker_interface,
             control_ports,
             midnam_note_names: UnsafeMutex::new(HashMap::new()),
+            bypassed: AtomicBool::new(false),
         };
         processor.validate_required_runtime_callbacks()?;
         processor.connect_ports();
@@ -703,6 +706,30 @@ impl Lv2Processor {
             .collect()
     }
 
+    pub fn set_bypassed(&self, bypassed: bool) {
+        self.bypassed.store(bypassed, Ordering::Relaxed);
+    }
+
+    pub fn is_bypassed(&self) -> bool {
+        self.bypassed.load(Ordering::Relaxed)
+    }
+
+    fn bypass_copy_inputs_to_outputs(&self) {
+        for (input, output) in self.audio_inputs.iter().zip(self.audio_outputs.iter()) {
+            let src = input.buffer.lock();
+            let dst = output.buffer.lock();
+            dst.fill(0.0);
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d = *s;
+            }
+            *output.finished.lock() = true;
+        }
+        for output in self.audio_outputs.iter().skip(self.audio_inputs.len()) {
+            output.buffer.lock().fill(0.0);
+            *output.finished.lock() = true;
+        }
+    }
+
     pub fn process_with_audio_io(
         &mut self,
         frames: usize,
@@ -720,6 +747,12 @@ impl Lv2Processor {
             buffer.fill(0.0);
             *io.finished.lock() = false;
         }
+
+        if self.bypassed.load(Ordering::Relaxed) {
+            self.bypass_copy_inputs_to_outputs();
+            return vec![Vec::new(); self.midi_outputs];
+        }
+
         for buffer in &mut self.atom_inputs {
             prepare_empty_atom_sequence(
                 buffer.bytes_mut(),

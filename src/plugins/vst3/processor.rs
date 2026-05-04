@@ -11,7 +11,7 @@ use crate::midi::io::MidiEvent;
 use std::ffi::{CString, c_void};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vst3::ComPtr;
 use vst3::ComWrapper;
@@ -48,6 +48,7 @@ pub struct Vst3Processor {
     max_samples_per_block: usize,
     processing_started: bool,
     sample_rate: f64,
+    bypassed: AtomicBool,
 
     // GUI session
     gui_session: Arc<Mutex<Vst3GuiSession>>,
@@ -231,6 +232,7 @@ impl Vst3Processor {
             max_samples_per_block: buffer_size,
             processing_started,
             sample_rate,
+            bypassed: AtomicBool::new(false),
             gui_session,
         })
     }
@@ -280,10 +282,38 @@ impl Vst3Processor {
         }
     }
 
+    pub fn set_bypassed(&self, bypassed: bool) {
+        self.bypassed.store(bypassed, Ordering::Relaxed);
+    }
+
+    pub fn is_bypassed(&self) -> bool {
+        self.bypassed.load(Ordering::Relaxed)
+    }
+
+    fn bypass_copy_inputs_to_outputs(&self) {
+        for (input, output) in self.audio_inputs.iter().zip(self.audio_outputs.iter()) {
+            let src = input.buffer.lock();
+            let dst = output.buffer.lock();
+            dst.fill(0.0);
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d = *s;
+            }
+            *output.finished.lock() = true;
+        }
+        for output in self.audio_outputs.iter().skip(self.audio_inputs.len()) {
+            output.buffer.lock().fill(0.0);
+            *output.finished.lock() = true;
+        }
+    }
+
     pub fn process_with_audio_io(&self, frames: usize) {
         // Process all input AudioIO ports
         for input in &self.audio_inputs {
             input.process();
+        }
+        if self.bypassed.load(Ordering::Relaxed) {
+            self.bypass_copy_inputs_to_outputs();
+            return;
         }
 
         // Get the audio processor
@@ -307,6 +337,10 @@ impl Vst3Processor {
         // Process all input AudioIO ports
         for input in &self.audio_inputs {
             input.process();
+        }
+        if self.bypassed.load(Ordering::Relaxed) {
+            self.bypass_copy_inputs_to_outputs();
+            return Vec::new();
         }
 
         // Get the audio processor

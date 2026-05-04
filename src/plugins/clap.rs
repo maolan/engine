@@ -16,7 +16,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +130,7 @@ pub struct ClapProcessor {
     pending_param_events: Arc<UnsafeMutex<Vec<PendingParamEvent>>>,
     pending_param_events_ui: Arc<UnsafeMutex<Vec<PendingParamEvent>>>,
     process_lock: Arc<UnsafeMutex<()>>,
+    bypassed: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for ClapProcessor {
@@ -216,6 +217,7 @@ impl ClapProcessor {
             pending_param_events: Arc::new(UnsafeMutex::new(Vec::new())),
             pending_param_events_ui: Arc::new(UnsafeMutex::new(Vec::new())),
             process_lock: Arc::new(UnsafeMutex::new(())),
+            bypassed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -232,6 +234,30 @@ impl ClapProcessor {
         let _ = self.process_with_midi(frames, &[], ClapTransportInfo::default());
     }
 
+    pub fn set_bypassed(&self, bypassed: bool) {
+        self.bypassed.store(bypassed, Ordering::Relaxed);
+    }
+
+    pub fn is_bypassed(&self) -> bool {
+        self.bypassed.load(Ordering::Relaxed)
+    }
+
+    fn bypass_copy_inputs_to_outputs(&self) {
+        for (input, output) in self.audio_inputs.iter().zip(self.audio_outputs.iter()) {
+            let src = input.buffer.lock();
+            let dst = output.buffer.lock();
+            dst.fill(0.0);
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d = *s;
+            }
+            *output.finished.lock() = true;
+        }
+        for output in self.audio_outputs.iter().skip(self.audio_inputs.len()) {
+            output.buffer.lock().fill(0.0);
+            *output.finished.lock() = true;
+        }
+    }
+
     pub fn process_with_midi(
         &self,
         frames: usize,
@@ -246,6 +272,10 @@ impl ClapProcessor {
             if port.ready() {
                 port.process();
             }
+        }
+        if self.bypassed.load(Ordering::Relaxed) {
+            self.bypass_copy_inputs_to_outputs();
+            return Vec::new();
         }
         let (processed, processed_midi) = match self.process_native(frames, midi_in, transport) {
             Ok(ok) => ok,

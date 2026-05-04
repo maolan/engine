@@ -152,6 +152,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackUnloadVst3PluginInstance { .. }
         | Action::TrackSetClapParameter { .. }
         | Action::TrackSetVst3Parameter { .. }
+        | Action::TrackSetPluginBypassed { .. }
         | Action::ModifyMidiNotes { .. }
         | Action::ModifyMidiControllers { .. }
         | Action::DeleteMidiControllers { .. }
@@ -800,6 +801,40 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 track_name: track_name.clone(),
                 instance_id: *instance_id,
                 state: snapshot,
+            })
+        }
+        Action::TrackSetPluginBypassed {
+            track_name,
+            instance_id,
+            format,
+            bypassed,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let current_bypassed = match format.as_str() {
+                "CLAP" => track
+                    .clap_plugins
+                    .iter()
+                    .find(|i| i.id == *instance_id)
+                    .map(|i| i.processor.is_bypassed()),
+                "VST3" => track
+                    .vst3_processors
+                    .iter()
+                    .find(|i| i.id == *instance_id)
+                    .map(|i| i.processor.is_bypassed()),
+                #[cfg(all(unix, not(target_os = "macos")))]
+                "LV2" => track
+                    .lv2_processors
+                    .iter()
+                    .find(|i| i.id == *instance_id)
+                    .map(|i| i.processor.is_bypassed()),
+                _ => None,
+            };
+            Some(Action::TrackSetPluginBypassed {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                format: format.clone(),
+                bypassed: current_bypassed.unwrap_or(!*bypassed),
             })
         }
         #[cfg(all(unix, not(target_os = "macos")))]

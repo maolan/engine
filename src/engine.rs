@@ -2851,7 +2851,7 @@ impl Engine {
                         clip.input_channel = clip.input_channel.min(max_lane);
                         track.audio.clips.push(clip);
                         #[cfg(unix)]
-                    track.clip_pitch_shifters.clear();
+                        track.clip_pitch_shifters.clear();
                     }
                 }
                 Kind::MIDI => {
@@ -5544,6 +5544,30 @@ impl Engine {
                     }
                 }
             }
+            Action::TrackSetPluginBypassed {
+                ref track_name,
+                instance_id,
+                ref format,
+                bypassed,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => {
+                    let result = match format.as_str() {
+                        "CLAP" => track.lock().set_clap_plugin_bypassed(instance_id, bypassed),
+                        "VST3" => track.lock().set_vst3_plugin_bypassed(instance_id, bypassed),
+                        #[cfg(all(unix, not(target_os = "macos")))]
+                        "LV2" => track.lock().set_lv2_plugin_bypassed(instance_id, bypassed),
+                        _ => Err(format!("Unknown plugin format for bypass: {format}")),
+                    };
+                    if let Err(e) = result {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                    self.notify_clients(Ok(a.clone())).await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
             Action::TrackGetVst3Parameters {
                 ref track_name,
                 instance_id,
