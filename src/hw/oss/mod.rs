@@ -6,7 +6,6 @@ use std::{
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     sync::{Arc, Mutex},
 };
-use wavers::Samples;
 
 pub use super::midi_hub::MidiHub;
 
@@ -54,7 +53,7 @@ pub struct Audio {
     pub rate: i32,
     pub format: u32,
     pub chsamples: usize,
-    buffer: Samples<i32>,
+    buffer: Vec<i32>,
     pub buffer_info: BufferInfo,
     frame_size_bytes: usize,
     buffer_frames_cached: i64,
@@ -336,7 +335,7 @@ impl Audio {
             rate: effective_rate,
             format,
             chsamples,
-            buffer: Samples::new(vec![0_i32; chsamples * (channels as usize)].into_boxed_slice()),
+            buffer: vec![0_i32; chsamples * (channels as usize)],
             buffer_info,
             frame_size_bytes: frame_size,
             buffer_frames_cached,
@@ -537,7 +536,7 @@ impl Audio {
 
         if self.input {
             let norm_factor = convert_policy::F32_FROM_I32_MAX;
-            let data_slice: &mut [i32] = self.buffer.as_mut();
+            let data_slice: &mut [i32] = self.buffer.as_mut_slice();
             crate::hw::ports::fill_ports_from_interleaved(
                 &self.channels,
                 self.chsamples,
@@ -549,7 +548,7 @@ impl Audio {
             );
         } else {
             let playing = self.playing.load(std::sync::atomic::Ordering::Relaxed);
-            let data_i32 = self.buffer.as_mut();
+            let data_i32 = self.buffer.as_mut_slice();
             if !playing {
                 data_i32.fill(0);
             } else {

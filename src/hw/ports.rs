@@ -23,7 +23,7 @@ pub fn fill_ports_from_interleaved(
             continue;
         }
         let channel_buf_lock = io_port.buffer.lock();
-        let channel_samples = channel_buf_lock.as_mut();
+        let channel_samples: &mut [f32] = &mut *channel_buf_lock;
         for (frame, sample) in channel_samples.iter_mut().enumerate().take(frames) {
             *sample = sample_at(ch_idx, frame);
         }
@@ -47,7 +47,7 @@ pub fn write_interleaved_from_ports(
         }
         io_port.process();
         let channel_buf_lock = io_port.buffer.lock();
-        let channel_samples = channel_buf_lock.as_ref();
+        let channel_samples: &[f32] = &*channel_buf_lock;
         let balance_gain = crate::hw::common::channel_balance_gain(ch_count, ch_idx, balance);
         for (frame, &sample) in channel_samples.iter().enumerate().take(frames) {
             write_sample(ch_idx, frame, sample * gain * balance_gain);
@@ -77,8 +77,8 @@ mod tests {
             |ch, frame| (ch * 10 + frame) as f32,
         );
 
-        assert_eq!(connected.buffer.lock().as_ref()[..3], [0.0, 1.0, 2.0]);
-        assert_eq!(disconnected.buffer.lock().as_ref()[..3], [0.0, 0.0, 0.0]);
+        assert_eq!(connected.buffer.lock().as_slice()[..3], [0.0, 1.0, 2.0]);
+        assert_eq!(disconnected.buffer.lock().as_slice()[..3], [0.0, 0.0, 0.0]);
         assert!(*connected.finished.lock());
         assert!(*disconnected.finished.lock());
     }
@@ -91,8 +91,8 @@ mod tests {
         let right = Arc::new(AudioIO::new(3));
         AudioIO::connect(&left_src, &left);
         AudioIO::connect(&right_src, &right);
-        left_src.buffer.lock().as_mut()[..3].copy_from_slice(&[1.0, 0.5, -1.0]);
-        right_src.buffer.lock().as_mut()[..3].copy_from_slice(&[0.25, -0.25, 0.75]);
+        left_src.buffer.lock().as_mut_slice()[..3].copy_from_slice(&[1.0, 0.5, -1.0]);
+        right_src.buffer.lock().as_mut_slice()[..3].copy_from_slice(&[0.25, -0.25, 0.75]);
 
         let mut written = vec![vec![0.0_f32; 3]; 2];
         write_interleaved_from_ports(&[left, right], 3, 2.0, 0.5, true, |ch, frame, sample| {

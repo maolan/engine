@@ -82,12 +82,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
-name = "bytemuck"
-version = "1.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -381,14 +375,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
-name = "i24"
-version = "1.0.1"
+name = "hound"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bafc62750bce7c2603750d1c19532e226bb85bd21f5385ab952cc29b8c31e2af"
-dependencies = [
- "bytemuck",
- "num-traits",
-]
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "indexmap"
@@ -605,13 +595,14 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "alsa",
  "byteorder",
  "coreaudio-sys",
  "coremidi 0.7.0",
  "cpal",
+ "hound",
  "jack",
  "libloading 0.8.9",
  "lilv",
@@ -626,7 +617,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vst3",
- "wavers",
  "windows-sys 0.61.2",
 ]
 
@@ -867,12 +857,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pin-project-lite"
@@ -1357,19 +1341,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fd04d9e306f1907bd13c6361b5c6bfc7b3b3c095ed3f8a9246390f8dbdee129"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "wavers"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d599ddd98c95ad3d3fc898cfb5c4023430f6ea62f96083f46d13cc8b82589bd3"
-dependencies = [
- "bytemuck",
- "i24",
- "num-traits",
- "paste",
- "thiserror",
 ]
 
 [[package]]

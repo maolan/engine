@@ -84,6 +84,7 @@ pub struct OfflineBounceWork {
     pub tsig_denom: u16,
     pub automation_lanes: Vec<OfflineAutomationLane>,
     pub cancel: Arc<AtomicBool>,
+    pub apply_fader: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -443,10 +444,12 @@ pub enum Action {
         start_sample: usize,
         length_samples: usize,
         automation_lanes: Vec<OfflineAutomationLane>,
+        apply_fader: bool,
     },
     TrackOfflineBounceCancel {
         track_name: String,
     },
+    TrackOfflineBounceCancelAll,
     TrackOfflineBounceCanceled {
         track_name: String,
     },

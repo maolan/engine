@@ -1,13 +1,12 @@
 use crate::mutex::UnsafeMutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use wavers::Samples;
 
 #[derive(Debug, Clone)]
 pub struct AudioIO {
     pub connections: Arc<UnsafeMutex<Vec<Arc<Self>>>>,
     pub connection_count: Arc<AtomicUsize>,
-    pub buffer: Arc<UnsafeMutex<Samples<f32>>>,
+    pub buffer: Arc<UnsafeMutex<Vec<f32>>>,
     pub finished: Arc<UnsafeMutex<bool>>,
 }
 
@@ -21,9 +20,7 @@ impl AudioIO {
         Self {
             connections: Arc::new(UnsafeMutex::new(vec![])),
             connection_count: Arc::new(AtomicUsize::new(0)),
-            buffer: Arc::new(UnsafeMutex::new(Samples::new(
-                vec![0.0; size].into_boxed_slice(),
-            ))),
+            buffer: Arc::new(UnsafeMutex::new(vec![0.0; size])),
             finished: Arc::new(UnsafeMutex::new(false)),
         }
     }
@@ -130,7 +127,7 @@ mod tests {
 
         io.process();
 
-        assert_eq!(io.buffer.lock().as_ref(), &[0.0, 0.0, 0.0]);
+        assert_eq!(io.buffer.lock().as_slice(), &[0.0, 0.0, 0.0]);
         assert!(*io.finished.lock());
     }
 
@@ -144,7 +141,7 @@ mod tests {
 
         dest.process();
 
-        assert_eq!(dest.buffer.lock().as_ref(), &[0.1, 0.2, 0.3]);
+        assert_eq!(dest.buffer.lock().as_slice(), &[0.1, 0.2, 0.3]);
     }
 
     #[test]
@@ -158,7 +155,7 @@ mod tests {
 
         dest.process();
 
-        assert_eq!(dest.buffer.lock().as_ref(), &[0.5, -0.25, 0.0, 0.0]);
+        assert_eq!(dest.buffer.lock().as_slice(), &[0.5, -0.25, 0.0, 0.0]);
     }
 
     #[test]
@@ -175,7 +172,7 @@ mod tests {
 
         dest.process();
 
-        assert_eq!(dest.buffer.lock().as_ref(), &[1.0, 1.0, 1.0]);
+        assert_eq!(dest.buffer.lock().as_slice(), &[1.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -196,7 +193,7 @@ mod tests {
 
         dest.process();
 
-        assert_eq!(dest.buffer.lock().as_ref(), &[1.0, 0.0, 0.25]);
+        assert_eq!(dest.buffer.lock().as_slice(), &[1.0, 0.0, 0.25]);
     }
 
     #[test]

@@ -867,11 +867,16 @@ impl Track {
                         let click_len = ((sample_rate as usize) / 50).max(64);
                         let phase_step = core::f32::consts::TAU * (freq / sample_rate as f32);
                         let end = (hit_frame + click_len).min(frames).min(buf.len());
-                        for n in hit_frame..end {
+                        for (n, buf_n) in buf
+                            .iter_mut()
+                            .enumerate()
+                            .skip(hit_frame)
+                            .take(end - hit_frame)
+                        {
                             let t = (n - hit_frame) as f32;
                             let env = (-t / (click_len as f32 * 0.28)).exp();
                             let s = (t * phase_step).sin() * amp * env;
-                            buf[n] = (buf[n] + s).clamp(-1.0, 1.0);
+                            *buf_n = (*buf_n + s).clamp(-1.0, 1.0);
                         }
                     }
                 }
@@ -1499,9 +1504,9 @@ impl Track {
             for ch in 0..channels {
                 let out = self.audio.outs[ch].buffer.lock();
                 let copy_len = step.min(out.len());
-                for i in 0..copy_len {
+                for (i, out_i) in out.iter().enumerate().take(copy_len) {
                     let dst = (cursor + i) * channels + ch;
-                    rendered[dst] = out[i];
+                    rendered[dst] = *out_i;
                 }
             }
             cursor = cursor.saturating_add(step);
@@ -1570,16 +1575,34 @@ impl Track {
     }
 
     fn load_audio_clip_buffer(path: &Path) -> Option<AudioClipBuffer> {
-        let mut wav = wavers::Wav::<f32>::from_path(path).ok()?;
-        let channels = wav.n_channels().max(1) as usize;
-        let samples: wavers::Samples<f32> = wav.read().ok()?;
+        let mut reader = hound::WavReader::open(path).ok()?;
+        let spec = reader.spec();
+        let channels = spec.channels.max(1) as usize;
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+            hound::SampleFormat::Int => match spec.bits_per_sample {
+                16 => reader
+                    .samples::<i16>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| (s as f32 / i16::MAX as f32).clamp(-1.0, 1.0))
+                    .collect(),
+                24 => reader
+                    .samples::<i32>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| (s as f32 / 8_388_608.0).clamp(-1.0, 1.0))
+                    .collect(),
+                32 => reader
+                    .samples::<i32>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| (s as f32 / i32::MAX as f32).clamp(-1.0, 1.0))
+                    .collect(),
+                _ => return None,
+            },
+        };
         if samples.is_empty() {
             return None;
         }
-        Some(AudioClipBuffer {
-            channels,
-            samples: samples.to_vec(),
-        })
+        Some(AudioClipBuffer { channels, samples })
     }
 
     fn clip_buffer(&mut self, clip_name: &str) -> Option<Arc<AudioClipBuffer>> {

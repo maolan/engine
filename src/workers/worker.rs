@@ -7,7 +7,6 @@ use nix::libc;
 use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
-use wavers::write as write_wav;
 
 #[derive(Debug)]
 pub struct Worker {
@@ -137,16 +136,46 @@ impl Worker {
                 t.sample_rate.round().max(1.0) as i32,
             )
         };
-        let (original_level, original_balance) = {
+        let freeze_state = if job.apply_fader {
+            None
+        } else {
             let t = target_track.lock();
-            Self::prepare_track_for_freeze_render(t)
+            Some(Self::prepare_track_for_freeze_render(t))
         };
 
-        let mut rendered = vec![0.0_f32; job.length_samples.saturating_mul(channels)];
+        let spec = hound::WavSpec {
+            channels: channels as u16,
+            sample_rate: sample_rate as u32,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = match hound::WavWriter::create(&job.output_path, spec) {
+            Ok(w) => w,
+            Err(e) => {
+                if let Some((original_level, original_balance)) = freeze_state {
+                    let t = target_track.lock();
+                    Self::restore_track_after_freeze_render(t, original_level, original_balance);
+                }
+                let _ = self
+                    .tx
+                    .send(Message::OfflineBounceFinished {
+                        result: Err(format!(
+                            "Failed to create offline bounce '{}': {e}",
+                            job.output_path
+                        )),
+                    })
+                    .await;
+                let _ = self.tx.send(Message::Ready(self.id)).await;
+                return;
+            }
+        };
+
         let mut cursor = 0usize;
         while cursor < job.length_samples {
             if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                {
+                let _ = writer.finalize();
+                let _ = std::fs::remove_file(&job.output_path);
+                if let Some((original_level, original_balance)) = freeze_state {
                     let t = target_track.lock();
                     Self::restore_track_after_freeze_render(t, original_level, original_balance);
                 }
@@ -175,15 +204,16 @@ impl Worker {
                 t.set_record_tap_enabled(false);
             }
 
-            let mut remaining = tracks.len();
-            while remaining > 0 {
+            loop {
+                let mut all_finished = true;
                 let mut progressed = false;
                 for handle in &tracks {
                     let t = handle.lock();
-                    if t.audio.finished || t.audio.processing {
+                    if t.audio.finished {
                         continue;
                     }
-                    if t.audio.ready() {
+                    all_finished = false;
+                    if !t.audio.processing && t.audio.ready() {
                         if t.name == job.track_name {
                             Self::apply_freeze_automation_at_sample(
                                 t,
@@ -195,10 +225,13 @@ impl Worker {
                         t.process();
                         t.audio.processing = false;
                         progressed = true;
-                        remaining = remaining.saturating_sub(1);
                     }
                 }
+                if all_finished {
+                    break;
+                }
                 if !progressed {
+                    // No track was ready — force-process all remaining non-finished tracks.
                     for handle in &tracks {
                         let t = handle.lock();
                         if t.audio.finished {
@@ -214,19 +247,40 @@ impl Worker {
                         t.audio.processing = true;
                         t.process();
                         t.audio.processing = false;
-                        remaining = remaining.saturating_sub(1);
                     }
+                    break;
                 }
             }
 
             {
                 let t = target_track.lock();
-                for ch in 0..channels {
-                    let out = t.audio.outs[ch].buffer.lock();
-                    let copy_len = step.min(out.len());
-                    for i in 0..copy_len {
-                        let dst = (cursor + i) * channels + ch;
-                        rendered[dst] = out[i];
+                for i in 0..step {
+                    for ch in 0..channels {
+                        let out = t.audio.outs[ch].buffer.lock();
+                        let sample = if i < out.len() { out[i] } else { 0.0 };
+                        if let Err(e) = writer.write_sample(sample) {
+                            let _ = writer.finalize();
+                            let _ = std::fs::remove_file(&job.output_path);
+                            if let Some((original_level, original_balance)) = freeze_state {
+                                let t = target_track.lock();
+                                Self::restore_track_after_freeze_render(
+                                    t,
+                                    original_level,
+                                    original_balance,
+                                );
+                            }
+                            let _ = self
+                                .tx
+                                .send(Message::OfflineBounceFinished {
+                                    result: Err(format!(
+                                        "Failed to write offline bounce '{}': {e}",
+                                        job.output_path
+                                    )),
+                                })
+                                .await;
+                            let _ = self.tx.send(Message::Ready(self.id)).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -244,10 +298,9 @@ impl Worker {
                 .await;
         }
 
-        if let Err(e) =
-            write_wav::<f32, _>(&job.output_path, &rendered, sample_rate, channels as u16)
-        {
-            {
+        if let Err(e) = writer.finalize() {
+            let _ = std::fs::remove_file(&job.output_path);
+            if let Some((original_level, original_balance)) = freeze_state {
                 let t = target_track.lock();
                 Self::restore_track_after_freeze_render(t, original_level, original_balance);
             }
@@ -255,7 +308,7 @@ impl Worker {
                 .tx
                 .send(Message::OfflineBounceFinished {
                     result: Err(format!(
-                        "Failed to write offline bounce '{}': {e}",
+                        "Failed to finalize offline bounce '{}': {e}",
                         job.output_path
                     )),
                 })
@@ -264,7 +317,7 @@ impl Worker {
             return;
         }
 
-        {
+        if let Some((original_level, original_balance)) = freeze_state {
             let t = target_track.lock();
             Self::restore_track_after_freeze_render(t, original_level, original_balance);
         }
@@ -278,6 +331,7 @@ impl Worker {
                     start_sample: job.start_sample,
                     length_samples: job.length_samples,
                     automation_lanes: vec![],
+                    apply_fader: job.apply_fader,
                 }),
             })
             .await;
@@ -523,6 +577,7 @@ mod tests {
             tsig_denom: 4,
             automation_lanes: vec![],
             cancel: Arc::new(AtomicBool::new(false)),
+            apply_fader: false,
         };
 
         worker.process_offline_bounce(job).await;
@@ -559,6 +614,7 @@ mod tests {
             tsig_denom: 4,
             automation_lanes: vec![],
             cancel: Arc::new(AtomicBool::new(true)),
+            apply_fader: false,
         };
 
         worker.process_offline_bounce(job).await;
@@ -600,6 +656,7 @@ mod tests {
             tsig_denom: 4,
             automation_lanes: vec![],
             cancel: Arc::new(AtomicBool::new(false)),
+            apply_fader: false,
         };
 
         worker.process_offline_bounce(job).await;
@@ -611,7 +668,11 @@ mod tests {
                     result: Ok(Action::TrackOfflineBounceProgress { .. }),
                 } => {}
                 Message::OfflineBounceFinished { result: Err(err) } => {
-                    assert!(err.contains("Failed to write offline bounce"));
+                    assert!(
+                        err.contains("Failed to create offline bounce")
+                            || err.contains("Failed to write offline bounce")
+                            || err.contains("Failed to finalize offline bounce")
+                    );
                     saw_error = true;
                 }
                 Message::Ready(3) => break,
@@ -649,6 +710,7 @@ mod tests {
             tsig_denom: 4,
             automation_lanes: vec![],
             cancel: Arc::new(AtomicBool::new(false)),
+            apply_fader: false,
         };
 
         worker.process_offline_bounce(job).await;

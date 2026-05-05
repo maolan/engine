@@ -18,7 +18,6 @@ use std::{
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 use tracing::error;
-use wavers::write as write_wav;
 
 /// Hardware device information: (input_channels, output_channels, sample_rate, latency_ranges)
 type HwDeviceInfo = (usize, usize, usize, ((usize, usize), (usize, usize)));
@@ -114,7 +113,6 @@ struct MidiHwThruRoute {
 }
 
 struct OfflineBounceJob {
-    track_name: String,
     cancel: Arc<AtomicBool>,
 }
 
@@ -235,7 +233,7 @@ pub struct Engine {
     history: History,
     history_group: Option<UndoEntry>,
     history_suspended: bool,
-    offline_bounce_job: Option<OfflineBounceJob>,
+    offline_bounce_jobs: HashMap<String, OfflineBounceJob>,
     pending_midi_learn: Option<(String, crate::message::TrackMidiLearnTarget, Option<String>)>,
     pending_global_midi_learn: Option<crate::message::GlobalMidiLearnTarget>,
     global_midi_learn_play_pause: Option<crate::message::MidiLearnBinding>,
@@ -972,7 +970,7 @@ impl Engine {
             history: History::default(),
             history_group: None,
             history_suspended: false,
-            offline_bounce_job: None,
+            offline_bounce_jobs: HashMap::new(),
             pending_midi_learn: None,
             pending_global_midi_learn: None,
             global_midi_learn_play_pause: None,
@@ -2481,7 +2479,26 @@ impl Engine {
             return;
         }
         let file_path = audio_dir.join(&rec.file_name);
-        if let Err(e) = write_wav::<f32, _>(&file_path, &rec.samples, rate, rec.channels as u16) {
+        let spec = hound::WavSpec {
+            channels: rec.channels as u16,
+            sample_rate: rate as u32,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let write_result = (|| {
+            let mut writer = hound::WavWriter::create(&file_path, spec)
+                .map_err(|e| std::io::Error::other(format!("Failed to create WAV writer: {e}")))?;
+            for sample in &rec.samples {
+                writer
+                    .write_sample(*sample)
+                    .map_err(|e| std::io::Error::other(format!("Failed to write sample: {e}")))?;
+            }
+            writer
+                .finalize()
+                .map_err(|e| std::io::Error::other(format!("Failed to finalize WAV: {e}")))?;
+            Ok::<(), std::io::Error>(())
+        })();
+        if let Err(e) = write_result {
             self.notify_clients(Err(format!(
                 "Failed to write recording {}: {}",
                 file_path.display(),
@@ -4473,11 +4490,13 @@ impl Engine {
                 start_sample,
                 length_samples,
                 automation_lanes,
+                apply_fader,
             } => {
-                if self.offline_bounce_job.is_some() {
-                    self.notify_clients(Err(
-                        "Another offline bounce is already in progress".to_string()
-                    ))
+                if self.offline_bounce_jobs.contains_key(&track_name) {
+                    self.notify_clients(Err(format!(
+                        "Offline bounce for track '{}' is already in progress",
+                        track_name
+                    )))
                     .await;
                     return;
                 }
@@ -4501,14 +4520,18 @@ impl Engine {
                             start_sample,
                             length_samples,
                             automation_lanes,
+                            apply_fader,
                         });
                     return;
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
-                self.offline_bounce_job = Some(OfflineBounceJob {
-                    track_name: track_name.clone(),
-                    cancel: cancel.clone(),
-                });
+                self.offline_bounce_jobs.insert(
+                    track_name.clone(),
+                    OfflineBounceJob {
+                        cancel: cancel.clone(),
+                    },
+                );
+                let track_name_clone = track_name.clone();
                 let worker = &self.workers[worker_index];
                 let job = crate::message::OfflineBounceWork {
                     state: self.state.clone(),
@@ -4521,15 +4544,17 @@ impl Engine {
                     tsig_denom: self.tsig_denom,
                     automation_lanes,
                     cancel,
+                    apply_fader,
                 };
                 if let Err(e) = worker.tx.send(Message::ProcessOfflineBounce(job)).await {
-                    self.offline_bounce_job = None;
+                    self.offline_bounce_jobs.remove(&track_name_clone);
                     self.notify_clients(Err(format!("Failed to schedule offline bounce: {e}")))
                         .await;
                 }
                 return;
             }
             Action::TrackOfflineBounceCancel { .. } => {}
+            Action::TrackOfflineBounceCancelAll => {}
             Action::TrackOfflineBounceCanceled { .. } => {}
             Action::TrackOfflineBounceProgress { .. } => {}
             Action::PianoKey {
@@ -6738,13 +6763,16 @@ impl Engine {
 
                 Message::Request(a) => match a {
                     Action::TrackOfflineBounceCancel { track_name } => {
-                        if let Some(job) = &self.offline_bounce_job
-                            && job.track_name == track_name
-                        {
+                        if let Some(job) = self.offline_bounce_jobs.get(&track_name) {
                             job.cancel.store(true, Ordering::Relaxed);
                         }
                     }
-                    _ if self.offline_bounce_job.is_some() => {
+                    Action::TrackOfflineBounceCancelAll => {
+                        for job in self.offline_bounce_jobs.values() {
+                            job.cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    _ if !self.offline_bounce_jobs.is_empty() => {
                         self.pending_requests.push_back(a);
                     }
                     Action::OpenAudioDevice { .. }
@@ -6807,10 +6835,14 @@ impl Engine {
                     }
                 },
                 Message::OfflineBounceFinished { result } => {
-                    self.offline_bounce_job = None;
+                    if let Ok(Action::TrackOfflineBounce { track_name, .. }) = &result {
+                        self.offline_bounce_jobs.remove(track_name);
+                    }
                     self.notify_clients(result).await;
-                    while let Some(next) = self.pending_requests.pop_front() {
-                        self.handle_request(next).await;
+                    if self.offline_bounce_jobs.is_empty() {
+                        while let Some(next) = self.pending_requests.pop_front() {
+                            self.handle_request(next).await;
+                        }
                     }
                 }
                 Message::HWFinished => {
@@ -7124,6 +7156,7 @@ mod tests {
                 start_sample: 0,
                 length_samples: 0,
                 automation_lanes: vec![],
+                apply_fader: false,
             })
             .await;
 
@@ -7136,12 +7169,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn track_offline_bounce_rejects_when_another_bounce_is_active() {
+    async fn track_offline_bounce_rejects_when_same_track_is_active() {
         let (mut engine, mut client_rx) = make_engine_with_client();
-        engine.offline_bounce_job = Some(OfflineBounceJob {
-            track_name: "other".to_string(),
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
+        engine.offline_bounce_jobs.insert(
+            "other".to_string(),
+            OfflineBounceJob {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        engine
+            .handle_request(Action::TrackOfflineBounce {
+                track_name: "other".to_string(),
+                output_path: "/tmp/out.wav".to_string(),
+                start_sample: 0,
+                length_samples: 128,
+                automation_lanes: vec![],
+                apply_fader: false,
+            })
+            .await;
+
+        match client_rx.recv().await.expect("response") {
+            Message::Response(Err(err)) => {
+                assert!(err.contains("already in progress"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn track_offline_bounce_allows_different_track_concurrently() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        engine.offline_bounce_jobs.insert(
+            "other".to_string(),
+            OfflineBounceJob {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
 
         engine
             .handle_request(Action::TrackOfflineBounce {
@@ -7150,15 +7218,13 @@ mod tests {
                 start_sample: 0,
                 length_samples: 128,
                 automation_lanes: vec![],
+                apply_fader: false,
             })
             .await;
 
-        match client_rx.recv().await.expect("response") {
-            Message::Response(Err(err)) => {
-                assert_eq!(err, "Another offline bounce is already in progress");
-            }
-            other => panic!("unexpected message: {other:?}"),
-        }
+        // Should be queued because no workers are ready (default test engine has 0 workers)
+        assert!(engine.offline_bounce_jobs.contains_key("other"));
+        assert_eq!(engine.pending_requests.len(), 1);
     }
 
     #[tokio::test]
@@ -7196,10 +7262,11 @@ mod tests {
                 start_sample: 0,
                 length_samples: 128,
                 automation_lanes: vec![],
+                apply_fader: false,
             })
             .await;
 
-        assert!(engine.offline_bounce_job.is_none());
+        assert!(engine.offline_bounce_jobs.is_empty());
         assert_eq!(engine.pending_requests.len(), 1);
         assert!(matches!(
             engine.pending_requests.front(),
@@ -7219,6 +7286,7 @@ mod tests {
                 start_sample: 0,
                 length_samples: 128,
                 automation_lanes: vec![],
+                apply_fader: false,
             })
             .await;
 
@@ -7251,10 +7319,11 @@ mod tests {
                 start_sample: 0,
                 length_samples: 128,
                 automation_lanes: vec![],
+                apply_fader: false,
             })
             .await;
 
-        assert!(engine.offline_bounce_job.is_none());
+        assert!(engine.offline_bounce_jobs.is_empty());
         match client_rx.recv().await.expect("response") {
             Message::Response(Err(err)) => {
                 assert!(err.contains("Failed to schedule offline bounce"));

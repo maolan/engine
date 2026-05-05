@@ -55,9 +55,7 @@ impl Process {
             let src = port.as_slice(ps);
             let dst = bridge.buffer.lock();
             let n = src.len().min(dst.len());
-            for i in 0..n {
-                dst[i] = src[i];
-            }
+            dst[..n].copy_from_slice(&src[..n]);
             if n < dst.len() {
                 for item in dst.iter_mut().skip(n) {
                     *item = 0.0;

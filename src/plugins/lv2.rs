@@ -702,7 +702,7 @@ impl Lv2Processor {
         }
         self.audio_outputs
             .iter()
-            .map(|io| io.buffer.lock().as_ref().to_vec())
+            .map(|io| io.buffer.lock().to_vec())
             .collect()
     }
 
