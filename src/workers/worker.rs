@@ -4,9 +4,11 @@ use crate::message::{
 };
 #[cfg(unix)]
 use nix::libc;
-use std::time::Instant;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct Worker {
@@ -143,6 +145,41 @@ impl Worker {
             Some(Self::prepare_track_for_freeze_render(t))
         };
 
+        // Collect all tracks once and compute the dependency closure for the
+        // target track so that unrelated tracks are skipped during bounce.
+        let all_tracks: Vec<_> = job.state.lock().tracks.values().cloned().collect();
+        let mut output_to_track: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        for handle in &all_tracks {
+            let t = handle.lock();
+            for out in &t.audio.outs {
+                output_to_track.insert(Arc::as_ptr(out) as usize, t.name.clone());
+            }
+        }
+        let mut relevant_names = HashSet::new();
+        let mut queue = vec![job.track_name.clone()];
+        while let Some(name) = queue.pop() {
+            if !relevant_names.insert(name.clone()) {
+                continue;
+            }
+            if let Some(handle) = all_tracks.iter().find(|h| h.lock().name == name) {
+                let t = handle.lock();
+                for input in &t.audio.ins {
+                    for conn in input.connections.lock().iter() {
+                        if let Some(source_name) =
+                            output_to_track.get(&(Arc::as_ptr(conn) as usize))
+                        {
+                            queue.push(source_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let relevant_tracks: Vec<_> = all_tracks
+            .into_iter()
+            .filter(|h| relevant_names.contains(&h.lock().name))
+            .collect();
+
         let spec = hound::WavSpec {
             channels: channels as u16,
             sample_rate: sample_rate as u32,
@@ -171,6 +208,11 @@ impl Worker {
         };
 
         let mut cursor = 0usize;
+        let mut last_reported_progress = 0.0_f32;
+        let mut total_process_time = Duration::ZERO;
+        let mut total_write_time = Duration::ZERO;
+        let mut block_count = 0usize;
+        let bounce_start = Instant::now();
         while cursor < job.length_samples {
             if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = writer.finalize();
@@ -192,8 +234,7 @@ impl Worker {
             }
 
             let step = (job.length_samples - cursor).min(block_size);
-            let tracks: Vec<_> = job.state.lock().tracks.values().cloned().collect();
-            for handle in &tracks {
+            for handle in &relevant_tracks {
                 let t = handle.lock();
                 t.audio.finished = false;
                 t.audio.processing = false;
@@ -204,10 +245,11 @@ impl Worker {
                 t.set_record_tap_enabled(false);
             }
 
+            let block_process_start = Instant::now();
             loop {
                 let mut all_finished = true;
                 let mut progressed = false;
-                for handle in &tracks {
+                for handle in &relevant_tracks {
                     let t = handle.lock();
                     if t.audio.finished {
                         continue;
@@ -222,7 +264,9 @@ impl Worker {
                             );
                         }
                         t.audio.processing = true;
+                        let p_start = Instant::now();
                         t.process();
+                        total_process_time += p_start.elapsed();
                         t.audio.processing = false;
                         progressed = true;
                     }
@@ -232,7 +276,7 @@ impl Worker {
                 }
                 if !progressed {
                     // No track was ready — force-process all remaining non-finished tracks.
-                    for handle in &tracks {
+                    for handle in &relevant_tracks {
                         let t = handle.lock();
                         if t.audio.finished {
                             continue;
@@ -245,58 +289,76 @@ impl Worker {
                             );
                         }
                         t.audio.processing = true;
+                        let p_start = Instant::now();
                         t.process();
+                        total_process_time += p_start.elapsed();
                         t.audio.processing = false;
                     }
                     break;
                 }
             }
+            let _block_process_elapsed = block_process_start.elapsed();
 
-            {
+            let write_start = Instant::now();
+            let write_result = {
                 let t = target_track.lock();
-                for i in 0..step {
-                    for ch in 0..channels {
-                        let out = t.audio.outs[ch].buffer.lock();
-                        let sample = if i < out.len() { out[i] } else { 0.0 };
-                        if let Err(e) = writer.write_sample(sample) {
-                            let _ = writer.finalize();
-                            let _ = std::fs::remove_file(&job.output_path);
-                            if let Some((original_level, original_balance)) = freeze_state {
-                                let t = target_track.lock();
-                                Self::restore_track_after_freeze_render(
-                                    t,
-                                    original_level,
-                                    original_balance,
-                                );
-                            }
-                            let _ = self
-                                .tx
-                                .send(Message::OfflineBounceFinished {
-                                    result: Err(format!(
-                                        "Failed to write offline bounce '{}': {e}",
-                                        job.output_path
-                                    )),
-                                })
-                                .await;
-                            let _ = self.tx.send(Message::Ready(self.id)).await;
-                            return;
+                let outs: Vec<_> = (0..channels)
+                    .map(|ch| t.audio.outs[ch].buffer.lock())
+                    .collect();
+                (|| -> Result<(), hound::Error> {
+                    for i in 0..step {
+                        for out in outs.iter().take(channels) {
+                            let sample = out.get(i).copied().unwrap_or(0.0);
+                            writer.write_sample(sample)?;
                         }
                     }
+                    Ok(())
+                })()
+            };
+            total_write_time += write_start.elapsed();
+            if let Err(e) = write_result {
+                let _ = writer.finalize();
+                let _ = std::fs::remove_file(&job.output_path);
+                if let Some((original_level, original_balance)) = freeze_state {
+                    let t = target_track.lock();
+                    Self::restore_track_after_freeze_render(t, original_level, original_balance);
                 }
+                let _ = self
+                    .tx
+                    .send(Message::OfflineBounceFinished {
+                        result: Err(format!(
+                            "Failed to write offline bounce '{}': {e}",
+                            job.output_path
+                        )),
+                    })
+                    .await;
+                let _ = self.tx.send(Message::Ready(self.id)).await;
+                return;
             }
 
             cursor = cursor.saturating_add(step);
-            let _ = self
-                .tx
-                .send(Message::OfflineBounceFinished {
-                    result: Ok(Action::TrackOfflineBounceProgress {
-                        track_name: job.track_name.clone(),
-                        progress: (cursor as f32 / job.length_samples as f32).clamp(0.0, 1.0),
-                        operation: Some("Rendering freeze".to_string()),
-                    }),
-                })
-                .await;
+            block_count += 1;
+            let progress = (cursor as f32 / job.length_samples as f32).clamp(0.0, 1.0);
+            // Throttle progress reports to ~1 % steps to avoid async channel overhead.
+            if progress - last_reported_progress >= 0.01 || cursor >= job.length_samples {
+                last_reported_progress = progress;
+                let _ = self
+                    .tx
+                    .send(Message::OfflineBounceFinished {
+                        result: Ok(Action::TrackOfflineBounceProgress {
+                            track_name: job.track_name.clone(),
+                            progress,
+                            operation: Some("Rendering freeze".to_string()),
+                        }),
+                    })
+                    .await;
+            }
         }
+        let bounce_elapsed = bounce_start.elapsed();
+        info!(
+            "Bounce '{}' — total: {:?}, blocks: {}, process: {:?}, write: {:?}",
+            job.track_name, bounce_elapsed, block_count, total_process_time, total_write_time
+        );
 
         if let Err(e) = writer.finalize() {
             let _ = std::fs::remove_file(&job.output_path);

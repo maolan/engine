@@ -1424,7 +1424,12 @@ impl Engine {
         )
     }
 
-    async fn publish_hw_infos(&self, input_channels: usize, output_channels: usize, rate: usize) {
+    async fn publish_hw_infos(
+        &mut self,
+        input_channels: usize,
+        output_channels: usize,
+        rate: usize,
+    ) {
         self.notify_clients(Ok(Action::HWInfo {
             channels: input_channels,
             rate,
@@ -2730,7 +2735,8 @@ impl Engine {
         }
     }
 
-    async fn notify_clients(&self, action: Result<Action, String>) {
+    async fn notify_clients(&mut self, action: Result<Action, String>) {
+        self.clients.retain(|client| !client.is_closed());
         for client in &self.clients {
             client
                 .send(Message::Response(action.clone()))
