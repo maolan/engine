@@ -2976,6 +2976,7 @@ impl Track {
         Ok(())
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn set_lv2_control_value(
         &mut self,
         instance_id: usize,
