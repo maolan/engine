@@ -1,7 +1,7 @@
 use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
-use crate::clap::ClapProcessor;
+use crate::clap::{ClapProcessor, SharedClapProcessor};
 #[cfg(unix)]
 use crate::clap::ClapTransportInfo;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -50,11 +50,11 @@ pub struct Vst3Instance {
 #[derive(Debug, Clone)]
 pub struct ClapInstance {
     pub id: usize,
-    pub processor: Arc<ClapProcessor>,
+    pub processor: SharedClapProcessor,
 }
 
 impl ClapInstance {
-    fn new(id: usize, processor: Arc<ClapProcessor>) -> Self {
+    fn new(id: usize, processor: SharedClapProcessor) -> Self {
         Self { id, processor }
     }
 }
@@ -1906,13 +1906,13 @@ impl Track {
                 } else if format.eq_ignore_ascii_case("CLAP") {
                     let instance_id = next_plugin_instance_id;
                     next_plugin_instance_id = next_plugin_instance_id.saturating_add(1);
-                    let processor = Arc::new(ClapProcessor::new(
+                    let processor = Arc::new(UnsafeMutex::new(ClapProcessor::new(
                         self.sample_rate,
                         buffer_size.max(1),
                         uri,
                         channels.max(1),
                         channels.max(1),
-                    )?);
+                    )?));
                     runtime
                         .clap_plugins
                         .push(ClapInstance::new(instance_id, processor));
@@ -3123,13 +3123,13 @@ impl Track {
             .unwrap_or(0);
         let input_count = self.audio.ins.len().max(1);
         let output_count = self.audio.outs.len().max(1);
-        let processor = Arc::new(ClapProcessor::new(
+        let processor = Arc::new(UnsafeMutex::new(ClapProcessor::new(
             self.sample_rate,
             buffer_size,
             plugin_path,
             input_count,
             output_count,
-        )?);
+        )?));
         self.clap_plugins.push(ClapInstance::new(id, processor));
         self.invalidate_audio_route_cache();
         Ok(())
@@ -3349,7 +3349,7 @@ impl Track {
         Ok((instance.processor.path().to_string(), state))
     }
 
-    pub fn clap_plugin_processor(&self, instance_id: usize) -> Result<Arc<ClapProcessor>, String> {
+    pub fn clap_plugin_processor(&self, instance_id: usize) -> Result<SharedClapProcessor, String> {
         let instance = self
             .clap_plugins
             .iter()
@@ -3367,7 +3367,7 @@ impl Track {
         &mut self,
         clip_idx: usize,
         instance_id: usize,
-    ) -> Result<Arc<ClapProcessor>, String> {
+    ) -> Result<SharedClapProcessor, String> {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
         let instance = runtime

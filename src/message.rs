@@ -717,13 +717,13 @@ pub enum Action {
     TrackClapProcessor {
         track_name: String,
         instance_id: usize,
-        processor: Arc<crate::clap::ClapProcessor>,
+        processor: crate::clap::SharedClapProcessor,
     },
     ClipClapProcessor {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-        processor: Arc<crate::clap::ClapProcessor>,
+        processor: crate::clap::SharedClapProcessor,
     },
     TrackClapStateSnapshot {
         track_name: String,

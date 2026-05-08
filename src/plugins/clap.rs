@@ -11,7 +11,7 @@ use crate::plugins::paths;
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,12 @@ struct PendingParamValue {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PendingParamGesture {
+    param_id: u32,
+    is_begin: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct ClapParamUpdate {
     pub param_id: u32,
     pub value: f64,
@@ -109,7 +115,6 @@ pub struct ClapPluginCapabilities {
     pub midi_outputs: usize,
 }
 
-#[derive(Clone)]
 pub struct ClapProcessor {
     path: String,
     plugin_id: String,
@@ -126,12 +131,14 @@ pub struct ClapProcessor {
     host_runtime: Arc<HostRuntime>,
     plugin_handle: Arc<PluginHandle>,
     param_infos: Arc<Vec<ClapParameterInfo>>,
-    param_values: Arc<UnsafeMutex<HashMap<u32, f64>>>,
-    pending_param_events: Arc<UnsafeMutex<Vec<PendingParamEvent>>>,
-    pending_param_events_ui: Arc<UnsafeMutex<Vec<PendingParamEvent>>>,
-    process_lock: Arc<UnsafeMutex<()>>,
+    param_values: UnsafeMutex<HashMap<u32, f64>>,
+    pending_param_events: UnsafeMutex<Vec<PendingParamEvent>>,
+    pending_param_events_ui: UnsafeMutex<Vec<PendingParamEvent>>,
+    active_local_gestures: UnsafeMutex<HashSet<u32>>,
     bypassed: Arc<AtomicBool>,
 }
+
+pub type SharedClapProcessor = Arc<UnsafeMutex<ClapProcessor>>;
 
 impl fmt::Debug for ClapProcessor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -192,9 +199,7 @@ impl ClapProcessor {
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect();
         let param_infos = Arc::new(plugin_handle.parameter_infos());
-        let param_values = Arc::new(UnsafeMutex::new(
-            plugin_handle.parameter_values(&param_infos),
-        ));
+        let param_values = UnsafeMutex::new(plugin_handle.parameter_values(&param_infos));
         Ok(Self {
             path: plugin_spec.to_string(),
             plugin_id: plugin_handle.plugin_id().to_string(),
@@ -214,9 +219,9 @@ impl ClapProcessor {
             plugin_handle,
             param_infos,
             param_values,
-            pending_param_events: Arc::new(UnsafeMutex::new(Vec::new())),
-            pending_param_events_ui: Arc::new(UnsafeMutex::new(Vec::new())),
-            process_lock: Arc::new(UnsafeMutex::new(())),
+            pending_param_events: UnsafeMutex::new(Vec::new()),
+            pending_param_events_ui: UnsafeMutex::new(Vec::new()),
+            active_local_gestures: UnsafeMutex::new(HashSet::new()),
             bypassed: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -264,9 +269,6 @@ impl ClapProcessor {
         midi_in: &[MidiEvent],
         transport: ClapTransportInfo,
     ) -> Vec<ClapMidiOutputEvent> {
-        // CLAP processors are not guaranteed to be re-entrant. Serialize
-        // processing per instance to avoid concurrent mutation of plugin state.
-        let _process_guard = self.process_lock.lock();
         let started = Instant::now();
         for port in &self.audio_inputs {
             if port.ready() {
@@ -327,13 +329,15 @@ impl ClapProcessor {
             return Err(format!("Unknown CLAP parameter id: {param_id}"));
         };
         let clamped = value.clamp(info.min_value, info.max_value);
-        self.pending_param_events
-            .lock()
-            .push(PendingParamEvent::Value {
-                param_id,
-                value: clamped,
-                frame,
-            });
+        if self.is_parameter_edit_active(param_id) {
+            self.param_values.lock().insert(param_id, clamped);
+            return Ok(());
+        }
+        self.pending_param_events.lock().push(PendingParamEvent::Value {
+            param_id,
+            value: clamped,
+            frame,
+        });
         self.pending_param_events_ui
             .lock()
             .push(PendingParamEvent::Value {
@@ -360,6 +364,7 @@ impl ClapProcessor {
         self.pending_param_events_ui
             .lock()
             .push(PendingParamEvent::GestureBegin { param_id, frame });
+        self.active_local_gestures.lock().insert(param_id);
         Ok(())
     }
 
@@ -378,7 +383,12 @@ impl ClapProcessor {
         self.pending_param_events_ui
             .lock()
             .push(PendingParamEvent::GestureEnd { param_id, frame });
+        self.active_local_gestures.lock().remove(&param_id);
         Ok(())
+    }
+
+    pub fn is_parameter_edit_active(&self, param_id: u32) -> bool {
+        self.active_local_gestures.lock().contains(&param_id)
     }
 
     pub fn snapshot_state(&self) -> Result<ClapPluginState, String> {
@@ -449,7 +459,14 @@ impl ClapProcessor {
             return Vec::new();
         }
         let _thread_scope = HostThreadScope::enter_main();
-        let updates = self.plugin_handle.flush_params(&pending_ui_events);
+        let (updates, gestures) = self.plugin_handle.flush_params(&pending_ui_events);
+        for gesture in gestures {
+            if gesture.is_begin {
+                self.active_local_gestures.lock().insert(gesture.param_id);
+            } else {
+                self.active_local_gestures.lock().remove(&gesture.param_id);
+            }
+        }
         if updates.is_empty() {
             return Vec::new();
         }
@@ -673,9 +690,14 @@ impl ClapProcessor {
                 }
             }
             for update in &out_ctx.param_values {
-                self.param_values
-                    .lock()
-                    .insert(update.param_id, update.value);
+                self.param_values.lock().insert(update.param_id, update.value);
+            }
+            for gesture in &out_ctx.param_gestures {
+                if gesture.is_begin {
+                    self.active_local_gestures.lock().insert(gesture.param_id);
+                } else {
+                    self.active_local_gestures.lock().remove(&gesture.param_id);
+                }
             }
             Ok((true, std::mem::take(&mut out_ctx.midi_events)))
         } else {
@@ -793,6 +815,7 @@ const CLAP_EVENT_MIDI: u16 = 10;
 const CLAP_EVENT_PARAM_VALUE: u16 = 5;
 const CLAP_EVENT_PARAM_GESTURE_BEGIN: u16 = 6;
 const CLAP_EVENT_PARAM_GESTURE_END: u16 = 7;
+const CLAP_EVENT_IS_LIVE: u32 = 1 << 0;
 const CLAP_EVENT_TRANSPORT: u16 = 9;
 const CLAP_TRANSPORT_HAS_TEMPO: u32 = 1 << 0;
 const CLAP_TRANSPORT_HAS_BEATS_TIMELINE: u32 = 1 << 1;
@@ -1064,6 +1087,161 @@ enum ClapInputEvent {
     Transport(ClapEventTransport),
 }
 
+impl UnsafeMutex<ClapProcessor> {
+    pub fn setup_audio_ports(&self) {
+        self.lock().setup_audio_ports();
+    }
+
+    pub fn process_with_midi(
+        &self,
+        frames: usize,
+        midi_events: &[MidiEvent],
+        transport: ClapTransportInfo,
+    ) -> Vec<ClapMidiOutputEvent> {
+        self.lock().process_with_midi(frames, midi_events, transport)
+    }
+
+    pub fn set_bypassed(&self, bypassed: bool) {
+        self.lock().set_bypassed(bypassed);
+    }
+
+    pub fn is_bypassed(&self) -> bool {
+        self.lock().is_bypassed()
+    }
+
+    pub fn parameter_infos(&self) -> Vec<ClapParameterInfo> {
+        self.lock().parameter_infos()
+    }
+
+    pub fn set_parameter(&self, param_id: u32, value: f64) -> Result<(), String> {
+        self.lock().set_parameter(param_id, value)
+    }
+
+    pub fn set_parameter_at(&self, param_id: u32, value: f64, frame: u32) -> Result<(), String> {
+        self.lock().set_parameter_at(param_id, value, frame)
+    }
+
+    pub fn begin_parameter_edit_at(&self, param_id: u32, frame: u32) -> Result<(), String> {
+        self.lock().begin_parameter_edit_at(param_id, frame)
+    }
+
+    pub fn end_parameter_edit_at(&self, param_id: u32, frame: u32) -> Result<(), String> {
+        self.lock().end_parameter_edit_at(param_id, frame)
+    }
+
+    pub fn snapshot_state(&self) -> Result<ClapPluginState, String> {
+        self.lock().snapshot_state()
+    }
+
+    pub fn restore_state(&self, state: &ClapPluginState) -> Result<(), String> {
+        self.lock().restore_state(state)
+    }
+
+    pub fn audio_inputs(&self) -> &[Arc<AudioIO>] {
+        self.lock().audio_inputs()
+    }
+
+    pub fn audio_outputs(&self) -> &[Arc<AudioIO>] {
+        self.lock().audio_outputs()
+    }
+
+    pub fn main_audio_input_count(&self) -> usize {
+        self.lock().main_audio_input_count()
+    }
+
+    pub fn main_audio_output_count(&self) -> usize {
+        self.lock().main_audio_output_count()
+    }
+
+    pub fn midi_input_count(&self) -> usize {
+        self.lock().midi_input_count()
+    }
+
+    pub fn midi_output_count(&self) -> usize {
+        self.lock().midi_output_count()
+    }
+
+    pub fn path(&self) -> String {
+        self.lock().path().to_string()
+    }
+
+    pub fn plugin_id(&self) -> String {
+        self.lock().plugin_id().to_string()
+    }
+
+    pub fn name(&self) -> String {
+        self.lock().name().to_string()
+    }
+
+    pub fn run_host_callbacks_main_thread(&self) {
+        self.lock().run_host_callbacks_main_thread();
+    }
+
+    pub fn ui_begin_session(&self) {
+        self.lock().ui_begin_session();
+    }
+
+    pub fn ui_end_session(&self) {
+        self.lock().ui_end_session();
+    }
+
+    pub fn ui_should_close(&self) -> bool {
+        self.lock().ui_should_close()
+    }
+
+    pub fn ui_take_due_timers(&self) -> Vec<u32> {
+        self.lock().ui_take_due_timers()
+    }
+
+    pub fn ui_take_param_updates(&self) -> Vec<ClapParamUpdate> {
+        self.lock().ui_take_param_updates()
+    }
+
+    pub fn ui_take_state_update(&self) -> Option<ClapPluginState> {
+        self.lock().ui_take_state_update()
+    }
+
+    pub fn gui_info(&self) -> Result<ClapGuiInfo, String> {
+        self.lock().gui_info()
+    }
+
+    pub fn gui_create(&self, api: &str, is_floating: bool) -> Result<(), String> {
+        self.lock().gui_create(api, is_floating)
+    }
+
+    pub fn gui_get_size(&self) -> Result<(u32, u32), String> {
+        self.lock().gui_get_size()
+    }
+
+    pub fn gui_set_parent_x11(&self, window: usize) -> Result<(), String> {
+        self.lock().gui_set_parent_x11(window)
+    }
+
+    pub fn gui_show(&self) -> Result<(), String> {
+        self.lock().gui_show()
+    }
+
+    pub fn gui_hide(&self) {
+        self.lock().gui_hide();
+    }
+
+    pub fn gui_destroy(&self) {
+        self.lock().gui_destroy();
+    }
+
+    pub fn gui_on_main_thread(&self) {
+        self.lock().gui_on_main_thread();
+    }
+
+    pub fn gui_on_timer(&self, timer_id: u32) {
+        self.lock().gui_on_timer(timer_id);
+    }
+
+    pub fn note_names(&self) -> std::collections::HashMap<u8, String> {
+        self.lock().note_names()
+    }
+}
+
 impl ClapInputEvent {
     fn header_ptr(&self) -> *const ClapEventHeader {
         match self {
@@ -1083,6 +1261,7 @@ struct ClapInputEventsCtx {
 struct ClapOutputEventsCtx {
     midi_events: Vec<ClapMidiOutputEvent>,
     param_values: Vec<PendingParamValue>,
+    param_gestures: Vec<PendingParamGesture>,
 }
 
 struct ClapIStreamCtx<'a> {
@@ -1595,12 +1774,15 @@ impl PluginHandle {
         out
     }
 
-    fn flush_params(&self, param_events: &[PendingParamEvent]) -> Vec<PendingParamValue> {
+    fn flush_params(
+        &self,
+        param_events: &[PendingParamEvent],
+    ) -> (Vec<PendingParamValue>, Vec<PendingParamGesture>) {
         let Some(params) = self.params_ext() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let Some(flush_fn) = params.flush else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let (in_events, _in_ctx) = param_input_events_from(param_events);
         let out_cap = param_events.len().max(32);
@@ -1609,7 +1791,10 @@ impl PluginHandle {
         unsafe {
             flush_fn(self.plugin, &in_events, &out_events);
         }
-        std::mem::take(&mut out_ctx.param_values)
+        (
+            std::mem::take(&mut out_ctx.param_values),
+            std::mem::take(&mut out_ctx.param_gestures),
+        )
     }
 
     fn snapshot_state(&self) -> Result<ClapPluginState, String> {
@@ -2151,6 +2336,19 @@ unsafe extern "C" fn output_events_try_push(
             }
             true
         }
+        CLAP_EVENT_PARAM_GESTURE_BEGIN | CLAP_EVENT_PARAM_GESTURE_END => {
+            if (header.size as usize) < std::mem::size_of::<ClapEventParamGesture>() {
+                return false;
+            }
+            let gesture = unsafe { &*(_event as *const ClapEventParamGesture) };
+            unsafe {
+                (*ctx).param_gestures.push(PendingParamGesture {
+                    param_id: gesture.param_id,
+                    is_begin: header.type_ == CLAP_EVENT_PARAM_GESTURE_BEGIN,
+                });
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -2305,7 +2503,7 @@ fn input_events_from(
                     time: frame,
                     space_id: CLAP_CORE_EVENT_SPACE_ID,
                     type_: CLAP_EVENT_PARAM_VALUE,
-                    flags: 0,
+                    flags: CLAP_EVENT_IS_LIVE,
                 },
                 param_id,
                 cookie: std::ptr::null_mut(),
@@ -2322,7 +2520,7 @@ fn input_events_from(
                         time: frame,
                         space_id: CLAP_CORE_EVENT_SPACE_ID,
                         type_: CLAP_EVENT_PARAM_GESTURE_BEGIN,
-                        flags: 0,
+                        flags: CLAP_EVENT_IS_LIVE,
                     },
                     param_id,
                 }))
@@ -2334,7 +2532,7 @@ fn input_events_from(
                         time: frame,
                         space_id: CLAP_CORE_EVENT_SPACE_ID,
                         type_: CLAP_EVENT_PARAM_GESTURE_END,
-                        flags: 0,
+                        flags: CLAP_EVENT_IS_LIVE,
                     },
                     param_id,
                 }))
@@ -2373,7 +2571,7 @@ fn param_input_events_from(
                     time: frame,
                     space_id: CLAP_CORE_EVENT_SPACE_ID,
                     type_: CLAP_EVENT_PARAM_VALUE,
-                    flags: 0,
+                    flags: CLAP_EVENT_IS_LIVE,
                 },
                 param_id,
                 cookie: std::ptr::null_mut(),
@@ -2390,7 +2588,7 @@ fn param_input_events_from(
                         time: frame,
                         space_id: CLAP_CORE_EVENT_SPACE_ID,
                         type_: CLAP_EVENT_PARAM_GESTURE_BEGIN,
-                        flags: 0,
+                        flags: CLAP_EVENT_IS_LIVE,
                     },
                     param_id,
                 }))
@@ -2402,7 +2600,7 @@ fn param_input_events_from(
                         time: frame,
                         space_id: CLAP_CORE_EVENT_SPACE_ID,
                         type_: CLAP_EVENT_PARAM_GESTURE_END,
-                        flags: 0,
+                        flags: CLAP_EVENT_IS_LIVE,
                     },
                     param_id,
                 }))
@@ -2429,6 +2627,7 @@ fn output_events_ctx(capacity: usize) -> (ClapOutputEvents, Box<ClapOutputEvents
     let mut ctx = Box::new(ClapOutputEventsCtx {
         midi_events: Vec::with_capacity(capacity),
         param_values: Vec::with_capacity(capacity / 2),
+        param_gestures: Vec::with_capacity(capacity / 4),
     });
     let list = ClapOutputEvents {
         ctx: (&mut *ctx as *mut ClapOutputEventsCtx).cast::<c_void>(),
