@@ -10,7 +10,7 @@ pub fn has_audio_connections(port: &Arc<AudioIO>) -> bool {
         > 0
 }
 
-#[cfg(unix)]
+#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "openbsd"))]
 pub fn fill_ports_from_interleaved(
     ports: &[Arc<AudioIO>],
     frames: usize,
@@ -26,6 +26,99 @@ pub fn fill_ports_from_interleaved(
         let channel_samples: &mut [f32] = &mut *channel_buf_lock;
         for (frame, sample) in channel_samples.iter_mut().enumerate().take(frames) {
             *sample = sample_at(ch_idx, frame);
+        }
+        *io_port.finished.lock() = true;
+    }
+}
+
+/// Fast path when the interleaved buffer is already in f32.
+#[cfg(unix)]
+pub fn fill_ports_from_interleaved_buffer(
+    ports: &[Arc<AudioIO>],
+    frames: usize,
+    connected_only: bool,
+    buffer: &[f32],
+    channels: usize,
+) {
+    let total = frames.saturating_mul(channels).min(buffer.len());
+
+    // Stereo SSE deinterleave fast path.
+    if channels == 2 && ports.len() >= 2 && total >= 8 {
+        let left_connected = !connected_only || has_audio_connections(&ports[0]);
+        let right_connected = !connected_only || has_audio_connections(&ports[1]);
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        if left_connected || right_connected {
+            let left_len = frames.min(ports[0].buffer.lock().len());
+            let right_len = frames.min(ports[1].buffer.lock().len());
+            let copy_frames = left_len.min(right_len).min(total / 2);
+            unsafe {
+                if std::arch::is_x86_feature_detected!("sse") {
+                    let left_lock = ports[0].buffer.lock();
+                    let right_lock = ports[1].buffer.lock();
+                    let left_dst = &mut left_lock[..left_len];
+                    let right_dst = &mut right_lock[..right_len];
+                    let n = copy_frames / 4;
+                    for i in 0..n {
+                        let src = std::arch::x86_64::_mm_loadu_ps(buffer.as_ptr().add(i * 8));
+                        let src2 = std::arch::x86_64::_mm_loadu_ps(buffer.as_ptr().add(i * 8 + 4));
+                        let left = std::arch::x86_64::_mm_shuffle_ps(src, src2, 0b10_00_10_00);
+                        let right = std::arch::x86_64::_mm_shuffle_ps(src, src2, 0b11_01_11_01);
+                        std::arch::x86_64::_mm_storeu_ps(left_dst.as_mut_ptr().add(i * 4), left);
+                        std::arch::x86_64::_mm_storeu_ps(right_dst.as_mut_ptr().add(i * 4), right);
+                    }
+                    for i in n * 4..copy_frames {
+                        left_dst[i] = buffer[i * 2];
+                        right_dst[i] = buffer[i * 2 + 1];
+                    }
+                    // Guards dropped implicitly at end of scope.
+                    if left_connected {
+                        *ports[0].finished.lock() = true;
+                    }
+                    if right_connected {
+                        *ports[1].finished.lock() = true;
+                    }
+                    // Handle any additional ports with the generic path.
+                    for (ch_idx, io_port) in ports.iter().enumerate().skip(2) {
+                        if connected_only && !has_audio_connections(io_port) {
+                            *io_port.finished.lock() = true;
+                            continue;
+                        }
+                        let channel_buf_lock = io_port.buffer.lock();
+                        let channel_samples: &mut [f32] = &mut *channel_buf_lock;
+                        let end = frames.min(channel_samples.len());
+                        let dst = &mut channel_samples[..end];
+                        let mut i = ch_idx;
+                        for d in dst.iter_mut() {
+                            *d = buffer.get(i).copied().unwrap_or(0.0);
+                            i = i.saturating_add(channels);
+                            if i >= total {
+                                break;
+                            }
+                        }
+                        *io_port.finished.lock() = true;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    for (ch_idx, io_port) in ports.iter().enumerate() {
+        if connected_only && !has_audio_connections(io_port) {
+            *io_port.finished.lock() = true;
+            continue;
+        }
+        let channel_buf_lock = io_port.buffer.lock();
+        let channel_samples: &mut [f32] = &mut *channel_buf_lock;
+        let end = frames.min(channel_samples.len());
+        let dst = &mut channel_samples[..end];
+        let mut i = ch_idx;
+        for d in dst.iter_mut() {
+            *d = buffer.get(i).copied().unwrap_or(0.0);
+            i = i.saturating_add(channels);
+            if i >= total {
+                break;
+            }
         }
         *io_port.finished.lock() = true;
     }
@@ -49,8 +142,19 @@ pub fn write_interleaved_from_ports(
         let channel_buf_lock = io_port.buffer.lock();
         let channel_samples: &[f32] = &*channel_buf_lock;
         let balance_gain = crate::hw::common::channel_balance_gain(ch_count, ch_idx, balance);
-        for (frame, &sample) in channel_samples.iter().enumerate().take(frames) {
-            write_sample(ch_idx, frame, sample * gain * balance_gain);
+        let total_gain = gain * balance_gain;
+        let mut offset = 0;
+        while offset + 64 <= frames {
+            let mut chunk = [0.0f32; 64];
+            chunk.copy_from_slice(&channel_samples[offset..offset + 64]);
+            crate::simd::mul_inplace(&mut chunk, total_gain);
+            for (i, v) in chunk.iter().enumerate() {
+                write_sample(ch_idx, offset + i, *v);
+            }
+            offset += 64;
+        }
+        for (frame, v) in channel_samples[offset..frames].iter().enumerate() {
+            write_sample(ch_idx, offset + frame, *v * total_gain);
         }
     }
 }

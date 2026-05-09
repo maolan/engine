@@ -1,4 +1,5 @@
 use crate::mutex::UnsafeMutex;
+use crate::simd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,11 +12,6 @@ pub struct AudioIO {
 }
 
 impl AudioIO {
-    #[inline]
-    fn sanitize_sample(sample: f32) -> f32 {
-        if sample.is_finite() { sample } else { 0.0 }
-    }
-
     pub fn new(size: usize) -> Self {
         Self {
             connections: Arc::new(UnsafeMutex::new(vec![])),
@@ -70,16 +66,18 @@ impl AudioIO {
             1 => {
                 let source_buf = connections[0].buffer.lock();
                 local_buf.fill(0.0);
-                for (out_sample, in_sample) in local_buf.iter_mut().zip(source_buf.iter()) {
-                    *out_sample = Self::sanitize_sample(*in_sample);
-                }
+                simd::copy_sanitized_inplace(local_buf, source_buf);
             }
             _ => {
                 local_buf.fill(0.0);
+                let mut first = true;
                 for source in connections.iter() {
                     let source_buf = source.buffer.lock();
-                    for (out_sample, in_sample) in local_buf.iter_mut().zip(source_buf.iter()) {
-                        *out_sample += Self::sanitize_sample(*in_sample);
+                    if first {
+                        simd::copy_sanitized_inplace(local_buf, source_buf);
+                        first = false;
+                    } else {
+                        simd::add_sanitized_inplace(local_buf, source_buf);
                     }
                 }
             }

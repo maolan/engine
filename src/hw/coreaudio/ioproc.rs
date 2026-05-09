@@ -167,9 +167,7 @@ impl SharedIOState {
         });
 
         for ch_buf in data.output_frames.iter_mut() {
-            for sample in ch_buf[..frames].iter_mut() {
-                *sample = 0.0;
-            }
+            ch_buf[..frames].fill(0.0);
         }
         ports::write_interleaved_from_ports(
             output_ports,

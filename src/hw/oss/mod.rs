@@ -54,6 +54,7 @@ pub struct Audio {
     pub format: u32,
     pub chsamples: usize,
     buffer: Vec<i32>,
+    f32_buffer: Vec<f32>,
     pub buffer_info: BufferInfo,
     frame_size_bytes: usize,
     buffer_frames_cached: i64,
@@ -336,6 +337,7 @@ impl Audio {
             format,
             chsamples,
             buffer: vec![0_i32; chsamples * (channels as usize)],
+            f32_buffer: Vec::new(),
             buffer_info,
             frame_size_bytes: frame_size,
             buffer_frames_cached,
@@ -536,15 +538,19 @@ impl Audio {
 
         if self.input {
             let norm_factor = convert_policy::F32_FROM_I32_MAX;
-            let data_slice: &mut [i32] = self.buffer.as_mut_slice();
-            crate::hw::ports::fill_ports_from_interleaved(
+            let total_samples = self.chsamples * num_channels;
+            self.f32_buffer.resize(total_samples, 0.0);
+            crate::simd::convert_i32_to_f32(
+                &self.buffer[..total_samples],
+                &mut self.f32_buffer,
+                norm_factor,
+            );
+            crate::hw::ports::fill_ports_from_interleaved_buffer(
                 &self.channels,
                 self.chsamples,
                 !all_connected,
-                |ch_idx, frame| {
-                    let source_idx = frame * num_channels + ch_idx;
-                    data_slice[source_idx] as f32 * norm_factor
-                },
+                &self.f32_buffer,
+                num_channels,
             );
         } else {
             let playing = self.playing.load(std::sync::atomic::Ordering::Relaxed);

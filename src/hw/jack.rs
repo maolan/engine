@@ -57,9 +57,7 @@ impl Process {
             let n = src.len().min(dst.len());
             dst[..n].copy_from_slice(&src[..n]);
             if n < dst.len() {
-                for item in dst.iter_mut().skip(n) {
-                    *item = 0.0;
-                }
+                dst[n..].fill(0.0);
             }
             *bridge.finished.lock() = true;
         }
@@ -96,13 +94,9 @@ impl Process {
             } else {
                 1.0
             };
-            for i in 0..n {
-                dst[i] = src[i] * gain * balance_gain;
-            }
+            crate::simd::copy_scaled_inplace(&mut dst[..n], &src[..n], gain * balance_gain);
             if n < dst.len() {
-                for item in dst.iter_mut().skip(n) {
-                    *item = 0.0;
-                }
+                dst[n..].fill(0.0);
             }
         }
     }

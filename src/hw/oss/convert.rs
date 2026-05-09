@@ -3,6 +3,9 @@ use crate::audio::io::AudioIO;
 use nix::libc;
 use std::sync::Arc;
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+use std::arch::x86_64::*;
+
 pub(super) fn bytes_per_sample(format: u32) -> Option<usize> {
     match format {
         AFMT_S16_LE | AFMT_S16_BE => Some(2),
@@ -44,6 +47,29 @@ pub(super) fn convert_in_to_i32_interleaved(
         }
         return;
     }
+
+    // SSE4.1 fast path for S16_LE
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if format == AFMT_S16_LE && is_x86_feature_detected!("sse4.1") {
+            let n = frames.saturating_mul(channels).min(dst.len());
+            let mut i = 0;
+            while i + 8 <= n {
+                let bytes = _mm_loadu_si128(src.as_ptr().add(i * 2) as *const __m128i);
+                let low = _mm_slli_epi32(_mm_cvtepi16_epi32(bytes), 16);
+                let high = _mm_slli_epi32(_mm_cvtepi16_epi32(_mm_srli_si128(bytes, 8)), 16);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, low);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i + 4) as *mut __m128i, high);
+                i += 8;
+            }
+            for (j, d) in dst[i..n].iter_mut().enumerate() {
+                let o = (i + j) * 2;
+                *d = i16::from_le_bytes([src[o], src[o + 1]]) as i32 * 65536;
+            }
+            return;
+        }
+    }
+
     let bps = bytes_per_sample(format).unwrap_or(4);
     let n = frames.saturating_mul(channels);
     for i in 0..n.min(dst.len()) {
@@ -136,6 +162,31 @@ pub(super) fn convert_out_from_i32_interleaved(
         }
         return;
     }
+
+    // SSE2 fast path for S16_LE
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if format == AFMT_S16_LE && is_x86_feature_detected!("sse2") {
+            let n = frames.saturating_mul(channels).min(src.len());
+            let mut i = 0;
+            while i + 8 <= n {
+                let low32 = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+                let high32 = _mm_loadu_si128(src.as_ptr().add(i + 4) as *const __m128i);
+                let low16 = _mm_srai_epi32(low32, 16);
+                let high16 = _mm_srai_epi32(high32, 16);
+                let packed = _mm_packs_epi32(low16, high16);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i * 2) as *mut __m128i, packed);
+                i += 8;
+            }
+            for (j, s) in src[i..n].iter().enumerate() {
+                let o = (i + j) * 2;
+                let v = (*s >> 16) as i16;
+                dst[o..o + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            return;
+        }
+    }
+
     let bps = bytes_per_sample(format).unwrap_or(4);
     let n = frames.saturating_mul(channels);
     for (i, _item) in src.iter().enumerate().take(n.min(src.len())) {

@@ -12,6 +12,7 @@ pub mod plugins;
 mod routing;
 #[cfg(unix)]
 mod rubberband;
+pub mod simd;
 pub mod state;
 mod track;
 pub mod workers;

@@ -333,11 +333,13 @@ impl ClapProcessor {
             self.param_values.lock().insert(param_id, clamped);
             return Ok(());
         }
-        self.pending_param_events.lock().push(PendingParamEvent::Value {
-            param_id,
-            value: clamped,
-            frame,
-        });
+        self.pending_param_events
+            .lock()
+            .push(PendingParamEvent::Value {
+                param_id,
+                value: clamped,
+                frame,
+            });
         self.pending_param_events_ui
             .lock()
             .push(PendingParamEvent::Value {
@@ -680,17 +682,16 @@ impl ClapProcessor {
                 }
                 let ch_count = scratch_count + 1;
                 for scratch in &out_channel_scratch[*scratch_start..*scratch_end] {
-                    for (dst, src) in out_buf.iter_mut().zip(scratch.iter().take(frames)) {
-                        *dst += *src;
-                    }
+                    let len = frames.min(scratch.len()).min(out_buf.len());
+                    crate::simd::add_inplace(&mut out_buf[..len], &scratch[..len]);
                 }
                 let inv = 1.0_f32 / ch_count as f32;
-                for sample in out_buf.iter_mut().take(frames) {
-                    *sample *= inv;
-                }
+                crate::simd::mul_inplace(&mut out_buf[..frames], inv);
             }
             for update in &out_ctx.param_values {
-                self.param_values.lock().insert(update.param_id, update.value);
+                self.param_values
+                    .lock()
+                    .insert(update.param_id, update.value);
             }
             for gesture in &out_ctx.param_gestures {
                 if gesture.is_begin {
@@ -1098,7 +1099,8 @@ impl UnsafeMutex<ClapProcessor> {
         midi_events: &[MidiEvent],
         transport: ClapTransportInfo,
     ) -> Vec<ClapMidiOutputEvent> {
-        self.lock().process_with_midi(frames, midi_events, transport)
+        self.lock()
+            .process_with_midi(frames, midi_events, transport)
     }
 
     pub fn set_bypassed(&self, bypassed: bool) {

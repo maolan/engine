@@ -1,9 +1,9 @@
 use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
-use crate::clap::{ClapProcessor, SharedClapProcessor};
 #[cfg(unix)]
 use crate::clap::ClapTransportInfo;
+use crate::clap::{ClapProcessor, SharedClapProcessor};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::lv2::{Lv2Processor, Lv2TransportInfo};
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -262,10 +262,9 @@ impl ClipPluginRuntime {
         self.setup_ports();
         for (source, samples) in self.input_sources.iter().zip(input_blocks.iter()) {
             let buffer = source.buffer.lock();
+            let len = buffer.len().min(request_len);
             buffer.fill(0.0);
-            for (dst, src) in buffer.iter_mut().zip(samples.iter().take(request_len)) {
-                *dst = *src;
-            }
+            buffer[..len].copy_from_slice(&samples[..len]);
             *source.finished.lock() = true;
         }
         for source in self.input_sources.iter().skip(input_blocks.len()) {
@@ -279,7 +278,7 @@ impl ClipPluginRuntime {
                 output.process();
             }
             let buf = output.buffer.lock();
-            outputs.push(buf.iter().copied().collect());
+            outputs.push(buf.to_vec());
             *output.finished.lock() = false;
         }
         outputs
@@ -295,10 +294,9 @@ impl ClipPluginRuntime {
         self.setup_ports();
         for (source, samples) in self.input_sources.iter().zip(input_blocks.iter()) {
             let buffer = source.buffer.lock();
+            let len = buffer.len().min(request_len);
             buffer.fill(0.0);
-            for (dst, src) in buffer.iter_mut().zip(samples.iter().take(request_len)) {
-                *dst = *src;
-            }
+            buffer[..len].copy_from_slice(&samples[..len]);
             *source.finished.lock() = true;
         }
         for source in self.input_sources.iter().skip(input_blocks.len()) {
@@ -759,15 +757,7 @@ impl Track {
     #[inline(always)]
     fn copy_scaled_with_zero_tail(dst: &mut [f32], src: &[f32], gain: f32) {
         let len = dst.len().min(src.len());
-        unsafe {
-            let mut i = 0usize;
-            let dp = dst.as_mut_ptr();
-            let sp = src.as_ptr();
-            while i < len {
-                *dp.add(i) = *sp.add(i) * gain;
-                i += 1;
-            }
-        }
+        crate::simd::copy_scaled_inplace(&mut dst[..len], &src[..len], gain);
         if len < dst.len() {
             dst[len..].fill(0.0);
         }
@@ -775,30 +765,12 @@ impl Track {
 
     #[inline(always)]
     fn add_unity(dst: &mut [f32], src: &[f32]) {
-        let len = dst.len().min(src.len());
-        unsafe {
-            let mut i = 0usize;
-            let dp = dst.as_mut_ptr();
-            let sp = src.as_ptr();
-            while i < len {
-                *dp.add(i) += *sp.add(i);
-                i += 1;
-            }
-        }
+        crate::simd::add_inplace(dst, src);
     }
 
     #[inline(always)]
     fn add_scaled(dst: &mut [f32], src: &[f32], gain: f32) {
-        let len = dst.len().min(src.len());
-        unsafe {
-            let mut i = 0usize;
-            let dp = dst.as_mut_ptr();
-            let sp = src.as_ptr();
-            while i < len {
-                *dp.add(i) += *sp.add(i) * gain;
-                i += 1;
-            }
-        }
+        crate::simd::add_scaled_inplace(dst, src, gain);
     }
 
     fn ensure_metronome_source(&mut self, frames: usize) -> Option<Arc<AudioIO>> {
@@ -1342,9 +1314,7 @@ impl Track {
                     tap.fill(0.0);
                 }
             }
-            let peak_now = out_samples
-                .iter()
-                .fold(0.0_f32, |acc, sample| acc.max(sample.abs()));
+            let peak_now = crate::simd::peak_abs(out_samples);
             // Peak-hold with decay gives stable, readable VU behavior for short transients.
             let held = self.meter_peak_hold_linear[out_idx] * 0.92;
             let next = peak_now.max(held);
@@ -1501,12 +1471,55 @@ impl Track {
             self.transport_sample = start_sample.saturating_add(cursor);
             self.process();
             let step = (length_samples - cursor).min(block_size);
-            for ch in 0..channels {
-                let out = self.audio.outs[ch].buffer.lock();
-                let copy_len = step.min(out.len());
-                for (i, out_i) in out.iter().enumerate().take(copy_len) {
-                    let dst = (cursor + i) * channels + ch;
-                    rendered[dst] = *out_i;
+            if channels == 2 {
+                let out_l = self.audio.outs[0].buffer.lock();
+                let out_r = self.audio.outs[1].buffer.lock();
+                let copy_len = step.min(out_l.len()).min(out_r.len());
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                unsafe {
+                    if std::arch::is_x86_feature_detected!("sse") {
+                        let n = copy_len / 4;
+                        for i in 0..n {
+                            let l = std::arch::x86_64::_mm_loadu_ps(out_l.as_ptr().add(i * 4));
+                            let r = std::arch::x86_64::_mm_loadu_ps(out_r.as_ptr().add(i * 4));
+                            let lr0 = std::arch::x86_64::_mm_unpacklo_ps(l, r);
+                            let lr1 = std::arch::x86_64::_mm_unpackhi_ps(l, r);
+                            let dst = (cursor + i * 4) * 2;
+                            std::arch::x86_64::_mm_storeu_ps(rendered.as_mut_ptr().add(dst), lr0);
+                            std::arch::x86_64::_mm_storeu_ps(
+                                rendered.as_mut_ptr().add(dst + 4),
+                                lr1,
+                            );
+                        }
+                        for i in n * 4..copy_len {
+                            let dst = (cursor + i) * 2;
+                            rendered[dst] = out_l[i];
+                            rendered[dst + 1] = out_r[i];
+                        }
+                    } else {
+                        for i in 0..copy_len {
+                            let dst = (cursor + i) * 2;
+                            rendered[dst] = out_l[i];
+                            rendered[dst + 1] = out_r[i];
+                        }
+                    }
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+                {
+                    for i in 0..copy_len {
+                        let dst = (cursor + i) * 2;
+                        rendered[dst] = out_l[i];
+                        rendered[dst + 1] = out_r[i];
+                    }
+                }
+            } else {
+                for ch in 0..channels {
+                    let out = self.audio.outs[ch].buffer.lock();
+                    let copy_len = step.min(out.len());
+                    for (i, out_i) in out.iter().enumerate().take(copy_len) {
+                        let dst = (cursor + i) * channels + ch;
+                        rendered[dst] = *out_i;
+                    }
                 }
             }
             cursor = cursor.saturating_add(step);
@@ -1578,24 +1591,37 @@ impl Track {
         let mut reader = hound::WavReader::open(path).ok()?;
         let spec = reader.spec();
         let channels = spec.channels.max(1) as usize;
-        let samples: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+        let total_samples = reader.duration() as usize * channels;
+        let mut samples = Vec::with_capacity(total_samples);
+        match spec.sample_format {
+            hound::SampleFormat::Float => {
+                samples.extend(reader.samples::<f32>().filter_map(|s| s.ok()));
+            }
             hound::SampleFormat::Int => match spec.bits_per_sample {
-                16 => reader
-                    .samples::<i16>()
-                    .filter_map(|s| s.ok())
-                    .map(|s| (s as f32 / i16::MAX as f32).clamp(-1.0, 1.0))
-                    .collect(),
-                24 => reader
-                    .samples::<i32>()
-                    .filter_map(|s| s.ok())
-                    .map(|s| (s as f32 / 8_388_608.0).clamp(-1.0, 1.0))
-                    .collect(),
-                32 => reader
-                    .samples::<i32>()
-                    .filter_map(|s| s.ok())
-                    .map(|s| (s as f32 / i32::MAX as f32).clamp(-1.0, 1.0))
-                    .collect(),
+                16 => {
+                    samples.extend(
+                        reader
+                            .samples::<i16>()
+                            .filter_map(|s| s.ok())
+                            .map(|s| s as f32 * (1.0 / 32768.0)),
+                    );
+                }
+                24 => {
+                    samples.extend(
+                        reader
+                            .samples::<i32>()
+                            .filter_map(|s| s.ok())
+                            .map(|s| s as f32 * (1.0 / 8_388_608.0)),
+                    );
+                }
+                32 => {
+                    samples.extend(
+                        reader
+                            .samples::<i32>()
+                            .filter_map(|s| s.ok())
+                            .map(|s| s as f32 * (1.0 / 2_147_483_648.0)),
+                    );
+                }
                 _ => return None,
             },
         };
@@ -1748,9 +1774,8 @@ impl Track {
             let Some(target) = outputs.get_mut(to_port) else {
                 continue;
             };
-            for (dst, src) in target.iter_mut().zip(source.iter().take(request_len)) {
-                *dst += *src;
-            }
+            let len = request_len.min(source.len()).min(target.len());
+            crate::simd::add_inplace(&mut target[..len], &source[..len]);
         }
         outputs
     }
@@ -2028,19 +2053,38 @@ impl Track {
             return;
         }
         for channel in samples.iter_mut() {
-            for (i, sample) in channel.iter_mut().enumerate() {
-                let absolute_sample = absolute_from + i;
-                let clip_sample_pos = absolute_sample.saturating_sub(absolute_clip_start);
-                if clip_sample_pos < clip.fade_in_samples {
-                    let t = clip_sample_pos as f32 / clip.fade_in_samples.max(1) as f32;
-                    *sample *= Self::fade_in_curve(t);
-                }
-                if clip_sample_pos >= clip_len.saturating_sub(clip.fade_out_samples) {
-                    let fade_out_start = clip_len.saturating_sub(clip.fade_out_samples);
-                    let t = (clip_sample_pos - fade_out_start) as f32
-                        / clip.fade_out_samples.max(1) as f32;
-                    *sample *= Self::fade_out_curve(t);
-                }
+            let channel_len = channel.len();
+            let fade_in_start = absolute_clip_start.saturating_sub(absolute_from);
+            let fade_in_end = (absolute_clip_start + clip.fade_in_samples)
+                .saturating_sub(absolute_from)
+                .min(channel_len);
+            if fade_in_start < fade_in_end {
+                let dt = 1.0 / clip.fade_in_samples.max(1) as f32;
+                let start_t =
+                    (absolute_from + fade_in_start).saturating_sub(absolute_clip_start) as f32 * dt;
+                crate::simd::apply_fade_in_inplace(
+                    &mut channel[fade_in_start..fade_in_end],
+                    start_t,
+                    dt,
+                );
+            }
+            let fade_out_start = (absolute_clip_start
+                + clip_len.saturating_sub(clip.fade_out_samples))
+            .saturating_sub(absolute_from);
+            let fade_out_end = (absolute_clip_start + clip_len)
+                .saturating_sub(absolute_from)
+                .min(channel_len);
+            if fade_out_start < fade_out_end {
+                let dt = 1.0 / clip.fade_out_samples.max(1) as f32;
+                let start_t = (absolute_from + fade_out_start).saturating_sub(
+                    absolute_clip_start + clip_len.saturating_sub(clip.fade_out_samples),
+                ) as f32
+                    * dt;
+                crate::simd::apply_fade_out_inplace(
+                    &mut channel[fade_out_start..fade_out_end],
+                    start_t,
+                    dt,
+                );
             }
         }
     }
@@ -2092,12 +2136,13 @@ impl Track {
                             .get(channel_idx)
                             .or_else(|| child_blocks.first());
                         if let Some(source) = source {
-                            for (i, sample) in source.iter().copied().enumerate() {
-                                if out_offset + i >= channel.len() {
-                                    break;
-                                }
-                                channel[out_offset + i] += sample;
-                            }
+                            let dest_len = channel.len().saturating_sub(out_offset);
+                            let src_len = source.len();
+                            let len = dest_len.min(src_len);
+                            crate::simd::add_inplace(
+                                &mut channel[out_offset..out_offset + len],
+                                &source[..len],
+                            );
                         }
                     }
                 }
@@ -2189,14 +2234,24 @@ impl Track {
                             input.iter_mut().enumerate().take(effective_channels)
                         {
                             let source_channel = if buffer.channels == 1 { 0 } else { ch };
-                            for (i, sample) in channel_input.iter_mut().enumerate().take(block_size)
-                            {
-                                let source_frame = block_start.saturating_add(i);
-                                *sample = if source_frame < total_frames {
-                                    buffer.samples[source_frame * buffer.channels + source_channel]
-                                } else {
-                                    0.0
-                                };
+                            if buffer.channels == 1 {
+                                let src_start = block_start.min(total_frames);
+                                let src_end = (block_start + block_size).min(total_frames);
+                                let len = src_end.saturating_sub(src_start);
+                                channel_input[..len]
+                                    .copy_from_slice(&buffer.samples[src_start..src_end]);
+                            } else {
+                                for (i, sample) in
+                                    channel_input.iter_mut().enumerate().take(block_size)
+                                {
+                                    let source_frame = block_start.saturating_add(i);
+                                    *sample = if source_frame < total_frames {
+                                        buffer.samples
+                                            [source_frame * buffer.channels + source_channel]
+                                    } else {
+                                        0.0
+                                    };
+                                }
                             }
                         }
                         scale
@@ -2251,15 +2306,22 @@ impl Track {
             } else {
                 continue;
             };
-            for (i, sample) in block.iter_mut().enumerate().take(request_len) {
-                let absolute_sample = absolute_from + i;
-                let clip_idx = absolute_sample
-                    .saturating_sub(clip_start)
-                    .saturating_add(clip.offset);
-                if clip_idx >= total_frames {
-                    break;
+            let start_clip_idx = absolute_from
+                .saturating_sub(clip_start)
+                .saturating_add(clip.offset);
+            if start_clip_idx >= total_frames {
+                continue;
+            }
+            let max_copy = total_frames.saturating_sub(start_clip_idx);
+            if channels == 1 {
+                let len = request_len.min(max_copy).min(block.len());
+                let src_start = start_clip_idx;
+                block[..len].copy_from_slice(&buffer.samples[src_start..src_start + len]);
+            } else {
+                for i in 0..request_len.min(max_copy).min(block.len()) {
+                    let clip_idx = start_clip_idx + i;
+                    block[i] = buffer.samples[clip_idx * channels + source_channel];
                 }
-                *sample = buffer.samples[clip_idx * channels + source_channel];
             }
         }
         Self::apply_audio_clip_fades(clip, clip_start, clip_len, absolute_from, &mut input_blocks);
@@ -2647,24 +2709,6 @@ impl Track {
         segments
     }
 
-    /// Ardour-like constant-power fade-in.
-    /// gain = sin(t * pi/2)
-    /// Input: t in range [0.0, 1.0] (position within fade-in region)
-    /// Output: gain value in range [0.0, 1.0]
-    #[inline]
-    fn fade_in_curve(t: f32) -> f32 {
-        (t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2).sin()
-    }
-
-    /// Ardour-like constant-power fade-out.
-    /// gain = cos(t * pi/2)
-    /// Input: t in range [0.0, 1.0] (position within fade-out region)
-    /// Output: gain value in range [1.0, 0.0]
-    #[inline]
-    fn fade_out_curve(t: f32) -> f32 {
-        (t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2).cos()
-    }
-
     fn mix_clip_audio_into_inputs(&mut self) {
         let frames = self
             .audio
@@ -2712,16 +2756,17 @@ impl Track {
                 };
                 for in_channel in 0..self.audio.ins.len() {
                     let in_samples = self.audio.ins[in_channel].buffer.lock();
-                    for (i, sample) in processed_blocks
+                    let processed = processed_blocks
                         .get(in_channel)
-                        .or_else(|| processed_blocks.first())
-                        .into_iter()
-                        .flat_map(|channel| channel.iter().copied().enumerate())
-                    {
-                        if track_idx + i >= in_samples.len() {
-                            break;
-                        }
-                        in_samples[track_idx + i] += sample;
+                        .or_else(|| processed_blocks.first());
+                    if let Some(processed) = processed {
+                        let dest_len = in_samples.len().saturating_sub(track_idx);
+                        let src_len = processed.len();
+                        let len = dest_len.min(src_len);
+                        crate::simd::add_inplace(
+                            &mut in_samples[track_idx..track_idx + len],
+                            &processed[..len],
+                        );
                     }
                 }
             }

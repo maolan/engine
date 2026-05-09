@@ -46,6 +46,7 @@ pub struct HwDriver {
     capture_buffer_i8: Vec<i8>,
     capture_buffer_i16: Vec<i16>,
     capture_buffer_i32: Vec<i32>,
+    capture_f32_buffer: Vec<f32>,
     playback_buffer_i8: Vec<i8>,
     playback_buffer_i16: Vec<i16>,
     playback_buffer_i32: Vec<i32>,
@@ -144,6 +145,7 @@ impl HwDriver {
             capture_buffer_i8: vec![0; period * channels_in],
             capture_buffer_i16: vec![0; period * channels_in],
             capture_buffer_i32: vec![0; period * channels_in],
+            capture_f32_buffer: vec![0.0; period * channels_in],
             playback_buffer_i8: vec![0; period * channels_out],
             playback_buffer_i16: vec![0; period * channels_out],
             playback_buffer_i32: vec![0; period * channels_out],
@@ -284,31 +286,54 @@ impl HwDriver {
         let all_in_connected = self.audio_ins.iter().all(ports::has_audio_connections);
         match self.capture_format {
             SampleFormat::S8 => {
-                ports::fill_ports_from_interleaved(
+                let total = frames * self.channels_in;
+                crate::simd::convert_i8_to_f32(
+                    &self.capture_buffer_i8[..total],
+                    &mut self.capture_f32_buffer[..total],
+                    convert_policy::F32_FROM_I8,
+                );
+                ports::fill_ports_from_interleaved_buffer(
                     &self.audio_ins,
                     frames,
                     !all_in_connected,
-                    |ch, frame| {
-                        let idx = frame * self.channels_in + ch;
-                        let sample = self.capture_buffer_i8.get(idx).copied().unwrap_or(0);
-                        (sample as f32) * convert_policy::F32_FROM_I8
-                    },
+                    &self.capture_f32_buffer[..total],
+                    self.channels_in,
                 );
             }
-            SampleFormat::S16LE | SampleFormat::S16BE => {
-                let needs_swap = self.capture_format.needs_swap();
-                ports::fill_ports_from_interleaved(
+            SampleFormat::S16LE => {
+                let total = frames * self.channels_in;
+                crate::simd::convert_i16_to_f32(
+                    &self.capture_buffer_i16[..total],
+                    &mut self.capture_f32_buffer[..total],
+                    convert_policy::F32_FROM_I16,
+                );
+                ports::fill_ports_from_interleaved_buffer(
                     &self.audio_ins,
                     frames,
                     !all_in_connected,
-                    |ch, frame| {
-                        let idx = frame * self.channels_in + ch;
-                        let mut sample = self.capture_buffer_i16.get(idx).copied().unwrap_or(0);
-                        if needs_swap {
-                            sample = sample.swap_bytes();
-                        }
-                        (sample as f32) * convert_policy::F32_FROM_I16
-                    },
+                    &self.capture_f32_buffer[..total],
+                    self.channels_in,
+                );
+            }
+            SampleFormat::S16BE => {
+                let total = frames * self.channels_in;
+                for s in &mut self.capture_buffer_i16[..total] {
+                    *s = s.swap_bytes();
+                }
+                crate::simd::convert_i16_to_f32(
+                    &self.capture_buffer_i16[..total],
+                    &mut self.capture_f32_buffer[..total],
+                    convert_policy::F32_FROM_I16,
+                );
+                for s in &mut self.capture_buffer_i16[..total] {
+                    *s = s.swap_bytes();
+                }
+                ports::fill_ports_from_interleaved_buffer(
+                    &self.audio_ins,
+                    frames,
+                    !all_in_connected,
+                    &self.capture_f32_buffer[..total],
+                    self.channels_in,
                 );
             }
             SampleFormat::S24LE | SampleFormat::S24BE => {
@@ -329,20 +354,40 @@ impl HwDriver {
                     },
                 );
             }
-            SampleFormat::S32LE | SampleFormat::S32BE => {
-                let needs_swap = self.capture_format.needs_swap();
-                ports::fill_ports_from_interleaved(
+            SampleFormat::S32LE => {
+                let total = frames * self.channels_in;
+                crate::simd::convert_i32_to_f32(
+                    &self.capture_buffer_i32[..total],
+                    &mut self.capture_f32_buffer[..total],
+                    convert_policy::F32_FROM_I32,
+                );
+                ports::fill_ports_from_interleaved_buffer(
                     &self.audio_ins,
                     frames,
                     !all_in_connected,
-                    |ch, frame| {
-                        let idx = frame * self.channels_in + ch;
-                        let mut sample = self.capture_buffer_i32.get(idx).copied().unwrap_or(0);
-                        if needs_swap {
-                            sample = sample.swap_bytes();
-                        }
-                        (sample as f32) * convert_policy::F32_FROM_I32
-                    },
+                    &self.capture_f32_buffer[..total],
+                    self.channels_in,
+                );
+            }
+            SampleFormat::S32BE => {
+                let total = frames * self.channels_in;
+                for s in &mut self.capture_buffer_i32[..total] {
+                    *s = s.swap_bytes();
+                }
+                crate::simd::convert_i32_to_f32(
+                    &self.capture_buffer_i32[..total],
+                    &mut self.capture_f32_buffer[..total],
+                    convert_policy::F32_FROM_I32,
+                );
+                for s in &mut self.capture_buffer_i32[..total] {
+                    *s = s.swap_bytes();
+                }
+                ports::fill_ports_from_interleaved_buffer(
+                    &self.audio_ins,
+                    frames,
+                    !all_in_connected,
+                    &self.capture_f32_buffer[..total],
+                    self.channels_in,
                 );
             }
         }

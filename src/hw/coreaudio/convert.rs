@@ -5,9 +5,7 @@ pub fn deinterleave_f32(src: &[f32], channels: usize, frames: usize, dst: &mut [
         let offset = ch * frames;
         let channel_dst = &mut dst[ch];
         channel_dst.resize(frames, 0.0);
-        for i in 0..frames {
-            channel_dst[i] = src[offset + i] * F32_FROM_F32;
-        }
+        channel_dst.copy_from_slice(&src[offset..offset + frames]);
     }
 }
 
@@ -15,8 +13,6 @@ pub fn interleave_f32(src: &[Vec<f32>], channels: usize, frames: usize, dst: &mu
     for ch in 0..channels {
         let offset = ch * frames;
         let channel_src = &src[ch];
-        for i in 0..frames {
-            dst[offset + i] = channel_src[i] * F32_TO_F32;
-        }
+        dst[offset..offset + frames].copy_from_slice(&channel_src[..frames]);
     }
 }

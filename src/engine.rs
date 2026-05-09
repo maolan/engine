@@ -3303,14 +3303,7 @@ impl Engine {
                             1.0
                         };
                         let buf = channel.buffer.lock();
-                        let mut peak = 0.0_f32;
-                        for &sample in buf.iter() {
-                            let v = if sample >= 0.0 { sample } else { -sample };
-                            if v > peak {
-                                peak = v;
-                            }
-                        }
-                        let peak = peak * gain * balance_gain;
+                        let peak = crate::simd::peak_abs(buf) * gain * balance_gain;
                         meters_linear.push(peak);
                     }
                     meters_linear

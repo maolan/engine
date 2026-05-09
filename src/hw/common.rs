@@ -20,13 +20,7 @@ pub fn output_meter_linear(audio_outs: &[Arc<AudioIO>], gain: f32, balance: f32)
     for (channel_idx, channel) in audio_outs.iter().enumerate() {
         let balance_gain = channel_balance_gain(ch_count, channel_idx, balance);
         let buf = channel.buffer.lock();
-        let mut peak = 0.0_f32;
-        for &sample in buf.iter() {
-            let v = sample.abs();
-            if v > peak {
-                peak = v;
-            }
-        }
+        let peak = crate::simd::peak_abs(buf);
         out.push(peak * gain * balance_gain);
     }
     out
