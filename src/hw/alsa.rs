@@ -46,10 +46,12 @@ pub struct HwDriver {
     capture_buffer_i8: Vec<i8>,
     capture_buffer_i16: Vec<i16>,
     capture_buffer_i32: Vec<i32>,
+    capture_temp_i32: Vec<i32>,
     capture_f32_buffer: Vec<f32>,
     playback_buffer_i8: Vec<i8>,
     playback_buffer_i16: Vec<i16>,
     playback_buffer_i32: Vec<i32>,
+    playback_f32_buffer: Vec<f32>,
     playing: Arc<AtomicBool>,
     xrun_count: u64,
 }
@@ -145,10 +147,12 @@ impl HwDriver {
             capture_buffer_i8: vec![0; period * channels_in],
             capture_buffer_i16: vec![0; period * channels_in],
             capture_buffer_i32: vec![0; period * channels_in],
+            capture_temp_i32: vec![0; period * channels_in],
             capture_f32_buffer: vec![0.0; period * channels_in],
             playback_buffer_i8: vec![0; period * channels_out],
             playback_buffer_i16: vec![0; period * channels_out],
             playback_buffer_i32: vec![0; period * channels_out],
+            playback_f32_buffer: vec![0.0; period * channels_out],
             playing: Arc::new(AtomicBool::new(false)),
             xrun_count: 0,
         };
@@ -336,22 +340,44 @@ impl HwDriver {
                     self.channels_in,
                 );
             }
-            SampleFormat::S24LE | SampleFormat::S24BE => {
-                let needs_swap = self.capture_format.needs_swap();
-                let is_be = matches!(self.capture_format, SampleFormat::S24BE);
-                ports::fill_ports_from_interleaved(
+            SampleFormat::S24LE => {
+                let total = frames * self.channels_in;
+                crate::simd::convert_i24_to_f32(
+                    &self.capture_buffer_i32[..total],
+                    &mut self.capture_f32_buffer[..total],
+                    convert_policy::F32_FROM_I24,
+                );
+                ports::fill_ports_from_interleaved_buffer(
                     &self.audio_ins,
                     frames,
                     !all_in_connected,
-                    |ch, frame| {
-                        let idx = frame * self.channels_in + ch;
-                        let mut raw = self.capture_buffer_i32.get(idx).copied().unwrap_or(0);
-                        if needs_swap {
-                            raw = raw.swap_bytes();
-                        }
-                        let sample = if is_be { raw >> 8 } else { sign_extend_24(raw) };
-                        (sample as f32) * convert_policy::F32_FROM_I24
-                    },
+                    &self.capture_f32_buffer[..total],
+                    self.channels_in,
+                );
+            }
+            SampleFormat::S24BE => {
+                let total = frames * self.channels_in;
+                let needs_swap = self.capture_format.needs_swap();
+                self.capture_temp_i32[..total].copy_from_slice(&self.capture_buffer_i32[..total]);
+                if needs_swap {
+                    for s in &mut self.capture_temp_i32[..total] {
+                        *s = s.swap_bytes();
+                    }
+                }
+                for s in &mut self.capture_temp_i32[..total] {
+                    *s >>= 8;
+                }
+                crate::simd::convert_i32_to_f32(
+                    &self.capture_temp_i32[..total],
+                    &mut self.capture_f32_buffer[..total],
+                    convert_policy::F32_FROM_I24,
+                );
+                ports::fill_ports_from_interleaved_buffer(
+                    &self.audio_ins,
+                    frames,
+                    !all_in_connected,
+                    &self.capture_f32_buffer[..total],
+                    self.channels_in,
                 );
             }
             SampleFormat::S32LE => {
@@ -479,10 +505,12 @@ impl HwDriver {
             SampleFormat::S24LE | SampleFormat::S24BE => {
                 let needs_swap = self.playback_format.needs_swap();
                 let is_be = matches!(self.playback_format, SampleFormat::S24BE);
+                let total = frames * self.channels_out;
                 if is_playing {
                     if !all_out_connected {
                         self.playback_buffer_i32.fill(0);
                     }
+                    self.playback_f32_buffer[..total].fill(0.0);
                     ports::write_interleaved_from_ports(
                         &self.audio_outs,
                         frames,
@@ -491,16 +519,26 @@ impl HwDriver {
                         !all_out_connected,
                         |ch, frame, sample| {
                             let idx = frame * self.channels_out + ch;
-                            let v24 = (sample.clamp(-1.0, 1.0) * convert_policy::F32_TO_I24) as i32;
-                            let mut v = if is_be { v24 << 8 } else { v24 & 0x00FF_FFFF };
-                            if needs_swap {
-                                v = v.swap_bytes();
-                            }
-                            if let Some(dst) = self.playback_buffer_i32.get_mut(idx) {
-                                *dst = v;
+                            if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                                *dst = sample;
                             }
                         },
                     );
+                    crate::simd::convert_f32_to_i24(
+                        &self.playback_f32_buffer[..total],
+                        &mut self.playback_buffer_i32[..total],
+                        convert_policy::F32_TO_I24,
+                    );
+                    if is_be {
+                        for s in &mut self.playback_buffer_i32[..total] {
+                            *s <<= 8;
+                        }
+                    }
+                    if needs_swap {
+                        for s in &mut self.playback_buffer_i32[..total] {
+                            *s = s.swap_bytes();
+                        }
+                    }
                 } else {
                     self.playback_buffer_i32.fill(0);
                 }
@@ -797,12 +835,4 @@ fn foreign_s32() -> SampleFormat {
 #[cfg(target_endian = "big")]
 fn foreign_s32() -> SampleFormat {
     SampleFormat::S32LE
-}
-
-fn sign_extend_24(raw: i32) -> i32 {
-    let mut v = raw & 0x00FF_FFFF;
-    if (v & 0x0080_0000) != 0 {
-        v |= 0xFF00_0000u32 as i32;
-    }
-    v
 }

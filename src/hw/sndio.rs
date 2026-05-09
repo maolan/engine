@@ -75,6 +75,12 @@ pub struct HwDriver {
     output_latency_frames: usize,
     capture_buffer: Vec<u8>,
     playback_buffer: Vec<u8>,
+    capture_f32_buffer: Vec<f32>,
+    playback_f32_buffer: Vec<f32>,
+    capture_temp_i16: Vec<i16>,
+    capture_temp_i32: Vec<i32>,
+    playback_temp_i16: Vec<i16>,
+    playback_temp_i32: Vec<i32>,
     playing: bool,
 }
 
@@ -218,6 +224,8 @@ impl HwDriver {
 
         let capture_buffer = vec![0_u8; period_frames * channels_in * bps];
         let playback_buffer = vec![0_u8; period_frames * channels_out * bps];
+        let capture_f32_buffer = vec![0.0_f32; period_frames * channels_in];
+        let playback_f32_buffer = vec![0.0_f32; period_frames * channels_out];
 
         Ok(Self {
             hdl,
@@ -239,6 +247,12 @@ impl HwDriver {
             output_latency_frames: options.output_latency_frames,
             capture_buffer,
             playback_buffer,
+            capture_f32_buffer,
+            playback_f32_buffer,
+            capture_temp_i16: vec![0; period_frames * channels_in],
+            capture_temp_i32: vec![0; period_frames * channels_in],
+            playback_temp_i16: vec![0; period_frames * channels_out],
+            playback_temp_i32: vec![0; period_frames * channels_out],
             playing: false,
         })
     }
@@ -330,33 +344,306 @@ impl HwDriver {
         let le = self.le;
         let msb = self.msb;
         let channels_in = self.channels_in;
-        let frames = self.period_frames;
-
-        ports::fill_ports_from_interleaved(&self.audio_ins, frames, false, |ch, frame| {
-            let idx = (frame * channels_in + ch) * bps;
-            decode_sample(&self.capture_buffer[idx..idx + bps], bits, bps, le, msb)
-        });
-
-        self.playback_buffer.fill(0);
         let channels_out = self.channels_out;
-        ports::write_interleaved_from_ports(
-            &self.audio_outs,
-            frames,
-            self.output_gain_linear,
-            self.output_balance,
-            false,
-            |ch, frame, sample| {
-                let idx = (frame * channels_out + ch) * bps;
-                encode_sample(
-                    sample,
-                    bits,
-                    bps,
-                    le,
-                    msb,
-                    &mut self.playback_buffer[idx..idx + bps],
+        let frames = self.period_frames;
+        let total_in = frames.saturating_mul(channels_in);
+        let total_out = frames.saturating_mul(channels_out);
+
+        // --- Capture: fast SIMD paths for common bps ---
+        match bps {
+            1 if bits == 8 => {
+                let src = unsafe {
+                    std::slice::from_raw_parts(self.capture_buffer.as_ptr() as *const i8, total_in)
+                };
+                crate::simd::convert_i8_to_f32(
+                    src,
+                    &mut self.capture_f32_buffer[..total_in],
+                    1.0 / 128.0,
                 );
-            },
-        );
+                ports::fill_ports_from_interleaved_buffer(
+                    &self.audio_ins,
+                    frames,
+                    false,
+                    &self.capture_f32_buffer[..total_in],
+                    channels_in,
+                );
+            }
+            2 if bits == 16 => {
+                if !le {
+                    for i in 0..total_in {
+                        let o = i * 2;
+                        self.capture_temp_i16[i] = i16::from_be_bytes([
+                            self.capture_buffer[o],
+                            self.capture_buffer[o + 1],
+                        ]);
+                    }
+                } else {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            self.capture_buffer.as_ptr() as *const i16,
+                            total_in,
+                        )
+                    };
+                    self.capture_temp_i16[..total_in].copy_from_slice(src);
+                }
+                crate::simd::convert_i16_to_f32(
+                    &self.capture_temp_i16[..total_in],
+                    &mut self.capture_f32_buffer[..total_in],
+                    1.0 / 32768.0,
+                );
+                ports::fill_ports_from_interleaved_buffer(
+                    &self.audio_ins,
+                    frames,
+                    false,
+                    &self.capture_f32_buffer[..total_in],
+                    channels_in,
+                );
+            }
+            4 if bits == 32 => {
+                if !le {
+                    for i in 0..total_in {
+                        let o = i * 4;
+                        self.capture_temp_i32[i] = i32::from_be_bytes([
+                            self.capture_buffer[o],
+                            self.capture_buffer[o + 1],
+                            self.capture_buffer[o + 2],
+                            self.capture_buffer[o + 3],
+                        ]);
+                    }
+                } else {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            self.capture_buffer.as_ptr() as *const i32,
+                            total_in,
+                        )
+                    };
+                    self.capture_temp_i32[..total_in].copy_from_slice(src);
+                }
+                crate::simd::convert_i32_to_f32(
+                    &self.capture_temp_i32[..total_in],
+                    &mut self.capture_f32_buffer[..total_in],
+                    1.0 / 2147483648.0,
+                );
+                ports::fill_ports_from_interleaved_buffer(
+                    &self.audio_ins,
+                    frames,
+                    false,
+                    &self.capture_f32_buffer[..total_in],
+                    channels_in,
+                );
+            }
+            4 if bits == 24 && msb => {
+                if !le {
+                    for i in 0..total_in {
+                        let o = i * 4;
+                        self.capture_temp_i32[i] = i32::from_be_bytes([
+                            self.capture_buffer[o],
+                            self.capture_buffer[o + 1],
+                            self.capture_buffer[o + 2],
+                            self.capture_buffer[o + 3],
+                        ]);
+                    }
+                } else {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            self.capture_buffer.as_ptr() as *const i32,
+                            total_in,
+                        )
+                    };
+                    self.capture_temp_i32[..total_in].copy_from_slice(src);
+                }
+                for s in &mut self.capture_temp_i32[..total_in] {
+                    *s >>= 8;
+                }
+                crate::simd::convert_i24_to_f32(
+                    &self.capture_temp_i32[..total_in],
+                    &mut self.capture_f32_buffer[..total_in],
+                    1.0 / 8388608.0,
+                );
+                ports::fill_ports_from_interleaved_buffer(
+                    &self.audio_ins,
+                    frames,
+                    false,
+                    &self.capture_f32_buffer[..total_in],
+                    channels_in,
+                );
+            }
+            _ => {
+                ports::fill_ports_from_interleaved(&self.audio_ins, frames, false, |ch, frame| {
+                    let idx = (frame * channels_in + ch) * bps;
+                    decode_sample(&self.capture_buffer[idx..idx + bps], bits, bps, le, msb)
+                });
+            }
+        }
+
+        // --- Playback: fast SIMD paths for common bps ---
+        self.playback_buffer.fill(0);
+        match bps {
+            1 if bits == 8 => {
+                self.playback_f32_buffer[..total_out].fill(0.0);
+                ports::write_interleaved_from_ports(
+                    &self.audio_outs,
+                    frames,
+                    self.output_gain_linear,
+                    self.output_balance,
+                    false,
+                    |ch, frame, sample| {
+                        let idx = frame * channels_out + ch;
+                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                            *dst = sample;
+                        }
+                    },
+                );
+                crate::simd::convert_f32_to_i8(
+                    &self.playback_f32_buffer[..total_out],
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            self.playback_buffer.as_mut_ptr() as *mut i8,
+                            total_out,
+                        )
+                    },
+                    127.0,
+                );
+            }
+            2 if bits == 16 => {
+                self.playback_f32_buffer[..total_out].fill(0.0);
+                ports::write_interleaved_from_ports(
+                    &self.audio_outs,
+                    frames,
+                    self.output_gain_linear,
+                    self.output_balance,
+                    false,
+                    |ch, frame, sample| {
+                        let idx = frame * channels_out + ch;
+                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                            *dst = sample;
+                        }
+                    },
+                );
+                crate::simd::convert_f32_to_i16(
+                    &self.playback_f32_buffer[..total_out],
+                    &mut self.playback_temp_i16[..total_out],
+                    32767.0,
+                );
+                if !le {
+                    for i in 0..total_out {
+                        let o = i * 2;
+                        let bytes = self.playback_temp_i16[i].to_be_bytes();
+                        self.playback_buffer[o] = bytes[0];
+                        self.playback_buffer[o + 1] = bytes[1];
+                    }
+                } else {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.playback_temp_i16.as_ptr(),
+                            self.playback_buffer.as_mut_ptr() as *mut i16,
+                            total_out,
+                        );
+                    }
+                }
+            }
+            4 if bits == 32 => {
+                self.playback_f32_buffer[..total_out].fill(0.0);
+                ports::write_interleaved_from_ports(
+                    &self.audio_outs,
+                    frames,
+                    self.output_gain_linear,
+                    self.output_balance,
+                    false,
+                    |ch, frame, sample| {
+                        let idx = frame * channels_out + ch;
+                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                            *dst = sample;
+                        }
+                    },
+                );
+                crate::simd::convert_f32_to_i32(
+                    &self.playback_f32_buffer[..total_out],
+                    &mut self.playback_temp_i32[..total_out],
+                    2147483647.0,
+                );
+                if !le {
+                    for i in 0..total_out {
+                        let o = i * 4;
+                        let bytes = self.playback_temp_i32[i].to_be_bytes();
+                        self.playback_buffer[o] = bytes[0];
+                        self.playback_buffer[o + 1] = bytes[1];
+                        self.playback_buffer[o + 2] = bytes[2];
+                        self.playback_buffer[o + 3] = bytes[3];
+                    }
+                } else {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.playback_temp_i32.as_ptr(),
+                            self.playback_buffer.as_mut_ptr() as *mut i32,
+                            total_out,
+                        );
+                    }
+                }
+            }
+            4 if bits == 24 && msb => {
+                self.playback_f32_buffer[..total_out].fill(0.0);
+                ports::write_interleaved_from_ports(
+                    &self.audio_outs,
+                    frames,
+                    self.output_gain_linear,
+                    self.output_balance,
+                    false,
+                    |ch, frame, sample| {
+                        let idx = frame * channels_out + ch;
+                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                            *dst = sample;
+                        }
+                    },
+                );
+                crate::simd::convert_f32_to_i24(
+                    &self.playback_f32_buffer[..total_out],
+                    &mut self.playback_temp_i32[..total_out],
+                    8388607.0,
+                );
+                for s in &mut self.playback_temp_i32[..total_out] {
+                    *s <<= 8;
+                }
+                if !le {
+                    for i in 0..total_out {
+                        let o = i * 4;
+                        let bytes = self.playback_temp_i32[i].to_be_bytes();
+                        self.playback_buffer[o] = bytes[0];
+                        self.playback_buffer[o + 1] = bytes[1];
+                        self.playback_buffer[o + 2] = bytes[2];
+                        self.playback_buffer[o + 3] = bytes[3];
+                    }
+                } else {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.playback_temp_i32.as_ptr(),
+                            self.playback_buffer.as_mut_ptr() as *mut i32,
+                            total_out,
+                        );
+                    }
+                }
+            }
+            _ => {
+                ports::write_interleaved_from_ports(
+                    &self.audio_outs,
+                    frames,
+                    self.output_gain_linear,
+                    self.output_balance,
+                    false,
+                    |ch, frame, sample| {
+                        let idx = (frame * channels_out + ch) * bps;
+                        encode_sample(
+                            sample,
+                            bits,
+                            bps,
+                            le,
+                            msb,
+                            &mut self.playback_buffer[idx..idx + bps],
+                        );
+                    },
+                );
+            }
+        }
 
         Self::write_exact(self.hdl, &self.playback_buffer)
     }

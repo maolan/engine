@@ -860,6 +860,323 @@ unsafe fn convert_i8_to_f32_avx2(src: &[i8], dst: &mut [f32], gain: f32) {
     }
 }
 
+/// Convert i32 samples with lower 24 bits valid to f32 and scale by `gain`.
+/// Sign-extends the lower 24 bits of each i32 before conversion.
+/// `dst` must be at least as long as `src`.
+pub fn convert_i24_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
+    let n = src.len().min(dst.len());
+    if n == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if is_x86_feature_detected!("avx2") {
+            convert_i24_to_f32_avx2(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            convert_i24_to_f32_sse41(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+    }
+    convert_i24_to_f32_scalar(&src[..n], &mut dst[..n], gain);
+}
+
+fn convert_i24_to_f32_scalar(src: &[i32], dst: &mut [f32], gain: f32) {
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        let mut v = *s & 0x00FF_FFFF;
+        if (v & 0x0080_0000) != 0 {
+            v |= 0xFF00_0000u32 as i32;
+        }
+        *d = v as f32 * gain;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+unsafe fn convert_i24_to_f32_sse41(src: &[i32], dst: &mut [f32], gain: f32) {
+    let g = _mm_set1_ps(gain);
+    let mut i = 0;
+    while i + 4 <= src.len() {
+        let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+        let extended = _mm_srai_epi32(_mm_slli_epi32(s, 8), 8);
+        let f = _mm_cvtepi32_ps(extended);
+        let r = _mm_mul_ps(f, g);
+        _mm_storeu_ps(dst.as_mut_ptr().add(i), r);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        let mut v = *s & 0x00FF_FFFF;
+        if (v & 0x0080_0000) != 0 {
+            v |= 0xFF00_0000u32 as i32;
+        }
+        *d = v as f32 * gain;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2")]
+unsafe fn convert_i24_to_f32_avx2(src: &[i32], dst: &mut [f32], gain: f32) {
+    let g = _mm256_set1_ps(gain);
+    let mut i = 0;
+    while i + 8 <= src.len() {
+        let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+        let extended = _mm256_srai_epi32(_mm256_slli_epi32(s, 8), 8);
+        let f = _mm256_cvtepi32_ps(extended);
+        let r = _mm256_mul_ps(f, g);
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
+        i += 8;
+    }
+    if i + 4 <= src.len() {
+        let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+        let extended = _mm_srai_epi32(_mm_slli_epi32(s, 8), 8);
+        let f = _mm_cvtepi32_ps(extended);
+        let r = _mm_mul_ps(f, _mm_set1_ps(gain));
+        _mm_storeu_ps(dst.as_mut_ptr().add(i), r);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        let mut v = *s & 0x00FF_FFFF;
+        if (v & 0x0080_0000) != 0 {
+            v |= 0xFF00_0000u32 as i32;
+        }
+        *d = v as f32 * gain;
+    }
+}
+
+/// Convert f32 samples to i32 and scale by `gain`, masking to lower 24 bits.
+/// Uses truncation toward zero (matching Rust `as i32`).
+/// `dst` must be at least as long as `src`.
+pub fn convert_f32_to_i24(src: &[f32], dst: &mut [i32], gain: f32) {
+    let n = src.len().min(dst.len());
+    if n == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if is_x86_feature_detected!("avx") {
+            convert_f32_to_i24_avx(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+        if is_x86_feature_detected!("sse2") {
+            convert_f32_to_i24_sse2(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+    }
+    convert_f32_to_i24_scalar(&src[..n], &mut dst[..n], gain);
+}
+
+fn convert_f32_to_i24_scalar(src: &[f32], dst: &mut [i32], gain: f32) {
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        *d = (*s * gain) as i32 & 0x00FF_FFFF;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+unsafe fn convert_f32_to_i24_sse2(src: &[f32], dst: &mut [i32], gain: f32) {
+    let g = _mm_set1_ps(gain);
+    let mask = _mm_set1_epi32(0x00FF_FFFF);
+    let mut i = 0;
+    while i + 4 <= src.len() {
+        let s = _mm_loadu_ps(src.as_ptr().add(i));
+        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g));
+        let m = _mm_and_si128(v, mask);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, m);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i32 & 0x00FF_FFFF;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx")]
+unsafe fn convert_f32_to_i24_avx(src: &[f32], dst: &mut [i32], gain: f32) {
+    let g = _mm256_set1_ps(gain);
+    let mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x00FF_FFFF));
+    let mut i = 0;
+    while i + 8 <= src.len() {
+        let s = _mm256_loadu_ps(src.as_ptr().add(i));
+        let v = _mm256_cvttps_epi32(_mm256_mul_ps(s, g));
+        let m = _mm256_castps_si256(_mm256_and_ps(_mm256_castsi256_ps(v), mask));
+        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, m);
+        i += 8;
+    }
+    if i + 4 <= src.len() {
+        let g_sse = _mm_set1_ps(gain);
+        let mask_sse = _mm_set1_epi32(0x00FF_FFFF);
+        let s = _mm_loadu_ps(src.as_ptr().add(i));
+        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g_sse));
+        let m = _mm_and_si128(v, mask_sse);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, m);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i32 & 0x00FF_FFFF;
+    }
+}
+
+/// Convert f32 samples to i32 and scale by `gain`.
+/// Uses truncation toward zero (matching Rust `as i32`).
+/// `dst` must be at least as long as `src`.
+pub fn convert_f32_to_i32(src: &[f32], dst: &mut [i32], gain: f32) {
+    let n = src.len().min(dst.len());
+    if n == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if is_x86_feature_detected!("avx") {
+            convert_f32_to_i32_avx(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+        if is_x86_feature_detected!("sse2") {
+            convert_f32_to_i32_sse2(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+    }
+    convert_f32_to_i32_scalar(&src[..n], &mut dst[..n], gain);
+}
+
+fn convert_f32_to_i32_scalar(src: &[f32], dst: &mut [i32], gain: f32) {
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        *d = (*s * gain) as i32;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+unsafe fn convert_f32_to_i32_sse2(src: &[f32], dst: &mut [i32], gain: f32) {
+    let g = _mm_set1_ps(gain);
+    let mut i = 0;
+    while i + 4 <= src.len() {
+        let s = _mm_loadu_ps(src.as_ptr().add(i));
+        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g));
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, v);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i32;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx")]
+unsafe fn convert_f32_to_i32_avx(src: &[f32], dst: &mut [i32], gain: f32) {
+    let g = _mm256_set1_ps(gain);
+    let mut i = 0;
+    while i + 8 <= src.len() {
+        let s = _mm256_loadu_ps(src.as_ptr().add(i));
+        let v = _mm256_cvttps_epi32(_mm256_mul_ps(s, g));
+        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, v);
+        i += 8;
+    }
+    if i + 4 <= src.len() {
+        let s = _mm_loadu_ps(src.as_ptr().add(i));
+        let v = _mm_cvttps_epi32(_mm_mul_ps(s, _mm_set1_ps(gain)));
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, v);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i32;
+    }
+}
+
+/// Convert f32 samples to i16 and scale by `gain`.
+/// Uses truncation toward zero (matching Rust `as i16`).
+/// `dst` must be at least as long as `src`.
+pub fn convert_f32_to_i16(src: &[f32], dst: &mut [i16], gain: f32) {
+    let n = src.len().min(dst.len());
+    if n == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if is_x86_feature_detected!("sse2") {
+            convert_f32_to_i16_sse2(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+    }
+    convert_f32_to_i16_scalar(&src[..n], &mut dst[..n], gain);
+}
+
+fn convert_f32_to_i16_scalar(src: &[f32], dst: &mut [i16], gain: f32) {
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        *d = (*s * gain) as i16;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+unsafe fn convert_f32_to_i16_sse2(src: &[f32], dst: &mut [i16], gain: f32) {
+    let g = _mm_set1_ps(gain);
+    let mut i = 0;
+    while i + 8 <= src.len() {
+        let s0 = _mm_loadu_ps(src.as_ptr().add(i));
+        let s1 = _mm_loadu_ps(src.as_ptr().add(i + 4));
+        let v0 = _mm_cvttps_epi32(_mm_mul_ps(s0, g));
+        let v1 = _mm_cvttps_epi32(_mm_mul_ps(s1, g));
+        let packed = _mm_packs_epi32(v0, v1);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
+        i += 8;
+    }
+    if i + 4 <= src.len() {
+        let s = _mm_loadu_ps(src.as_ptr().add(i));
+        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g));
+        let packed = _mm_packs_epi32(v, _mm_setzero_si128());
+        _mm_storel_epi64(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i16;
+    }
+}
+
+/// Convert f32 samples to i8 and scale by `gain`.
+/// Uses truncation toward zero (matching Rust `as i8`).
+/// `dst` must be at least as long as `src`.
+pub fn convert_f32_to_i8(src: &[f32], dst: &mut [i8], gain: f32) {
+    let n = src.len().min(dst.len());
+    if n == 0 {
+        return;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if is_x86_feature_detected!("sse2") {
+            convert_f32_to_i8_sse2(&src[..n], &mut dst[..n], gain);
+            return;
+        }
+    }
+    convert_f32_to_i8_scalar(&src[..n], &mut dst[..n], gain);
+}
+
+fn convert_f32_to_i8_scalar(src: &[f32], dst: &mut [i8], gain: f32) {
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        *d = (*s * gain) as i8;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+unsafe fn convert_f32_to_i8_sse2(src: &[f32], dst: &mut [i8], gain: f32) {
+    let g = _mm_set1_ps(gain);
+    let mut i = 0;
+    while i + 16 <= src.len() {
+        let s0 = _mm_loadu_ps(src.as_ptr().add(i));
+        let s1 = _mm_loadu_ps(src.as_ptr().add(i + 4));
+        let s2 = _mm_loadu_ps(src.as_ptr().add(i + 8));
+        let s3 = _mm_loadu_ps(src.as_ptr().add(i + 12));
+        let v0 = _mm_cvttps_epi32(_mm_mul_ps(s0, g));
+        let v1 = _mm_cvttps_epi32(_mm_mul_ps(s1, g));
+        let v2 = _mm_cvttps_epi32(_mm_mul_ps(s2, g));
+        let v3 = _mm_cvttps_epi32(_mm_mul_ps(s3, g));
+        let p0 = _mm_packs_epi32(v0, v1);
+        let p1 = _mm_packs_epi32(v2, v3);
+        let packed = _mm_packs_epi16(p0, p1);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
+        i += 16;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i8;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fade ramps (sin/cos based)
 // ---------------------------------------------------------------------------

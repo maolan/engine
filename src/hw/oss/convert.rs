@@ -70,6 +70,31 @@ pub(super) fn convert_in_to_i32_interleaved(
         }
     }
 
+    // SSSE3 fast path for S24_LE
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if format == AFMT_S24_LE && is_x86_feature_detected!("ssse3") {
+            let n = frames.saturating_mul(channels).min(dst.len());
+            let mut i = 0;
+            while i + 4 <= n {
+                let bytes = _mm_loadu_si128(src.as_ptr().add(i * 3) as *const __m128i);
+                let shuffle = _mm_set_epi8(-1, 11, 10, 9, -1, 8, 7, 6, -1, 5, 4, 3, -1, 2, 1, 0);
+                let unpacked = _mm_shuffle_epi8(bytes, shuffle);
+                let extended = _mm_srai_epi32(_mm_slli_epi32(unpacked, 8), 8);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, extended);
+                i += 4;
+            }
+            for (j, d) in dst[i..n].iter_mut().enumerate() {
+                let o = (i + j) * 3;
+                let v = ((src[o + 2] as i32) << 24)
+                    | ((src[o + 1] as i32) << 16)
+                    | ((src[o] as i32) << 8);
+                *d = v >> 8;
+            }
+            return;
+        }
+    }
+
     let bps = bytes_per_sample(format).unwrap_or(4);
     let n = frames.saturating_mul(channels);
     for i in 0..n.min(dst.len()) {
@@ -182,6 +207,31 @@ pub(super) fn convert_out_from_i32_interleaved(
                 let o = (i + j) * 2;
                 let v = (*s >> 16) as i16;
                 dst[o..o + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            return;
+        }
+    }
+
+    // SSSE3 fast path for S24_LE
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if format == AFMT_S24_LE && is_x86_feature_detected!("ssse3") {
+            let n = frames.saturating_mul(channels).min(src.len());
+            let mut i = 0;
+            while i + 4 <= n {
+                let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+                let shifted = _mm_srai_epi32(s, 8);
+                let shuffle = _mm_set_epi8(-1, -1, -1, -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0);
+                let packed = _mm_shuffle_epi8(shifted, shuffle);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i * 3) as *mut __m128i, packed);
+                i += 4;
+            }
+            for (j, s) in src[i..n].iter().enumerate() {
+                let o = (i + j) * 3;
+                let v = s >> 8;
+                dst[o] = v as u8;
+                dst[o + 1] = (v >> 8) as u8;
+                dst[o + 2] = (v >> 16) as u8;
             }
             return;
         }
