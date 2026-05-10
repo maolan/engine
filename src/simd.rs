@@ -2,7 +2,7 @@
 //!
 //! Uses runtime CPU feature detection to dispatch:
 //! - AVX (`f32x8`) on x86_64/x86 when available
-//! - SSE (`wide::f32x4`) as fallback on x86_64/x86
+//! - SSE intrinsics as fallback on x86_64/x86
 //! - Scalar loops on all other architectures
 
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -10,7 +10,6 @@
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 mod x86 {
     pub use std::arch::x86_64::*;
-    pub use wide::f32x4;
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -56,6 +55,10 @@ pub fn mul_inplace(dst: &mut [f32], gain: f32) {
 pub fn add_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
+        if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
+            add_scaled_inplace_avx_fma(dst, src, gain);
+            return;
+        }
         if is_x86_feature_detected!("avx") {
             add_scaled_inplace_avx(dst, src, gain);
             return;
@@ -221,136 +224,144 @@ fn clamp_inplace_scalar(buf: &mut [f32], min: f32, max: f32) {
 }
 
 // ---------------------------------------------------------------------------
-// SSE paths (wide::f32x4)
+// SSE paths (std::arch::x86/_mm*)
 // ---------------------------------------------------------------------------
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn add_inplace_sse(dst: &mut [f32], src: &[f32]) {
     let len = dst.len().min(src.len());
     let dst_head = &mut dst[..len];
     let src_head = &src[..len];
-    let n = dst_head.len() / 4;
-    for i in 0..n {
-        let d_chunk = &mut dst_head[i * 4..(i + 1) * 4];
-        let s_chunk = &src_head[i * 4..(i + 1) * 4];
-        let d: f32x4 = [d_chunk[0], d_chunk[1], d_chunk[2], d_chunk[3]].into();
-        let s: f32x4 = [s_chunk[0], s_chunk[1], s_chunk[2], s_chunk[3]].into();
-        let r = d + s;
-        d_chunk.copy_from_slice(&r.to_array());
+    let mut i = 0usize;
+    while i + 4 <= dst_head.len() {
+        let d = _mm_loadu_ps(dst_head.as_ptr().add(i));
+        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
+        let r = _mm_add_ps(d, s);
+        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for (d, s) in dst_head[n * 4..].iter_mut().zip(src_head[n * 4..].iter()) {
+    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
         *d += *s;
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn mul_inplace_sse(dst: &mut [f32], gain: f32) {
-    let n = dst.len() / 4;
-    let g: f32x4 = [gain; 4].into();
-    for i in 0..n {
-        let d_chunk = &mut dst[i * 4..(i + 1) * 4];
-        let d: f32x4 = [d_chunk[0], d_chunk[1], d_chunk[2], d_chunk[3]].into();
-        let r = d * g;
-        d_chunk.copy_from_slice(&r.to_array());
+    let g = _mm_set1_ps(gain);
+    let mut i = 0usize;
+    while i + 4 <= dst.len() {
+        let d = _mm_loadu_ps(dst.as_ptr().add(i));
+        let r = _mm_mul_ps(d, g);
+        _mm_storeu_ps(dst.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for d in &mut dst[n * 4..] {
+    for d in &mut dst[i..] {
         *d *= gain;
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn add_scaled_inplace_sse(dst: &mut [f32], src: &[f32], gain: f32) {
     let len = dst.len().min(src.len());
     let dst_head = &mut dst[..len];
     let src_head = &src[..len];
-    let n = dst_head.len() / 4;
-    let g: f32x4 = [gain; 4].into();
-    for i in 0..n {
-        let d_chunk = &mut dst_head[i * 4..(i + 1) * 4];
-        let s_chunk = &src_head[i * 4..(i + 1) * 4];
-        let d: f32x4 = [d_chunk[0], d_chunk[1], d_chunk[2], d_chunk[3]].into();
-        let s: f32x4 = [s_chunk[0], s_chunk[1], s_chunk[2], s_chunk[3]].into();
-        let r = d + s * g;
-        d_chunk.copy_from_slice(&r.to_array());
+    let g = _mm_set1_ps(gain);
+    let mut i = 0usize;
+    while i + 4 <= dst_head.len() {
+        let d = _mm_loadu_ps(dst_head.as_ptr().add(i));
+        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
+        let r = _mm_add_ps(d, _mm_mul_ps(s, g));
+        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for (d, s) in dst_head[n * 4..].iter_mut().zip(src_head[n * 4..].iter()) {
+    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
         *d += *s * gain;
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn copy_scaled_inplace_sse(dst: &mut [f32], src: &[f32], gain: f32) {
     let len = dst.len().min(src.len());
     let dst_head = &mut dst[..len];
     let src_head = &src[..len];
-    let n = dst_head.len() / 4;
-    let g: f32x4 = [gain; 4].into();
-    for i in 0..n {
-        let d_chunk = &mut dst_head[i * 4..(i + 1) * 4];
-        let s_chunk = &src_head[i * 4..(i + 1) * 4];
-        let s: f32x4 = [s_chunk[0], s_chunk[1], s_chunk[2], s_chunk[3]].into();
-        let r = s * g;
-        d_chunk.copy_from_slice(&r.to_array());
+    let g = _mm_set1_ps(gain);
+    let mut i = 0usize;
+    while i + 4 <= dst_head.len() {
+        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
+        let r = _mm_mul_ps(s, g);
+        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for (d, s) in dst_head[n * 4..].iter_mut().zip(src_head[n * 4..].iter()) {
+    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
         *d = *s * gain;
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn add_sanitized_inplace_sse(dst: &mut [f32], src: &[f32]) {
     let len = dst.len().min(src.len());
     let dst_head = &mut dst[..len];
     let src_head = &src[..len];
-    let n = dst_head.len() / 4;
-    let zero: f32x4 = [0.0; 4].into();
-    for i in 0..n {
-        let d_chunk = &mut dst_head[i * 4..(i + 1) * 4];
-        let s_chunk = &src_head[i * 4..(i + 1) * 4];
-        let d: f32x4 = [d_chunk[0], d_chunk[1], d_chunk[2], d_chunk[3]].into();
-        let s: f32x4 = [s_chunk[0], s_chunk[1], s_chunk[2], s_chunk[3]].into();
-        let mask = s.is_finite();
-        let sanitized = mask.blend(s, zero);
-        let r = d + sanitized;
-        d_chunk.copy_from_slice(&r.to_array());
+    let sign_mask = _mm_set1_ps(-0.0);
+    let finite_max = _mm_set1_ps(f32::MAX);
+    let mut i = 0usize;
+    while i + 4 <= dst_head.len() {
+        let d = _mm_loadu_ps(dst_head.as_ptr().add(i));
+        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
+        let abs_s = _mm_andnot_ps(sign_mask, s);
+        let finite_mask = _mm_cmple_ps(abs_s, finite_max);
+        let sanitized = _mm_and_ps(s, finite_mask);
+        let r = _mm_add_ps(d, sanitized);
+        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for (d, s) in dst_head[n * 4..].iter_mut().zip(src_head[n * 4..].iter()) {
+    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
         *d += if s.is_finite() { *s } else { 0.0 };
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn copy_sanitized_inplace_sse(dst: &mut [f32], src: &[f32]) {
     let len = dst.len().min(src.len());
     let dst_head = &mut dst[..len];
     let src_head = &src[..len];
-    let n = dst_head.len() / 4;
-    let zero: f32x4 = [0.0; 4].into();
-    for i in 0..n {
-        let d_chunk = &mut dst_head[i * 4..(i + 1) * 4];
-        let s_chunk = &src_head[i * 4..(i + 1) * 4];
-        let s: f32x4 = [s_chunk[0], s_chunk[1], s_chunk[2], s_chunk[3]].into();
-        let mask = s.is_finite();
-        let r = mask.blend(s, zero);
-        d_chunk.copy_from_slice(&r.to_array());
+    let sign_mask = _mm_set1_ps(-0.0);
+    let finite_max = _mm_set1_ps(f32::MAX);
+    let mut i = 0usize;
+    while i + 4 <= dst_head.len() {
+        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
+        let abs_s = _mm_andnot_ps(sign_mask, s);
+        let finite_mask = _mm_cmple_ps(abs_s, finite_max);
+        let r = _mm_and_ps(s, finite_mask);
+        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for (d, s) in dst_head[n * 4..].iter_mut().zip(src_head[n * 4..].iter()) {
+    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
         *d = if s.is_finite() { *s } else { 0.0 };
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn sanitize_finite_inplace_sse(buf: &mut [f32]) {
-    let n = buf.len() / 4;
-    let zero: f32x4 = [0.0; 4].into();
-    for i in 0..n {
-        let chunk = &mut buf[i * 4..(i + 1) * 4];
-        let v: f32x4 = [chunk[0], chunk[1], chunk[2], chunk[3]].into();
-        let mask = v.is_finite();
-        let r = mask.blend(v, zero);
-        chunk.copy_from_slice(&r.to_array());
+    let sign_mask = _mm_set1_ps(-0.0);
+    let finite_max = _mm_set1_ps(f32::MAX);
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let v = _mm_loadu_ps(buf.as_ptr().add(i));
+        let abs_v = _mm_andnot_ps(sign_mask, v);
+        let finite_mask = _mm_cmple_ps(abs_v, finite_max);
+        let r = _mm_and_ps(v, finite_mask);
+        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for s in &mut buf[n * 4..] {
+    for s in &mut buf[i..] {
         if !s.is_finite() {
             *s = 0.0;
         }
@@ -358,33 +369,39 @@ unsafe fn sanitize_finite_inplace_sse(buf: &mut [f32]) {
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn peak_abs_sse(buf: &[f32]) -> f32 {
-    let n = buf.len() / 4;
-    let mut peak: f32x4 = [0.0; 4].into();
-    for i in 0..n {
-        let chunk = &buf[i * 4..(i + 1) * 4];
-        let v: f32x4 = [chunk[0], chunk[1], chunk[2], chunk[3]].into();
-        peak = peak.max(v.abs());
+    let sign_mask = _mm_set1_ps(-0.0);
+    let mut peak = _mm_setzero_ps();
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let v = _mm_loadu_ps(buf.as_ptr().add(i));
+        let abs_v = _mm_andnot_ps(sign_mask, v);
+        peak = _mm_max_ps(peak, abs_v);
+        i += 4;
     }
-    let mut max_scalar = peak.to_array().into_iter().fold(0.0f32, |a, b| a.max(b));
-    for s in &buf[n * 4..] {
+    let mut arr = [0.0f32; 4];
+    _mm_storeu_ps(arr.as_mut_ptr(), peak);
+    let mut max_scalar = arr.into_iter().fold(0.0f32, |a, b| a.max(b));
+    for s in &buf[i..] {
         max_scalar = max_scalar.max(s.abs());
     }
     max_scalar
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
 unsafe fn clamp_inplace_sse(buf: &mut [f32], min: f32, max: f32) {
-    let n = buf.len() / 4;
-    let vmin: f32x4 = [min; 4].into();
-    let vmax: f32x4 = [max; 4].into();
-    for i in 0..n {
-        let chunk = &mut buf[i * 4..(i + 1) * 4];
-        let v: f32x4 = [chunk[0], chunk[1], chunk[2], chunk[3]].into();
-        let r = v.clamp(vmin, vmax);
-        chunk.copy_from_slice(&r.to_array());
+    let vmin = _mm_set1_ps(min);
+    let vmax = _mm_set1_ps(max);
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let v = _mm_loadu_ps(buf.as_ptr().add(i));
+        let r = _mm_min_ps(_mm_max_ps(v, vmin), vmax);
+        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
+        i += 4;
     }
-    for s in &mut buf[n * 4..] {
+    for s in &mut buf[i..] {
         *s = s.clamp(min, max);
     }
 }
@@ -440,6 +457,26 @@ unsafe fn add_scaled_inplace_avx(dst: &mut [f32], src: &[f32], gain: f32) {
         let d = _mm256_loadu_ps(dst_head.as_ptr().add(i));
         let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
         let r = _mm256_add_ps(d, _mm256_mul_ps(s, g));
+        _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
+        i += 8;
+    }
+    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
+        *d += *s * gain;
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx,fma")]
+unsafe fn add_scaled_inplace_avx_fma(dst: &mut [f32], src: &[f32], gain: f32) {
+    let len = dst.len().min(src.len());
+    let dst_head = &mut dst[..len];
+    let src_head = &src[..len];
+    let g = _mm256_set1_ps(gain);
+    let mut i = 0;
+    while i + 8 <= dst_head.len() {
+        let d = _mm256_loadu_ps(dst_head.as_ptr().add(i));
+        let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
+        let r = _mm256_fmadd_ps(s, g, d);
         _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
         i += 8;
     }
@@ -1090,6 +1127,10 @@ pub fn convert_f32_to_i16(src: &[f32], dst: &mut [i16], gain: f32) {
     }
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
+        if is_x86_feature_detected!("avx") {
+            convert_f32_to_i16_avx(&src[..n], &mut dst[..n], gain);
+            return;
+        }
         if is_x86_feature_detected!("sse2") {
             convert_f32_to_i16_sse2(&src[..n], &mut dst[..n], gain);
             return;
@@ -1129,6 +1170,32 @@ unsafe fn convert_f32_to_i16_sse2(src: &[f32], dst: &mut [i16], gain: f32) {
     }
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx")]
+unsafe fn convert_f32_to_i16_avx(src: &[f32], dst: &mut [i16], gain: f32) {
+    let g = _mm256_set1_ps(gain);
+    let mut i = 0usize;
+    while i + 8 <= src.len() {
+        let s = _mm256_loadu_ps(src.as_ptr().add(i));
+        let v = _mm256_cvttps_epi32(_mm256_mul_ps(s, g));
+        let vlo = _mm256_castsi256_si128(v);
+        let vhi = _mm256_extracti128_si256(v, 1);
+        let packed = _mm_packs_epi32(vlo, vhi);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
+        i += 8;
+    }
+    if i + 4 <= src.len() {
+        let s = _mm_loadu_ps(src.as_ptr().add(i));
+        let v = _mm_cvttps_epi32(_mm_mul_ps(s, _mm_set1_ps(gain)));
+        let packed = _mm_packs_epi32(v, _mm_setzero_si128());
+        _mm_storel_epi64(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
+        i += 4;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i16;
+    }
+}
+
 /// Convert f32 samples to i8 and scale by `gain`.
 /// Uses truncation toward zero (matching Rust `as i8`).
 /// `dst` must be at least as long as `src`.
@@ -1139,6 +1206,10 @@ pub fn convert_f32_to_i8(src: &[f32], dst: &mut [i8], gain: f32) {
     }
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
+        if is_x86_feature_detected!("avx") {
+            convert_f32_to_i8_avx(&src[..n], &mut dst[..n], gain);
+            return;
+        }
         if is_x86_feature_detected!("sse2") {
             convert_f32_to_i8_sse2(&src[..n], &mut dst[..n], gain);
             return;
@@ -1177,6 +1248,27 @@ unsafe fn convert_f32_to_i8_sse2(src: &[f32], dst: &mut [i8], gain: f32) {
     }
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx")]
+unsafe fn convert_f32_to_i8_avx(src: &[f32], dst: &mut [i8], gain: f32) {
+    let g = _mm256_set1_ps(gain);
+    let mut i = 0usize;
+    while i + 16 <= src.len() {
+        let s0 = _mm256_loadu_ps(src.as_ptr().add(i));
+        let s1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
+        let v0 = _mm256_cvttps_epi32(_mm256_mul_ps(s0, g));
+        let v1 = _mm256_cvttps_epi32(_mm256_mul_ps(s1, g));
+        let p0 = _mm_packs_epi32(_mm256_castsi256_si128(v0), _mm256_extracti128_si256(v0, 1));
+        let p1 = _mm_packs_epi32(_mm256_castsi256_si128(v1), _mm256_extracti128_si256(v1, 1));
+        let packed = _mm_packs_epi16(p0, p1);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
+        i += 16;
+    }
+    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
+        *d = (*s * gain) as i8;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fade ramps (sin/cos based)
 // ---------------------------------------------------------------------------
@@ -1184,22 +1276,19 @@ unsafe fn convert_f32_to_i8_sse2(src: &[f32], dst: &mut [i8], gain: f32) {
 /// Apply a sine-based fade-in gain ramp in place: `gain = sin(t * π/2)`.
 /// `t` for sample `i` is `(start_t + i as f32 * dt).clamp(0.0, 1.0)`.
 pub fn apply_fade_in_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
-    use wide::f32x4;
-    let pi_2 = f32x4::splat(std::f32::consts::FRAC_PI_2);
-    let dt_vec = f32x4::from([0.0, dt, 2.0 * dt, 3.0 * dt]);
-    let mut i = 0;
-    while i + 4 <= buf.len() {
-        let base_t = f32x4::splat(start_t + i as f32 * dt);
-        let t = (base_t + dt_vec).clamp(f32x4::splat(0.0), f32x4::splat(1.0));
-        let gain = (t * pi_2).sin();
-        let chunk = &mut buf[i..i + 4];
-        let s: f32x4 = [chunk[0], chunk[1], chunk[2], chunk[3]].into();
-        let r = s * gain;
-        chunk.copy_from_slice(&r.to_array());
-        i += 4;
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if is_x86_feature_detected!("avx") {
+            apply_fade_in_inplace_avx(buf, start_t, dt);
+            return;
+        }
+        if is_x86_feature_detected!("sse") {
+            apply_fade_in_inplace_sse(buf, start_t, dt);
+            return;
+        }
     }
-    for (j, v) in buf[i..].iter_mut().enumerate() {
-        let t = (((i + j) as f32 * dt) + start_t).clamp(0.0, 1.0);
+    for (i, v) in buf.iter_mut().enumerate() {
+        let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
         *v *= (t * std::f32::consts::FRAC_PI_2).sin();
     }
 }
@@ -1207,22 +1296,107 @@ pub fn apply_fade_in_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
 /// Apply a cosine-based fade-out gain ramp in place: `gain = cos(t * π/2)`.
 /// `t` for sample `i` is `(start_t + i as f32 * dt).clamp(0.0, 1.0)`.
 pub fn apply_fade_out_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
-    use wide::f32x4;
-    let pi_2 = f32x4::splat(std::f32::consts::FRAC_PI_2);
-    let dt_vec = f32x4::from([0.0, dt, 2.0 * dt, 3.0 * dt]);
-    let mut i = 0;
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        if is_x86_feature_detected!("avx") {
+            apply_fade_out_inplace_avx(buf, start_t, dt);
+            return;
+        }
+        if is_x86_feature_detected!("sse") {
+            apply_fade_out_inplace_sse(buf, start_t, dt);
+            return;
+        }
+    }
+    for (i, v) in buf.iter_mut().enumerate() {
+        let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
+        *v *= (t * std::f32::consts::FRAC_PI_2).cos();
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx")]
+unsafe fn apply_fade_in_inplace_avx(buf: &mut [f32], start_t: f32, dt: f32) {
+    let mut i = 0usize;
+    while i + 8 <= buf.len() {
+        let mut gain = [0.0f32; 8];
+        for (lane, g) in gain.iter_mut().enumerate() {
+            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
+            *g = (t * std::f32::consts::FRAC_PI_2).sin();
+        }
+        let s = _mm256_loadu_ps(buf.as_ptr().add(i));
+        let g = _mm256_loadu_ps(gain.as_ptr());
+        let r = _mm256_mul_ps(s, g);
+        _mm256_storeu_ps(buf.as_mut_ptr().add(i), r);
+        i += 8;
+    }
+    for (j, v) in buf[i..].iter_mut().enumerate() {
+        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
+        *v *= (t * std::f32::consts::FRAC_PI_2).sin();
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
+unsafe fn apply_fade_in_inplace_sse(buf: &mut [f32], start_t: f32, dt: f32) {
+    let mut i = 0usize;
     while i + 4 <= buf.len() {
-        let base_t = f32x4::splat(start_t + i as f32 * dt);
-        let t = (base_t + dt_vec).clamp(f32x4::splat(0.0), f32x4::splat(1.0));
-        let gain = (t * pi_2).cos();
-        let chunk = &mut buf[i..i + 4];
-        let s: f32x4 = [chunk[0], chunk[1], chunk[2], chunk[3]].into();
-        let r = s * gain;
-        chunk.copy_from_slice(&r.to_array());
+        let mut gain = [0.0f32; 4];
+        for (lane, g) in gain.iter_mut().enumerate() {
+            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
+            *g = (t * std::f32::consts::FRAC_PI_2).sin();
+        }
+        let s = _mm_loadu_ps(buf.as_ptr().add(i));
+        let g = _mm_loadu_ps(gain.as_ptr());
+        let r = _mm_mul_ps(s, g);
+        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
         i += 4;
     }
     for (j, v) in buf[i..].iter_mut().enumerate() {
-        let t = (((i + j) as f32 * dt) + start_t).clamp(0.0, 1.0);
+        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
+        *v *= (t * std::f32::consts::FRAC_PI_2).sin();
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx")]
+unsafe fn apply_fade_out_inplace_avx(buf: &mut [f32], start_t: f32, dt: f32) {
+    let mut i = 0usize;
+    while i + 8 <= buf.len() {
+        let mut gain = [0.0f32; 8];
+        for (lane, g) in gain.iter_mut().enumerate() {
+            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
+            *g = (t * std::f32::consts::FRAC_PI_2).cos();
+        }
+        let s = _mm256_loadu_ps(buf.as_ptr().add(i));
+        let g = _mm256_loadu_ps(gain.as_ptr());
+        let r = _mm256_mul_ps(s, g);
+        _mm256_storeu_ps(buf.as_mut_ptr().add(i), r);
+        i += 8;
+    }
+    for (j, v) in buf[i..].iter_mut().enumerate() {
+        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
+        *v *= (t * std::f32::consts::FRAC_PI_2).cos();
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse")]
+unsafe fn apply_fade_out_inplace_sse(buf: &mut [f32], start_t: f32, dt: f32) {
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let mut gain = [0.0f32; 4];
+        for (lane, g) in gain.iter_mut().enumerate() {
+            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
+            *g = (t * std::f32::consts::FRAC_PI_2).cos();
+        }
+        let s = _mm_loadu_ps(buf.as_ptr().add(i));
+        let g = _mm_loadu_ps(gain.as_ptr());
+        let r = _mm_mul_ps(s, g);
+        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
+        i += 4;
+    }
+    for (j, v) in buf[i..].iter_mut().enumerate() {
+        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
         *v *= (t * std::f32::consts::FRAC_PI_2).cos();
     }
 }
