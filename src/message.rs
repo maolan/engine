@@ -291,6 +291,7 @@ pub enum Action {
     SetSessionPath(String),
     BeginHistoryGroup,
     EndHistoryGroup,
+    ApplyGroupedActions(Vec<Action>),
     ClearHistory,
     BeginSessionRestore,
     EndSessionRestore,
@@ -355,6 +356,14 @@ pub enum Action {
         length: usize,
         offset: usize,
     },
+    SyncClipBounds {
+        track_name: String,
+        clip_index: usize,
+        kind: Kind,
+        start: usize,
+        length: usize,
+        offset: usize,
+    },
     SetClipMuted {
         track_name: String,
         clip_index: usize,
@@ -383,6 +392,12 @@ pub enum Action {
         kind: Kind,
         clip_index: usize,
         new_name: String,
+    },
+    SetClipSourceName {
+        track_name: String,
+        kind: Kind,
+        clip_index: usize,
+        name: String,
     },
     RenameTrack {
         old_name: String,

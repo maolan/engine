@@ -141,6 +141,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::SetClipFade { .. }
         | Action::SetClipBounds { .. }
         | Action::SetClipMuted { .. }
+        | Action::SetClipSourceName { .. }
         | Action::ClearAllMidiLearnBindings
         | Action::Connect { .. }
         | Action::Disconnect { .. }
@@ -537,7 +538,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                         clip_index: *clip_index,
                         kind: *kind,
                         start: clip.start,
-                        length: clip.end.max(1),
+                        length: clip.end.saturating_sub(clip.start).max(1),
                         offset: clip.offset,
                     })
                 }
@@ -548,7 +549,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                         clip_index: *clip_index,
                         kind: *kind,
                         start: clip.start,
-                        length: clip.end.max(1),
+                        length: clip.end.saturating_sub(clip.start).max(1),
                         offset: clip.offset,
                     })
                 }
@@ -571,6 +572,25 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 clip_index: *clip_index,
                 kind: *kind,
                 muted,
+            })
+        }
+        Action::SetClipSourceName {
+            track_name,
+            clip_index,
+            kind,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let name = match kind {
+                Kind::Audio => track_lock.audio.clips.get(*clip_index)?.name.clone(),
+                Kind::MIDI => track_lock.midi.clips.get(*clip_index)?.name.clone(),
+            };
+            Some(Action::SetClipSourceName {
+                track_name: track_name.clone(),
+                kind: *kind,
+                clip_index: *clip_index,
+                name,
             })
         }
         Action::SetClipPitchCorrection {
@@ -1532,7 +1552,7 @@ mod tests {
                 assert_eq!(clip_index, 0);
                 assert_eq!(kind, Kind::Audio);
                 assert_eq!(start, 10);
-                assert_eq!(length, 30);
+                assert_eq!(length, 20);
                 assert_eq!(offset, 7);
             }
             other => panic!("unexpected inverse action: {other:?}"),
@@ -1577,7 +1597,7 @@ mod tests {
                 assert_eq!(clip_index, 0);
                 assert_eq!(kind, Kind::MIDI);
                 assert_eq!(start, 24);
-                assert_eq!(length, 120);
+                assert_eq!(length, 96);
                 assert_eq!(offset, 9);
             }
             other => panic!("unexpected inverse action: {other:?}"),

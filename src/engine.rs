@@ -2514,7 +2514,11 @@ impl Engine {
         }
         let length = rec.samples.len() / rec.channels;
         let clip_rel_name = format!("audio/{}", rec.file_name);
-        let clip = AudioClip::new(clip_rel_name.clone(), rec.start_sample, length);
+        let clip = AudioClip::new(
+            clip_rel_name.clone(),
+            rec.start_sample,
+            rec.start_sample.saturating_add(length.max(1)),
+        );
         let (audio_ins, audio_outs) = if let Some(track) = self.state.lock().tracks.get(&track_name)
         {
             let track = track.lock();
@@ -2652,7 +2656,11 @@ impl Engine {
             .await;
             return;
         }
-        let mut clip = MIDIClip::new(clip_rel_name.clone(), rec.start_sample, clip_len_samples);
+        let mut clip = MIDIClip::new(
+            clip_rel_name.clone(),
+            rec.start_sample,
+            rec.start_sample.saturating_add(clip_len_samples.max(1)),
+        );
         clip.offset = 0;
         if let Some(track) = self.state.lock().tracks.get(&track_name) {
             track.lock().midi.clips.push(clip);
@@ -2776,8 +2784,11 @@ impl Engine {
             let track = track.lock();
             match request.kind {
                 Kind::Audio => {
-                    let mut clip =
-                        AudioClip::new(request.name.to_string(), request.start, request.length);
+                    let mut clip = AudioClip::new(
+                        request.name.to_string(),
+                        request.start,
+                        request.start.saturating_add(request.length.max(1)),
+                    );
                     clip.offset = request.offset;
                     let max_lane = track.audio.ins.len().saturating_sub(1);
                     clip.input_channel = request.input_channel.min(max_lane);
@@ -2801,8 +2812,11 @@ impl Engine {
                     track.clip_pitch_shifters.clear();
                 }
                 Kind::MIDI => {
-                    let mut clip =
-                        MIDIClip::new(request.name.to_string(), request.start, request.length);
+                    let mut clip = MIDIClip::new(
+                        request.name.to_string(),
+                        request.start,
+                        request.start.saturating_add(request.length.max(1)),
+                    );
                     clip.offset = request.offset;
                     let max_lane = track.midi.ins.len().saturating_sub(1);
                     clip.input_channel = request.input_channel.min(max_lane);
@@ -2814,7 +2828,11 @@ impl Engine {
     }
 
     fn audio_clip_from_data(data: &crate::message::AudioClipData) -> AudioClip {
-        let mut clip = AudioClip::new(data.name.clone(), data.start, data.length.max(1));
+        let mut clip = AudioClip::new(
+            data.name.clone(),
+            data.start,
+            data.start.saturating_add(data.length.max(1)),
+        );
         clip.offset = data.offset;
         clip.input_channel = data.input_channel;
         clip.muted = data.muted;
@@ -2845,7 +2863,11 @@ impl Engine {
     }
 
     fn midi_clip_from_data(data: &crate::message::MidiClipData) -> MIDIClip {
-        let mut clip = MIDIClip::new(data.name.clone(), data.start, data.length.max(1));
+        let mut clip = MIDIClip::new(
+            data.name.clone(),
+            data.start,
+            data.start.saturating_add(data.length.max(1)),
+        );
         clip.offset = data.offset;
         clip.input_channel = data.input_channel;
         clip.muted = data.muted;
@@ -3021,8 +3043,16 @@ impl Engine {
             Kind::Audio => {
                 if let Some(clip) = track.audio.clips.get_mut(clip_index) {
                     clip.start = start;
-                    clip.end = length.max(1);
+                    clip.end = start.saturating_add(length.max(1));
                     clip.offset = offset;
+                    clip.pitch_correction_preview_name = None;
+                    clip.pitch_correction_source_name = None;
+                    clip.pitch_correction_source_offset = None;
+                    clip.pitch_correction_source_length = None;
+                    clip.pitch_correction_points.clear();
+                    clip.pitch_correction_frame_likeness = None;
+                    clip.pitch_correction_inertia_ms = None;
+                    clip.pitch_correction_formant_compensation = None;
                 }
                 #[cfg(unix)]
                 track.clip_pitch_shifters.clear();
@@ -3030,8 +3060,29 @@ impl Engine {
             Kind::MIDI => {
                 if let Some(clip) = track.midi.clips.get_mut(clip_index) {
                     clip.start = start;
-                    clip.end = length.max(1);
+                    clip.end = start.saturating_add(length.max(1));
                     clip.offset = offset;
+                }
+            }
+        }
+    }
+
+    fn set_clip_source_name(&self, track_name: &str, clip_index: usize, kind: Kind, name: String) {
+        let Some(track) = self.state.lock().tracks.get(track_name) else {
+            return;
+        };
+        let track = track.lock();
+        match kind {
+            Kind::Audio => {
+                if let Some(clip) = track.audio.clips.get_mut(clip_index) {
+                    clip.name = name;
+                }
+                #[cfg(unix)]
+                track.clip_pitch_shifters.clear();
+            }
+            Kind::MIDI => {
+                if let Some(clip) = track.midi.clips.get_mut(clip_index) {
+                    clip.name = name;
                 }
             }
         }
@@ -3543,8 +3594,10 @@ impl Engine {
         match a {
             Action::Undo => {
                 let Some(actions) = self.history.undo() else {
+                    eprintln!("[undo] stack empty");
                     return;
                 };
+                eprintln!("[undo] applying {} action(s): {:?}", actions.len(), actions);
                 let was_suspended = self.history_suspended;
                 self.history_suspended = true;
                 for action in actions {
@@ -3554,14 +3607,25 @@ impl Engine {
             }
             Action::Redo => {
                 let Some(actions) = self.history.redo() else {
+                    eprintln!("[redo] stack empty");
                     return;
                 };
+                eprintln!("[redo] applying {} action(s): {:?}", actions.len(), actions);
                 let was_suspended = self.history_suspended;
                 self.history_suspended = true;
                 for action in actions {
                     self.handle_request_inner(action, false).await;
                 }
                 self.history_suspended = was_suspended;
+            }
+            Action::ApplyGroupedActions(actions) => {
+                self.handle_request_inner(Action::BeginHistoryGroup, true)
+                    .await;
+                for action in actions {
+                    self.handle_request_inner(action, true).await;
+                }
+                self.handle_request_inner(Action::EndHistoryGroup, true)
+                    .await;
             }
             other => {
                 self.handle_request_inner(other, true).await;
@@ -3917,10 +3981,13 @@ impl Engine {
             }
             Action::BeginHistoryGroup => {
                 if self.history_group.is_none() {
+                    eprintln!("[history] begin group");
                     self.history_group = Some(UndoEntry {
                         forward_actions: vec![],
                         inverse_actions: vec![],
                     });
+                } else {
+                    eprintln!("[history] begin group (already open)");
                 }
             }
             Action::EndHistoryGroup => {
@@ -3928,7 +3995,16 @@ impl Engine {
                     && !group.forward_actions.is_empty()
                     && !group.inverse_actions.is_empty()
                 {
+                    eprintln!(
+                        "[history] end group record forward={} inverse={} forward_actions={:?} inverse_actions={:?}",
+                        group.forward_actions.len(),
+                        group.inverse_actions.len(),
+                        group.forward_actions,
+                        group.inverse_actions
+                    );
                     self.history.record(group);
+                } else {
+                    eprintln!("[history] end group (empty or missing)");
                 }
             }
             Action::SetSessionPath(ref path) => {
@@ -5936,6 +6012,14 @@ impl Engine {
             } => {
                 self.rename_clip_references(track_name, kind, clip_index, new_name);
             }
+            Action::SetClipSourceName {
+                ref track_name,
+                kind,
+                clip_index,
+                ref name,
+            } => {
+                self.set_clip_source_name(track_name, clip_index, kind, name.clone());
+            }
             Action::SetClipFade {
                 ref track_name,
                 clip_index,
@@ -5954,6 +6038,16 @@ impl Engine {
                 );
             }
             Action::SetClipBounds {
+                ref track_name,
+                clip_index,
+                kind,
+                start,
+                length,
+                offset,
+            } => {
+                self.set_clip_bounds(track_name, clip_index, kind, start, length, offset);
+            }
+            Action::SyncClipBounds {
                 ref track_name,
                 clip_index,
                 kind,
@@ -6705,6 +6799,7 @@ impl Engine {
             Action::HWInfo { .. } => {}
             Action::Undo => {} // Already handled at the beginning
             Action::Redo => {} // Already handled at the beginning
+            Action::ApplyGroupedActions(_) => {} // Already handled at request dispatch
             Action::TrackClapProcessor { .. } => {}
             Action::ClipClapProcessor { .. } => {}
         }
@@ -6712,9 +6807,17 @@ impl Engine {
         // Record action in history after successful processing
         if let Some(inverse) = inverse_actions {
             if let Some(group) = self.history_group.as_mut() {
+                eprintln!(
+                    "[history] group push forward={:?} inverse={:?}",
+                    action_to_process, inverse
+                );
                 group.forward_actions.push(action_to_process.clone());
                 group.inverse_actions.splice(0..0, inverse);
             } else {
+                eprintln!(
+                    "[history] single push forward={:?} inverse={:?}",
+                    action_to_process, inverse
+                );
                 self.history.record(UndoEntry {
                     forward_actions: vec![action_to_process.clone()],
                     inverse_actions: inverse,
@@ -7244,6 +7347,60 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn undo_restores_original_clip_bounds_after_stretch_style_group() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/original.wav".to_string(), 100, 220);
+        clip.offset = 12;
+        clip.fade_in_samples = 20;
+        clip.fade_out_samples = 30;
+        track.audio.clips.push(clip);
+        insert_track(&mut engine, track);
+
+        engine.handle_request(Action::BeginHistoryGroup).await;
+        engine
+            .handle_request(Action::SetClipBounds {
+                track_name: "track".to_string(),
+                clip_index: 0,
+                kind: Kind::Audio,
+                start: 120,
+                length: 180,
+                offset: 0,
+            })
+            .await;
+        engine
+            .handle_request(Action::SetClipSourceName {
+                track_name: "track".to_string(),
+                clip_index: 0,
+                kind: Kind::Audio,
+                name: "audio/stretched.wav".to_string(),
+            })
+            .await;
+        engine
+            .handle_request(Action::SetClipFade {
+                track_name: "track".to_string(),
+                clip_index: 0,
+                kind: Kind::Audio,
+                fade_enabled: true,
+                fade_in_samples: 12,
+                fade_out_samples: 12,
+            })
+            .await;
+        engine.handle_request(Action::EndHistoryGroup).await;
+
+        engine.handle_request(Action::Undo).await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        let clip = track.audio.clips.first().expect("clip exists");
+        assert_eq!(clip.name, "audio/original.wav");
+        assert_eq!(clip.start, 100);
+        assert_eq!(clip.end, 220);
+        assert_eq!(clip.end.saturating_sub(clip.start), 120);
+        assert_eq!(clip.offset, 12);
     }
 
     #[tokio::test]
