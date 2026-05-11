@@ -551,9 +551,7 @@ impl ClapProcessor {
             let _thread_scope = HostThreadScope::enter_main();
             self.plugin_handle.on_main_thread();
         }
-        if host_flags.process {
-            // Host already continuously schedules process blocks.
-        }
+        if host_flags.process {}
     }
 
     fn process_native(
@@ -670,7 +668,6 @@ impl ClapProcessor {
         }
         let processed = result?;
         if processed {
-            // Downmix multi-channel CLAP output ports into track output buffers.
             for (port_idx, out_buf) in out_buffers.iter_mut().enumerate() {
                 let Some((scratch_start, scratch_end)) = out_channel_scratch_ranges.get(port_idx)
                 else {
@@ -1415,11 +1412,8 @@ impl HostRuntime {
     }
 }
 
-// SAFETY: HostRuntime owns stable CString storage and a CLAP host struct that
-// contains raw pointers into that owned storage. The data is immutable after
-// construction and safe to share/move across threads.
 unsafe impl Send for HostRuntime {}
-// SAFETY: See Send rationale above; HostRuntime has no interior mutation.
+
 unsafe impl Sync for HostRuntime {}
 
 struct PluginHandle {
@@ -1430,10 +1424,8 @@ struct PluginHandle {
     plugin_name: String,
 }
 
-// SAFETY: PluginHandle only stores pointers/libraries managed by the CLAP ABI.
-// Access to plugin processing is synchronized by the engine track scheduling.
 unsafe impl Send for PluginHandle {}
-// SAFETY: Shared references do not mutate PluginHandle fields directly.
+
 unsafe impl Sync for PluginHandle {}
 
 impl PluginHandle {
@@ -1446,9 +1438,8 @@ impl PluginHandle {
     ) -> Result<Self, String> {
         let factory_id = c"clap.plugin-factory";
 
-        // SAFETY: We keep `library` alive for at least as long as plugin and entry pointers.
         let library = unsafe { Library::new(plugin_path) }.map_err(|e| e.to_string())?;
-        // SAFETY: Symbol name and type follow CLAP ABI (`clap_entry` global variable).
+
         let entry_ptr = unsafe {
             let sym = library
                 .get::<*const ClapPluginEntry>(b"clap_entry\0")
@@ -1458,25 +1449,25 @@ impl PluginHandle {
         if entry_ptr.is_null() {
             return Err("CLAP entry symbol is null".to_string());
         }
-        // SAFETY: entry pointer comes from validated CLAP symbol.
+
         let entry = unsafe { &*entry_ptr };
         let init = entry
             .init
             .ok_or_else(|| "CLAP entry missing init()".to_string())?;
         let host_ptr = &host_runtime.host as *const ClapHost;
-        // SAFETY: Valid host pointer for plugin bundle.
+
         if unsafe { !init(host_ptr) } {
             return Err(format!("CLAP entry init failed for {plugin_path}"));
         }
         let get_factory = entry
             .get_factory
             .ok_or_else(|| "CLAP entry missing get_factory()".to_string())?;
-        // SAFETY: Factory id is a static NUL-terminated C string.
+
         let factory = unsafe { get_factory(factory_id.as_ptr()) } as *const ClapPluginFactory;
         if factory.is_null() {
             return Err("CLAP plugin factory not found".to_string());
         }
-        // SAFETY: factory pointer was validated above.
+
         let factory_ref = unsafe { &*factory };
         let get_count = factory_ref
             .get_plugin_count
@@ -1488,7 +1479,6 @@ impl PluginHandle {
             .create_plugin
             .ok_or_else(|| "CLAP factory missing create_plugin()".to_string())?;
 
-        // SAFETY: factory function pointers are valid CLAP ABI function pointers.
         let count = unsafe { get_count(factory) };
         if count == 0 {
             return Err("CLAP factory returned zero plugins".to_string());
@@ -1496,23 +1486,21 @@ impl PluginHandle {
         let mut selected_id = None::<CString>;
         let mut selected_name = None::<String>;
         for i in 0..count {
-            // SAFETY: i < count.
             let desc = unsafe { get_desc(factory, i) };
             if desc.is_null() {
                 continue;
             }
-            // SAFETY: descriptor pointer comes from factory.
+
             let desc = unsafe { &*desc };
             if desc.id.is_null() {
                 continue;
             }
-            // SAFETY: descriptor id is NUL-terminated per CLAP ABI.
+
             let id = unsafe { CStr::from_ptr(desc.id) };
             let id_str = id.to_string_lossy();
             let name_str = if desc.name.is_null() {
                 String::new()
             } else {
-                // SAFETY: descriptor name is NUL-terminated per CLAP ABI.
                 unsafe { CStr::from_ptr(desc.name) }
                     .to_string_lossy()
                     .into_owned()
@@ -1538,31 +1526,29 @@ impl PluginHandle {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| plugin_path.to_string())
         });
-        // SAFETY: valid host pointer and plugin id.
+
         let plugin = unsafe { create(factory, &host_runtime.host, selected_id.as_ptr()) };
         if plugin.is_null() {
             return Err("CLAP factory create_plugin failed".to_string());
         }
-        // SAFETY: plugin pointer validated above.
+
         let plugin_ref = unsafe { &*plugin };
         let plugin_init = plugin_ref
             .init
             .ok_or_else(|| "CLAP plugin missing init()".to_string())?;
-        // SAFETY: plugin pointer and function pointer follow CLAP ABI.
+
         if unsafe { !plugin_init(plugin) } {
             return Err("CLAP plugin init() failed".to_string());
         }
-        if let Some(activate) = plugin_ref.activate {
-            // SAFETY: plugin pointer and arguments are valid for current engine buffer config.
-            if unsafe { !activate(plugin, sample_rate, frames.max(1), frames.max(1)) } {
-                return Err("CLAP plugin activate() failed".to_string());
-            }
+        if let Some(activate) = plugin_ref.activate
+            && unsafe { !activate(plugin, sample_rate, frames.max(1), frames.max(1)) }
+        {
+            return Err("CLAP plugin activate() failed".to_string());
         }
-        if let Some(start_processing) = plugin_ref.start_processing {
-            // SAFETY: plugin activated above.
-            if unsafe { !start_processing(plugin) } {
-                return Err("CLAP plugin start_processing() failed".to_string());
-            }
+        if let Some(start_processing) = plugin_ref.start_processing
+            && unsafe { !start_processing(plugin) }
+        {
+            return Err("CLAP plugin start_processing() failed".to_string());
         }
         let plugin_id_str = selected_id.to_string_lossy().into_owned();
         Ok(Self {
@@ -1583,87 +1569,82 @@ impl PluginHandle {
     }
 
     fn process(&self, process: &mut ClapProcess) -> Result<bool, String> {
-        // SAFETY: plugin pointer is valid for lifetime of self.
         let plugin = unsafe { &*self.plugin };
         let Some(process_fn) = plugin.process else {
             return Ok(false);
         };
-        // SAFETY: process struct references live buffers for the duration of call.
+
         let _status = unsafe { process_fn(self.plugin, process as *const _) };
         Ok(true)
     }
 
     fn reset(&self) {
-        // SAFETY: plugin pointer valid during self lifetime.
         let plugin = unsafe { &*self.plugin };
         if let Some(reset) = plugin.reset {
-            // SAFETY: function pointer follows CLAP ABI.
             unsafe { reset(self.plugin) };
         }
     }
 
     fn on_main_thread(&self) {
-        // SAFETY: plugin pointer valid during self lifetime.
         let plugin = unsafe { &*self.plugin };
         if let Some(on_main_thread) = plugin.on_main_thread {
-            // SAFETY: function pointer follows CLAP ABI.
             unsafe { on_main_thread(self.plugin) };
         }
     }
 
     fn params_ext(&self) -> Option<&ClapPluginParams> {
         let ext_id = c"clap.params";
-        // SAFETY: plugin pointer is valid while self is alive.
+
         let plugin = unsafe { &*self.plugin };
         let get_extension = plugin.get_extension?;
-        // SAFETY: extension id is a valid static C string.
+
         let ext_ptr = unsafe { get_extension(self.plugin, ext_id.as_ptr()) };
         if ext_ptr.is_null() {
             return None;
         }
-        // SAFETY: CLAP guarantees extension pointer layout for requested extension id.
+
         Some(unsafe { &*(ext_ptr as *const ClapPluginParams) })
     }
 
     fn state_ext(&self) -> Option<&ClapPluginStateExt> {
         let ext_id = c"clap.state";
-        // SAFETY: plugin pointer is valid while self is alive.
+
         let plugin = unsafe { &*self.plugin };
         let get_extension = plugin.get_extension?;
-        // SAFETY: extension id is valid static C string.
+
         let ext_ptr = unsafe { get_extension(self.plugin, ext_id.as_ptr()) };
         if ext_ptr.is_null() {
             return None;
         }
-        // SAFETY: extension pointer layout follows clap.state ABI.
+
         Some(unsafe { &*(ext_ptr as *const ClapPluginStateExt) })
     }
 
     fn audio_ports_ext(&self) -> Option<&ClapPluginAudioPorts> {
         let ext_id = c"clap.audio-ports";
-        // SAFETY: plugin pointer is valid while self is alive.
+
         let plugin = unsafe { &*self.plugin };
         let get_extension = plugin.get_extension?;
-        // SAFETY: extension id is valid static C string.
+
         let ext_ptr = unsafe { get_extension(self.plugin, ext_id.as_ptr()) };
         if ext_ptr.is_null() {
             return None;
         }
-        // SAFETY: extension pointer layout follows clap.audio-ports ABI.
+
         Some(unsafe { &*(ext_ptr as *const ClapPluginAudioPorts) })
     }
 
     fn note_ports_ext(&self) -> Option<&ClapPluginNotePorts> {
         let ext_id = c"clap.note-ports";
-        // SAFETY: plugin pointer is valid while self is alive.
+
         let plugin = unsafe { &*self.plugin };
         let get_extension = plugin.get_extension?;
-        // SAFETY: extension id is valid static C string.
+
         let ext_ptr = unsafe { get_extension(self.plugin, ext_id.as_ptr()) };
         if ext_ptr.is_null() {
             return None;
         }
-        // SAFETY: extension pointer layout follows clap.note-ports ABI.
+
         Some(unsafe { &*(ext_ptr as *const ClapPluginNotePorts) })
     }
 
@@ -1721,7 +1702,7 @@ impl PluginHandle {
         let Some(get_info_fn) = params.get_info else {
             return Vec::new();
         };
-        // SAFETY: function pointers come from plugin extension table.
+
         let count = unsafe { count_fn(self.plugin) };
         let mut out = Vec::with_capacity(count as usize);
         for idx in 0..count {
@@ -1735,7 +1716,7 @@ impl PluginHandle {
                 max_value: 1.0,
                 default_value: 0.0,
             };
-            // SAFETY: info points to valid writable struct.
+
             if unsafe { !get_info_fn(self.plugin, idx, &mut info as *mut _) } {
                 continue;
             }
@@ -1767,7 +1748,7 @@ impl PluginHandle {
         };
         for info in infos {
             let mut value = info.default_value;
-            // SAFETY: pointer to stack `value` is valid and param id belongs to plugin metadata.
+
             if unsafe { !get_value_fn(self.plugin, info.id, &mut value as *mut _) } {
                 value = info.default_value;
             }
@@ -1789,7 +1770,7 @@ impl PluginHandle {
         let (in_events, _in_ctx) = param_input_events_from(param_events);
         let out_cap = param_events.len().max(32);
         let (out_events, mut out_ctx) = output_events_ctx(out_cap);
-        // SAFETY: input/output event wrappers stay valid for duration of flush callback.
+
         unsafe {
             flush_fn(self.plugin, &in_events, &out_events);
         }
@@ -1811,7 +1792,7 @@ impl PluginHandle {
             ctx: (&mut bytes as *mut Vec<u8>).cast::<c_void>(),
             write: Some(clap_ostream_write),
         };
-        // SAFETY: stream callbacks reference `bytes` for duration of call.
+
         if unsafe {
             !save_fn(
                 self.plugin,
@@ -1838,7 +1819,7 @@ impl PluginHandle {
             ctx: (&mut ctx as *mut ClapIStreamCtx).cast::<c_void>(),
             read: Some(clap_istream_read),
         };
-        // SAFETY: stream callbacks reference `ctx` for duration of call.
+
         if unsafe {
             !load_fn(
                 self.plugin,
@@ -1896,9 +1877,9 @@ impl PluginHandle {
         let Some(count_fn) = ext.count else {
             return (None, None);
         };
-        // SAFETY: function pointer comes from plugin extension table.
+
         let in_count = unsafe { count_fn(self.plugin, true) } as usize;
-        // SAFETY: function pointer comes from plugin extension table.
+
         let out_count = unsafe { count_fn(self.plugin, false) } as usize;
         (Some(in_count), Some(out_count))
     }
@@ -2035,7 +2016,6 @@ impl PluginHandle {
 
 impl Drop for PluginHandle {
     fn drop(&mut self) {
-        // SAFETY: pointers were obtained from valid CLAP entry and plugin factory.
         unsafe {
             if !self.plugin.is_null() {
                 let plugin = &*self.plugin;
@@ -2111,7 +2091,7 @@ unsafe extern "C" fn host_get_extension(
     if _extension_id.is_null() {
         return std::ptr::null();
     }
-    // SAFETY: extension id is expected to be a valid NUL-terminated string.
+
     let id = unsafe { CStr::from_ptr(_extension_id) }.to_string_lossy();
     match id.as_ref() {
         "clap.host.thread-check" => {
@@ -2192,7 +2172,7 @@ unsafe extern "C" fn host_timer_register(
             next_tick: Instant::now() + Duration::from_millis(period_ms as u64),
         });
     }
-    // SAFETY: timer_id points to writable u32 provided by plugin.
+
     unsafe {
         *timer_id = id;
     }
@@ -2261,12 +2241,12 @@ unsafe extern "C" fn input_events_size(_list: *const ClapInputEvents) -> u32 {
     if _list.is_null() {
         return 0;
     }
-    // SAFETY: ctx points to ClapInputEventsCtx owned by process_native.
+
     let ctx = unsafe { (*_list).ctx as *const ClapInputEventsCtx };
     if ctx.is_null() {
         return 0;
     }
-    // SAFETY: ctx is valid during process callback lifetime.
+
     unsafe { (*ctx).events.len() as u32 }
 }
 
@@ -2277,12 +2257,12 @@ unsafe extern "C" fn input_events_get(
     if _list.is_null() {
         return std::ptr::null();
     }
-    // SAFETY: ctx points to ClapInputEventsCtx owned by process_native.
+
     let ctx = unsafe { (*_list).ctx as *const ClapInputEventsCtx };
     if ctx.is_null() {
         return std::ptr::null();
     }
-    // SAFETY: ctx is valid during process callback lifetime.
+
     let events = unsafe { &(*ctx).events };
     let Some(event) = events.get(_index as usize) else {
         return std::ptr::null();
@@ -2297,12 +2277,12 @@ unsafe extern "C" fn output_events_try_push(
     if _list.is_null() || _event.is_null() {
         return false;
     }
-    // SAFETY: ctx points to ClapOutputEventsCtx owned by process_native.
+
     let ctx = unsafe { (*_list).ctx as *mut ClapOutputEventsCtx };
     if ctx.is_null() {
         return false;
     }
-    // SAFETY: event pointer is valid for callback lifetime.
+
     let header = unsafe { &*_event };
     if header.space_id != CLAP_CORE_EVENT_SPACE_ID {
         return false;
@@ -2312,9 +2292,9 @@ unsafe extern "C" fn output_events_try_push(
             if (header.size as usize) < std::mem::size_of::<ClapEventMidi>() {
                 return false;
             }
-            // SAFETY: validated type/size above.
+
             let midi = unsafe { &*(_event as *const ClapEventMidi) };
-            // SAFETY: ctx pointer is valid and uniquely owned during processing.
+
             unsafe {
                 (*ctx).midi_events.push(ClapMidiOutputEvent {
                     port: midi.port_index as usize,
@@ -2327,9 +2307,9 @@ unsafe extern "C" fn output_events_try_push(
             if (header.size as usize) < std::mem::size_of::<ClapEventParamValue>() {
                 return false;
             }
-            // SAFETY: validated type/size above.
+
             let param = unsafe { &*(_event as *const ClapEventParamValue) };
-            // SAFETY: ctx pointer is valid and uniquely owned during processing.
+
             unsafe {
                 (*ctx).param_values.push(PendingParamValue {
                     param_id: param.param_id,
@@ -2442,7 +2422,6 @@ fn input_events_from(
             let key = data.get(1).copied().unwrap_or(0).min(127) as i16;
             let velocity_byte = data.get(2).copied().unwrap_or(0);
             let velocity = if is_note_on && velocity_byte == 0 {
-                // Note-on with velocity 0 is conventionally note-off.
                 events.push(ClapInputEvent::Note(ClapEventNote {
                     header: ClapEventHeader {
                         size: std::mem::size_of::<ClapEventNote>() as u32,
@@ -2664,15 +2643,15 @@ unsafe extern "C" fn clap_ostream_write(
     if stream.is_null() || buffer.is_null() {
         return -1;
     }
-    // SAFETY: ctx is initialized by snapshot_state and valid during callback.
+
     let ctx = unsafe { (*stream).ctx as *mut Vec<u8> };
     if ctx.is_null() {
         return -1;
     }
     let n = (size as usize).min(isize::MAX as usize);
-    // SAFETY: source pointer is valid for `n` bytes per caller contract.
+
     let src = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), n) };
-    // SAFETY: ctx points to writable Vec<u8>.
+
     unsafe {
         (*ctx).extend_from_slice(src);
     }
@@ -2687,19 +2666,19 @@ unsafe extern "C" fn clap_istream_read(
     if stream.is_null() || buffer.is_null() {
         return -1;
     }
-    // SAFETY: ctx is initialized by restore_state and valid during callback.
+
     let ctx = unsafe { (*stream).ctx as *mut ClapIStreamCtx<'_> };
     if ctx.is_null() {
         return -1;
     }
-    // SAFETY: ctx points to valid read context.
+
     let ctx = unsafe { &mut *ctx };
     let remaining = ctx.bytes.len().saturating_sub(ctx.offset);
     if remaining == 0 {
         return 0;
     }
     let n = remaining.min(size as usize);
-    // SAFETY: destination pointer is valid for `n` bytes per caller contract.
+
     let dst = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), n) };
     dst.copy_from_slice(&ctx.bytes[ctx.offset..ctx.offset + n]);
     ctx.offset += n;
@@ -2788,12 +2767,12 @@ fn scan_bundle_descriptors(path: &Path, scan_capabilities: bool) -> Vec<ClapPlug
         Ok(runtime) => runtime,
         Err(_) => return Vec::new(),
     };
-    // SAFETY: path points to plugin module file.
+
     let library = match unsafe { Library::new(path) } {
         Ok(lib) => lib,
         Err(_) => return Vec::new(),
     };
-    // SAFETY: symbol is CLAP entry pointer.
+
     let entry_ptr = unsafe {
         match library.get::<*const ClapPluginEntry>(b"clap_entry\0") {
             Ok(sym) => *sym,
@@ -2803,45 +2782,41 @@ fn scan_bundle_descriptors(path: &Path, scan_capabilities: bool) -> Vec<ClapPlug
     if entry_ptr.is_null() {
         return Vec::new();
     }
-    // SAFETY: entry pointer validated above.
+
     let entry = unsafe { &*entry_ptr };
     let Some(init) = entry.init else {
         return Vec::new();
     };
     let host_ptr = &host_runtime.host;
-    // SAFETY: valid host pointer.
+
     if unsafe { !init(host_ptr) } {
         return Vec::new();
     }
     let mut out = Vec::new();
     if let Some(get_factory) = entry.get_factory {
-        // SAFETY: static factory id.
         let factory = unsafe { get_factory(factory_id.as_ptr()) } as *const ClapPluginFactory;
         if !factory.is_null() {
-            // SAFETY: factory pointer validated above.
             let factory_ref = unsafe { &*factory };
             if let (Some(get_count), Some(get_desc)) = (
                 factory_ref.get_plugin_count,
                 factory_ref.get_plugin_descriptor,
             ) {
-                // SAFETY: function pointer from plugin.
                 let count = unsafe { get_count(factory) };
                 for i in 0..count {
-                    // SAFETY: i < count.
                     let desc = unsafe { get_desc(factory, i) };
                     if desc.is_null() {
                         continue;
                     }
-                    // SAFETY: descriptor pointer from plugin factory.
+
                     let desc = unsafe { &*desc };
                     if desc.id.is_null() || desc.name.is_null() {
                         continue;
                     }
-                    // SAFETY: CLAP descriptor strings are NUL-terminated.
+
                     let id = unsafe { CStr::from_ptr(desc.id) }
                         .to_string_lossy()
                         .to_string();
-                    // SAFETY: CLAP descriptor strings are NUL-terminated.
+
                     let name = unsafe { CStr::from_ptr(desc.name) }
                         .to_string_lossy()
                         .to_string();
@@ -2861,7 +2836,7 @@ fn scan_bundle_descriptors(path: &Path, scan_capabilities: bool) -> Vec<ClapPlug
             }
         }
     }
-    // SAFETY: deinit belongs to entry and is valid after init.
+
     if let Some(deinit) = entry.deinit {
         unsafe { deinit() };
     }
@@ -2877,17 +2852,15 @@ fn scan_plugin_capabilities(
     let create = factory.create_plugin?;
 
     let id_cstring = CString::new(plugin_id).ok()?;
-    // SAFETY: valid factory, host, and id pointers.
+
     let plugin = unsafe { create(factory_ptr, host, id_cstring.as_ptr()) };
     if plugin.is_null() {
         return None;
     }
 
-    // SAFETY: plugin pointer validated above.
     let plugin_ref = unsafe { &*plugin };
     let plugin_init = plugin_ref.init?;
 
-    // SAFETY: plugin pointer and function pointer follow CLAP ABI.
     if unsafe { !plugin_init(plugin) } {
         return None;
     }
@@ -2905,29 +2878,23 @@ fn scan_plugin_capabilities(
         midi_outputs: 0,
     };
 
-    // Check for extensions
     if let Some(get_extension) = plugin_ref.get_extension {
-        // Check GUI extension
         let gui_ext_id = c"clap.gui";
-        // SAFETY: extension id is valid static C string.
+
         let gui_ptr = unsafe { get_extension(plugin, gui_ext_id.as_ptr()) };
         if !gui_ptr.is_null() {
             capabilities.has_gui = true;
-            // SAFETY: CLAP guarantees extension pointer layout for requested extension id.
+
             let gui = unsafe { &*(gui_ptr as *const ClapPluginGui) };
 
-            // Check which GUI APIs are supported
             if let Some(is_api_supported) = gui.is_api_supported {
                 for api in ["x11", "cocoa"] {
                     if let Ok(api_cstr) = CString::new(api) {
-                        // Check embedded mode
-                        // SAFETY: valid plugin and API string pointers.
                         if unsafe { is_api_supported(plugin, api_cstr.as_ptr(), false) } {
                             capabilities.gui_apis.push(format!("{} (embedded)", api));
                             capabilities.supports_embedded = true;
                         }
-                        // Check floating mode
-                        // SAFETY: valid plugin and API string pointers.
+
                         if unsafe { is_api_supported(plugin, api_cstr.as_ptr(), true) } {
                             if !capabilities.supports_embedded {
                                 capabilities.gui_apis.push(format!("{} (floating)", api));
@@ -2939,52 +2906,42 @@ fn scan_plugin_capabilities(
             }
         }
 
-        // Check params extension
         let params_ext_id = c"clap.params";
-        // SAFETY: extension id is valid static C string.
+
         let params_ptr = unsafe { get_extension(plugin, params_ext_id.as_ptr()) };
         capabilities.has_params = !params_ptr.is_null();
 
-        // Check state extension
         let state_ext_id = c"clap.state";
-        // SAFETY: extension id is valid static C string.
+
         let state_ptr = unsafe { get_extension(plugin, state_ext_id.as_ptr()) };
         capabilities.has_state = !state_ptr.is_null();
 
-        // Check audio-ports extension
         let audio_ports_ext_id = c"clap.audio-ports";
-        // SAFETY: extension id is valid static C string.
+
         let audio_ports_ptr = unsafe { get_extension(plugin, audio_ports_ext_id.as_ptr()) };
         if !audio_ports_ptr.is_null() {
-            // SAFETY: CLAP guarantees extension pointer layout for requested extension id.
             let audio_ports = unsafe { &*(audio_ports_ptr as *const ClapPluginAudioPorts) };
             if let Some(count_fn) = audio_ports.count {
-                // SAFETY: function pointer comes from plugin extension table.
                 capabilities.audio_inputs = unsafe { count_fn(plugin, true) } as usize;
-                // SAFETY: function pointer comes from plugin extension table.
+
                 capabilities.audio_outputs = unsafe { count_fn(plugin, false) } as usize;
             }
         }
 
-        // Check note-ports extension
         let note_ports_ext_id = c"clap.note-ports";
-        // SAFETY: extension id is valid static C string.
+
         let note_ports_ptr = unsafe { get_extension(plugin, note_ports_ext_id.as_ptr()) };
         if !note_ports_ptr.is_null() {
-            // SAFETY: CLAP guarantees extension pointer layout for requested extension id.
             let note_ports = unsafe { &*(note_ports_ptr as *const ClapPluginNotePorts) };
             if let Some(count_fn) = note_ports.count {
-                // SAFETY: function pointer comes from plugin extension table.
                 capabilities.midi_inputs = unsafe { count_fn(plugin, true) } as usize;
-                // SAFETY: function pointer comes from plugin extension table.
+
                 capabilities.midi_outputs = unsafe { count_fn(plugin, false) } as usize;
             }
         }
     }
 
-    // Clean up plugin instance
     if let Some(destroy) = plugin_ref.destroy {
-        // SAFETY: plugin pointer is valid.
         unsafe { destroy(plugin) };
     }
 

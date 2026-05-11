@@ -145,8 +145,6 @@ impl Worker {
             Some(Self::prepare_track_for_freeze_render(t))
         };
 
-        // Collect all tracks once and compute the dependency closure for the
-        // target track so that unrelated tracks are skipped during bounce.
         let all_tracks: Vec<_> = job.state.lock().tracks.values().cloned().collect();
         let mut output_to_track: std::collections::HashMap<usize, String> =
             std::collections::HashMap::new();
@@ -275,7 +273,6 @@ impl Worker {
                     break;
                 }
                 if !progressed {
-                    // No track was ready — force-process all remaining non-finished tracks.
                     for handle in &relevant_tracks {
                         let t = handle.lock();
                         if t.audio.finished {
@@ -339,7 +336,7 @@ impl Worker {
             cursor = cursor.saturating_add(step);
             block_count += 1;
             let progress = (cursor as f32 / job.length_samples as f32).clamp(0.0, 1.0);
-            // Throttle progress reports to ~1 % steps to avoid async channel overhead.
+
             if progress - last_reported_progress >= 0.01 || cursor >= job.length_samples {
                 last_reported_progress = progress;
                 let _ = self

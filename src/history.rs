@@ -68,9 +68,8 @@ impl History {
 
     pub fn record(&mut self, entry: UndoEntry) {
         self.undo_stack.push_back(entry);
-        self.redo_stack.clear(); // Clear redo stack on new action
+        self.redo_stack.clear();
 
-        // Limit history size
         if self.undo_stack.len() > self.max_history {
             self.undo_stack.pop_front();
         }
@@ -181,7 +180,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         Action::AddTrack { name, .. } => Some(Action::RemoveTrack(name.clone())),
 
         Action::RemoveTrack(name) => {
-            // Find the track to capture its data
             let track = state.tracks.get(name)?;
             let track_lock = track.lock();
             Some(Action::AddTrack {
@@ -199,14 +197,12 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         }),
 
         Action::TrackLevel(name, _new_level) => {
-            // Find current level
             let track = state.tracks.get(name)?;
             let track_lock = track.lock();
             Some(Action::TrackLevel(name.clone(), track_lock.level))
         }
 
         Action::TrackBalance(name, _new_balance) => {
-            // Find current balance
             let track = state.tracks.get(name)?;
             let track_lock = track.lock();
             Some(Action::TrackBalance(name.clone(), track_lock.balance))
@@ -272,7 +268,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         Action::AddClip {
             track_name, kind, ..
         } => {
-            // To undo adding a clip, we need to know which index it will have
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let clip_index = match kind {
@@ -307,11 +302,9 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             kind,
             clip_indices,
         } => {
-            // To undo removing clips, we need to capture their data
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
 
-            // For now, we only support undoing single clip removal
             if clip_indices.len() != 1 {
                 return None;
             }
@@ -400,7 +393,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             clip_index,
             new_name: _,
         } => {
-            // Find current name
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let old_name = match kind {
@@ -437,7 +429,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             };
 
             if *copy {
-                // If it was a copy, we need to remove the newly created clip
                 let dest_track = state.tracks.get(&to.track_name)?;
                 let dest_lock = dest_track.lock();
                 let clip_idx = match kind {
@@ -450,7 +441,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                     clip_indices: vec![clip_idx],
                 })
             } else {
-                // If it was a move, reverse the move from the destination track.
                 let dest_track = state.tracks.get(&to.track_name)?;
                 let dest_lock = dest_track.lock();
                 let dest_len = match kind {
@@ -494,7 +484,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             kind,
             ..
         } => {
-            // Capture current fade settings
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             match kind {
@@ -509,17 +498,14 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                         fade_out_samples: clip.fade_out_samples,
                     })
                 }
-                Kind::MIDI => {
-                    // MIDI clips don't have fade fields in engine, use defaults
-                    Some(Action::SetClipFade {
-                        track_name: track_name.clone(),
-                        clip_index: *clip_index,
-                        kind: *kind,
-                        fade_enabled: true,
-                        fade_in_samples: 240,
-                        fade_out_samples: 240,
-                    })
-                }
+                Kind::MIDI => Some(Action::SetClipFade {
+                    track_name: track_name.clone(),
+                    clip_index: *clip_index,
+                    kind: *kind,
+                    fade_enabled: true,
+                    fade_in_samples: 240,
+                    fade_out_samples: 240,
+                }),
             }
         }
         Action::SetClipBounds {
@@ -961,7 +947,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             old_sysex_events: new_sysex_events.clone(),
         }),
 
-        // These are more complex and would need additional state tracking
         _ => None,
     }
 }

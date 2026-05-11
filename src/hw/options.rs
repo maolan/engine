@@ -31,9 +31,7 @@ mod tests {
     #[test]
     fn hw_options_default_values() {
         let opts: HwOptions = Default::default();
-        // Default values are platform-specific
-        // macOS: exclusive=false, period_frames=512, nperiods=1, sync_mode=true
-        // OSS (FreeBSD/Linux): exclusive=false, period_frames=1024, nperiods=1, sync_mode=false
+
         assert!(!opts.ignore_hwbuf);
         assert_eq!(opts.input_latency_frames, 0);
         assert_eq!(opts.output_latency_frames, 0);

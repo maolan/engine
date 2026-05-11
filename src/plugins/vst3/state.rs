@@ -49,7 +49,6 @@ impl MemoryStream {
         unsafe { self.data_ref().clone() }
     }
 
-    // Helper methods for safe access (used in unsafe blocks)
     #[allow(clippy::mut_from_ref)]
     unsafe fn data_mut(&self) -> &mut Vec<u8> {
         unsafe { &mut *self.data.get() }
@@ -102,7 +101,6 @@ impl IBStreamTrait for MemoryStream {
             return kResultFalse;
         }
 
-        // Copy data from internal buffer to provided buffer
         let src_slice = &data[position..position + actual_read];
         let dst_slice = unsafe { std::slice::from_raw_parts_mut(buffer as *mut u8, actual_read) };
         dst_slice.copy_from_slice(src_slice);
@@ -136,13 +134,11 @@ impl IBStreamTrait for MemoryStream {
         let data = unsafe { self.data_mut() };
         let position = unsafe { *self.position_ref() };
 
-        // Ensure capacity
         let required_len = position + bytes_to_write;
         if required_len > data.len() {
             data.resize(required_len, 0);
         }
 
-        // Write data
         data[position..position + bytes_to_write].copy_from_slice(src_slice);
         unsafe {
             *self.position_mut() += bytes_to_write;
@@ -163,14 +159,12 @@ impl IBStreamTrait for MemoryStream {
 
         let new_position = match mode {
             0 => {
-                // kIBSeekSet - absolute position from start
                 if pos < 0 {
                     return kResultFalse;
                 }
                 pos as usize
             }
             1 => {
-                // kIBSeekCur - relative to current position
                 if pos < 0 {
                     current_pos.saturating_sub((-pos) as usize)
                 } else {
@@ -178,7 +172,6 @@ impl IBStreamTrait for MemoryStream {
                 }
             }
             2 => {
-                // kIBSeekEnd - relative to end
                 if pos > 0 {
                     return kResultFalse;
                 }
@@ -232,14 +225,12 @@ mod tests {
             assert_eq!(written, test_data.len() as i32);
         }
 
-        // Seek back to start
         unsafe {
             let mut new_pos = 0;
             stream.seek(0, 0, &mut new_pos);
             assert_eq!(new_pos, 0);
         }
 
-        // Read back
         let mut read_buffer = vec![0u8; test_data.len()];
         unsafe {
             let mut read_count = 0;
@@ -259,28 +250,24 @@ mod tests {
     fn test_memory_stream_seek() {
         let stream = MemoryStream::from_bytes(b"0123456789");
 
-        // Seek to position 5
         unsafe {
             let mut pos = 0;
             stream.seek(5, 0, &mut pos);
             assert_eq!(pos, 5);
         }
 
-        // Tell should return 5
         unsafe {
             let mut pos = 0;
             stream.tell(&mut pos);
             assert_eq!(pos, 5);
         }
 
-        // Seek relative forward
         unsafe {
             let mut pos = 0;
             stream.seek(2, 1, &mut pos);
             assert_eq!(pos, 7);
         }
 
-        // Seek from end
         unsafe {
             let mut pos = 0;
             stream.seek(-3, 2, &mut pos);

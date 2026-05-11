@@ -215,7 +215,6 @@ pub struct PluginGraphConnection {
 
 pub type PluginGraphSnapshot = (Vec<PluginGraphPlugin>, Vec<PluginGraphConnection>);
 
-// VST3 graph types
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Vst3GraphNode {
     TrackInput,
@@ -422,6 +421,7 @@ pub enum Action {
     TrackToggleMute(String),
     TrackTogglePhase(String),
     TrackToggleSolo(String),
+    TrackToggleMaster(String),
     TrackToggleInputMonitor(String),
     TrackToggleDiskMonitor(String),
     TrackArmMidiLearn {

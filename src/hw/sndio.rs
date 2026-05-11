@@ -349,7 +349,6 @@ impl HwDriver {
         let total_in = frames.saturating_mul(channels_in);
         let total_out = frames.saturating_mul(channels_out);
 
-        // --- Capture: fast SIMD paths for common bps ---
         match bps {
             1 if bits == 8 => {
                 let src = unsafe {
@@ -476,7 +475,6 @@ impl HwDriver {
             }
         }
 
-        // --- Playback: fast SIMD paths for common bps ---
         self.playback_buffer.fill(0);
         match bps {
             1 if bits == 8 => {

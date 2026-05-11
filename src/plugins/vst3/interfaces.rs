@@ -1,11 +1,3 @@
-// VST3 COM interface wrappers using vst3 crate
-//
-// This module provides safe Rust wrappers around VST3 COM interfaces
-// using the vst3 crate's trait-based API.
-
-// The vst3 crate uses platform-dependent types (c_int / DefaultEnumType) for
-// enum constants, so explicit casts are required for cross-platform compilation
-// even though they appear unnecessary on some platforms.
 #![allow(clippy::unnecessary_cast)]
 
 use std::ffi::c_void;
@@ -59,8 +51,6 @@ fn run_loop_state() -> &'static Mutex<HostRunLoopState> {
 }
 
 pub fn pump_host_run_loop() {
-    // Linux VST3 UIs can rely on host-owned timers/fd callbacks.
-    // Drive those callbacks from the GUI-side UI loop.
     let (event_calls, timer_calls): (Vec<(usize, i32)>, Vec<usize>) = {
         let mut state = run_loop_state().lock().expect("run loop mutex poisoned");
         let now = Instant::now();
@@ -101,7 +91,6 @@ pub fn pump_host_run_loop() {
 
 /// Safe wrapper around VST3 plugin factory
 pub struct PluginFactory {
-    // Keep COM objects before the module so they are released before dlclose.
     factory: ComPtr<IPluginFactory>,
     module: libloading::Library,
     module_inited: bool,
@@ -119,17 +108,13 @@ impl std::fmt::Debug for PluginFactory {
 impl PluginFactory {
     /// Load a VST3 plugin bundle and create a factory
     pub fn from_module(bundle_path: &Path) -> Result<Self, String> {
-        // Determine the actual module path based on platform
         let module_path = get_module_path(bundle_path)?;
 
-        // Load the shared library
         let library = unsafe {
             libloading::Library::new(&module_path)
                 .map_err(|e| format!("Failed to load VST3 module {:?}: {}", module_path, e))?
         };
 
-        // Many Windows plugins (including iPlug2-based VST3) rely on InitDll to
-        // initialize module globals used for resource lookup and UI setup.
         let module_inited = unsafe {
             match library.get::<unsafe extern "system" fn() -> bool>(b"InitDll") {
                 Ok(init_dll) => init_dll(),
@@ -137,21 +122,17 @@ impl PluginFactory {
             }
         };
 
-        // Get the factory function
-        // VST3 plugins export: extern "system" fn GetPluginFactory() -> *mut c_void
         let get_factory: libloading::Symbol<unsafe extern "system" fn() -> *mut c_void> = unsafe {
             library
                 .get(b"GetPluginFactory")
                 .map_err(|e| format!("Failed to find GetPluginFactory: {}", e))?
         };
 
-        // Call it to get the factory
         let factory_ptr = unsafe { get_factory() };
         if factory_ptr.is_null() {
             return Err("GetPluginFactory returned null".to_string());
         }
 
-        // Wrap in ComPtr - the vst3 crate provides this smart pointer
         let factory = unsafe { ComPtr::from_raw(factory_ptr as *mut IPluginFactory) }
             .ok_or("Failed to create ComPtr for IPluginFactory")?;
 
@@ -503,7 +484,6 @@ impl PluginInstance {
         use vst3::Steinberg::IPluginBaseTrait;
         use vst3::Steinberg::Vst::{IComponentTrait, IEditControllerTrait};
 
-        // Pass a stable host application context for plugins that require IHostApplication.
         let context = &mut self.host_context.host as *mut IHostApplication as *mut FUnknown;
         let result = unsafe { self.component.initialize(context) };
 
@@ -514,14 +494,12 @@ impl PluginInstance {
             ));
         }
 
-        // Query for IAudioProcessor
         let mut processor_ptr: *mut c_void = std::ptr::null_mut();
         let result = unsafe {
-            // Access the vtable through the raw pointer
             let component_raw = self.component.as_ptr();
             let vtbl = (*component_raw).vtbl;
             let query_interface = (*vtbl).base.base.queryInterface;
-            // Cast IID from [u8; 16] to [i8; 16]
+
             let iid = std::mem::transmute::<&[u8; 16], &[i8; 16]>(&IAudioProcessor::IID);
             query_interface(component_raw as *mut _, iid, &mut processor_ptr)
         };
@@ -531,7 +509,6 @@ impl PluginInstance {
                 unsafe { ComPtr::from_raw(processor_ptr as *mut IAudioProcessor) };
         }
 
-        // Query for IEditController directly from component first.
         let mut controller_ptr: *mut c_void = std::ptr::null_mut();
         let query_result = unsafe {
             let component_raw = self.component.as_ptr();
@@ -545,7 +522,6 @@ impl PluginInstance {
                 unsafe { ComPtr::from_raw(controller_ptr as *mut IEditController) };
         }
 
-        // If not available directly, instantiate the dedicated controller class.
         if self.edit_controller.is_none() {
             let mut controller_cid: TUID = [0; 16];
             let cid_result = unsafe { self.component.getControllerClassId(&mut controller_cid) };
@@ -571,7 +547,6 @@ impl PluginInstance {
             self.component_handler = Some(handler);
         }
 
-        // Connect component and controller via IConnectionPoint when separate
         if let Some(ref controller) = self.edit_controller {
             let _ = connect_component_and_controller(&self.component, controller);
         }
@@ -924,7 +899,6 @@ unsafe extern "system" fn host_query_interface(
 ) -> tresult {
     if this.is_null() || iid.is_null() {
         if !obj.is_null() {
-            // SAFETY: Caller provides output storage.
             unsafe {
                 *obj = std::ptr::null_mut();
             }
@@ -950,7 +924,6 @@ unsafe extern "system" fn host_query_interface(
     let requested_run_loop = false;
     if !(requested_host || requested_unknown || requested_run_loop) {
         if !obj.is_null() {
-            // SAFETY: Caller provides output storage.
             unsafe {
                 *obj = std::ptr::null_mut();
             }
@@ -964,7 +937,6 @@ unsafe extern "system" fn host_query_interface(
             if requested_run_loop {
                 (*ctx).run_loop.ref_count.fetch_add(1, Ordering::Relaxed);
             } else {
-                // SAFETY: `this` is the first field in HostApplicationContext.
                 (*ctx).ref_count.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -975,7 +947,6 @@ unsafe extern "system" fn host_query_interface(
             if requested_run_loop {
                 *obj = (&mut (*ctx).run_loop.iface as *mut Linux::IRunLoop).cast::<c_void>();
             } else {
-                // SAFETY: Caller supplies storage for out-pointer.
                 *obj = this.cast::<c_void>();
             }
         }
@@ -988,7 +959,7 @@ unsafe extern "system" fn host_add_ref(this: *mut FUnknown) -> uint32 {
         return 0;
     }
     let ctx = this as *mut HostApplicationContext;
-    // SAFETY: `this` points to embedded host interface at offset 0.
+
     unsafe { (*ctx).ref_count.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
@@ -997,7 +968,7 @@ unsafe extern "system" fn host_release(this: *mut FUnknown) -> uint32 {
         return 0;
     }
     let ctx = this as *mut HostApplicationContext;
-    // SAFETY: `this` points to embedded host interface at offset 0.
+
     unsafe { (*ctx).ref_count.fetch_sub(1, Ordering::Relaxed) - 1 }
 }
 
@@ -1009,7 +980,7 @@ unsafe extern "system" fn host_get_name(
         return kNoInterface;
     }
     let encoded: Vec<u16> = "Maolan".encode_utf16().collect();
-    // SAFETY: `name` points to writable `String128`.
+
     unsafe {
         (*name).fill(0);
         for (idx, ch) in encoded
@@ -1032,7 +1003,7 @@ unsafe extern "system" fn host_create_instance(
     if obj.is_null() {
         return kInvalidArgument;
     }
-    // SAFETY: caller provided out pointer.
+
     unsafe {
         *obj = std::ptr::null_mut();
     }
@@ -1044,7 +1015,7 @@ unsafe extern "system" fn host_create_instance(
     if wants_message {
         let message = Box::new(HostMessage::new());
         let raw = Box::into_raw(message);
-        // SAFETY: `iface` is first field and valid for COM client usage.
+
         unsafe {
             *obj = (&mut (*raw).iface as *mut IMessage).cast::<c_void>();
         }
@@ -1054,7 +1025,7 @@ unsafe extern "system" fn host_create_instance(
     if wants_attributes {
         let attrs = Box::new(HostAttributeList::new());
         let raw = Box::into_raw(attrs);
-        // SAFETY: `iface` is first field and valid for COM client usage.
+
         unsafe {
             *obj = (&mut (*raw).iface as *mut IAttributeList).cast::<c_void>();
         }
@@ -1174,7 +1145,6 @@ unsafe extern "system" fn run_loop_register_timer(
         next_tick: Instant::now() + interval,
     });
     unsafe {
-        // Kick timer once so plugins that defer first paint to timer callbacks can initialize.
         ((*(*handler).vtbl).onTimer)(handler);
     }
     kResultOk
@@ -1232,7 +1202,7 @@ impl HostMessage {
             },
             ref_count: AtomicU32::new(1),
             message_id: c"".as_ptr(),
-            // SAFETY: `iface` is first field.
+
             attributes: unsafe { &mut (*attrs_raw).iface as *mut IAttributeList },
         }
     }
@@ -1259,7 +1229,7 @@ fn iid_ptr_matches(iid_ptr: *const TUID, guid: &[u8; 16]) -> bool {
     if iid_ptr.is_null() {
         return false;
     }
-    // SAFETY: caller provides valid IID pointer for the duration of call.
+
     let iid = unsafe { &*iid_ptr };
     iid.iter()
         .zip(guid.iter())
@@ -1277,12 +1247,11 @@ unsafe extern "system" fn host_message_query_interface(
     let requested_message = iid_ptr_matches(iid, &IMessage::IID);
     let requested_unknown = iid_ptr_matches(iid, &FUnknown::IID);
     if !(requested_message || requested_unknown) {
-        // SAFETY: out pointer valid.
         unsafe { *obj = std::ptr::null_mut() };
         return kNoInterface;
     }
     let msg = this as *mut HostMessage;
-    // SAFETY: message context pointer is valid.
+
     unsafe {
         (*msg).ref_count.fetch_add(1, Ordering::Relaxed);
         *obj = this.cast::<c_void>();
@@ -1295,7 +1264,7 @@ unsafe extern "system" fn host_message_add_ref(this: *mut FUnknown) -> uint32 {
         return 0;
     }
     let msg = this as *mut HostMessage;
-    // SAFETY: pointer valid for atomic update.
+
     unsafe { (*msg).ref_count.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
@@ -1304,10 +1273,9 @@ unsafe extern "system" fn host_message_release(this: *mut FUnknown) -> uint32 {
         return 0;
     }
     let msg = this as *mut HostMessage;
-    // SAFETY: pointer valid for atomic update.
+
     let remaining = unsafe { (*msg).ref_count.fetch_sub(1, Ordering::AcqRel) - 1 };
     if remaining == 0 {
-        // SAFETY: Release the message-owned reference to attributes before freeing message.
         unsafe {
             if !(*msg).attributes.is_null() {
                 let attrs_unknown = (*msg).attributes.cast::<FUnknown>();
@@ -1325,7 +1293,7 @@ unsafe extern "system" fn host_message_get_id(this: *mut IMessage) -> FIDString 
         return c"".as_ptr();
     }
     let msg = this as *mut HostMessage;
-    // SAFETY: valid pointer for message context.
+
     unsafe { (*msg).message_id }
 }
 
@@ -1334,7 +1302,7 @@ unsafe extern "system" fn host_message_set_id(this: *mut IMessage, id: FIDString
         return;
     }
     let msg = this as *mut HostMessage;
-    // SAFETY: we only keep borrowed pointer; plugin controls lifetime for call scope.
+
     unsafe {
         (*msg).message_id = if id.is_null() { c"".as_ptr() } else { id };
     }
@@ -1345,7 +1313,7 @@ unsafe extern "system" fn host_message_get_attributes(this: *mut IMessage) -> *m
         return std::ptr::null_mut();
     }
     let msg = this as *mut HostMessage;
-    // SAFETY: return a referenced COM pointer to caller.
+
     unsafe {
         if !(*msg).attributes.is_null() {
             let attrs_unknown = (*msg).attributes.cast::<FUnknown>();
@@ -1377,12 +1345,11 @@ unsafe extern "system" fn host_attr_query_interface(
     let requested_attr = iid_ptr_matches(iid, &IAttributeList::IID);
     let requested_unknown = iid_ptr_matches(iid, &FUnknown::IID);
     if !(requested_attr || requested_unknown) {
-        // SAFETY: out pointer valid.
         unsafe { *obj = std::ptr::null_mut() };
         return kNoInterface;
     }
     let attrs = this as *mut HostAttributeList;
-    // SAFETY: pointer valid.
+
     unsafe {
         (*attrs).ref_count.fetch_add(1, Ordering::Relaxed);
         *obj = this.cast::<c_void>();
@@ -1395,7 +1362,7 @@ unsafe extern "system" fn host_attr_add_ref(this: *mut FUnknown) -> uint32 {
         return 0;
     }
     let attrs = this as *mut HostAttributeList;
-    // SAFETY: pointer valid.
+
     unsafe { (*attrs).ref_count.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
@@ -1404,10 +1371,9 @@ unsafe extern "system" fn host_attr_release(this: *mut FUnknown) -> uint32 {
         return 0;
     }
     let attrs = this as *mut HostAttributeList;
-    // SAFETY: pointer valid.
+
     let remaining = unsafe { (*attrs).ref_count.fetch_sub(1, Ordering::AcqRel) - 1 };
     if remaining == 0 {
-        // SAFETY: pointer was allocated with Box::into_raw.
         unsafe {
             let _ = Box::from_raw(attrs);
         }
@@ -1431,7 +1397,7 @@ unsafe extern "system" fn host_attr_get_int(
     if value.is_null() {
         return kInvalidArgument;
     }
-    // SAFETY: caller provides writable pointer.
+
     unsafe { *value = 0 };
     kResultFalse
 }
@@ -1452,7 +1418,7 @@ unsafe extern "system" fn host_attr_get_float(
     if value.is_null() {
         return kInvalidArgument;
     }
-    // SAFETY: caller provides writable pointer.
+
     unsafe { *value = 0.0 };
     kResultFalse
 }
@@ -1474,7 +1440,7 @@ unsafe extern "system" fn host_attr_get_string(
     if string.is_null() || size_in_bytes < std::mem::size_of::<TChar>() as u32 {
         return kInvalidArgument;
     }
-    // SAFETY: buffer has at least one TChar cell.
+
     unsafe { *string = 0 };
     kResultFalse
 }
@@ -1497,7 +1463,7 @@ unsafe extern "system" fn host_attr_get_binary(
     if data.is_null() || size_in_bytes.is_null() {
         return kInvalidArgument;
     }
-    // SAFETY: caller provides writable pointers.
+
     unsafe {
         *data = std::ptr::null();
         *size_in_bytes = 0;
@@ -1525,7 +1491,6 @@ static HOST_ATTRIBUTE_LIST_VTBL: IAttributeListVtbl = IAttributeListVtbl {
 fn get_module_path(bundle_path: &Path) -> Result<std::path::PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
-        // macOS: .vst3/Contents/MacOS/plugin
         let module = bundle_path.join("Contents").join("MacOS").join(
             bundle_path
                 .file_stem()
@@ -1541,7 +1506,6 @@ fn get_module_path(bundle_path: &Path) -> Result<std::path::PathBuf, String> {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
     {
-        // Linux/FreeBSD: .vst3/Contents/x86_64-linux/plugin.so
         let module = bundle_path
             .join("Contents")
             .join("x86_64-linux")
@@ -1561,9 +1525,6 @@ fn get_module_path(bundle_path: &Path) -> Result<std::path::PathBuf, String> {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows: .vst3/Contents/{x86_64-win|x86-win}/plugin.vst3
-        // Scan the architecture directory like rust-vst3-host does,
-        // since binary names don't always match the bundle name.
         let contents = bundle_path.join("Contents");
         let arch_dir = if cfg!(target_arch = "x86_64") {
             contents.join("x86_64-win")
@@ -1584,7 +1545,6 @@ fn get_module_path(bundle_path: &Path) -> Result<std::path::PathBuf, String> {
             }
         }
 
-        // Fallback: try the other architecture directory
         let fallback_dir = if cfg!(target_arch = "x86_64") {
             contents.join("x86-win")
         } else {

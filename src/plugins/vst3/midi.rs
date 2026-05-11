@@ -1,5 +1,3 @@
-// The vst3 crate uses platform-dependent types for enum constants, so explicit
-// casts are required for cross-platform compilation.
 #![allow(clippy::unnecessary_cast)]
 
 use crate::midi::io::MidiEvent;
@@ -570,8 +568,8 @@ mod tests {
     #[test]
     fn test_midi_events_conversion() {
         let midi = vec![
-            MidiEvent::new(0, vec![0x90, 60, 100]),  // Note On C4
-            MidiEvent::new(100, vec![0x80, 60, 64]), // Note Off C4
+            MidiEvent::new(0, vec![0x90, 60, 100]),
+            MidiEvent::new(100, vec![0x80, 60, 64]),
         ];
 
         let buffer = EventBuffer::from_midi_events(&midi, 0);

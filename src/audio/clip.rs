@@ -36,7 +36,7 @@ impl AudioClip {
             muted: false,
             peaks_file: None,
             fade_enabled: true,
-            fade_in_samples: 240, // 5ms at 48kHz
+            fade_in_samples: 240,
             fade_out_samples: 240,
             pitch_correction_preview_name: None,
             pitch_correction_source_name: None,

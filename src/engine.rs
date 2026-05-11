@@ -596,7 +596,6 @@ impl Engine {
         controllers.sort_by_key(|c| (c.sample, c.controller));
         passthrough_events.sort_by_key(|(sample, _)| *sample);
 
-        // Normalize absolute timeline timestamps to clip-relative coordinates.
         let min_sample = notes
             .iter()
             .map(|n| n.start_sample)
@@ -2166,6 +2165,25 @@ impl Engine {
                             .await;
                     }
                 }
+                Action::TrackToggleMaster(ref track_name) => {
+                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                        let blocked = {
+                            let t = track.lock();
+                            t.vca_master.is_some() || !self.vca_followers(track_name).is_empty()
+                        };
+                        if blocked {
+                            self.notify_clients(Err(format!(
+                                "Track '{}' cannot be promoted to Master while part of a VCA group",
+                                track_name
+                            )))
+                            .await;
+                            continue;
+                        }
+                        track.lock().toggle_master();
+                        self.notify_clients(Ok(Action::TrackToggleMaster(track_name.clone())))
+                            .await;
+                    }
+                }
                 Action::TrackToggleArm(ref track_name) => {
                     if let Some(track) = self.state.lock().tracks.get(track_name) {
                         track.lock().arm();
@@ -2212,16 +2230,74 @@ impl Engine {
             .collect()
     }
 
+    fn upstream_audio_track_names(
+        &self,
+        seeds: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        let state = self.state.lock();
+        let mut output_to_track: std::collections::HashMap<
+            *const crate::audio::io::AudioIO,
+            String,
+        > = std::collections::HashMap::new();
+        for (name, track) in &state.tracks {
+            let t = track.lock();
+            for out in &t.audio.outs {
+                output_to_track.insert(std::sync::Arc::as_ptr(out), name.clone());
+            }
+        }
+        let mut upstream = std::collections::HashSet::new();
+        let mut to_process: Vec<String> = seeds.iter().cloned().collect();
+        let mut processed = std::collections::HashSet::new();
+        while let Some(target_name) = to_process.pop() {
+            if !processed.insert(target_name.clone()) {
+                continue;
+            }
+            if let Some(target_track) = state.tracks.get(&target_name) {
+                let tt = target_track.lock();
+                for input in &tt.audio.ins {
+                    for conn in input.connections.lock().iter() {
+                        let conn_ptr = std::sync::Arc::as_ptr(conn);
+                        if let Some(source_name) = output_to_track.get(&conn_ptr)
+                            && source_name != &target_name
+                            && !seeds.contains(source_name)
+                        {
+                            upstream.insert(source_name.clone());
+                            to_process.push(source_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        upstream
+    }
+
     fn apply_mute_solo_policy(&mut self) {
         let mut newly_disabled_tracks = Vec::new();
         {
             let tracks = &self.state.lock().tracks;
-            let any_soloed = tracks.values().any(|t| t.lock().soloed);
+            let soloed: std::collections::HashSet<String> = tracks
+                .iter()
+                .filter_map(|(name, t)| {
+                    if t.lock().soloed {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let any_soloed = !soloed.is_empty();
+            let upstream = if any_soloed {
+                self.upstream_audio_track_names(&soloed)
+            } else {
+                std::collections::HashSet::new()
+            };
             for track in tracks.values() {
                 let t = track.lock();
                 let was_enabled = t.output_enabled;
-                let enabled = if any_soloed {
-                    t.soloed && !t.muted
+                let enabled = if t.is_master {
+                    !t.muted
+                } else if any_soloed {
+                    (t.soloed || upstream.contains(&t.name)) && !t.muted
                 } else {
                     !t.muted
                 };
@@ -2642,7 +2718,7 @@ impl Engine {
             .last()
             .map(|(s, _)| s.saturating_sub(rec.start_sample as u64) as usize + 1)
             .unwrap_or(1);
-        // Normalize to clip-relative coordinates so the file starts at sample 0.
+
         for (sample, _) in &mut rec.events {
             *sample = sample.saturating_sub(rec.start_sample as u64);
         }
@@ -2782,6 +2858,9 @@ impl Engine {
     fn add_clip_to_track(&self, request: ClipAddRequest<'_>) {
         if let Some(track) = self.state.lock().tracks.get(request.track_name) {
             let track = track.lock();
+            if track.is_master {
+                return;
+            }
             match request.kind {
                 Kind::Audio => {
                     let mut clip = AudioClip::new(
@@ -2888,6 +2967,9 @@ impl Engine {
     ) {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
             let track = track.lock();
+            if track.is_master {
+                return;
+            }
             match kind {
                 Kind::Audio => {
                     if let Some(mut clip) = audio_clip.map(|clip| Self::audio_clip_from_data(&clip))
@@ -3425,9 +3507,9 @@ impl Engine {
             t.set_loop_config(self.loop_enabled, self.loop_range_samples);
             t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
             t.process_epoch = self.track_process_epoch;
-            // Avoid continuously mixing clip audio/MIDI while transport is stopped.
+
             t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
-            // Tap buffers are only needed while actively recording.
+
             t.set_record_tap_enabled(self.playing && self.record_enabled);
             t.audio.processing = true;
             self.track_processing_started_at
@@ -3594,10 +3676,9 @@ impl Engine {
         match a {
             Action::Undo => {
                 let Some(actions) = self.history.undo() else {
-                    eprintln!("[undo] stack empty");
                     return;
                 };
-                eprintln!("[undo] applying {} action(s): {:?}", actions.len(), actions);
+
                 let was_suspended = self.history_suspended;
                 self.history_suspended = true;
                 for action in actions {
@@ -3607,10 +3688,9 @@ impl Engine {
             }
             Action::Redo => {
                 let Some(actions) = self.history.redo() else {
-                    eprintln!("[redo] stack empty");
                     return;
                 };
-                eprintln!("[redo] applying {} action(s): {:?}", actions.len(), actions);
+
                 let was_suspended = self.history_suspended;
                 self.history_suspended = true;
                 for action in actions {
@@ -3966,8 +4046,6 @@ impl Engine {
             Action::SetRecordEnabled(enabled) => {
                 self.record_enabled = enabled;
                 if !enabled {
-                    // If a HW cycle is currently in-flight, capture its recorded taps
-                    // before flushing recordings to disk.
                     if self.awaiting_hwfinished {
                         self.append_recorded_cycle();
                     }
@@ -3981,13 +4059,10 @@ impl Engine {
             }
             Action::BeginHistoryGroup => {
                 if self.history_group.is_none() {
-                    eprintln!("[history] begin group");
                     self.history_group = Some(UndoEntry {
                         forward_actions: vec![],
                         inverse_actions: vec![],
                     });
-                } else {
-                    eprintln!("[history] begin group (already open)");
                 }
             }
             Action::EndHistoryGroup => {
@@ -3995,16 +4070,7 @@ impl Engine {
                     && !group.forward_actions.is_empty()
                     && !group.inverse_actions.is_empty()
                 {
-                    eprintln!(
-                        "[history] end group record forward={} inverse={} forward_actions={:?} inverse_actions={:?}",
-                        group.forward_actions.len(),
-                        group.inverse_actions.len(),
-                        group.forward_actions,
-                        group.inverse_actions
-                    );
                     self.history.record(group);
-                } else {
-                    eprintln!("[history] end group (empty or missing)");
                 }
             }
             Action::SetSessionPath(ref path) => {
@@ -4204,14 +4270,12 @@ impl Engine {
                 ref old_name,
                 ref new_name,
             } => {
-                // Check if new name already exists
                 if self.state.lock().tracks.contains_key(new_name) {
                     self.notify_clients(Err(format!("Track '{}' already exists", new_name)))
                         .await;
                     return;
                 }
 
-                // Get the track and update its name
                 let Some(track) = self.state.lock().tracks.remove(old_name) else {
                     self.notify_clients(Err(format!("Track '{}' not found", old_name)))
                         .await;
@@ -4227,7 +4291,6 @@ impl Engine {
                     }
                 }
 
-                // Update recording references
                 if let Some(recording) = self.audio_recordings.remove(old_name) {
                     self.audio_recordings.insert(new_name.clone(), recording);
                 }
@@ -4235,7 +4298,6 @@ impl Engine {
                     self.midi_recordings.insert(new_name.clone(), recording);
                 }
 
-                // Update MIDI routing references
                 for route in &mut self.midi_hw_in_routes {
                     if route.to_track == *old_name {
                         route.to_track = new_name.clone();
@@ -4408,6 +4470,23 @@ impl Engine {
                     }
                 }
             }
+            Action::TrackToggleMaster(ref name) => {
+                if let Some(track) = self.state.lock().tracks.get(name) {
+                    let blocked = {
+                        let t = track.lock();
+                        t.vca_master.is_some() || !self.vca_followers(name).is_empty()
+                    };
+                    if blocked {
+                        self.notify_clients(Err(format!(
+                            "Track '{}' cannot be promoted to Master while part of a VCA group",
+                            name
+                        )))
+                        .await;
+                        return;
+                    }
+                    track.lock().toggle_master();
+                }
+            }
             Action::TrackToggleInputMonitor(ref name) => {
                 if let Some(track) = self.state.lock().tracks.get(name) {
                     track.lock().toggle_input_monitor();
@@ -4523,11 +4602,30 @@ impl Engine {
                         return;
                     }
                 };
+                if track.lock().is_master {
+                    self.notify_clients(Err(format!(
+                        "Master track '{}' cannot be part of a VCA group",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
                 if let Some(master_name) = master_track
                     && master_name == track_name
                 {
                     self.notify_clients(Err("Track cannot be its own VCA master".to_string()))
                         .await;
+                    return;
+                }
+                if let Some(master_name) = master_track
+                    && let Some(master) = self.state.lock().tracks.get(master_name)
+                    && master.lock().is_master
+                {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' cannot be grouped to Master track '{}'",
+                        track_name, master_name
+                    )))
+                    .await;
                     return;
                 }
                 track.lock().set_vca_master(master_track.clone());
@@ -5612,9 +5710,7 @@ impl Engine {
                     }
                 }
             }
-            Action::TrackVst3Graph { .. } => {
-                // Response action, no handling needed
-            }
+            Action::TrackVst3Graph { .. } => {}
             Action::TrackSetVst3Parameter {
                 ref track_name,
                 instance_id,
@@ -5689,9 +5785,7 @@ impl Engine {
                     self.notify_clients(Err(e)).await;
                 }
             },
-            Action::TrackVst3Parameters { .. } => {
-                // Response action, no handling needed
-            }
+            Action::TrackVst3Parameters { .. } => {}
             Action::TrackGetVst3Processor {
                 ref track_name,
                 instance_id,
@@ -5739,12 +5833,8 @@ impl Engine {
                     self.notify_clients(Err(e)).await;
                 }
             },
-            Action::TrackVst3Processor { .. } => {
-                // Response action, no handling needed
-            }
-            Action::ClipVst3Processor { .. } => {
-                // Response action, no handling needed
-            }
+            Action::TrackVst3Processor { .. } => {}
+            Action::ClipVst3Processor { .. } => {}
             Action::TrackVst3SnapshotState {
                 ref track_name,
                 instance_id,
@@ -5789,12 +5879,8 @@ impl Engine {
                     self.notify_clients(Err(e)).await;
                 }
             },
-            Action::TrackVst3StateSnapshot { .. } => {
-                // Response action, no handling needed
-            }
-            Action::ClipVst3StateSnapshot { .. } => {
-                // Response action, no handling needed
-            }
+            Action::TrackVst3StateSnapshot { .. } => {}
+            Action::ClipVst3StateSnapshot { .. } => {}
             Action::TrackVst3RestoreState {
                 ref track_name,
                 instance_id,
@@ -6797,27 +6883,18 @@ impl Engine {
             Action::SessionDiagnosticsReport { .. } => {}
             Action::MidiLearnMappingsReport { .. } => {}
             Action::HWInfo { .. } => {}
-            Action::Undo => {} // Already handled at the beginning
-            Action::Redo => {} // Already handled at the beginning
-            Action::ApplyGroupedActions(_) => {} // Already handled at request dispatch
+            Action::Undo => {}
+            Action::Redo => {}
+            Action::ApplyGroupedActions(_) => {}
             Action::TrackClapProcessor { .. } => {}
             Action::ClipClapProcessor { .. } => {}
         }
 
-        // Record action in history after successful processing
         if let Some(inverse) = inverse_actions {
             if let Some(group) = self.history_group.as_mut() {
-                eprintln!(
-                    "[history] group push forward={:?} inverse={:?}",
-                    action_to_process, inverse
-                );
                 group.forward_actions.push(action_to_process.clone());
                 group.inverse_actions.splice(0..0, inverse);
             } else {
-                eprintln!(
-                    "[history] single push forward={:?} inverse={:?}",
-                    action_to_process, inverse
-                );
                 self.history.record(UndoEntry {
                     forward_actions: vec![action_to_process.clone()],
                     inverse_actions: inverse,
@@ -6825,7 +6902,6 @@ impl Engine {
             }
         }
 
-        // Notify clients with the actual action that was processed
         self.notify_clients(Ok(action_to_process)).await;
     }
 
@@ -7324,7 +7400,6 @@ mod tests {
             })
             .await;
 
-        // Should be queued because no workers are ready (default test engine has 0 workers)
         assert!(engine.offline_bounce_jobs.contains_key("other"));
         assert_eq!(engine.pending_requests.len(), 1);
     }

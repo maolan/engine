@@ -42,7 +42,6 @@ pub fn fill_ports_from_interleaved_buffer(
 ) {
     let total = frames.saturating_mul(channels).min(buffer.len());
 
-    // Stereo SSE deinterleave fast path.
     if channels == 2 && ports.len() >= 2 && total >= 8 {
         let left_connected = !connected_only || has_audio_connections(&ports[0]);
         let right_connected = !connected_only || has_audio_connections(&ports[1]);
@@ -70,14 +69,14 @@ pub fn fill_ports_from_interleaved_buffer(
                         left_dst[i] = buffer[i * 2];
                         right_dst[i] = buffer[i * 2 + 1];
                     }
-                    // Guards dropped implicitly at end of scope.
+
                     if left_connected {
                         *ports[0].finished.lock() = true;
                     }
                     if right_connected {
                         *ports[1].finished.lock() = true;
                     }
-                    // Handle any additional ports with the generic path.
+
                     for (ch_idx, io_port) in ports.iter().enumerate().skip(2) {
                         if connected_only && !has_audio_connections(io_port) {
                             *io_port.finished.lock() = true;

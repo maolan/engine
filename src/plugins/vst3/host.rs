@@ -5,10 +5,10 @@ use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vst3PluginInfo {
-    pub id: String, // FUID as string
+    pub id: String,
     pub name: String,
     pub vendor: String,
-    pub path: String, // Path to .vst3 bundle
+    pub path: String,
     pub category: String,
     pub version: String,
     pub audio_inputs: usize,
@@ -37,7 +37,6 @@ impl Vst3Host {
     pub fn list_plugins(&mut self) -> Vec<Vst3PluginInfo> {
         let mut roots = default_vst3_search_roots();
 
-        // Add paths from VST3_PATH environment variable
         if let Ok(extra) = std::env::var("VST3_PATH") {
             for p in std::env::split_paths(&extra) {
                 if !p.as_os_str().is_empty() {
@@ -51,10 +50,8 @@ impl Vst3Host {
             collect_vst3_plugins(&root, &mut out);
         }
 
-        // Sort by name
         out.sort_by_key(|a| a.name.to_lowercase());
 
-        // Deduplicate by path
         out.dedup_by(|a, b| a.path.eq_ignore_ascii_case(&b.path));
 
         self.plugins = out.clone();
@@ -83,7 +80,6 @@ fn collect_vst3_plugins(root: &Path, out: &mut Vec<Vst3PluginInfo>) {
             continue;
         }
 
-        // Check if this is a .vst3 bundle
         if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
@@ -92,7 +88,6 @@ fn collect_vst3_plugins(root: &Path, out: &mut Vec<Vst3PluginInfo>) {
                 out.push(info);
             }
         } else {
-            // Recurse into subdirectories
             collect_vst3_plugins(&path, out);
         }
     }
@@ -107,7 +102,6 @@ fn scan_vst3_bundle(bundle_path: &Path) -> Option<Vst3PluginInfo> {
 
     let factory_info = factory.get_factory_info();
 
-    // Prefer Audio Module classes, matching rust-vst3-host behavior
     let mut audio_module_index = None;
     let mut fallback_index = None;
     for index in 0..class_count {
@@ -180,14 +174,12 @@ fn class_info_to_plugin_info(
 }
 
 fn tuid_to_string(tuid: &[i8; 16]) -> String {
-    // Convert TUID to hexadecimal string
     tuid.iter()
         .map(|&b| format!("{:02X}", b as u8))
         .collect::<Vec<_>>()
         .join("")
 }
 
-// Standalone function for backward compatibility with old API
 pub fn list_plugins() -> Vec<Vst3PluginInfo> {
     let mut host = Vst3Host::new();
     host.list_plugins()

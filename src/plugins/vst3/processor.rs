@@ -1,5 +1,3 @@
-// The vst3 crate uses platform-dependent types for enum constants, so explicit
-// casts are required for cross-platform compilation.
 #![allow(clippy::unnecessary_cast)]
 
 use super::interfaces::{HostPlugFrame, PluginInstance, Vst3GuiInfo, protected_call};
@@ -21,17 +19,14 @@ use vst3::Steinberg::Vst::{IEditControllerTrait, ViewType};
 use vst3::Steinberg::{FIDString, IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk};
 
 pub struct Vst3Processor {
-    // Plugin identity
     path: String,
     name: String,
     plugin_id: String,
 
-    // COM interfaces
     instance: PluginInstance,
-    // Keep factory/module alive for the plugin instance lifetime.
+
     _factory: super::interfaces::PluginFactory,
 
-    // Audio I/O (reuse existing AudioIO)
     audio_inputs: Vec<Arc<AudioIO>>,
     audio_outputs: Vec<Arc<AudioIO>>,
     midi_input_ports: usize,
@@ -41,7 +36,6 @@ pub struct Vst3Processor {
     input_buses: Vec<BusInfo>,
     output_buses: Vec<BusInfo>,
 
-    // Parameters
     parameters: Vec<ParameterInfo>,
     scalar_values: Arc<Mutex<Vec<f32>>>,
     previous_values: Arc<Mutex<Vec<f32>>>,
@@ -50,7 +44,6 @@ pub struct Vst3Processor {
     sample_rate: f64,
     bypassed: AtomicBool,
 
-    // GUI session
     gui_session: Arc<Mutex<Vst3GuiSession>>,
 }
 
@@ -99,7 +92,6 @@ impl Vst3Processor {
             .unwrap_or("Unknown VST3")
             .to_string();
 
-        // Load plugin factory and create instance
         let factory = super::interfaces::PluginFactory::from_module(path_buf)?;
 
         let class_count = factory.count_classes();
@@ -107,7 +99,6 @@ impl Vst3Processor {
             return Err("No plugin classes found".to_string());
         }
 
-        // Find the first Audio Module class, matching rust-vst3-host behavior
         let mut class_info = None;
         for i in 0..class_count {
             if let Some(info) = factory.get_class_info(i)
@@ -117,14 +108,13 @@ impl Vst3Processor {
                 break;
             }
         }
-        // Fallback to first class if no Audio Module found
+
         let class_info = class_info
             .or_else(|| factory.get_class_info(0))
             .ok_or("Failed to get class info")?;
 
         let mut instance = factory.create_instance(&class_info.cid)?;
 
-        // Initialize the plugin
         instance.initialize(&factory)?;
 
         let (plugin_input_buses, plugin_output_buses) = instance.audio_bus_counts();
@@ -148,7 +138,7 @@ impl Vst3Processor {
         } else {
             0
         };
-        // Query buses (for now, use the provided counts)
+
         let input_buses = if plugin_input_buses > 0 {
             vec![BusInfo {
                 index: 0,
@@ -171,7 +161,6 @@ impl Vst3Processor {
             vec![]
         };
 
-        // Create AudioIO for each channel
         let mut audio_input_ios = Vec::new();
         for _ in 0..requested_inputs {
             audio_input_ios.push(Arc::new(AudioIO::new(buffer_size)));
@@ -182,8 +171,6 @@ impl Vst3Processor {
             audio_output_ios.push(Arc::new(AudioIO::new(buffer_size)));
         }
 
-        // Configure processing before activation so plugins see the final
-        // host sample rate/block size when they enter active state.
         instance.setup_processing(
             sample_rate,
             buffer_size as i32,
@@ -194,8 +181,6 @@ impl Vst3Processor {
 
         let processing_started = false;
 
-        // Query parameters safely; if the plugin panics during enumeration,
-        // catch_unwind lets us fall back to an empty list.
         let parameters = protected_call(|| instance.query_parameters()).unwrap_or_default();
         let scalar_values = Arc::new(Mutex::new(
             parameters.iter().map(|p| p.default_value as f32).collect(),
@@ -307,7 +292,6 @@ impl Vst3Processor {
     }
 
     pub fn process_with_audio_io(&self, frames: usize) {
-        // Process all input AudioIO ports
         for input in &self.audio_inputs {
             input.process();
         }
@@ -316,7 +300,6 @@ impl Vst3Processor {
             return;
         }
 
-        // Get the audio processor
         let processor = match &self.instance.audio_processor {
             Some(proc) => proc,
             None => {
@@ -325,7 +308,6 @@ impl Vst3Processor {
             }
         };
 
-        // Call real VST3 processing (no MIDI)
         if self.process_vst3(processor, frames, &[]).is_err() {
             self.process_silence();
         }
@@ -334,7 +316,6 @@ impl Vst3Processor {
     /// Process audio with MIDI events
     #[allow(clippy::unnecessary_cast)]
     pub fn process_with_midi(&self, frames: usize, input_events: &[MidiEvent]) -> Vec<MidiEvent> {
-        // Process all input AudioIO ports
         for input in &self.audio_inputs {
             input.process();
         }
@@ -343,7 +324,6 @@ impl Vst3Processor {
             return Vec::new();
         }
 
-        // Get the audio processor
         let processor = match &self.instance.audio_processor {
             Some(proc) => proc,
             None => {
@@ -352,12 +332,8 @@ impl Vst3Processor {
             }
         };
 
-        // Call real VST3 processing with MIDI
         match self.process_vst3(processor, frames, input_events) {
-            Ok(output_buffer) => {
-                // Convert output events back to MIDI
-                output_buffer.to_midi_events()
-            }
+            Ok(output_buffer) => output_buffer.to_midi_events(),
             Err(_) => {
                 self.process_silence();
                 Vec::new()
@@ -374,7 +350,6 @@ impl Vst3Processor {
         use vst3::Steinberg::Vst::IAudioProcessorTrait;
         use vst3::Steinberg::Vst::*;
 
-        // Keep buffer guards alive while the plugin reads/writes through raw pointers.
         let input_guards: Vec<_> = self
             .audio_inputs
             .iter()
@@ -432,7 +407,6 @@ impl Vst3Processor {
             });
         }
 
-        // Create ProcessData
         let mut process_context: ProcessContext = unsafe { std::mem::zeroed() };
         process_context.sampleRate = self.sample_rate;
         process_context.tempo = 120.0;
@@ -500,7 +474,6 @@ impl Vst3Processor {
             processContext: &mut process_context,
         };
 
-        // Call VST3 process with crash protection
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             processor.process(&mut process_data)
         }));
@@ -515,7 +488,6 @@ impl Vst3Processor {
             }
         }
 
-        // Mark outputs as finished
         for output in &self.audio_outputs {
             *output.finished.lock() = true;
         }
@@ -552,7 +524,6 @@ impl Vst3Processor {
 
         self.scalar_values.lock().unwrap()[idx] = normalized_value;
 
-        // Update controller if available
         if let Some(controller) = &self.instance.edit_controller {
             use vst3::Steinberg::Vst::IEditControllerTrait;
             unsafe {
@@ -569,7 +540,6 @@ impl Vst3Processor {
 
         let instance = &self.instance;
 
-        // Save component state
         let comp_stream = vst3::ComWrapper::new(MemoryStream::new());
         unsafe {
             let result = instance
@@ -580,7 +550,6 @@ impl Vst3Processor {
             }
         }
 
-        // Save controller state (if available)
         let ctrl_stream = vst3::ComWrapper::new(MemoryStream::new());
         if let Some(controller) = &instance.edit_controller {
             unsafe {
@@ -608,7 +577,6 @@ impl Vst3Processor {
 
         let instance = &self.instance;
 
-        // Restore component state
         if !state.component_state.is_empty() {
             let comp_stream =
                 vst3::ComWrapper::new(MemoryStream::from_bytes(&state.component_state));
@@ -622,7 +590,6 @@ impl Vst3Processor {
             }
         }
 
-        // Restore controller state (if available)
         if !state.controller_state.is_empty()
             && let Some(controller) = &instance.edit_controller
         {
@@ -632,7 +599,6 @@ impl Vst3Processor {
                 controller.setState(ibstream_ptr(&ctrl_stream) as *mut _);
             }
 
-            // Re-sync parameter values after restoring state
             for (idx, param) in self.parameters.iter().enumerate() {
                 let value = unsafe { controller.getParamNormalized(param.id) };
                 self.scalar_values.lock().unwrap()[idx] = value as f32;
@@ -642,10 +608,6 @@ impl Vst3Processor {
 
         Ok(())
     }
-
-    // ------------------------------------------------------------------
-    // GUI abstraction (mirrors ClapProcessor pattern)
-    // ------------------------------------------------------------------
 
     pub fn gui_info(&self) -> Result<Vst3GuiInfo, String> {
         let controller = self
@@ -660,7 +622,7 @@ impl Vst3Processor {
                 size: None,
             });
         }
-        // Release the probe view without calling removed() — it was never attached.
+
         unsafe {
             let _ = ComPtr::<IPlugView>::from_raw(view);
         }
@@ -839,7 +801,6 @@ impl Drop for Vst3Processor {
     }
 }
 
-// Standalone function for listing plugins (backward compatibility)
 pub fn list_plugins() -> Vec<super::host::Vst3PluginInfo> {
     super::host::list_plugins()
 }

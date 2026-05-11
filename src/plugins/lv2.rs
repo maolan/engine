@@ -57,7 +57,6 @@ const LV2_WORKER_ERR_UNKNOWN: Lv2WorkerStatus = 1;
 const LV2_WORKER__SCHEDULE: &str = "http://lv2plug.in/ns/ext/worker#schedule";
 const LV2_WORKER__INTERFACE: &str = "http://lv2plug.in/ns/ext/worker#interface";
 
-// Midnam interface
 const LV2_MIDNAM__INTERFACE: &str = "http://ardour.org/lv2/midnam#interface";
 
 #[repr(C)]
@@ -1173,7 +1172,6 @@ impl Lv2Processor {
         };
         let interface = unsafe { interface_ptr.as_ref() };
 
-        // Query the midnam XML
         let Some(midnam_fn) = interface.midnam else {
             return;
         };
@@ -1192,7 +1190,6 @@ impl Lv2Processor {
             return;
         };
 
-        // Parse the midnam XML to extract note names
         let note_names = self.parse_midnam_xml(xml_str);
         *self.midnam_note_names.lock() = note_names;
 
@@ -1202,16 +1199,14 @@ impl Lv2Processor {
     fn parse_midnam_xml(&self, xml: &str) -> HashMap<u8, String> {
         let mut note_names = HashMap::new();
 
-        // Simple XML parsing for <Note Number="X" Name="Y"/> elements
         for line in xml.lines() {
             let line = line.trim();
             if !line.starts_with("<Note ") {
                 continue;
             }
 
-            // Extract Number attribute
             let number = if let Some(start) = line.find("Number=\"") {
-                let start = start + 8; // len("Number=\"")
+                let start = start + 8;
                 if let Some(end) = line[start..].find('"') {
                     line[start..start + end].parse::<u8>().ok()
                 } else {
@@ -1221,9 +1216,8 @@ impl Lv2Processor {
                 None
             };
 
-            // Extract Name attribute
             let name = if let Some(start) = line.find("Name=\"") {
-                let start = start + 6; // len("Name=\"")
+                let start = start + 6;
                 line[start..]
                     .find('"')
                     .map(|end| line[start..start + end].to_string())

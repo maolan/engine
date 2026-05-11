@@ -25,7 +25,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Use a mutex to prevent tests from running in parallel and interfering with each other
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]

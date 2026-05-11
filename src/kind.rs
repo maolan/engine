@@ -49,7 +49,7 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(Kind::Audio);
         set.insert(Kind::MIDI);
-        set.insert(Kind::Audio); // Duplicate
+        set.insert(Kind::Audio);
 
         assert_eq!(set.len(), 2);
     }

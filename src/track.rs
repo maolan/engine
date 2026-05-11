@@ -488,6 +488,7 @@ pub struct Track {
     pub muted: bool,
     pub phase_inverted: bool,
     pub soloed: bool,
+    pub is_master: bool,
     pub input_monitor: bool,
     pub disk_monitor: bool,
     pub midi_learn_volume: Option<crate::message::MidiLearnBinding>,
@@ -569,6 +570,7 @@ impl Track {
             muted: false,
             phase_inverted: false,
             soloed: false,
+            is_master: false,
             input_monitor: false,
             disk_monitor: true,
             midi_learn_volume: None,
@@ -1315,7 +1317,7 @@ impl Track {
                 }
             }
             let peak_now = crate::simd::peak_abs(out_samples);
-            // Peak-hold with decay gives stable, readable VU behavior for short transients.
+
             let held = self.meter_peak_hold_linear[out_idx] * 0.92;
             let next = peak_now.max(held);
             self.meter_peak_hold_linear[out_idx] = next;
@@ -1397,6 +1399,12 @@ impl Track {
     pub fn solo(&mut self) {
         self.soloed = !self.soloed;
     }
+    pub fn toggle_master(&mut self) {
+        self.is_master = !self.is_master;
+    }
+    pub fn set_master(&mut self, master: bool) {
+        self.is_master = master;
+    }
     pub fn toggle_input_monitor(&mut self) {
         self.input_monitor = !self.input_monitor;
     }
@@ -1412,7 +1420,7 @@ impl Track {
     pub fn set_session_base_dir(&mut self, base_dir: Option<PathBuf>) {
         if self.session_base_dir != base_dir {
             self.session_base_dir = base_dir;
-            // Clip names are relative in sessions; if base dir changes, cached buffers can go stale.
+
             self.audio_clip_cache.clear();
             self.midi_clip_cache.clear();
         }
@@ -1552,13 +1560,11 @@ impl Track {
                 }
             }
 
-            // Keep direct relative path support for runs started from the session directory.
             let cwd_candidate = clip_path.to_path_buf();
             if cwd_candidate.exists() {
                 return cwd_candidate;
             }
 
-            // Allow explicit session root override for diagnostics/recovery scenarios.
             if let Ok(session_root) = std::env::var("MAOLAN_SESSION_PATH") {
                 let candidate = Path::new(&session_root).join(clip_path);
                 if candidate.exists() {
@@ -1566,7 +1572,6 @@ impl Track {
                 }
             }
 
-            // Fallback to default recordings folder used by the app.
             if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
                 let candidate = Path::new(&home).join("recordings").join(clip_path);
                 if candidate.exists() {
@@ -1574,7 +1579,6 @@ impl Track {
                 }
             }
 
-            // Preserve original behavior for missing files: if we know session root, keep it.
             if let Some(base) = &self.session_base_dir {
                 base.join(clip_path)
             } else {
@@ -2613,7 +2617,7 @@ impl Track {
                         }
                         Some(data)
                     }
-                    // "Escape" packets are already prefixed with 0xF7 in SMF stream form.
+
                     TrackEventKind::Escape(payload) => {
                         let mut data = Vec::with_capacity(payload.len() + 1);
                         data.push(0xF7);
@@ -3058,7 +3062,6 @@ impl Track {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     pub fn get_lv2_midnam(&self) -> std::collections::HashMap<u8, String> {
-        // Get midnam from the first LV2 plugin that has it
         for instance in &self.lv2_processors {
             let note_names = instance.processor.midnam_note_names();
             if !note_names.is_empty() {
@@ -3562,14 +3565,10 @@ impl Track {
 
         let mut connections = Vec::new();
 
-        // Build connections by inspecting AudioIO connections
-        // Similar to plugin_graph_connections approach
         for instance in &self.vst3_processors {
-            // Check audio input connections
             for (port_idx, input) in instance.processor.audio_inputs().iter().enumerate() {
                 let conns = input.connections.lock();
                 for conn in conns.iter() {
-                    // Try to find source: could be track input, another VST3 output, or LV2 output
                     let from_node = self.find_vst3_audio_source_node(conn.as_ref());
                     if let Some((node, from_port)) = from_node {
                         connections.push(Vst3GraphConnection {
@@ -3583,11 +3582,9 @@ impl Track {
                 }
             }
 
-            // Check audio output connections to track outputs
             for (port_idx, output) in instance.processor.audio_outputs().iter().enumerate() {
                 let conns = output.connections.lock();
                 for conn in conns.iter() {
-                    // Check if connected to track outputs
                     if self.audio.outs.iter().any(|out| Arc::ptr_eq(out, conn)) {
                         let to_port = self
                             .audio
@@ -3617,14 +3614,12 @@ impl Track {
     ) -> Option<(crate::message::Vst3GraphNode, usize)> {
         use crate::message::Vst3GraphNode;
 
-        // Check if it's a track input
         for (idx, input) in self.audio.ins.iter().enumerate() {
             if std::ptr::eq(input.as_ref(), audio_io) {
                 return Some((Vst3GraphNode::TrackInput, idx));
             }
         }
 
-        // Check if it's a VST3 output
         for instance in &self.vst3_processors {
             for (port_idx, output) in instance.processor.audio_outputs().iter().enumerate() {
                 if std::ptr::eq(output.as_ref(), audio_io) {
@@ -3729,7 +3724,6 @@ impl Track {
     ) -> Result<(), String> {
         use crate::message::Vst3GraphNode;
 
-        // Get source AudioIO and clone it immediately to avoid borrow issues
         let from_io = match from_node {
             Vst3GraphNode::TrackInput => self
                 .audio
@@ -3755,7 +3749,6 @@ impl Track {
             }
         };
 
-        // Get destination AudioIO
         let to_io = match to_node {
             Vst3GraphNode::PluginInstance(id) => {
                 let instance = self
@@ -3777,7 +3770,6 @@ impl Track {
             Vst3GraphNode::TrackInput => return Err("Cannot connect to track input".to_string()),
         };
 
-        // Add connection
         to_io.connections.lock().push(from_io);
         self.invalidate_audio_route_cache();
         Ok(())
@@ -3792,7 +3784,6 @@ impl Track {
     ) -> Result<(), String> {
         use crate::message::Vst3GraphNode;
 
-        // Get source AudioIO and clone to avoid borrow issues
         let from_io = match from_node {
             Vst3GraphNode::TrackInput => self
                 .audio
@@ -3818,7 +3809,6 @@ impl Track {
             }
         };
 
-        // Get destination AudioIO
         let to_io = match to_node {
             Vst3GraphNode::PluginInstance(id) => {
                 let instance = self
@@ -3840,7 +3830,6 @@ impl Track {
             Vst3GraphNode::TrackInput => return Err("Cannot disconnect to track input".to_string()),
         };
 
-        // Remove connection
         to_io
             .connections
             .lock()

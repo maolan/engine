@@ -15,10 +15,6 @@ mod x86 {
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 use x86::*;
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /// dst[i] += src[i]
 pub fn add_inplace(dst: &mut [f32], src: &[f32]) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -165,10 +161,6 @@ pub fn clamp_inplace(buf: &mut [f32], min: f32, max: f32) {
     clamp_inplace_scalar(buf, min, max);
 }
 
-// ---------------------------------------------------------------------------
-// Scalar fallbacks
-// ---------------------------------------------------------------------------
-
 fn add_inplace_scalar(dst: &mut [f32], src: &[f32]) {
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         *d += *s;
@@ -222,10 +214,6 @@ fn clamp_inplace_scalar(buf: &mut [f32], min: f32, max: f32) {
         *s = s.clamp(min, max);
     }
 }
-
-// ---------------------------------------------------------------------------
-// SSE paths (std::arch::x86/_mm*)
-// ---------------------------------------------------------------------------
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "sse")]
@@ -405,10 +393,6 @@ unsafe fn clamp_inplace_sse(buf: &mut [f32], min: f32, max: f32) {
         *s = s.clamp(min, max);
     }
 }
-
-// ---------------------------------------------------------------------------
-// AVX paths (std::arch::x86_64::__m256)
-// ---------------------------------------------------------------------------
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "avx")]
@@ -689,10 +673,6 @@ mod tests {
         assert_eq!(a, [-1.0, -0.5, 0.0, 0.5, 1.0]);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Integer -> f32 conversion
-// ---------------------------------------------------------------------------
 
 /// Convert i32 samples to f32 and scale by `gain`.
 /// `dst` must be at least as long as `src`.
@@ -1268,10 +1248,6 @@ unsafe fn convert_f32_to_i8_avx(src: &[f32], dst: &mut [i8], gain: f32) {
         *d = (*s * gain) as i8;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Fade ramps (sin/cos based)
-// ---------------------------------------------------------------------------
 
 /// Apply a sine-based fade-in gain ramp in place: `gain = sin(t * π/2)`.
 /// `t` for sample `i` is `(start_t + i as f32 * dt).clamp(0.0, 1.0)`.

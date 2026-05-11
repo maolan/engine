@@ -141,10 +141,9 @@ mod tests {
             ("B".to_string(), vec!["C".to_string()]),
             ("C".to_string(), vec!["D".to_string()]),
             ("D".to_string(), vec!["E".to_string()]),
-            ("E".to_string(), vec!["A".to_string()]), // Creates cycle
+            ("E".to_string(), vec!["A".to_string()]),
         ]);
 
-        // Connecting any node in the cycle to any other should detect the cycle
         assert!(would_create_cycle(
             &"E".to_string(),
             &"A".to_string(),
@@ -154,7 +153,6 @@ mod tests {
 
     #[test]
     fn allows_connecting_sibling_nodes() {
-        // Two disconnected trees
         let graph = HashMap::from([
             ("A".to_string(), vec!["B".to_string()]),
             ("B".to_string(), vec![]),
@@ -162,7 +160,6 @@ mod tests {
             ("D".to_string(), vec![]),
         ]);
 
-        // Adding edge from one tree to another should not create cycle
         assert!(!would_create_cycle(
             &"B".to_string(),
             &"C".to_string(),
@@ -179,7 +176,6 @@ mod tests {
             ("D".to_string(), vec![]),
         ]);
 
-        // Connecting a new node E to D should not create a cycle
         assert!(!would_create_cycle(
             &"E".to_string(),
             &"D".to_string(),
@@ -205,7 +201,6 @@ mod tests {
             ("B".to_string(), vec!["A".to_string()]),
         ]);
 
-        // A->B->A already forms a cycle
         assert!(would_create_cycle(
             &"B".to_string(),
             &"A".to_string(),
@@ -220,7 +215,6 @@ mod tests {
             ("B".to_string(), vec!["C".to_string()]),
         ]);
 
-        // Connecting to/from a node not in the graph
         assert!(!would_create_cycle(
             &"X".to_string(),
             &"A".to_string(),
@@ -232,7 +226,6 @@ mod tests {
     fn single_node_no_edges() {
         let graph = HashMap::from([("A".to_string(), vec![])]);
 
-        // Self-edge on single node is a cycle
         assert!(would_create_cycle(
             &"A".to_string(),
             &"A".to_string(),
@@ -250,7 +243,6 @@ mod tests {
             ("E".to_string(), vec![]),
         ]);
 
-        // Connecting a new node F to E should be allowed
         assert!(!would_create_cycle(
             &"F".to_string(),
             &"E".to_string(),

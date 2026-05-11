@@ -5,17 +5,14 @@ pub mod port;
 pub mod processor;
 pub mod state;
 
-// Re-export main types
 pub use host::{Vst3Host, Vst3PluginInfo};
 pub use midi::EventBuffer;
 pub use port::{BusInfo, PortBinding};
 pub use processor::Vst3Processor;
 pub use state::{MemoryStream, Vst3PluginState, ibstream_ptr};
 
-// Re-export from old vst3.rs for backward compatibility
 pub use processor::list_plugins;
 
-// Helper for VST3 search paths (moved from old vst3.rs)
 #[cfg(any(
     target_os = "macos",
     target_os = "linux",

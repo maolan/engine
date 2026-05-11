@@ -203,11 +203,11 @@ impl MidiParser {
                     self.in_sysex = false;
                     return Some(std::mem::take(&mut self.sysex));
                 }
-                // Realtime can be interleaved in SysEx without ending it.
+
                 if byte >= 0xF8 {
                     return Some(vec![byte]);
                 }
-                // Any other status interrupts an unterminated SysEx.
+
                 self.in_sysex = false;
                 self.sysex.clear();
             }

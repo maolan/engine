@@ -231,7 +231,6 @@ impl HwDriver {
     pub fn run_cycle(&mut self) -> Result<(), String> {
         let frames = self.period_frames;
 
-        // --- Capture read ---
         match self.capture_format {
             SampleFormat::S8 => {
                 let in_io = self
@@ -286,7 +285,6 @@ impl HwDriver {
             }
         }
 
-        // --- Capture deinterleave (connected-only optimization) ---
         let all_in_connected = self.audio_ins.iter().all(ports::has_audio_connections);
         match self.capture_format {
             SampleFormat::S8 => {
@@ -418,7 +416,6 @@ impl HwDriver {
             }
         }
 
-        // --- Playback ---
         let is_playing = self.playing.load(Ordering::Relaxed);
         let gain = self.output_gain_linear;
         let balance = self.output_balance;

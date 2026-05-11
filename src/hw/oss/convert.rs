@@ -48,7 +48,6 @@ pub(super) fn convert_in_to_i32_interleaved(
         return;
     }
 
-    // SSE4.1 fast path for S16_LE
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
         if format == AFMT_S16_LE && is_x86_feature_detected!("sse4.1") {
@@ -70,7 +69,6 @@ pub(super) fn convert_in_to_i32_interleaved(
         }
     }
 
-    // SSSE3 fast path for S24_LE
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
         if format == AFMT_S24_LE && is_x86_feature_detected!("ssse3") {
@@ -188,7 +186,6 @@ pub(super) fn convert_out_from_i32_interleaved(
         return;
     }
 
-    // SSE2 fast path for S16_LE
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
         if format == AFMT_S16_LE && is_x86_feature_detected!("sse2") {
@@ -212,7 +209,6 @@ pub(super) fn convert_out_from_i32_interleaved(
         }
     }
 
-    // SSSE3 fast path for S24_LE
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
         if format == AFMT_S24_LE && is_x86_feature_detected!("ssse3") {
