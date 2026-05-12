@@ -116,6 +116,7 @@ struct OfflineBounceJob {
     cancel: Arc<AtomicBool>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JackTransportPlaySync {
     Start,
@@ -159,6 +160,7 @@ struct ClipAddRequest<'a> {
     plugin_graph_json: Option<serde_json::Value>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JackTransportSyncDecision {
     play_sync: Option<JackTransportPlaySync>,
@@ -1273,6 +1275,7 @@ impl Engine {
         sample
     }
 
+    #[cfg(unix)]
     fn jack_transport_sync_decision(
         current_playing: bool,
         current_sample: usize,
@@ -7252,6 +7255,7 @@ mod tests {
     use tokio::time::{Duration as TokioDuration, timeout};
 
     #[test]
+    #[cfg(unix)]
     fn jack_transport_sync_decision_starts_and_syncs_position_on_external_play() {
         let decision = Engine::jack_transport_sync_decision(false, 128, true, 256, 64);
 
@@ -7260,6 +7264,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn jack_transport_sync_decision_stops_and_syncs_position_on_external_stop() {
         let decision = Engine::jack_transport_sync_decision(true, 512, false, 96, 64);
 
@@ -7268,6 +7273,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn jack_transport_sync_decision_ignores_small_rolling_drift() {
         let decision = Engine::jack_transport_sync_decision(true, 1024, true, 1040, 64);
 
@@ -7276,6 +7282,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn jack_transport_sync_decision_syncs_large_rolling_jump() {
         let decision = Engine::jack_transport_sync_decision(true, 1024, true, 1200, 64);
 
@@ -7284,6 +7291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn jack_transport_sync_decision_syncs_locate_while_stopped() {
         let decision = Engine::jack_transport_sync_decision(false, 400, false, 900, 64);
 

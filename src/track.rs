@@ -1573,6 +1573,7 @@ impl Track {
         }
     }
 
+    #[cfg(unix)]
     fn clip_pitch_key(clip: &crate::audio::clip::AudioClip) -> String {
         format!(
             "{}:{}:{}:{}:{}",
@@ -2393,6 +2394,7 @@ impl Track {
         Ok(instance.processor.snapshot_state())
     }
 
+    #[cfg(unix)]
     fn pitch_shift_for_sample(
         clip: &crate::audio::clip::AudioClip,
         sample: usize,
@@ -4192,6 +4194,7 @@ impl Track {
         }
     }
 
+    #[allow(unused_variables)]
     fn lv2_audio_output_io(
         &self,
         instance_id: usize,
@@ -4207,10 +4210,11 @@ impl Track {
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         {
-            Err(Self::lv2_unsupported_error(instance_id))
+            Err("LV2 plugins are not supported on this platform".to_string())
         }
     }
 
+    #[allow(unused_variables)]
     fn lv2_audio_input_io(&self, instance_id: usize, _port: usize) -> Result<Arc<AudioIO>, String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -4222,10 +4226,11 @@ impl Track {
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         {
-            Err(Self::lv2_unsupported_error(instance_id))
+            Err("LV2 plugins are not supported on this platform".to_string())
         }
     }
 
+    #[allow(unused_variables)]
     fn lv2_validate_midi_output(&self, instance_id: usize, _port: usize) -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -4239,10 +4244,11 @@ impl Track {
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         {
-            Err(Self::lv2_unsupported_error(instance_id))
+            Err("LV2 plugins are not supported on this platform".to_string())
         }
     }
 
+    #[allow(unused_variables)]
     fn lv2_validate_midi_input(&self, instance_id: usize, _port: usize) -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -4256,7 +4262,7 @@ impl Track {
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         {
-            Err(Self::lv2_unsupported_error(instance_id))
+            Err("LV2 plugins are not supported on this platform".to_string())
         }
     }
 
