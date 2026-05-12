@@ -55,6 +55,7 @@ pub struct History {
     undo_stack: VecDeque<UndoEntry>,
     redo_stack: VecDeque<UndoEntry>,
     max_history: usize,
+    save_point: Option<usize>,
 }
 
 impl History {
@@ -63,6 +64,18 @@ impl History {
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             max_history,
+            save_point: None,
+        }
+    }
+
+    pub fn mark_save_point(&mut self) {
+        self.save_point = Some(self.undo_stack.len());
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        match self.save_point {
+            Some(point) => self.undo_stack.len() != point,
+            None => !self.undo_stack.is_empty(),
         }
     }
 
@@ -124,6 +137,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackToggleSolo(_)
         | Action::TrackToggleInputMonitor(_)
         | Action::TrackToggleDiskMonitor(_)
+        | Action::TrackSetColor { .. }
         | Action::TrackSetMidiLearnBinding { .. }
         | Action::SetGlobalMidiLearnBinding { .. }
         | Action::TrackSetVcaMaster { .. }
@@ -216,6 +230,17 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             Some(Action::TrackToggleInputMonitor(name.clone()))
         }
         Action::TrackToggleDiskMonitor(name) => Some(Action::TrackToggleDiskMonitor(name.clone())),
+        Action::TrackSetColor {
+            track_name,
+            color: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetColor {
+                track_name: track_name.clone(),
+                color: track_lock.color,
+            })
+        }
         Action::TrackSetMidiLearnBinding {
             track_name, target, ..
         } => {
@@ -713,6 +738,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         Action::TrackLoadClapPlugin {
             track_name,
             plugin_path,
+            ..
         } => Some(Action::TrackUnloadClapPlugin {
             track_name: track_name.clone(),
             plugin_path: plugin_path.clone(),
@@ -724,11 +750,13 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         } => Some(Action::TrackLoadClapPlugin {
             track_name: track_name.clone(),
             plugin_path: plugin_path.clone(),
+            instance_id: None,
         }),
         #[cfg(all(unix, not(target_os = "macos")))]
         Action::TrackLoadLv2Plugin {
             track_name,
             plugin_uri: _,
+            ..
         } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -752,11 +780,13 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             Some(Action::TrackLoadLv2Plugin {
                 track_name: track_name.clone(),
                 plugin_uri,
+                instance_id: None,
             })
         }
         Action::TrackLoadVst3Plugin {
             track_name,
             plugin_path: _,
+            ..
         } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -779,6 +809,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             Some(Action::TrackLoadVst3Plugin {
                 track_name: track_name.clone(),
                 plugin_path,
+                instance_id: None,
             })
         }
         Action::TrackSetClapParameter {
@@ -999,6 +1030,86 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         return Some(actions);
     }
 
+    if let Action::TrackUnloadClapPlugin {
+        track_name,
+        plugin_path,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let instance = track
+            .clap_plugins
+            .iter()
+            .find(|p| p.processor.path().eq_ignore_ascii_case(plugin_path))?;
+        let id = instance.id;
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
+        return Some(vec![
+            Action::TrackLoadClapPlugin {
+                track_name: track_name.clone(),
+                plugin_path: plugin_path.clone(),
+                instance_id: Some(id),
+            },
+            Action::TrackClapRestoreState {
+                track_name: track_name.clone(),
+                instance_id: id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
+    if let Action::TrackUnloadVst3PluginInstance {
+        track_name,
+        instance_id,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let (_, path, _) = track
+            .loaded_vst3_instances()
+            .into_iter()
+            .find(|(id, _, _)| *id == *instance_id)?;
+        let state_snapshot = track.vst3_snapshot_state(*instance_id).ok()?;
+        return Some(vec![
+            Action::TrackLoadVst3Plugin {
+                track_name: track_name.clone(),
+                plugin_path: path,
+                instance_id: Some(*instance_id),
+            },
+            Action::TrackVst3RestoreState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Action::TrackUnloadLv2PluginInstance {
+        track_name,
+        instance_id,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let (_, uri) = track
+            .loaded_lv2_instances()
+            .into_iter()
+            .find(|(id, _)| *id == *instance_id)?;
+        let state_snapshot = track.lv2_snapshot_state(*instance_id).ok()?;
+        return Some(vec![
+            Action::TrackLoadLv2Plugin {
+                track_name: track_name.clone(),
+                plugin_uri: uri,
+                instance_id: Some(*instance_id),
+            },
+            Action::TrackSetLv2PluginState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
     if let Action::RemoveTrack(track_name) = action {
         let mut actions = Vec::new();
         {
@@ -1038,6 +1149,12 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             }
             if !track.disk_monitor {
                 actions.push(Action::TrackToggleDiskMonitor(track.name.clone()));
+            }
+            if let Some(color) = track.color {
+                actions.push(Action::TrackSetColor {
+                    track_name: track.name.clone(),
+                    color: Some(color),
+                });
             }
             if track.midi_learn_volume.is_some() {
                 actions.push(Action::TrackSetMidiLearnBinding {
@@ -1158,6 +1275,61 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     pitch_correction_inertia_ms: None,
                     pitch_correction_formant_compensation: None,
                     plugin_graph_json: None,
+                });
+            }
+
+            for (id, path, _) in track.loaded_vst3_instances() {
+                if let Ok(state) = track.vst3_snapshot_state(id) {
+                    actions.push(Action::TrackLoadVst3Plugin {
+                        track_name: track.name.clone(),
+                        plugin_path: path,
+                        instance_id: Some(id),
+                    });
+                    actions.push(Action::TrackVst3RestoreState {
+                        track_name: track.name.clone(),
+                        instance_id: id,
+                        state,
+                    });
+                }
+            }
+
+            for (id, path, state) in track.clap_snapshot_all_states() {
+                actions.push(Action::TrackLoadClapPlugin {
+                    track_name: track.name.clone(),
+                    plugin_path: path,
+                    instance_id: Some(id),
+                });
+                actions.push(Action::TrackClapRestoreState {
+                    track_name: track.name.clone(),
+                    instance_id: id,
+                    state,
+                });
+            }
+
+            #[cfg(all(unix, not(target_os = "macos")))]
+            for (id, uri) in track.loaded_lv2_instances() {
+                if let Ok(state) = track.lv2_snapshot_state(id) {
+                    actions.push(Action::TrackLoadLv2Plugin {
+                        track_name: track.name.clone(),
+                        plugin_uri: uri,
+                        instance_id: Some(id),
+                    });
+                    actions.push(Action::TrackSetLv2PluginState {
+                        track_name: track.name.clone(),
+                        instance_id: id,
+                        state,
+                    });
+                }
+            }
+
+            #[cfg(unix)]
+            for conn in &track.plugin_midi_connections {
+                actions.push(Action::TrackConnectPluginMidi {
+                    track_name: track.name.clone(),
+                    from_node: conn.from_node.clone(),
+                    from_port: conn.from_port,
+                    to_node: conn.to_node.clone(),
+                    to_port: conn.to_port,
                 });
             }
         }
@@ -1419,12 +1591,14 @@ mod tests {
         assert!(should_record(&Action::TrackLoadVst3Plugin {
             track_name: "t".to_string(),
             plugin_path: "/tmp/test.vst3".to_string(),
+            instance_id: None,
         }));
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             assert!(should_record(&Action::TrackLoadLv2Plugin {
                 track_name: "t".to_string(),
                 plugin_uri: "urn:test".to_string(),
+                instance_id: None,
             }));
             assert!(should_record(&Action::TrackSetLv2ControlValue {
                 track_name: "t".to_string(),
@@ -2162,6 +2336,7 @@ mod tests {
             &Action::TrackLoadVst3Plugin {
                 track_name: "t".to_string(),
                 plugin_path: "/tmp/test.vst3".to_string(),
+                instance_id: None,
             },
             &state,
         )
@@ -2190,6 +2365,7 @@ mod tests {
             &Action::TrackLoadLv2Plugin {
                 track_name: "t".to_string(),
                 plugin_uri: "urn:test".to_string(),
+                instance_id: None,
             },
             &state,
         )

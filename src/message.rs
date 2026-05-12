@@ -7,6 +7,14 @@ use crate::{kind::Kind, mutex::UnsafeMutex, track::Track};
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc::Sender;
 
+#[derive(Clone, Debug, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackColor {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct MidiNoteData {
     pub start_sample: usize,
@@ -424,6 +432,10 @@ pub enum Action {
     TrackToggleMaster(String),
     TrackToggleInputMonitor(String),
     TrackToggleDiskMonitor(String),
+    TrackSetColor {
+        track_name: String,
+        color: Option<TrackColor>,
+    },
     TrackArmMidiLearn {
         track_name: String,
         target: TrackMidiLearnTarget,
@@ -525,6 +537,7 @@ pub enum Action {
     TrackLoadLv2Plugin {
         track_name: String,
         plugin_uri: String,
+        instance_id: Option<usize>,
     },
     TrackClearDefaultPassthrough {
         track_name: String,
@@ -665,6 +678,7 @@ pub enum Action {
     TrackLoadClapPlugin {
         track_name: String,
         plugin_path: String,
+        instance_id: Option<usize>,
     },
     TrackUnloadClapPlugin {
         track_name: String,
@@ -773,6 +787,7 @@ pub enum Action {
     TrackLoadVst3Plugin {
         track_name: String,
         plugin_path: String,
+        instance_id: Option<usize>,
     },
     TrackUnloadVst3PluginInstance {
         track_name: String,
@@ -931,6 +946,10 @@ pub enum Action {
         channels: usize,
         rate: usize,
         input: bool,
+    },
+    MarkHistorySavePoint,
+    HistoryState {
+        dirty: bool,
     },
     Undo,
     Redo,

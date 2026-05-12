@@ -491,6 +491,7 @@ pub struct Track {
     pub is_master: bool,
     pub input_monitor: bool,
     pub disk_monitor: bool,
+    pub color: Option<crate::message::TrackColor>,
     pub midi_learn_volume: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_balance: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_mute: Option<crate::message::MidiLearnBinding>,
@@ -573,6 +574,7 @@ impl Track {
             is_master: false,
             input_monitor: false,
             disk_monitor: true,
+            color: None,
             midi_learn_volume: None,
             midi_learn_balance: None,
             midi_learn_mute: None,
@@ -2793,7 +2795,7 @@ impl Track {
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub fn load_lv2_plugin(&mut self, uri: &str) -> Result<(), String> {
+    pub fn load_lv2_plugin(&mut self, uri: &str, instance_id: Option<usize>) -> Result<(), String> {
         let buffer_size = self
             .audio
             .ins
@@ -2803,12 +2805,19 @@ impl Track {
             .unwrap_or(0);
         let processor = Lv2Processor::new(self.sample_rate, buffer_size, uri)?;
         let mut processor = processor;
-        let id = self.alloc_plugin_instance_id();
+        let id = instance_id
+            .filter(|&id| {
+                !self.vst3_processors.iter().any(|i| i.id == id)
+                    && !self.clap_plugins.iter().any(|i| i.id == id)
+                    && !self.lv2_processors.iter().any(|i| i.id == id)
+            })
+            .unwrap_or_else(|| self.alloc_plugin_instance_id());
         if let Some(base_dir) = &self.lv2_state_base_dir {
             let plugin_dir = base_dir.join(format!("{}_{}", Self::sanitize_name(&self.name), id));
             processor.set_state_base_dir(plugin_dir);
         }
         self.next_lv2_instance_id = self.next_lv2_instance_id.max(id.saturating_add(1));
+        self.next_plugin_instance_id = self.next_plugin_instance_id.max(id.saturating_add(1));
         self.lv2_processors.push(Lv2Instance { id, processor });
         self.invalidate_audio_route_cache();
         Ok(())
@@ -3113,7 +3122,11 @@ impl Track {
         }
     }
 
-    pub fn load_vst3_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
+    pub fn load_vst3_plugin(
+        &mut self,
+        plugin_path: &str,
+        instance_id: Option<usize>,
+    ) -> Result<(), String> {
         let buffer_size = self
             .audio
             .ins
@@ -3131,8 +3144,15 @@ impl Track {
             input_count,
             output_count,
         )?;
-        let id = self.alloc_plugin_instance_id();
+        let id = instance_id
+            .filter(|&id| {
+                !self.vst3_processors.iter().any(|i| i.id == id)
+                    && !self.clap_plugins.iter().any(|i| i.id == id)
+                    && !self.lv2_processors.iter().any(|i| i.id == id)
+            })
+            .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_vst3_instance_id = self.next_vst3_instance_id.max(id.saturating_add(1));
+        self.next_plugin_instance_id = self.next_plugin_instance_id.max(id.saturating_add(1));
         self.vst3_processors.push(Vst3Instance {
             id,
             processor: Arc::new(processor),
@@ -3141,7 +3161,11 @@ impl Track {
         Ok(())
     }
 
-    pub fn load_clap_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
+    pub fn load_clap_plugin(
+        &mut self,
+        plugin_path: &str,
+        instance_id: Option<usize>,
+    ) -> Result<(), String> {
         let bundle_path = plugin_path
             .split_once("::")
             .map(|(path, _)| path)
@@ -3161,8 +3185,15 @@ impl Track {
             return Err(format!("CLAP plugin already loaded: {plugin_path}"));
         }
 
-        let id = self.alloc_plugin_instance_id();
+        let id = instance_id
+            .filter(|&id| {
+                !self.vst3_processors.iter().any(|i| i.id == id)
+                    && !self.clap_plugins.iter().any(|i| i.id == id)
+                    && !self.lv2_processors.iter().any(|i| i.id == id)
+            })
+            .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_clap_instance_id = self.next_clap_instance_id.max(id.saturating_add(1));
+        self.next_plugin_instance_id = self.next_plugin_instance_id.max(id.saturating_add(1));
         let buffer_size = self
             .audio
             .ins

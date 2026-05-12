@@ -3675,8 +3675,16 @@ impl Engine {
     async fn handle_request(&mut self, a: Action) {
         match a {
             Action::Undo => {
-                let Some(actions) = self.history.undo() else {
-                    return;
+                let actions = match self.history.undo() {
+                    Some(actions) => actions,
+                    None => {
+                        self.notify_clients(Ok(Action::Undo)).await;
+                        self.notify_clients(Ok(Action::HistoryState {
+                            dirty: self.history.is_dirty(),
+                        }))
+                        .await;
+                        return;
+                    }
                 };
 
                 let was_suspended = self.history_suspended;
@@ -3685,10 +3693,23 @@ impl Engine {
                     self.handle_request_inner(action, false).await;
                 }
                 self.history_suspended = was_suspended;
+                self.notify_clients(Ok(Action::Undo)).await;
+                self.notify_clients(Ok(Action::HistoryState {
+                    dirty: self.history.is_dirty(),
+                }))
+                .await;
             }
             Action::Redo => {
-                let Some(actions) = self.history.redo() else {
-                    return;
+                let actions = match self.history.redo() {
+                    Some(actions) => actions,
+                    None => {
+                        self.notify_clients(Ok(Action::Redo)).await;
+                        self.notify_clients(Ok(Action::HistoryState {
+                            dirty: self.history.is_dirty(),
+                        }))
+                        .await;
+                        return;
+                    }
                 };
 
                 let was_suspended = self.history_suspended;
@@ -3697,6 +3718,11 @@ impl Engine {
                     self.handle_request_inner(action, false).await;
                 }
                 self.history_suspended = was_suspended;
+                self.notify_clients(Ok(Action::Redo)).await;
+                self.notify_clients(Ok(Action::HistoryState {
+                    dirty: self.history.is_dirty(),
+                }))
+                .await;
             }
             Action::ApplyGroupedActions(actions) => {
                 self.handle_request_inner(Action::BeginHistoryGroup, true)
@@ -4084,8 +4110,16 @@ impl Engine {
                     track.lock().set_session_base_dir(self.session_dir.clone());
                 }
             }
+            Action::MarkHistorySavePoint => {
+                self.history.mark_save_point();
+                self.notify_clients(Ok(Action::HistoryState {
+                    dirty: self.history.is_dirty(),
+                }))
+                .await;
+            }
             Action::ClearHistory => {
                 self.history.clear();
+                self.history.mark_save_point();
             }
             Action::BeginSessionRestore => {
                 self.history_suspended = true;
@@ -4497,6 +4531,14 @@ impl Engine {
                     track.lock().toggle_disk_monitor();
                 }
             }
+            Action::TrackSetColor {
+                ref track_name,
+                color,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track.lock().color = color;
+                }
+            }
             Action::TrackArmMidiLearn {
                 ref track_name,
                 target,
@@ -4763,6 +4805,7 @@ impl Engine {
             Action::TrackLoadLv2Plugin {
                 ref track_name,
                 ref plugin_uri,
+                instance_id,
             } => {
                 if self
                     .reject_if_track_frozen(track_name, "LV2 plugin loading")
@@ -4777,7 +4820,7 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) = track.lock().load_lv2_plugin(plugin_uri) {
+                if let Err(e) = track.lock().load_lv2_plugin(plugin_uri, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -5227,6 +5270,7 @@ impl Engine {
             Action::TrackLoadClapPlugin {
                 ref track_name,
                 ref plugin_path,
+                instance_id,
             } => {
                 if self
                     .reject_if_track_frozen(track_name, "CLAP plugin loading")
@@ -5250,7 +5294,7 @@ impl Engine {
                     .await;
                     return;
                 }
-                if let Err(e) = track.load_clap_plugin(plugin_path) {
+                if let Err(e) = track.load_clap_plugin(plugin_path, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -5651,6 +5695,7 @@ impl Engine {
             Action::TrackLoadVst3Plugin {
                 ref track_name,
                 ref plugin_path,
+                instance_id,
             } => {
                 if self
                     .reject_if_track_frozen(track_name, "VST3 plugin loading")
@@ -5665,7 +5710,7 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) = track.lock().load_vst3_plugin(plugin_path) {
+                if let Err(e) = track.lock().load_vst3_plugin(plugin_path, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -6883,6 +6928,7 @@ impl Engine {
             Action::SessionDiagnosticsReport { .. } => {}
             Action::MidiLearnMappingsReport { .. } => {}
             Action::HWInfo { .. } => {}
+            Action::HistoryState { .. } => {}
             Action::Undo => {}
             Action::Redo => {}
             Action::ApplyGroupedActions(_) => {}
