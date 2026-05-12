@@ -624,17 +624,14 @@ pub enum Action {
         instance_id: usize,
         state: Lv2PluginState,
     },
-    #[cfg(unix)]
     TrackGetPluginGraph {
         track_name: String,
     },
-    #[cfg(unix)]
     TrackPluginGraph {
         track_name: String,
         plugins: Vec<PluginGraphPlugin>,
         connections: Vec<PluginGraphConnection>,
     },
-    #[cfg(unix)]
     TrackConnectPluginAudio {
         track_name: String,
         from_node: PluginGraphNode,
@@ -642,7 +639,6 @@ pub enum Action {
         to_node: PluginGraphNode,
         to_port: usize,
     },
-    #[cfg(unix)]
     TrackConnectPluginMidi {
         track_name: String,
         from_node: PluginGraphNode,
@@ -650,7 +646,6 @@ pub enum Action {
         to_node: PluginGraphNode,
         to_port: usize,
     },
-    #[cfg(unix)]
     TrackDisconnectPluginAudio {
         track_name: String,
         from_node: PluginGraphNode,
@@ -658,7 +653,6 @@ pub enum Action {
         to_node: PluginGraphNode,
         to_port: usize,
     },
-    #[cfg(unix)]
     TrackDisconnectPluginMidi {
         track_name: String,
         from_node: PluginGraphNode,

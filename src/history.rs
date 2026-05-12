@@ -174,7 +174,6 @@ pub fn should_record(action: &Action) -> bool {
         | Action::DeleteMidiNotes { .. }
         | Action::InsertMidiNotes { .. }
         | Action::SetMidiSysExEvents { .. } => true,
-        #[cfg(unix)]
         Action::TrackConnectPluginAudio { .. }
         | Action::TrackDisconnectPluginAudio { .. }
         | Action::TrackConnectPluginMidi { .. }
@@ -678,7 +677,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
-        #[cfg(unix)]
         Action::TrackConnectPluginAudio {
             track_name,
             from_node,
@@ -692,7 +690,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
-        #[cfg(unix)]
         Action::TrackDisconnectPluginAudio {
             track_name,
             from_node,
@@ -706,7 +703,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
-        #[cfg(unix)]
         Action::TrackConnectPluginMidi {
             track_name,
             from_node,
@@ -720,7 +716,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_node: to_node.clone(),
             to_port: *to_port,
         }),
-        #[cfg(unix)]
         Action::TrackDisconnectPluginMidi {
             track_name,
             from_node,
@@ -1322,7 +1317,6 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 }
             }
 
-            #[cfg(unix)]
             for conn in &track.plugin_midi_connections {
                 actions.push(Action::TrackConnectPluginMidi {
                     track_name: track.name.clone(),

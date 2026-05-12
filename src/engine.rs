@@ -5087,7 +5087,6 @@ impl Engine {
                 }))
                 .await;
             }
-            #[cfg(unix)]
             Action::TrackGetPluginGraph { ref track_name } => {
                 let track = match self.track_handle_or_err(track_name) {
                     Ok(track) => track,
@@ -5111,9 +5110,7 @@ impl Engine {
                 .await;
                 return;
             }
-            #[cfg(unix)]
             Action::TrackPluginGraph { .. } => {}
-            #[cfg(unix)]
             Action::TrackConnectPluginAudio {
                 ref track_name,
                 ref from_node,
@@ -5144,7 +5141,6 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(unix)]
             Action::TrackConnectPluginMidi {
                 ref track_name,
                 ref from_node,
@@ -5175,7 +5171,6 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(unix)]
             Action::TrackDisconnectPluginAudio {
                 ref track_name,
                 ref from_node,
@@ -5206,7 +5201,6 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(unix)]
             Action::TrackDisconnectPluginMidi {
                 ref track_name,
                 ref from_node,

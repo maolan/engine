@@ -1,7 +1,6 @@
 use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
-#[cfg(unix)]
 use crate::clap::ClapTransportInfo;
 use crate::clap::{ClapProcessor, SharedClapProcessor};
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -9,9 +8,8 @@ use crate::lv2::{Lv2Processor, Lv2TransportInfo};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::message::Lv2ControlPortInfo;
 use crate::message::PluginGraphNode;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use crate::message::{Lv2PluginState, Lv2StatePortValue, Lv2StateProperty};
-#[cfg(unix)]
 use crate::message::{PluginGraphConnection, PluginGraphPlugin};
 use crate::mutex::UnsafeMutex;
 #[cfg(unix)]
@@ -21,7 +19,6 @@ use crate::{
     audio::io::AudioIO,
     midi::io::{MIDIIO, MidiEvent},
 };
-#[cfg(unix)]
 use crate::{kind::Kind, routing};
 use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
 use serde_json::Value;
@@ -79,12 +76,10 @@ struct ClipPluginRuntime {
     lv2_processors: Vec<Lv2Instance>,
     vst3_processors: Vec<Vst3Instance>,
     clap_plugins: Vec<ClapInstance>,
-    #[cfg(unix)]
     plugin_midi_connections: Vec<PluginGraphConnection>,
 }
 
 #[derive(Clone, Copy)]
-#[cfg(all(unix, not(target_os = "macos")))]
 struct ClipRuntimeProcessContext {
     transport_sample: usize,
     loop_enabled: bool,
@@ -127,7 +122,6 @@ impl ClipPluginRuntime {
         Ok(())
     }
 
-    #[cfg(unix)]
     fn connect_midi(
         &mut self,
         from_node: PluginGraphNode,
@@ -212,7 +206,6 @@ impl ClipPluginRuntime {
         }
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     fn plugin_midi_ready(
         &self,
         node: &PluginGraphNode,
@@ -233,7 +226,6 @@ impl ClipPluginRuntime {
             .all(|conn| processed.contains(&conn.from_node))
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     fn plugin_midi_input_events(
         &self,
         node: &PluginGraphNode,
@@ -257,34 +249,6 @@ impl ClipPluginRuntime {
         per_port
     }
 
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn process(&mut self, input_blocks: &[Vec<f32>], request_len: usize) -> Vec<Vec<f32>> {
-        self.setup_ports();
-        for (source, samples) in self.input_sources.iter().zip(input_blocks.iter()) {
-            let buffer = source.buffer.lock();
-            let len = buffer.len().min(request_len);
-            buffer.fill(0.0);
-            buffer[..len].copy_from_slice(&samples[..len]);
-            *source.finished.lock() = true;
-        }
-        for source in self.input_sources.iter().skip(input_blocks.len()) {
-            source.buffer.lock().fill(0.0);
-            *source.finished.lock() = true;
-        }
-
-        let mut outputs = Vec::with_capacity(self.outputs.len());
-        for output in &self.outputs {
-            if output.ready() {
-                output.process();
-            }
-            let buf = output.buffer.lock();
-            outputs.push(buf.to_vec());
-            *output.finished.lock() = false;
-        }
-        outputs
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
     fn process(
         &mut self,
         input_blocks: &[Vec<f32>],
@@ -306,16 +270,21 @@ impl ClipPluginRuntime {
 
         {
             let track_input_midi_events = vec![Vec::<MidiEvent>::new(); self.input_sources.len()];
+            #[cfg(all(unix, not(target_os = "macos")))]
             let mut lv2_processed = vec![false; self.lv2_processors.len()];
             let mut vst3_processed = vec![false; self.vst3_processors.len()];
             let mut clap_processed = vec![false; self.clap_plugins.len()];
+            #[cfg(all(unix, not(target_os = "macos")))]
             let mut remaining = lv2_processed.len() + vst3_processed.len() + clap_processed.len();
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            let mut remaining = vst3_processed.len() + clap_processed.len();
             let mut processed_midi_plugins = HashSet::<PluginGraphNode>::new();
             let mut midi_node_events = HashMap::<(PluginGraphNode, usize), Vec<MidiEvent>>::new();
 
             while remaining > 0 {
                 let mut progressed = false;
 
+                #[cfg(all(unix, not(target_os = "macos")))]
                 for (idx, already_processed) in lv2_processed.iter_mut().enumerate() {
                     if *already_processed {
                         continue;
@@ -510,7 +479,6 @@ pub struct Track {
     pub lv2_processors: Vec<Lv2Instance>,
     pub vst3_processors: Vec<Vst3Instance>,
     pub clap_plugins: Vec<ClapInstance>,
-    #[cfg(unix)]
     pub plugin_midi_connections: Vec<PluginGraphConnection>,
     pub pending_hw_midi_out_events: Vec<HwMidiOutEvent>,
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -593,7 +561,6 @@ impl Track {
             lv2_processors: Vec::new(),
             vst3_processors: Vec::new(),
             clap_plugins: Vec::new(),
-            #[cfg(unix)]
             plugin_midi_connections: Vec::new(),
             pending_hw_midi_out_events: vec![],
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -905,23 +872,22 @@ impl Track {
             self.mix_clip_audio_into_inputs();
         }
 
-        #[cfg(target_os = "macos")]
-        let mut plugin_midi_events = track_input_midi_events.first().cloned().unwrap_or_default();
-        #[cfg(target_os = "macos")]
-        let mut last_clap_output: Vec<ClapMidiOutputEvent> = Vec::new();
-
-        #[cfg(all(unix, not(target_os = "macos")))]
         {
+            #[cfg(all(unix, not(target_os = "macos")))]
             let mut lv2_processed = vec![false; self.lv2_processors.len()];
             let mut vst3_processed = vec![false; self.vst3_processors.len()];
             let mut clap_processed = vec![false; self.clap_plugins.len()];
+            #[cfg(all(unix, not(target_os = "macos")))]
             let mut remaining = lv2_processed.len() + vst3_processed.len() + clap_processed.len();
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            let mut remaining = vst3_processed.len() + clap_processed.len();
             let mut processed_midi_plugins = HashSet::<PluginGraphNode>::new();
             let mut midi_node_events = HashMap::<(PluginGraphNode, usize), Vec<MidiEvent>>::new();
 
             while remaining > 0 {
                 let mut progressed = false;
 
+                #[cfg(all(unix, not(target_os = "macos")))]
                 for (idx, already_processed) in lv2_processed.iter_mut().enumerate() {
                     if *already_processed {
                         continue;
@@ -1059,6 +1025,7 @@ impl Track {
                 }
             }
 
+            #[cfg(all(unix, not(target_os = "macos")))]
             for (idx, done) in lv2_processed.iter().enumerate() {
                 if *done {
                     continue;
@@ -1149,63 +1116,8 @@ impl Track {
             );
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            if !self.vst3_processors.is_empty() {
-                for instance in &self.vst3_processors {
-                    let ready = instance
-                        .processor
-                        .audio_inputs()
-                        .iter()
-                        .all(|audio_in| audio_in.ready());
-                    if ready {
-                        plugin_midi_events = instance
-                            .processor
-                            .process_with_midi(frames, &plugin_midi_events);
-                    }
-                }
-            }
-            if !self.clap_plugins.is_empty() {
-                let mut clap_midi_events = plugin_midi_events.clone();
-                for instance in &self.clap_plugins {
-                    let ready = instance
-                        .processor
-                        .audio_inputs()
-                        .iter()
-                        .all(|audio_in| audio_in.ready());
-                    if ready {
-                        last_clap_output = instance.processor.process_with_midi(
-                            frames,
-                            &clap_midi_events,
-                            ClapTransportInfo {
-                                transport_sample: self.transport_sample,
-                                playing: self.disk_monitor && self.clip_playback_enabled,
-                                loop_enabled: self.loop_enabled,
-                                loop_range_samples: self.loop_range_samples,
-                                bpm: self.tempo_bpm,
-                                tsig_num: self.tsig_num,
-                                tsig_denom: self.tsig_denom,
-                            },
-                        );
-                        clap_midi_events = last_clap_output
-                            .iter()
-                            .map(|evt| evt.event.clone())
-                            .collect();
-                    }
-                }
-            }
-        }
-
         self.ensure_midi_route_cache();
         self.route_track_inputs_to_track_outputs(&track_input_midi_events);
-        #[cfg(target_os = "macos")]
-        {
-            if self.clap_plugins.is_empty() {
-                self.route_plugin_midi_to_track_outputs(&plugin_midi_events);
-            } else {
-                self.route_clap_midi_to_track_outputs(&last_clap_output);
-            }
-        }
         self.collect_hw_midi_output_events();
         self.dispatch_track_output_midi_to_connected_inputs();
         self.clear_local_midi_inputs();
@@ -1805,7 +1717,6 @@ impl Track {
             lv2_processors: Vec::new(),
             vst3_processors: Vec::new(),
             clap_plugins: Vec::new(),
-            #[cfg(unix)]
             plugin_midi_connections: Vec::new(),
         };
 
@@ -1988,7 +1899,6 @@ impl Track {
                         runtime.connect_audio(from_node, from_port, to_node, to_port)?;
                     }
                     Some("midi") => {
-                        #[cfg(unix)]
                         runtime.connect_midi(from_node, from_port, to_node, to_port);
                     }
                     _ => {}
@@ -2027,25 +1937,18 @@ impl Track {
             .get_mut(&runtime_key)
             .ok_or_else(|| "Missing clip plugin runtime".to_string())?;
 
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            Ok(runtime.process(
-                input_blocks,
-                request_len,
-                ClipRuntimeProcessContext {
-                    transport_sample: _absolute_start_sample,
-                    loop_enabled: self.loop_enabled,
-                    loop_range_samples: self.loop_range_samples,
-                    tempo_bpm: self.tempo_bpm,
-                    tsig_num: self.tsig_num,
-                    tsig_denom: self.tsig_denom,
-                },
-            ))
-        }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
-        {
-            Ok(runtime.process(input_blocks, request_len))
-        }
+        Ok(runtime.process(
+            input_blocks,
+            request_len,
+            ClipRuntimeProcessContext {
+                transport_sample: _absolute_start_sample,
+                loop_enabled: self.loop_enabled,
+                loop_range_samples: self.loop_range_samples,
+                tempo_bpm: self.tempo_bpm,
+                tsig_num: self.tsig_num,
+                tsig_denom: self.tsig_denom,
+            },
+        ))
     }
 
     fn apply_audio_clip_fades(
@@ -2809,7 +2712,7 @@ impl Track {
             .filter(|&id| {
                 !self.vst3_processors.iter().any(|i| i.id == id)
                     && !self.clap_plugins.iter().any(|i| i.id == id)
-                    && !self.lv2_processors.iter().any(|i| i.id == id)
+                    && !self.lv2_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
         if let Some(base_dir) = &self.lv2_state_base_dir {
@@ -2873,7 +2776,6 @@ impl Track {
         self.invalidate_audio_route_cache();
     }
 
-    #[cfg(unix)]
     fn prune_plugin_midi_connections(&mut self, node: PluginGraphNode) {
         self.plugin_midi_connections
             .retain(|conn| conn.from_node != node && conn.to_node != node);
@@ -2895,12 +2797,10 @@ impl Track {
             .collect()
     }
 
-    #[cfg(unix)]
     fn push_plugin_graph_plugin(plugins: &mut Vec<PluginGraphPlugin>, plugin: PluginGraphPlugin) {
         plugins.push(plugin);
     }
 
-    #[cfg(unix)]
     pub fn plugin_graph_plugins(&self) -> Vec<PluginGraphPlugin> {
         let mut plugins = Vec::new();
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -3148,7 +3048,7 @@ impl Track {
             .filter(|&id| {
                 !self.vst3_processors.iter().any(|i| i.id == id)
                     && !self.clap_plugins.iter().any(|i| i.id == id)
-                    && !self.lv2_processors.iter().any(|i| i.id == id)
+                    && !self.lv2_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_vst3_instance_id = self.next_vst3_instance_id.max(id.saturating_add(1));
@@ -3189,7 +3089,7 @@ impl Track {
             .filter(|&id| {
                 !self.vst3_processors.iter().any(|i| i.id == id)
                     && !self.clap_plugins.iter().any(|i| i.id == id)
-                    && !self.lv2_processors.iter().any(|i| i.id == id)
+                    && !self.lv2_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_clap_instance_id = self.next_clap_instance_id.max(id.saturating_add(1));
@@ -3227,7 +3127,6 @@ impl Track {
             ));
         };
         self.clap_plugins.remove(index);
-        #[cfg(unix)]
         self.prune_plugin_midi_connections(PluginGraphNode::ClapPluginInstance(instance_id));
         self.invalidate_audio_route_cache();
         Ok(())
@@ -3244,10 +3143,8 @@ impl Track {
                 self.name, plugin_path
             ));
         };
-        #[cfg(unix)]
         let removed_id = self.clap_plugins[index].id;
         self.clap_plugins.remove(index);
-        #[cfg(unix)]
         self.prune_plugin_midi_connections(PluginGraphNode::ClapPluginInstance(removed_id));
         self.invalidate_audio_route_cache();
         Ok(())
@@ -3555,7 +3452,6 @@ impl Track {
         for port in removed.processor.audio_outputs() {
             Self::disconnect_all(port);
         }
-        #[cfg(unix)]
         self.prune_plugin_midi_connections(PluginGraphNode::Vst3PluginInstance(instance_id));
         self.invalidate_audio_route_cache();
         Ok(())
@@ -3958,7 +3854,6 @@ impl Track {
         Ok(())
     }
 
-    #[cfg(unix)]
     pub fn plugin_graph_connections(&self) -> Vec<PluginGraphConnection> {
         let mut source_ports: Vec<(PluginGraphNode, usize, Arc<AudioIO>)> = self
             .audio
@@ -4097,7 +3992,6 @@ impl Track {
         connections
     }
 
-    #[cfg(unix)]
     pub fn connect_plugin_audio(
         &mut self,
         from_node: PluginGraphNode,
@@ -4121,7 +4015,6 @@ impl Track {
         Ok(())
     }
 
-    #[cfg(unix)]
     pub fn disconnect_plugin_audio(
         &mut self,
         from_node: PluginGraphNode,
@@ -4136,7 +4029,6 @@ impl Track {
         Ok(())
     }
 
-    #[cfg(unix)]
     pub fn connect_plugin_midi(
         &mut self,
         from_node: PluginGraphNode,
@@ -4188,7 +4080,6 @@ impl Track {
         Ok(())
     }
 
-    #[cfg(unix)]
     pub fn disconnect_plugin_midi(
         &mut self,
         from_node: PluginGraphNode,
@@ -4301,12 +4192,6 @@ impl Track {
         }
     }
 
-    #[cfg(all(unix, target_os = "macos"))]
-    fn lv2_unsupported_error(instance_id: usize) -> String {
-        format!("LV2 instance {instance_id} is not supported on this platform")
-    }
-
-    #[cfg(unix)]
     fn lv2_audio_output_io(
         &self,
         instance_id: usize,
@@ -4326,7 +4211,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn lv2_audio_input_io(&self, instance_id: usize, _port: usize) -> Result<Arc<AudioIO>, String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -4342,7 +4226,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn lv2_validate_midi_output(&self, instance_id: usize, _port: usize) -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -4360,7 +4243,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn lv2_validate_midi_input(&self, instance_id: usize, _port: usize) -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -4378,7 +4260,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn vst3_audio_output_io(
         &self,
         instance_id: usize,
@@ -4391,7 +4272,6 @@ impl Track {
             .ok_or_else(|| format!("VST3 instance {instance_id} output port {port} missing"))
     }
 
-    #[cfg(unix)]
     fn vst3_audio_input_io(&self, instance_id: usize, port: usize) -> Result<Arc<AudioIO>, String> {
         self.vst3_processors
             .iter()
@@ -4400,7 +4280,6 @@ impl Track {
             .ok_or_else(|| format!("VST3 instance {instance_id} input port {port} missing"))
     }
 
-    #[cfg(unix)]
     fn clap_audio_output_io(
         &self,
         instance_id: usize,
@@ -4413,7 +4292,6 @@ impl Track {
             .ok_or_else(|| format!("CLAP instance {instance_id} output port {port} missing"))
     }
 
-    #[cfg(unix)]
     fn clap_audio_input_io(&self, instance_id: usize, port: usize) -> Result<Arc<AudioIO>, String> {
         self.clap_plugins
             .iter()
@@ -4422,7 +4300,6 @@ impl Track {
             .ok_or_else(|| format!("CLAP instance {instance_id} input port {port} missing"))
     }
 
-    #[cfg(unix)]
     fn vst3_validate_midi_output(&self, instance_id: usize, port: usize) -> Result<(), String> {
         self.vst3_processors
             .iter()
@@ -4431,7 +4308,6 @@ impl Track {
             .ok_or_else(|| format!("VST3 instance {instance_id} MIDI output port {port} missing"))
     }
 
-    #[cfg(unix)]
     fn clap_validate_midi_output(&self, instance_id: usize, port: usize) -> Result<(), String> {
         self.clap_plugins
             .iter()
@@ -4440,7 +4316,6 @@ impl Track {
             .ok_or_else(|| format!("CLAP instance {instance_id} MIDI output port {port} missing"))
     }
 
-    #[cfg(unix)]
     fn vst3_validate_midi_input(&self, instance_id: usize, port: usize) -> Result<(), String> {
         self.vst3_processors
             .iter()
@@ -4449,7 +4324,6 @@ impl Track {
             .ok_or_else(|| format!("VST3 instance {instance_id} MIDI input port {port} missing"))
     }
 
-    #[cfg(unix)]
     fn clap_validate_midi_input(&self, instance_id: usize, port: usize) -> Result<(), String> {
         self.clap_plugins
             .iter()
@@ -4458,7 +4332,16 @@ impl Track {
             .ok_or_else(|| format!("CLAP instance {instance_id} MIDI input port {port} missing"))
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn lv2_instance_id_exists(&self, id: usize) -> bool {
+        self.lv2_processors.iter().any(|i| i.id == id)
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn lv2_instance_id_exists(&self, _id: usize) -> bool {
+        false
+    }
+
     fn plugin_source_io(
         &self,
         node: &PluginGraphNode,
@@ -4484,7 +4367,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn plugin_target_io(
         &self,
         node: &PluginGraphNode,
@@ -4510,7 +4392,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn validate_plugin_midi_source(
         &self,
         node: &PluginGraphNode,
@@ -4538,7 +4419,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn validate_plugin_midi_target(
         &self,
         node: &PluginGraphNode,
@@ -4566,7 +4446,6 @@ impl Track {
         }
     }
 
-    #[cfg(unix)]
     fn plugin_connected_neighbors(
         &self,
         kind: Kind,
@@ -4674,7 +4553,6 @@ impl Track {
         }
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     fn plugin_midi_ready(
         &self,
         node: &PluginGraphNode,
@@ -4695,7 +4573,6 @@ impl Track {
             .all(|conn| processed.contains(&conn.from_node))
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     fn plugin_midi_input_events(
         &self,
         node: &PluginGraphNode,
@@ -4719,7 +4596,6 @@ impl Track {
         per_port
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     fn route_plugin_midi_to_track_outputs_graph(
         &self,
         track_input_events: &[Vec<MidiEvent>],
@@ -4794,7 +4670,6 @@ mod tests {
     use super::{AudioClipBuffer, HwMidiOutEvent, Track};
     use crate::audio::clip::AudioClip;
     use crate::audio::io::AudioIO;
-    #[cfg(unix)]
     use crate::{kind::Kind, message::PluginGraphNode};
     use std::sync::Arc;
 
@@ -4843,7 +4718,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn plugin_graph_includes_default_track_midi_passthrough() {
         let track = Track::new("t".to_string(), 0, 0, 1, 2, 64, 48_000.0);
         let connections = track.plugin_graph_connections();
@@ -4971,7 +4845,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn disconnecting_one_stereo_internal_channel_mutes_only_that_channel() {
         let mut track = Track::new("t".to_string(), 2, 2, 0, 0, 8, 48_000.0);
         let left = Arc::new(AudioIO::new(8));
