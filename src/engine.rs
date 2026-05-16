@@ -7099,6 +7099,7 @@ impl Engine {
                     self.flush_completed_recordings().await;
                     let hw_in_routes = self.midi_hw_in_routes.clone();
                     let pending_hw_in_by_device = self.pending_hw_midi_events_by_device.clone();
+                    let mut reconfigured_tracks = Vec::new();
                     for (track_name, track) in self.state.lock().tracks.iter() {
                         let track_lock = track.lock();
                         if self.jack_runtime_is_some() {
@@ -7112,9 +7113,29 @@ impl Engine {
                                 }
                             }
                         }
-                        track_lock.setup();
+                        if track_lock.setup() {
+                            reconfigured_tracks.push(track_name.clone());
+                        }
                     }
                     self.publish_track_meters().await;
+                    for track_name in reconfigured_tracks {
+                        let track = self.state.lock().tracks.get(&track_name).cloned();
+                        if let Some(track) = track {
+                            let (plugins, connections) = {
+                                let track_lock = track.lock();
+                                (
+                                    track_lock.plugin_graph_plugins(),
+                                    track_lock.plugin_graph_connections(),
+                                )
+                            };
+                            self.notify_clients(Ok(Action::TrackPluginGraph {
+                                track_name: track_name.clone(),
+                                plugins,
+                                connections,
+                            }))
+                            .await;
+                        }
+                    }
                     self.pending_hw_midi_events.clear();
                     self.pending_hw_midi_events_by_device.clear();
                     if self.playing {

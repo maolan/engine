@@ -120,6 +120,7 @@ pub struct ClapProcessor {
     plugin_id: String,
     name: String,
     sample_rate: f64,
+    buffer_size: usize,
     audio_inputs: Vec<Arc<AudioIO>>,
     audio_outputs: Vec<Arc<AudioIO>>,
     input_port_channels: Vec<usize>,
@@ -205,6 +206,7 @@ impl ClapProcessor {
             plugin_id: plugin_handle.plugin_id().to_string(),
             name: plugin_handle.plugin_name().to_string(),
             sample_rate,
+            buffer_size: buffer_size.max(1),
             audio_inputs,
             audio_outputs,
             input_port_channels: input_port_channels_opt
@@ -552,6 +554,82 @@ impl ClapProcessor {
             self.plugin_handle.on_main_thread();
         }
         if host_flags.process {}
+    }
+
+    pub fn reconfigure_ports_if_needed(&mut self) -> Result<bool, String> {
+        let audio_rescan = self
+            .host_runtime
+            .state
+            .audio_ports_rescan_requested
+            .swap(0, Ordering::Acquire)
+            != 0;
+        let note_rescan = self
+            .host_runtime
+            .state
+            .note_ports_rescan_requested
+            .swap(0, Ordering::Acquire)
+            != 0;
+
+        if !audio_rescan && !note_rescan {
+            return Ok(false);
+        }
+
+        let _thread_scope = HostThreadScope::enter_main();
+
+        // Deactivate
+        self.plugin_handle.stop_processing();
+        self.plugin_handle.deactivate();
+
+        // Re-query ports
+        let (input_layout_opt, output_layout_opt) = self.plugin_handle.audio_port_channels();
+        let (discovered_midi_inputs, discovered_midi_outputs) = self.plugin_handle.note_port_layout();
+
+        let input_port_channels_opt = input_layout_opt.as_ref().map(|(c, _)| c.clone());
+        let output_port_channels_opt = output_layout_opt.as_ref().map(|(c, _)| c.clone());
+        let discovered_inputs = input_layout_opt.as_ref().map(|(c, _)| c.len());
+        let discovered_outputs = output_layout_opt.as_ref().map(|(c, _)| c.len());
+
+        let resolved_inputs = discovered_inputs.unwrap_or(self.audio_inputs.len());
+        let resolved_outputs = discovered_outputs.unwrap_or(self.audio_outputs.len());
+        let main_audio_inputs = input_layout_opt
+            .as_ref()
+            .map(|(_, main)| *main)
+            .unwrap_or(self.main_audio_inputs);
+        let main_audio_outputs = output_layout_opt
+            .as_ref()
+            .map(|(_, main)| *main)
+            .unwrap_or(self.main_audio_outputs);
+
+        // Resize audio input buffers
+        while self.audio_inputs.len() < resolved_inputs {
+            self.audio_inputs.push(Arc::new(AudioIO::new(self.buffer_size)));
+        }
+        self.audio_inputs.truncate(resolved_inputs);
+
+        // Resize audio output buffers
+        while self.audio_outputs.len() < resolved_outputs {
+            self.audio_outputs.push(Arc::new(AudioIO::new(self.buffer_size)));
+        }
+        self.audio_outputs.truncate(resolved_outputs);
+
+        self.input_port_channels = input_port_channels_opt
+            .unwrap_or_else(|| vec![1; resolved_inputs]);
+        self.output_port_channels = output_port_channels_opt
+            .unwrap_or_else(|| vec![1; resolved_outputs]);
+        self.midi_input_ports = discovered_midi_inputs.unwrap_or(self.midi_input_ports);
+        self.midi_output_ports = discovered_midi_outputs.unwrap_or(self.midi_output_ports);
+        self.main_audio_inputs = main_audio_inputs;
+        self.main_audio_outputs = main_audio_outputs;
+
+        // Reactivate
+        self.plugin_handle.activate(
+            self.sample_rate,
+            self.buffer_size as u32,
+            self.buffer_size as u32,
+        )?;
+        self.plugin_handle.start_processing()?;
+
+        Ok(true)
     }
 
     fn process_native(
@@ -1025,6 +1103,18 @@ struct ClapHostState {
 }
 
 #[repr(C)]
+struct ClapHostAudioPorts {
+    is_rescan_flag_supported: Option<unsafe extern "C" fn(*const ClapHost, flag: u32) -> bool>,
+    rescan: Option<unsafe extern "C" fn(*const ClapHost, flags: u32)>,
+}
+
+#[repr(C)]
+struct ClapHostNotePorts {
+    supported_dialects: Option<unsafe extern "C" fn(*const ClapHost) -> u32>,
+    rescan: Option<unsafe extern "C" fn(*const ClapHost, flags: u32)>,
+}
+
+#[repr(C)]
 struct ClapNoteName {
     name: [c_char; 256],
     port: i16,
@@ -1176,6 +1266,10 @@ impl UnsafeMutex<ClapProcessor> {
         self.lock().run_host_callbacks_main_thread();
     }
 
+    pub fn reconfigure_ports_if_needed(&self) -> Result<bool, String> {
+        self.lock().reconfigure_ports_if_needed()
+    }
+
     pub fn ui_begin_session(&self) {
         self.lock().ui_begin_session();
     }
@@ -1290,6 +1384,8 @@ struct HostRuntimeState {
     param_flush_requested: AtomicU32,
     state_dirty_requested: AtomicU32,
     note_names_dirty: AtomicU32,
+    audio_ports_rescan_requested: AtomicU32,
+    note_ports_rescan_requested: AtomicU32,
 }
 
 thread_local! {
@@ -1347,6 +1443,8 @@ impl HostRuntime {
             param_flush_requested: AtomicU32::new(0),
             state_dirty_requested: AtomicU32::new(0),
             note_names_dirty: AtomicU32::new(0),
+            audio_ports_rescan_requested: AtomicU32::new(0),
+            note_ports_rescan_requested: AtomicU32::new(0),
         });
         let host = ClapHost {
             clap_version: CLAP_VERSION,
@@ -2012,6 +2110,56 @@ impl PluginHandle {
             unsafe { on_timer(self.plugin, timer_id) };
         }
     }
+
+    fn stop_processing(&self) {
+        unsafe {
+            if !self.plugin.is_null() {
+                let plugin = &*self.plugin;
+                if let Some(stop) = plugin.stop_processing {
+                    stop(self.plugin);
+                }
+            }
+        }
+    }
+
+    fn deactivate(&self) {
+        unsafe {
+            if !self.plugin.is_null() {
+                let plugin = &*self.plugin;
+                if let Some(deactivate) = plugin.deactivate {
+                    deactivate(self.plugin);
+                }
+            }
+        }
+    }
+
+    fn activate(&self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<(), String> {
+        unsafe {
+            if !self.plugin.is_null() {
+                let plugin = &*self.plugin;
+                if let Some(activate) = plugin.activate {
+                    if !activate(self.plugin, sample_rate, min_frames, max_frames) {
+                        return Err("CLAP plugin activate() failed".to_string());
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn start_processing(&self) -> Result<(), String> {
+        unsafe {
+            if !self.plugin.is_null() {
+                let plugin = &*self.plugin;
+                if let Some(start) = plugin.start_processing {
+                    if !start(self.plugin) {
+                        return Err("CLAP plugin start_processing() failed".to_string());
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 impl Drop for PluginHandle {
@@ -2071,6 +2219,14 @@ static HOST_STATE_EXT: ClapHostState = ClapHostState {
 static HOST_NOTE_NAME_EXT: ClapHostNoteName = ClapHostNoteName {
     changed: Some(host_note_name_changed),
 };
+static HOST_AUDIO_PORTS_EXT: ClapHostAudioPorts = ClapHostAudioPorts {
+    is_rescan_flag_supported: Some(host_audio_ports_is_rescan_flag_supported),
+    rescan: Some(host_audio_ports_rescan),
+};
+static HOST_NOTE_PORTS_EXT: ClapHostNotePorts = ClapHostNotePorts {
+    supported_dialects: Some(host_note_ports_supported_dialects),
+    rescan: Some(host_note_ports_rescan),
+};
 static NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1);
 
 fn host_runtime_state(host: *const ClapHost) -> Option<&'static HostRuntimeState> {
@@ -2115,6 +2271,12 @@ unsafe extern "C" fn host_get_extension(
             .map(|_| (&HOST_STATE_EXT as *const ClapHostState).cast::<c_void>())
             .unwrap_or(std::ptr::null()),
         "clap.host.note-name" => (&HOST_NOTE_NAME_EXT as *const ClapHostNoteName).cast::<c_void>(),
+        "clap.host.audio-ports" => {
+            (&HOST_AUDIO_PORTS_EXT as *const ClapHostAudioPorts).cast::<c_void>()
+        }
+        "clap.host.note-ports" => {
+            (&HOST_NOTE_PORTS_EXT as *const ClapHostNotePorts).cast::<c_void>()
+        }
         _ => std::ptr::null(),
     }
 }
@@ -2135,6 +2297,30 @@ unsafe extern "C" fn host_request_restart(_host: *const ClapHost) {
     if let Some(state) = host_runtime_state(_host) {
         state.callback_flags.lock().restart = true;
     }
+}
+
+unsafe extern "C" fn host_audio_ports_is_rescan_flag_supported(
+    _host: *const ClapHost,
+    _flag: u32,
+) -> bool {
+    true
+}
+
+unsafe extern "C" fn host_audio_ports_rescan(_host: *const ClapHost, _flags: u32) {
+    if let Some(state) = host_runtime_state(_host) {
+        state.audio_ports_rescan_requested.store(1, Ordering::Release);
+    }
+}
+
+unsafe extern "C" fn host_note_ports_rescan(_host: *const ClapHost, _flags: u32) {
+    if let Some(state) = host_runtime_state(_host) {
+        state.note_ports_rescan_requested.store(1, Ordering::Release);
+    }
+}
+
+unsafe extern "C" fn host_note_ports_supported_dialects(_host: *const ClapHost) -> u32 {
+    let _ = _host;
+    0x1F
 }
 
 unsafe extern "C" fn host_note_name_changed(_host: *const ClapHost) {

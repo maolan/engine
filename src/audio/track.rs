@@ -8,6 +8,7 @@ pub struct AudioTrack {
     pub outs: Vec<Arc<AudioIO>>,
     pub finished: bool,
     pub processing: bool,
+    buffer_size: usize,
 }
 
 impl AudioTrack {
@@ -18,6 +19,7 @@ impl AudioTrack {
             outs: Vec::with_capacity(outs_count),
             finished: false,
             processing: false,
+            buffer_size,
         };
         for _ in 0..ins_count {
             ret.ins.push(Arc::new(AudioIO::new(buffer_size)));
@@ -26,6 +28,10 @@ impl AudioTrack {
             ret.outs.push(Arc::new(AudioIO::new(buffer_size)));
         }
         ret
+    }
+
+    pub fn buffer_size(&self) -> usize {
+        self.buffer_size
     }
 
     pub fn connect_in(&self, index: usize, from: Arc<AudioIO>) -> Result<(), String> {

@@ -609,7 +609,7 @@ impl Track {
         id
     }
 
-    pub fn setup(&mut self) {
+    pub fn setup(&mut self) -> bool {
         self.audio.setup();
         #[cfg(all(unix, not(target_os = "macos")))]
         for instance in &self.lv2_processors {
@@ -618,15 +618,39 @@ impl Track {
         for instance in &self.vst3_processors {
             instance.processor.setup_audio_ports();
         }
+        let mut reconfigured = false;
         for instance in &self.clap_plugins {
             instance.processor.run_host_callbacks_main_thread();
             instance.processor.setup_audio_ports();
+            match instance.processor.reconfigure_ports_if_needed() {
+                Ok(true) => reconfigured = true,
+                Err(e) => {
+                    tracing::warn!(
+                        "CLAP port reconfiguration failed for '{}': {}",
+                        instance.processor.name(),
+                        e
+                    );
+                }
+                Ok(false) => {}
+            }
         }
         for runtime in self.clip_plugin_tracks.values() {
             for instance in &runtime.clap_plugins {
                 instance.processor.run_host_callbacks_main_thread();
+                match instance.processor.reconfigure_ports_if_needed() {
+                    Ok(true) => reconfigured = true,
+                    Err(e) => {
+                        tracing::warn!(
+                            "CLAP port reconfiguration failed for '{}': {}",
+                            instance.processor.name(),
+                            e
+                        );
+                    }
+                    Ok(false) => {}
+                }
             }
         }
+        reconfigured
     }
 
     fn connect_directed_audio(from: &Arc<AudioIO>, to: &Arc<AudioIO>) {
