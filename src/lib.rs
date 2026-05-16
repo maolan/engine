@@ -1,6 +1,7 @@
 mod audio;
 pub mod client;
 mod engine;
+pub use engine::Engine;
 pub mod history;
 mod hw;
 pub mod kind;

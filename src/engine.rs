@@ -251,6 +251,10 @@ type MidiEditParseResult = (
 );
 
 impl Engine {
+    pub fn state(&self) -> Arc<UnsafeMutex<State>> {
+        self.state.clone()
+    }
+
     const METRONOME_TRACK: &'static str = "metronome";
     const METRONOME_DEFAULT_LEVEL_DB: f32 = -10.0;
     const MIDI_CC_ALL_SOUND_OFF: u8 = 120;
@@ -4095,10 +4099,25 @@ impl Engine {
                 }
             }
             Action::EndHistoryGroup => {
-                if let Some(group) = self.history_group.take()
+                if let Some(mut group) = self.history_group.take()
                     && !group.forward_actions.is_empty()
                     && !group.inverse_actions.is_empty()
                 {
+                    let mut add_tracks = Vec::new();
+                    let mut connections = Vec::new();
+                    let mut rest = Vec::new();
+                    for action in group.inverse_actions {
+                        if matches!(action, Action::AddTrack { .. }) {
+                            add_tracks.push(action);
+                        } else if matches!(action, Action::Connect { .. }) {
+                            connections.push(action);
+                        } else {
+                            rest.push(action);
+                        }
+                    }
+                    group.inverse_actions = add_tracks;
+                    group.inverse_actions.extend(rest);
+                    group.inverse_actions.extend(connections);
                     self.history.record(group);
                 }
             }
@@ -7016,8 +7035,6 @@ impl Engine {
                     | Action::SetOscEnabled(_)
                     | Action::SetClipPlaybackEnabled(_)
                     | Action::SetRecordEnabled(_)
-                    | Action::BeginHistoryGroup
-                    | Action::EndHistoryGroup
                     | Action::SetSessionPath(_)
                     | Action::ClearHistory
                     | Action::BeginSessionRestore

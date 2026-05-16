@@ -582,7 +582,8 @@ impl ClapProcessor {
 
         // Re-query ports
         let (input_layout_opt, output_layout_opt) = self.plugin_handle.audio_port_channels();
-        let (discovered_midi_inputs, discovered_midi_outputs) = self.plugin_handle.note_port_layout();
+        let (discovered_midi_inputs, discovered_midi_outputs) =
+            self.plugin_handle.note_port_layout();
 
         let input_port_channels_opt = input_layout_opt.as_ref().map(|(c, _)| c.clone());
         let output_port_channels_opt = output_layout_opt.as_ref().map(|(c, _)| c.clone());
@@ -602,20 +603,22 @@ impl ClapProcessor {
 
         // Resize audio input buffers
         while self.audio_inputs.len() < resolved_inputs {
-            self.audio_inputs.push(Arc::new(AudioIO::new(self.buffer_size)));
+            self.audio_inputs
+                .push(Arc::new(AudioIO::new(self.buffer_size)));
         }
         self.audio_inputs.truncate(resolved_inputs);
 
         // Resize audio output buffers
         while self.audio_outputs.len() < resolved_outputs {
-            self.audio_outputs.push(Arc::new(AudioIO::new(self.buffer_size)));
+            self.audio_outputs
+                .push(Arc::new(AudioIO::new(self.buffer_size)));
         }
         self.audio_outputs.truncate(resolved_outputs);
 
-        self.input_port_channels = input_port_channels_opt
-            .unwrap_or_else(|| vec![1; resolved_inputs]);
-        self.output_port_channels = output_port_channels_opt
-            .unwrap_or_else(|| vec![1; resolved_outputs]);
+        self.input_port_channels =
+            input_port_channels_opt.unwrap_or_else(|| vec![1; resolved_inputs]);
+        self.output_port_channels =
+            output_port_channels_opt.unwrap_or_else(|| vec![1; resolved_outputs]);
         self.midi_input_ports = discovered_midi_inputs.unwrap_or(self.midi_input_ports);
         self.midi_output_ports = discovered_midi_outputs.unwrap_or(self.midi_output_ports);
         self.main_audio_inputs = main_audio_inputs;
@@ -2137,10 +2140,10 @@ impl PluginHandle {
         unsafe {
             if !self.plugin.is_null() {
                 let plugin = &*self.plugin;
-                if let Some(activate) = plugin.activate {
-                    if !activate(self.plugin, sample_rate, min_frames, max_frames) {
-                        return Err("CLAP plugin activate() failed".to_string());
-                    }
+                if let Some(activate) = plugin.activate
+                    && !activate(self.plugin, sample_rate, min_frames, max_frames)
+                {
+                    return Err("CLAP plugin activate() failed".to_string());
                 }
             }
             Ok(())
@@ -2151,10 +2154,10 @@ impl PluginHandle {
         unsafe {
             if !self.plugin.is_null() {
                 let plugin = &*self.plugin;
-                if let Some(start) = plugin.start_processing {
-                    if !start(self.plugin) {
-                        return Err("CLAP plugin start_processing() failed".to_string());
-                    }
+                if let Some(start) = plugin.start_processing
+                    && !start(self.plugin)
+                {
+                    return Err("CLAP plugin start_processing() failed".to_string());
                 }
             }
             Ok(())
@@ -2308,13 +2311,17 @@ unsafe extern "C" fn host_audio_ports_is_rescan_flag_supported(
 
 unsafe extern "C" fn host_audio_ports_rescan(_host: *const ClapHost, _flags: u32) {
     if let Some(state) = host_runtime_state(_host) {
-        state.audio_ports_rescan_requested.store(1, Ordering::Release);
+        state
+            .audio_ports_rescan_requested
+            .store(1, Ordering::Release);
     }
 }
 
 unsafe extern "C" fn host_note_ports_rescan(_host: *const ClapHost, _flags: u32) {
     if let Some(state) = host_runtime_state(_host) {
-        state.note_ports_rescan_requested.store(1, Ordering::Release);
+        state
+            .note_ports_rescan_requested
+            .store(1, Ordering::Release);
     }
 }
 

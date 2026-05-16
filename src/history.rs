@@ -1339,7 +1339,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     for (to_name, to_track_handle) in &state.tracks {
                         let to_track = to_track_handle.lock();
                         for (to_port, to_in) in to_track.audio.ins.iter().enumerate() {
-                            if Arc::ptr_eq(&conn, to_in)
+                            if from_name != to_name
+                                && Arc::ptr_eq(&conn, to_in)
                                 && (from_name == track_name || to_name == track_name)
                                 && seen_audio.insert((
                                     from_name.clone(),
@@ -1368,7 +1369,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     for (to_name, to_track_handle) in &state.tracks {
                         let to_track = to_track_handle.lock();
                         for (to_port, to_in) in to_track.midi.ins.iter().enumerate() {
-                            if Arc::ptr_eq(&conn, to_in)
+                            if from_name != to_name
+                                && Arc::ptr_eq(&conn, to_in)
                                 && (from_name == track_name || to_name == track_name)
                                 && seen_midi.insert((
                                     from_name.clone(),
@@ -1401,7 +1403,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     let from_track = from_track_handle.lock();
                     for (from_port, out) in from_track.audio.outs.iter().enumerate() {
                         let conns: Vec<Arc<AudioIO>> = out.connections.lock().to_vec();
-                        if conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
+                        if from_name != to_name
+                            && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
                             && seen_audio.insert((
                                 from_name.clone(),
                                 from_port,
@@ -1426,7 +1429,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     for (from_port, out) in from_track.midi.outs.iter().enumerate() {
                         let conns: Vec<Arc<crate::mutex::UnsafeMutex<Box<MIDIIO>>>> =
                             out.lock().connections.to_vec();
-                        if conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
+                        if from_name != to_name
+                            && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
                             && seen_midi.insert((
                                 from_name.clone(),
                                 from_port,
@@ -2477,5 +2481,28 @@ mod tests {
                 } if track_name == "t" && master == "bus"
             )
         }));
+    }
+
+    #[test]
+    fn create_inverse_actions_for_remove_track_omits_internal_passthrough() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track.ensure_default_audio_passthrough();
+        track.ensure_default_midi_passthrough();
+        let state = make_state_with_track(track);
+
+        let inverses =
+            create_inverse_actions(&Action::RemoveTrack("t".to_string()), &state).unwrap();
+
+        assert!(
+            !inverses.iter().any(|action| matches!(
+                action,
+                Action::Connect {
+                    from_track,
+                    to_track,
+                    ..
+                } if from_track == to_track
+            )),
+            "internal passthrough should not be captured as a track-to-track Connect action"
+        );
     }
 }
