@@ -237,6 +237,16 @@ impl ClapProcessor {
         }
     }
 
+    pub fn host_ptr(&self) -> usize {
+        &self.host_runtime.host as *const _ as usize
+    }
+
+    pub fn set_sidechain_options(&self, json: &str) -> Result<(), String> {
+        let _thread_scope = HostThreadScope::enter_main();
+        self.plugin_handle
+            .set_sidechain_options(self.host_ptr(), json)
+    }
+
     pub fn process_with_audio_io(&self, frames: usize) {
         let _ = self.process_with_midi(frames, &[], ClapTransportInfo::default());
     }
@@ -1273,6 +1283,10 @@ impl UnsafeMutex<ClapProcessor> {
         self.lock().reconfigure_ports_if_needed()
     }
 
+    pub fn set_sidechain_options(&self, json: &str) -> Result<(), String> {
+        self.lock().set_sidechain_options(json)
+    }
+
     pub fn ui_begin_session(&self) {
         self.lock().ui_begin_session();
     }
@@ -2162,6 +2176,19 @@ impl PluginHandle {
             }
             Ok(())
         }
+    }
+
+    fn set_sidechain_options(&self, host_ptr: usize, json: &str) -> Result<(), String> {
+        let sym = unsafe {
+            self._library
+                .get::<unsafe extern "C" fn(usize, *const c_char)>(
+                    b"maolan_eq_set_sidechain_options\0",
+                )
+        }
+        .map_err(|e| format!("symbol not found: {e}"))?;
+        let cstr = CString::new(json).map_err(|e| e.to_string())?;
+        unsafe { sym(host_ptr, cstr.as_ptr()) };
+        Ok(())
     }
 }
 

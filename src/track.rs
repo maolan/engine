@@ -664,7 +664,7 @@ impl Track {
         to.connection_count.store(new_len, Ordering::Relaxed);
     }
 
-    fn invalidate_audio_route_cache(&mut self) {
+    pub fn invalidate_audio_route_cache(&mut self) {
         self.audio_route_cache_dirty = true;
     }
 
@@ -4372,7 +4372,7 @@ impl Track {
         false
     }
 
-    fn plugin_source_io(
+    pub fn plugin_source_io(
         &self,
         node: &PluginGraphNode,
         port: usize,
@@ -4397,7 +4397,7 @@ impl Track {
         }
     }
 
-    fn plugin_target_io(
+    pub fn plugin_target_io(
         &self,
         node: &PluginGraphNode,
         port: usize,
