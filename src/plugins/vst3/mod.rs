@@ -8,7 +8,7 @@ pub mod state;
 pub use host::{Vst3Host, Vst3PluginInfo};
 pub use midi::EventBuffer;
 pub use port::{BusInfo, PortBinding};
-pub use processor::Vst3Processor;
+pub use processor::{Vst3Processor, Vst3TransportInfo};
 pub use state::{MemoryStream, Vst3PluginState, ibstream_ptr};
 
 pub use processor::list_plugins;

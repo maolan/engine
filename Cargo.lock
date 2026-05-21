@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "alsa",
  "byteorder",
@@ -613,6 +613,7 @@ dependencies = [
  "libloading 0.8.9",
  "lilv",
  "lv2_raw",
+ "maolan-plugin-host-protocol",
  "midir",
  "midly",
  "nix",
@@ -624,6 +625,15 @@ dependencies = [
  "tracing-subscriber",
  "vst3",
  "wide",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "maolan-plugin-host-protocol"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 

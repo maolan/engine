@@ -71,7 +71,7 @@ impl Worker {
                     let lo = min.min(max);
                     let hi = max.max(min);
                     let param_value = (lo + value * (hi - lo)).clamp(lo, hi);
-                    let _ = track.set_lv2_control_value(instance_id, index, param_value);
+                    let _ = track.set_lv2_control_value(instance_id, index as usize, param_value as f64);
                 }
                 OfflineAutomationTarget::Vst3Parameter {
                     instance_id,
@@ -442,7 +442,7 @@ impl Worker {
                     return;
                 }
                 Message::ProcessTrack(t) => {
-                    let (track_name, output_linear, process_epoch) = {
+                    let (track_name, output_linear, process_epoch, parameter_updates) = {
                         let track = t.lock();
                         let process_epoch = track.process_epoch;
                         let started = Instant::now();
@@ -456,10 +456,12 @@ impl Worker {
                             );
                         }
                         track.audio.processing = false;
+                        let updates = std::mem::take(track.echoed_parameter_updates.lock());
                         (
                             track.name.clone(),
                             track.output_meter_linear(),
                             process_epoch,
+                            updates,
                         )
                     };
                     match self
@@ -469,6 +471,7 @@ impl Worker {
                             track_name,
                             output_linear,
                             process_epoch,
+                            parameter_updates,
                         })
                         .await
                     {

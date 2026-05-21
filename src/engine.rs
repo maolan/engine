@@ -4090,14 +4090,13 @@ impl Engine {
                     .await;
                 }
             }
-            Action::BeginHistoryGroup => {
-                if self.history_group.is_none() {
+            Action::BeginHistoryGroup
+                if self.history_group.is_none() => {
                     self.history_group = Some(UndoEntry {
                         forward_actions: vec![],
                         inverse_actions: vec![],
                     });
                 }
-            }
             Action::EndHistoryGroup => {
                 if let Some(mut group) = self.history_group.take()
                     && !group.forward_actions.is_empty()
@@ -4125,10 +4124,8 @@ impl Engine {
                 self.session_dir = Some(Path::new(path).to_path_buf());
                 self.ensure_session_subdirs();
                 #[cfg(all(unix, not(target_os = "macos")))]
-                let lv2_dir = self.session_plugins_dir();
+                let _lv2_dir = self.session_plugins_dir();
                 for track in self.state.lock().tracks.values() {
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    track.lock().set_lv2_state_base_dir(lv2_dir.clone());
                     track.lock().set_session_base_dir(self.session_dir.clone());
                 }
             }
@@ -4245,11 +4242,6 @@ impl Engine {
                             self.tsig_num,
                             self.tsig_denom,
                         );
-                        #[cfg(all(unix, not(target_os = "macos")))]
-                        {
-                            let lv2_dir = self.session_plugins_dir();
-                            track.lock().set_lv2_state_base_dir(lv2_dir);
-                        }
                         track.lock().set_session_base_dir(self.session_dir.clone());
                     }
                 } else {
@@ -4823,30 +4815,6 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackLoadLv2Plugin {
-                ref track_name,
-                ref plugin_uri,
-                instance_id,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "LV2 plugin loading")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().load_lv2_plugin(plugin_uri, instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
             Action::TrackClearDefaultPassthrough { ref track_name } => {
                 if self
                     .reject_if_track_frozen(track_name, "plugin graph editing")
@@ -4864,105 +4832,11 @@ impl Engine {
                 track.lock().clear_default_passthrough();
             }
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackSetLv2PluginState {
-                ref track_name,
-                instance_id,
-                ref state,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "LV2 plugin state changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track
-                    .lock()
-                    .set_lv2_plugin_state(instance_id, state.clone())
-                {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::ClipSetLv2PluginState {
-                ref track_name,
-                clip_idx,
-                instance_id,
-                ref state,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "LV2 plugin state changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) =
-                    track
-                        .lock()
-                        .clip_set_lv2_plugin_state(clip_idx, instance_id, state.clone())
-                {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-                self.notify_clients(Ok(Action::ClipLv2StateSnapshot {
-                    track_name: track_name.clone(),
-                    clip_idx,
-                    instance_id,
-                    state: state.clone(),
-                }))
-                .await;
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackUnloadLv2PluginInstance {
-                ref track_name,
-                instance_id,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "LV2 plugin unloading")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().unload_lv2_plugin_instance(instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackGetLv2Midnam { ref track_name } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let note_names = track.lock().get_lv2_midnam();
-                self.notify_clients(Ok(Action::TrackLv2Midnam {
-                    track_name: track_name.clone(),
-                    note_names,
-                }))
+            Action::ClipSetLv2PluginState { ref track_name, .. } => {
+                self.notify_clients(Err(format!(
+                    "Track '{}': clip LV2 plugin state changes are not supported",
+                    track_name
+                )))
                 .await;
             }
             Action::TrackGetClapNoteNames { ref track_name } => {
@@ -4977,135 +4851,6 @@ impl Engine {
                 self.notify_clients(Ok(Action::TrackClapNoteNames {
                     track_name: track_name.clone(),
                     note_names,
-                }))
-                .await;
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackGetLv2PluginControls {
-                ref track_name,
-                instance_id,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let (controls, instance_access_handle) =
-                    match track.lock().lv2_plugin_controls(instance_id) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                    };
-                self.notify_clients(Ok(Action::TrackLv2PluginControls {
-                    track_name: track_name.clone(),
-                    instance_id,
-                    controls,
-                    instance_access_handle,
-                }))
-                .await;
-                return;
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::ClipGetLv2PluginControls {
-                ref track_name,
-                clip_idx,
-                instance_id,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let (controls, instance_access_handle) =
-                    match track.lock().clip_lv2_plugin_controls(clip_idx, instance_id) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                    };
-                self.notify_clients(Ok(Action::ClipLv2PluginControls {
-                    track_name: track_name.clone(),
-                    clip_idx,
-                    instance_id,
-                    controls,
-                    instance_access_handle,
-                }))
-                .await;
-                return;
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackSetLv2ControlValue {
-                ref track_name,
-                instance_id,
-                index,
-                value,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "LV2 parameter changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track
-                    .lock()
-                    .set_lv2_control_value(instance_id, index, value)
-                {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Action::ClipSetLv2ControlValue {
-                ref track_name,
-                clip_idx,
-                instance_id,
-                index,
-                value,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "LV2 parameter changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let state = match track.lock().clip_set_lv2_control_value(
-                    clip_idx,
-                    instance_id,
-                    index,
-                    value,
-                ) {
-                    Ok(state) => state,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                self.notify_clients(Ok(Action::ClipLv2StateSnapshot {
-                    track_name: track_name.clone(),
-                    clip_idx,
-                    instance_id,
-                    state,
                 }))
                 .await;
             }
@@ -5283,13 +5028,13 @@ impl Engine {
                 return;
             }
             Action::ClapPlugins(_) => {}
-            Action::TrackLoadClapPlugin {
+            Action::TrackLoadOopClapPlugin {
                 ref track_name,
                 ref plugin_path,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "CLAP plugin loading")
+                    .reject_if_track_frozen(track_name, "OOP CLAP plugin loading")
                     .await
                 {
                     return;
@@ -5304,23 +5049,23 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before loading CLAP plugins",
+                        "Track '{}' is currently processing audio; stop playback before loading OOP CLAP plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.load_clap_plugin(plugin_path, instance_id) {
+                if let Err(e) = track.load_oop_clap_plugin(plugin_path, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackUnloadClapPlugin {
+            Action::TrackUnloadOopClapPlugin {
                 ref track_name,
                 ref plugin_path,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "CLAP plugin unloading")
+                    .reject_if_track_frozen(track_name, "OOP CLAP plugin unloading")
                     .await
                 {
                     return;
@@ -5335,13 +5080,284 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
+                        "Track '{}' is currently processing audio; stop playback before unloading OOP CLAP plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.unload_clap_plugin(plugin_path) {
+                if let Err(e) = track.unload_oop_clap_plugin(plugin_path) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackUnloadOopClapPluginInstance {
+                ref track_name,
+                instance_id,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "OOP CLAP plugin unloading")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if track.audio.processing {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' is currently processing audio; stop playback before unloading OOP CLAP plugins",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
+                if let Err(e) = track.unload_oop_clap_plugin_instance(instance_id) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackShowOopClapGui {
+                ref track_name,
+                instance_id,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) = track.lock().show_oop_clap_gui(instance_id) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackLoadOopVst3Plugin {
+                ref track_name,
+                ref plugin_path,
+                instance_id,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "OOP VST3 plugin loading")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if track.audio.processing {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' is currently processing audio; stop playback before loading OOP VST3 plugins",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
+                if let Err(e) = track.load_oop_vst3_plugin(plugin_path, instance_id) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackUnloadOopVst3Plugin {
+                ref track_name,
+                ref plugin_path,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "OOP VST3 plugin unloading")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if track.audio.processing {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' is currently processing audio; stop playback before unloading OOP VST3 plugins",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
+                if let Err(e) = track.unload_oop_vst3_plugin(plugin_path) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackUnloadOopVst3PluginInstance {
+                ref track_name,
+                instance_id,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "OOP VST3 plugin unloading")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if track.audio.processing {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' is currently processing audio; stop playback before unloading OOP VST3 plugins",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
+                if let Err(e) = track.unload_oop_vst3_plugin_instance(instance_id) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackShowOopVst3Gui {
+                ref track_name,
+                instance_id,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) = track.lock().show_oop_vst3_gui(instance_id) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackLoadOopLv2Plugin {
+                ref track_name,
+                ref plugin_uri,
+                instance_id,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "OOP LV2 plugin loading")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if track.audio.processing {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' is currently processing audio; stop playback before loading OOP LV2 plugins",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
+                if let Err(e) = track.load_oop_lv2_plugin(plugin_uri, instance_id) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackUnloadOopLv2Plugin {
+                ref track_name,
+                ref plugin_uri,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "OOP LV2 plugin unloading")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if track.audio.processing {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' is currently processing audio; stop playback before unloading OOP LV2 plugins",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
+                if let Err(e) = track.unload_oop_lv2_plugin(plugin_uri) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackUnloadOopLv2PluginInstance {
+                ref track_name,
+                instance_id,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "OOP LV2 plugin unloading")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if track.audio.processing {
+                    self.notify_clients(Err(format!(
+                        "Track '{}' is currently processing audio; stop playback before unloading OOP LV2 plugins",
+                        track_name
+                    )))
+                    .await;
+                    return;
+                }
+                if let Err(e) = track.unload_oop_lv2_plugin_instance(instance_id) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackShowOopLv2Gui {
+                ref track_name,
+                instance_id,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) = track.lock().show_oop_lv2_gui(instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -5523,10 +5539,10 @@ impl Engine {
                 Ok(track) => {
                     let plugin_path = track
                         .lock()
-                        .loaded_clap_instances()
-                        .into_iter()
-                        .find(|(id, _, _)| *id == instance_id)
-                        .map(|(_, path, _)| path)
+                        .oop_clap_plugins
+                        .iter()
+                        .find(|instance| instance.id == instance_id)
+                        .map(|instance| instance.processor.lock().path().to_string())
                         .unwrap_or_default();
                     match track.lock().clap_snapshot_state(instance_id) {
                         Ok(state) => {
@@ -5560,53 +5576,6 @@ impl Engine {
                             instance_id,
                             plugin_path,
                             state,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::TrackGetClapProcessor {
-                ref track_name,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().clap_plugin_processor(instance_id) {
-                    Ok(processor) => {
-                        self.notify_clients(Ok(Action::TrackClapProcessor {
-                            track_name: track_name.clone(),
-                            instance_id,
-                            processor,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::ClipGetClapProcessor {
-                ref track_name,
-                clip_idx,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track
-                    .lock()
-                    .clip_clap_plugin_processor(clip_idx, instance_id)
-                {
-                    Ok(processor) => {
-                        self.notify_clients(Ok(Action::ClipClapProcessor {
-                            track_name: track_name.clone(),
-                            clip_idx,
-                            instance_id,
-                            processor,
                         }))
                         .await;
                     }
@@ -5708,51 +5677,6 @@ impl Engine {
                 .await;
             }
             Action::TrackSnapshotAllClapStatesDone { .. } => {}
-            Action::TrackLoadVst3Plugin {
-                ref track_name,
-                ref plugin_path,
-                instance_id,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "VST3 plugin loading")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().load_vst3_plugin(plugin_path, instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            Action::TrackUnloadVst3PluginInstance {
-                ref track_name,
-                instance_id,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "VST3 plugin unloading")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().unload_vst3_plugin_instance(instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
             Action::TrackGetVst3Graph { ref track_name } => {
                 match self.track_handle_or_err(track_name) {
                     Ok(track) => {
@@ -5847,55 +5771,6 @@ impl Engine {
                 }
             },
             Action::TrackVst3Parameters { .. } => {}
-            Action::TrackGetVst3Processor {
-                ref track_name,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().vst3_plugin_processor(instance_id) {
-                    Ok(processor) => {
-                        self.notify_clients(Ok(Action::TrackVst3Processor {
-                            track_name: track_name.clone(),
-                            instance_id,
-                            processor,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::ClipGetVst3Processor {
-                ref track_name,
-                clip_idx,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track
-                    .lock()
-                    .clip_vst3_plugin_processor(clip_idx, instance_id)
-                {
-                    Ok(processor) => {
-                        self.notify_clients(Ok(Action::ClipVst3Processor {
-                            track_name: track_name.clone(),
-                            clip_idx,
-                            instance_id,
-                            processor,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::TrackVst3Processor { .. } => {}
-            Action::ClipVst3Processor { .. } => {}
             Action::TrackVst3SnapshotState {
                 ref track_name,
                 instance_id,
@@ -6811,10 +6686,10 @@ impl Engine {
                         midi_clip_count += t.midi.clips.len();
                         #[cfg(all(unix, not(target_os = "macos")))]
                         {
-                            lv2_instance_count += t.lv2_processors.len();
+                            lv2_instance_count += t.oop_lv2_plugins.len();
                         }
-                        vst3_instance_count += t.vst3_processors.len();
-                        clap_instance_count += t.clap_plugins.len();
+                        vst3_instance_count += t.oop_vst3_plugins.len();
+                        clap_instance_count += t.oop_clap_plugins.len();
                     }
                     (
                         track_count,
@@ -6937,8 +6812,6 @@ impl Engine {
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::ClipLv2PluginControls { .. } => {}
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::ClipLv2StateSnapshot { .. } => {}
-            #[cfg(all(unix, not(target_os = "macos")))]
             Action::TrackLv2Midnam { .. } => {}
             Action::TrackClapNoteNames { .. } => {}
             Action::SessionDiagnosticsReport { .. } => {}
@@ -6948,8 +6821,7 @@ impl Engine {
             Action::Undo => {}
             Action::Redo => {}
             Action::ApplyGroupedActions(_) => {}
-            Action::TrackClapProcessor { .. } => {}
-            Action::ClipClapProcessor { .. } => {}
+            _ => {}
         }
 
         if let Some(inverse) = inverse_actions {
@@ -6978,6 +6850,7 @@ impl Engine {
                     track_name,
                     output_linear,
                     process_epoch,
+                    parameter_updates,
                 } => {
                     self.ready_workers.push(worker_id);
                     self.track_processing_started_at.remove(&track_name);
@@ -6991,6 +6864,9 @@ impl Engine {
                     }
                     self.track_meter_linear_by_track
                         .insert(track_name, output_linear);
+                    for action in parameter_updates {
+                        self.notify_clients(Ok(action)).await;
+                    }
                     self.force_stalled_track_completions();
                     let all_finished = self.send_tracks().await;
                     if all_finished {
@@ -7463,7 +7339,7 @@ mod tests {
 
     #[tokio::test]
     async fn track_offline_bounce_allows_different_track_concurrently() {
-        let (mut engine, mut client_rx) = make_engine_with_client();
+        let (mut engine, _client_rx) = make_engine_with_client();
         insert_track(
             &mut engine,
             Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),

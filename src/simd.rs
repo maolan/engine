@@ -592,88 +592,6 @@ unsafe fn clamp_inplace_avx(buf: &mut [f32], min: f32, max: f32) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn add_inplace_basic() {
-        let mut a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let b = [10.0f32, 20.0, 30.0, 40.0, 50.0];
-        add_inplace(&mut a, &b);
-        assert_eq!(a, [11.0, 22.0, 33.0, 44.0, 55.0]);
-    }
-
-    #[test]
-    fn mul_inplace_basic() {
-        let mut a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        mul_inplace(&mut a, 2.0);
-        assert_eq!(a, [2.0, 4.0, 6.0, 8.0, 10.0]);
-    }
-
-    #[test]
-    fn add_scaled_inplace_basic() {
-        let mut a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let b = [10.0f32, 20.0, 30.0, 40.0, 50.0];
-        add_scaled_inplace(&mut a, &b, 0.5);
-        assert_eq!(a, [6.0, 12.0, 18.0, 24.0, 30.0]);
-    }
-
-    #[test]
-    fn copy_scaled_inplace_basic() {
-        let mut a = [0.0f32; 5];
-        let b = [10.0f32, 20.0, 30.0, 40.0, 50.0];
-        copy_scaled_inplace(&mut a, &b, 0.5);
-        assert_eq!(a, [5.0, 10.0, 15.0, 20.0, 25.0]);
-    }
-
-    #[test]
-    fn add_sanitized_inplace_basic() {
-        let mut a = [1.0f32, 2.0, 3.0, 4.0];
-        let b = [0.5f32, f32::NAN, f32::INFINITY, 1.0];
-        add_sanitized_inplace(&mut a, &b);
-        assert!(a[0].is_finite() && a[0] == 1.5);
-        assert!(a[1].is_finite() && a[1] == 2.0);
-        assert!(a[2].is_finite() && a[2] == 3.0);
-        assert!(a[3].is_finite() && a[3] == 5.0);
-    }
-
-    #[test]
-    fn copy_sanitized_inplace_basic() {
-        let mut a = [0.0f32; 4];
-        let b = [0.5f32, f32::NAN, f32::INFINITY, 1.0];
-        copy_sanitized_inplace(&mut a, &b);
-        assert!(a[0].is_finite() && a[0] == 0.5);
-        assert!(a[1].is_finite() && a[1] == 0.0);
-        assert!(a[2].is_finite() && a[2] == 0.0);
-        assert!(a[3].is_finite() && a[3] == 1.0);
-    }
-
-    #[test]
-    fn sanitize_finite_inplace_basic() {
-        let mut a = [1.0f32, f32::NAN, f32::INFINITY, 4.0, f32::NEG_INFINITY];
-        sanitize_finite_inplace(&mut a);
-        assert!(a[0].is_finite() && a[0] == 1.0);
-        assert_eq!(a[1], 0.0);
-        assert_eq!(a[2], 0.0);
-        assert!(a[3].is_finite() && a[3] == 4.0);
-        assert_eq!(a[4], 0.0);
-    }
-
-    #[test]
-    fn peak_abs_basic() {
-        let a = [1.0f32, -3.0, 2.0, 0.5];
-        assert_eq!(peak_abs(&a), 3.0);
-    }
-
-    #[test]
-    fn clamp_inplace_basic() {
-        let mut a = [-2.0f32, -0.5, 0.0, 0.5, 2.0];
-        clamp_inplace(&mut a, -1.0, 1.0);
-        assert_eq!(a, [-1.0, -0.5, 0.0, 0.5, 1.0]);
-    }
-}
-
 /// Convert i32 samples to f32 and scale by `gain`.
 /// `dst` must be at least as long as `src`.
 pub fn convert_i32_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
@@ -1374,5 +1292,87 @@ unsafe fn apply_fade_out_inplace_sse(buf: &mut [f32], start_t: f32, dt: f32) {
     for (j, v) in buf[i..].iter_mut().enumerate() {
         let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
         *v *= (t * std::f32::consts::FRAC_PI_2).cos();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_inplace_basic() {
+        let mut a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let b = [10.0f32, 20.0, 30.0, 40.0, 50.0];
+        add_inplace(&mut a, &b);
+        assert_eq!(a, [11.0, 22.0, 33.0, 44.0, 55.0]);
+    }
+
+    #[test]
+    fn mul_inplace_basic() {
+        let mut a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        mul_inplace(&mut a, 2.0);
+        assert_eq!(a, [2.0, 4.0, 6.0, 8.0, 10.0]);
+    }
+
+    #[test]
+    fn add_scaled_inplace_basic() {
+        let mut a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let b = [10.0f32, 20.0, 30.0, 40.0, 50.0];
+        add_scaled_inplace(&mut a, &b, 0.5);
+        assert_eq!(a, [6.0, 12.0, 18.0, 24.0, 30.0]);
+    }
+
+    #[test]
+    fn copy_scaled_inplace_basic() {
+        let mut a = [0.0f32; 5];
+        let b = [10.0f32, 20.0, 30.0, 40.0, 50.0];
+        copy_scaled_inplace(&mut a, &b, 0.5);
+        assert_eq!(a, [5.0, 10.0, 15.0, 20.0, 25.0]);
+    }
+
+    #[test]
+    fn add_sanitized_inplace_basic() {
+        let mut a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [0.5f32, f32::NAN, f32::INFINITY, 1.0];
+        add_sanitized_inplace(&mut a, &b);
+        assert!(a[0].is_finite() && a[0] == 1.5);
+        assert!(a[1].is_finite() && a[1] == 2.0);
+        assert!(a[2].is_finite() && a[2] == 3.0);
+        assert!(a[3].is_finite() && a[3] == 5.0);
+    }
+
+    #[test]
+    fn copy_sanitized_inplace_basic() {
+        let mut a = [0.0f32; 4];
+        let b = [0.5f32, f32::NAN, f32::INFINITY, 1.0];
+        copy_sanitized_inplace(&mut a, &b);
+        assert!(a[0].is_finite() && a[0] == 0.5);
+        assert!(a[1].is_finite() && a[1] == 0.0);
+        assert!(a[2].is_finite() && a[2] == 0.0);
+        assert!(a[3].is_finite() && a[3] == 1.0);
+    }
+
+    #[test]
+    fn sanitize_finite_inplace_basic() {
+        let mut a = [1.0f32, f32::NAN, f32::INFINITY, 4.0, f32::NEG_INFINITY];
+        sanitize_finite_inplace(&mut a);
+        assert!(a[0].is_finite() && a[0] == 1.0);
+        assert_eq!(a[1], 0.0);
+        assert_eq!(a[2], 0.0);
+        assert!(a[3].is_finite() && a[3] == 4.0);
+        assert_eq!(a[4], 0.0);
+    }
+
+    #[test]
+    fn peak_abs_basic() {
+        let a = [1.0f32, -3.0, 2.0, 0.5];
+        assert_eq!(peak_abs(&a), 3.0);
+    }
+
+    #[test]
+    fn clamp_inplace_basic() {
+        let mut a = [-2.0f32, -0.5, 0.0, 0.5, 2.0];
+        clamp_inplace(&mut a, -1.0, 1.0);
+        assert_eq!(a, [-1.0, -0.5, 0.0, 0.5, 1.0]);
     }
 }

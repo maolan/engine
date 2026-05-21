@@ -18,6 +18,16 @@ use vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32;
 use vst3::Steinberg::Vst::{IEditControllerTrait, ViewType};
 use vst3::Steinberg::{FIDString, IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk};
 
+/// Transport info for VST3 processing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Vst3TransportInfo {
+    pub playhead_sample: i64,
+    pub playing: bool,
+    pub tempo: f64,
+    pub tsig_num: i32,
+    pub tsig_denom: i32,
+}
+
 pub struct Vst3Processor {
     path: String,
     name: String,
@@ -43,6 +53,7 @@ pub struct Vst3Processor {
     processing_started: bool,
     sample_rate: f64,
     bypassed: AtomicBool,
+    transport_info: Mutex<Vst3TransportInfo>,
 
     gui_session: Arc<Mutex<Vst3GuiSession>>,
 }
@@ -218,6 +229,7 @@ impl Vst3Processor {
             processing_started,
             sample_rate,
             bypassed: AtomicBool::new(false),
+            transport_info: Mutex::new(Vst3TransportInfo::default()),
             gui_session,
         })
     }
@@ -407,19 +419,23 @@ impl Vst3Processor {
             });
         }
 
+        let transport = self.transport_info.lock().unwrap_or_else(|e| e.into_inner());
         let mut process_context: ProcessContext = unsafe { std::mem::zeroed() };
         process_context.sampleRate = self.sample_rate;
-        process_context.tempo = 120.0;
-        process_context.timeSigNumerator = 4;
-        process_context.timeSigDenominator = 4;
+        process_context.tempo = transport.tempo;
+        process_context.timeSigNumerator = transport.tsig_num;
+        process_context.timeSigDenominator = transport.tsig_denom;
+        process_context.projectTimeSamples = transport.playhead_sample;
         #[allow(clippy::unnecessary_cast)]
         {
-            process_context.state = (ProcessContext_::StatesAndFlags_::kPlaying
-                | ProcessContext_::StatesAndFlags_::kTempoValid
+            let mut state = ProcessContext_::StatesAndFlags_::kTempoValid
                 | ProcessContext_::StatesAndFlags_::kTimeSigValid
                 | ProcessContext_::StatesAndFlags_::kContTimeValid
-                | ProcessContext_::StatesAndFlags_::kSystemTimeValid)
-                as u32;
+                | ProcessContext_::StatesAndFlags_::kSystemTimeValid;
+            if transport.playing {
+                state |= ProcessContext_::StatesAndFlags_::kPlaying;
+            }
+            process_context.state = state as u32;
         }
         let input_event_list = if self.midi_input_ports > 0 {
             Some(ComWrapper::new(EventBuffer::from_midi_events(
@@ -513,6 +529,12 @@ impl Vst3Processor {
     pub fn get_parameter_value(&self, param_id: u32) -> Option<f32> {
         let idx = self.parameters.iter().position(|p| p.id == param_id)?;
         Some(self.scalar_values.lock().unwrap()[idx])
+    }
+
+    pub fn set_transport_info(&self, info: Vst3TransportInfo) {
+        if let Ok(mut t) = self.transport_info.lock() {
+            *t = info;
+        }
     }
 
     pub fn set_parameter_value(&self, param_id: u32, normalized_value: f32) -> Result<(), String> {

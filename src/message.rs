@@ -159,6 +159,10 @@ pub enum PluginGraphNode {
     Lv2PluginInstance(usize),
     Vst3PluginInstance(usize),
     ClapPluginInstance(usize),
+    OopClapPluginInstance(usize),
+    OopVst3PluginInstance(usize),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    OopLv2PluginInstance(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -546,14 +550,14 @@ pub enum Action {
     TrackSetLv2PluginState {
         track_name: String,
         instance_id: usize,
-        state: Lv2PluginState,
+        state: Vec<u8>,
     },
     #[cfg(all(unix, not(target_os = "macos")))]
     ClipSetLv2PluginState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-        state: Lv2PluginState,
+        state: Vec<u8>,
     },
     #[cfg(all(unix, not(target_os = "macos")))]
     TrackUnloadLv2PluginInstance {
@@ -622,7 +626,7 @@ pub enum Action {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-        state: Lv2PluginState,
+        state: Vec<u8>,
     },
     TrackGetPluginGraph {
         track_name: String,
@@ -728,26 +732,6 @@ pub enum Action {
         clip_idx: usize,
         instance_id: usize,
     },
-    TrackGetClapProcessor {
-        track_name: String,
-        instance_id: usize,
-    },
-    ClipGetClapProcessor {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-    },
-    TrackClapProcessor {
-        track_name: String,
-        instance_id: usize,
-        processor: crate::clap::SharedClapProcessor,
-    },
-    ClipClapProcessor {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        processor: crate::clap::SharedClapProcessor,
-    },
     TrackClapStateSnapshot {
         track_name: String,
         instance_id: usize,
@@ -777,6 +761,60 @@ pub enum Action {
     },
     TrackSnapshotAllClapStatesDone {
         track_name: String,
+    },
+    TrackLoadOopClapPlugin {
+        track_name: String,
+        plugin_path: String,
+        instance_id: Option<usize>,
+    },
+    TrackUnloadOopClapPlugin {
+        track_name: String,
+        plugin_path: String,
+    },
+    TrackUnloadOopClapPluginInstance {
+        track_name: String,
+        instance_id: usize,
+    },
+    TrackShowOopClapGui {
+        track_name: String,
+        instance_id: usize,
+    },
+    TrackLoadOopVst3Plugin {
+        track_name: String,
+        plugin_path: String,
+        instance_id: Option<usize>,
+    },
+    TrackUnloadOopVst3Plugin {
+        track_name: String,
+        plugin_path: String,
+    },
+    TrackUnloadOopVst3PluginInstance {
+        track_name: String,
+        instance_id: usize,
+    },
+    TrackShowOopVst3Gui {
+        track_name: String,
+        instance_id: usize,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackLoadOopLv2Plugin {
+        track_name: String,
+        plugin_uri: String,
+        instance_id: Option<usize>,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackUnloadOopLv2Plugin {
+        track_name: String,
+        plugin_uri: String,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackUnloadOopLv2PluginInstance {
+        track_name: String,
+        instance_id: usize,
+    },
+    TrackShowOopLv2Gui {
+        track_name: String,
+        instance_id: usize,
     },
     TrackLoadVst3Plugin {
         track_name: String,
@@ -815,26 +853,6 @@ pub enum Action {
         track_name: String,
         instance_id: usize,
         parameters: Vec<crate::vst3::port::ParameterInfo>,
-    },
-    TrackGetVst3Processor {
-        track_name: String,
-        instance_id: usize,
-    },
-    ClipGetVst3Processor {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-    },
-    TrackVst3Processor {
-        track_name: String,
-        instance_id: usize,
-        processor: Arc<crate::vst3::Vst3Processor>,
-    },
-    ClipVst3Processor {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        processor: Arc<crate::vst3::Vst3Processor>,
     },
     TrackVst3SnapshotState {
         track_name: String,
@@ -958,6 +976,7 @@ pub enum Message {
         track_name: String,
         output_linear: Vec<f32>,
         process_epoch: usize,
+        parameter_updates: Vec<Action>,
     },
     TracksFinished,
 
