@@ -26,12 +26,12 @@ midly = "0.5.3"
 vst3 = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-libloading = "0.8.9"
+libloading = "0.9.0"
 maolan-plugin-host-protocol = { path = "../daw/plugin-host-protocol" }
 wide = "1.4.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-alsa = { version = "0.9.1" }
+alsa = { version = "0.11.0" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.2", features = ["ioctl"] }
@@ -42,10 +42,10 @@ lilv = "0.2.4"
 lv2_raw = "0.2.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-cpal = { version = "0.15.3" }
-midir = "0.10.1"
+cpal = { version = "0.17.3" }
+midir = "0.11.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-sys = "0.2.17"
-coremidi = "0.7.0"
+coremidi = "0.9.0"
