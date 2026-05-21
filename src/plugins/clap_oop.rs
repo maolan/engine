@@ -368,8 +368,13 @@ impl OopClapProcessor {
         Err("GUI not yet supported for OOP CLAP plugins".to_string())
     }
 
-    pub fn gui_set_parent_x11(&self, _window: usize) -> Result<(), String> {
-        Err("GUI not yet supported for OOP CLAP plugins".to_string())
+    pub fn gui_set_parent_x11(&self, window: usize) -> Result<(), String> {
+        if let Some(ref mapping) = self.mapping {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.parent_window.store(window as u32, Ordering::Release);
+            return Ok(());
+        }
+        Err("No active host to set parent window".to_string())
     }
 
     pub fn gui_show(&self) -> Result<(), String> {

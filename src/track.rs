@@ -2557,7 +2557,9 @@ impl Track {
 
     pub fn show_oop_clap_gui(&self, instance_id: usize) -> Result<(), String> {
         if let Some(instance) = self.oop_clap_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.lock().gui_show();
+            let processor = instance.processor.lock();
+            processor.gui_set_parent_x11(0)?;
+            return processor.gui_show();
         }
         Err(format!(
             "Track '{}' does not have OOP CLAP instance id: {}",
