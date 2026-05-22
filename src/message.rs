@@ -156,13 +156,10 @@ pub struct ClipMoveTo {
 pub enum PluginGraphNode {
     TrackInput,
     TrackOutput,
-    Lv2PluginInstance(usize),
-    Vst3PluginInstance(usize),
     ClapPluginInstance(usize),
-    OopClapPluginInstance(usize),
-    OopVst3PluginInstance(usize),
+    Vst3PluginInstance(usize),
     #[cfg(all(unix, not(target_os = "macos")))]
-    OopLv2PluginInstance(usize),
+    Lv2PluginInstance(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -537,12 +534,6 @@ pub enum Action {
         new_sysex_events: Vec<MidiRawEventData>,
         old_sysex_events: Vec<MidiRawEventData>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
-    TrackLoadLv2Plugin {
-        track_name: String,
-        plugin_uri: String,
-        instance_id: Option<usize>,
-    },
     TrackClearDefaultPassthrough {
         track_name: String,
     },
@@ -558,11 +549,6 @@ pub enum Action {
         clip_idx: usize,
         instance_id: usize,
         state: Vec<u8>,
-    },
-    #[cfg(all(unix, not(target_os = "macos")))]
-    TrackUnloadLv2PluginInstance {
-        track_name: String,
-        instance_id: usize,
     },
     #[cfg(all(unix, not(target_os = "macos")))]
     TrackGetLv2PluginControls {
@@ -673,15 +659,6 @@ pub enum Action {
     ListClapPlugins,
     ListClapPluginsWithCapabilities,
     ClapPlugins(Vec<ClapPluginInfo>),
-    TrackLoadClapPlugin {
-        track_name: String,
-        plugin_path: String,
-        instance_id: Option<usize>,
-    },
-    TrackUnloadClapPlugin {
-        track_name: String,
-        plugin_path: String,
-    },
     TrackSetClapParameter {
         track_name: String,
         instance_id: usize,
@@ -762,57 +739,20 @@ pub enum Action {
     TrackSnapshotAllClapStatesDone {
         track_name: String,
     },
-    TrackLoadOopClapPlugin {
+    TrackLoadClapPlugin {
         track_name: String,
         plugin_path: String,
         instance_id: Option<usize>,
     },
-    TrackUnloadOopClapPlugin {
+    TrackUnloadClapPlugin {
         track_name: String,
         plugin_path: String,
     },
-    TrackUnloadOopClapPluginInstance {
+    TrackUnloadClapPluginInstance {
         track_name: String,
         instance_id: usize,
     },
-    TrackShowOopClapGui {
-        track_name: String,
-        instance_id: usize,
-    },
-    TrackLoadOopVst3Plugin {
-        track_name: String,
-        plugin_path: String,
-        instance_id: Option<usize>,
-    },
-    TrackUnloadOopVst3Plugin {
-        track_name: String,
-        plugin_path: String,
-    },
-    TrackUnloadOopVst3PluginInstance {
-        track_name: String,
-        instance_id: usize,
-    },
-    TrackShowOopVst3Gui {
-        track_name: String,
-        instance_id: usize,
-    },
-    #[cfg(all(unix, not(target_os = "macos")))]
-    TrackLoadOopLv2Plugin {
-        track_name: String,
-        plugin_uri: String,
-        instance_id: Option<usize>,
-    },
-    #[cfg(all(unix, not(target_os = "macos")))]
-    TrackUnloadOopLv2Plugin {
-        track_name: String,
-        plugin_uri: String,
-    },
-    #[cfg(all(unix, not(target_os = "macos")))]
-    TrackUnloadOopLv2PluginInstance {
-        track_name: String,
-        instance_id: usize,
-    },
-    TrackShowOopLv2Gui {
+    TrackShowClapGui {
         track_name: String,
         instance_id: usize,
     },
@@ -821,7 +761,35 @@ pub enum Action {
         plugin_path: String,
         instance_id: Option<usize>,
     },
+    TrackUnloadVst3Plugin {
+        track_name: String,
+        plugin_path: String,
+    },
     TrackUnloadVst3PluginInstance {
+        track_name: String,
+        instance_id: usize,
+    },
+    TrackShowVst3Gui {
+        track_name: String,
+        instance_id: usize,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackLoadLv2Plugin {
+        track_name: String,
+        plugin_uri: String,
+        instance_id: Option<usize>,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackUnloadLv2Plugin {
+        track_name: String,
+        plugin_uri: String,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackUnloadLv2PluginInstance {
+        track_name: String,
+        instance_id: usize,
+    },
+    TrackShowLv2Gui {
         track_name: String,
         instance_id: usize,
     },

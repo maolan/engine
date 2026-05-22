@@ -7,8 +7,142 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+// ---------------------------------------------------------------------------
+// X11 GUI support for VST3 (FreeBSD / Linux only)
+// ---------------------------------------------------------------------------
+#[cfg(all(unix, not(target_os = "macos")))]
+mod x11_ffi {
+    use std::os::raw::{c_char, c_int, c_uint, c_ulong};
+    pub type Display = std::ffi::c_void;
+    pub type Window = c_ulong;
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        pub fn XOpenDisplay(display_name: *const c_char) -> *mut Display;
+        pub fn XCloseDisplay(display: *mut Display) -> c_int;
+        pub fn XDefaultScreen(display: *mut Display) -> c_int;
+        pub fn XRootWindow(display: *mut Display, screen: c_int) -> Window;
+        pub fn XBlackPixel(display: *mut Display, screen: c_int) -> c_ulong;
+        pub fn XWhitePixel(display: *mut Display, screen: c_int) -> c_ulong;
+        pub fn XCreateSimpleWindow(
+            display: *mut Display,
+            parent: Window,
+            x: c_int,
+            y: c_int,
+            width: c_uint,
+            height: c_uint,
+            border_width: c_uint,
+            border: c_ulong,
+            background: c_ulong,
+        ) -> Window;
+        pub fn XStoreName(display: *mut Display, w: Window, name: *const c_char) -> c_int;
+        pub fn XMapWindow(display: *mut Display, w: Window) -> c_int;
+        pub fn XUnmapWindow(display: *mut Display, w: Window) -> c_int;
+        pub fn XDestroyWindow(display: *mut Display, w: Window) -> c_int;
+        pub fn XResizeWindow(display: *mut Display, w: Window, width: c_uint, height: c_uint)
+            -> c_int;
+        pub fn XFlush(display: *mut Display) -> c_int;
+    }
+}
+
+/// Owns the X11 display connection and container window for a VST3 plugin GUI.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct Vst3GuiWindow {
+    display: *mut x11_ffi::Display,
+    window: x11_ffi::Window,
+}
+
+// The display pointer is only used from the single plugin-host main thread.
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe impl Send for Vst3GuiWindow {}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Drop for Vst3GuiWindow {
+    fn drop(&mut self) {
+        unsafe {
+            x11_ffi::XDestroyWindow(self.display, self.window);
+            x11_ffi::XFlush(self.display);
+            x11_ffi::XCloseDisplay(self.display);
+        }
+    }
+}
+
+/// Create an X11 container window, attach the VST3 plugin view to it, and map
+/// (show) the window.  Called the first time GUI show is requested.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn create_vst3_gui(
+    processor: &maolan_engine::plugins::vst3::Vst3Processor,
+    plugin_path: &str,
+) -> Result<Vst3GuiWindow, String> {
+    use std::os::raw::c_uint;
+
+    let display = unsafe { x11_ffi::XOpenDisplay(std::ptr::null()) };
+    if display.is_null() {
+        return Err("VST3 GUI: failed to open X11 display".to_string());
+    }
+
+    let screen = unsafe { x11_ffi::XDefaultScreen(display) };
+    let root = unsafe { x11_ffi::XRootWindow(display, screen) };
+    let black = unsafe { x11_ffi::XBlackPixel(display, screen) };
+    let white = unsafe { x11_ffi::XWhitePixel(display, screen) };
+
+    let window = unsafe {
+        x11_ffi::XCreateSimpleWindow(
+            display, root,
+            100, 100,          // initial position
+            800, 600,          // initial size (resized after gui_get_size)
+            1, black, white,
+        )
+    };
+    if window == 0 {
+        unsafe { x11_ffi::XCloseDisplay(display); }
+        return Err("VST3 GUI: failed to create X11 container window".to_string());
+    }
+
+    // Use the plugin file name as the window title.
+    let title = std::path::Path::new(plugin_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Plugin");
+    if let Ok(cstr) = std::ffi::CString::new(title) {
+        unsafe { x11_ffi::XStoreName(display, window, cstr.as_ptr()); }
+    }
+
+    // Create the VST3 IPlugView and verify X11EmbedWindowID is supported.
+    processor.gui_create("X11EmbedWindowID").map_err(|e| {
+        unsafe {
+            x11_ffi::XDestroyWindow(display, window);
+            x11_ffi::XCloseDisplay(display);
+        }
+        format!("VST3 GUI: gui_create failed: {e}")
+    })?;
+
+    // Attach the view to our container window.
+    processor.gui_set_parent(window as usize, "X11EmbedWindowID").map_err(|e| {
+        unsafe {
+            x11_ffi::XDestroyWindow(display, window);
+            x11_ffi::XCloseDisplay(display);
+        }
+        format!("VST3 GUI: gui_set_parent failed: {e}")
+    })?;
+
+    // Resize container to the plugin's preferred size.
+    if let Ok((w, h)) = processor.gui_get_size() {
+        if w > 0 && h > 0 {
+            unsafe { x11_ffi::XResizeWindow(display, window, w as c_uint, h as c_uint); }
+        }
+    }
+
+    unsafe {
+        x11_ffi::XMapWindow(display, window);
+        x11_ffi::XFlush(display);
+    }
+
+    Ok(Vst3GuiWindow { display, window })
+}
+
 fn print_usage() {
-    eprintln!("Usage: maolan-engine-oophost <format> <plugin-spec> <shm-name> <instance-id> <d2h-fd> <h2d-fd> <sample-rate> <buffer-size> <num-inputs> <num-outputs>");
+    eprintln!("Usage: maolan-engine-plugin-host <format> <plugin-spec> <shm-name> <instance-id> <d2h-fd> <h2d-fd> <sample-rate> <buffer-size> <num-inputs> <num-outputs>");
     eprintln!("  format: vst3 | lv2");
 }
 
@@ -48,7 +182,7 @@ fn main() {
     // Signal readiness.
     let header = unsafe { header_mut(mapping.as_ptr()) };
     header.ready.store(1, Ordering::Release);
-    eprintln!("[oophost {}] Ready for {} plugin {}", instance_id, format, plugin_spec);
+    eprintln!("[plugin-host {}] Ready for {} plugin {}", instance_id, format, plugin_spec);
 
     match plugin_spec.as_str() {
         "__test__" => {
@@ -106,7 +240,7 @@ fn apply_vst3_param_ring(processor: &maolan_engine::plugins::vst3::Vst3Processor
     };
     while let Some(ev) = ring.pop() {
         if let Err(e) = processor.set_parameter_value(ev.param_index, ev.value) {
-            eprintln!("[oophost] VST3 set_parameter_value failed: {}", e);
+            eprintln!("[plugin-host] VST3 set_parameter_value failed: {}", e);
         }
     }
 }
@@ -145,7 +279,7 @@ fn write_vst3_echo_ring(
                 _pad: 0,
             };
             if !ring.push(ev) {
-                eprintln!("[oophost] Echo ring full, dropping parameter event");
+                eprintln!("[plugin-host] Echo ring full, dropping parameter event");
                 break;
             }
             cache.insert(param.id, current);
@@ -247,7 +381,7 @@ fn run_vst3(args: Vst3RunArgs) {
     ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[oophost {}] Failed to load VST3 plugin '{}': {}", instance_id, plugin_path, e);
+            eprintln!("[plugin-host {}] Failed to load VST3 plugin '{}': {}", instance_id, plugin_path, e);
             return;
         }
     };
@@ -257,14 +391,17 @@ fn run_vst3(args: Vst3RunArgs) {
     let header = unsafe { header_ref(mapping.as_ptr()) };
     let ptr = mapping.as_ptr();
     let mut vst3_param_cache = HashMap::new();
+    // X11 container window for VST3 GUI (created lazily on first GUI show request).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut vst3_gui_window: Option<Vst3GuiWindow> = None;
 
     loop {
         if header.shutdown_request.load(Ordering::Acquire) != 0 {
-            eprintln!("[oophost {}] Shutdown requested", instance_id);
+            eprintln!("[plugin-host {}] Shutdown requested", instance_id);
             break;
         }
 
-        // Check for state request before waiting for audio signal.
+        // Check for state/GUI request before waiting for audio signal.
         let req = header.request_type.load(Ordering::Acquire);
         if req != 0 {
             let scratch = unsafe { scratch_ptr(ptr) };
@@ -293,18 +430,52 @@ fn run_vst3(args: Vst3RunArgs) {
                     }
                 }
                 3 => {
-                    // GUI show
-                    processor.gui_show()
+                    // GUI show — create an X11 container window on first call,
+                    // then attach and map it.
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    {
+                        if vst3_gui_window.is_none() {
+                            match create_vst3_gui(&processor, plugin_path) {
+                                Ok(gw) => {
+                                    vst3_gui_window = Some(gw);
+                                    processor.gui_show()
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            if let Some(ref gw) = vst3_gui_window {
+                                unsafe {
+                                    x11_ffi::XMapWindow(gw.display, gw.window);
+                                    x11_ffi::XFlush(gw.display);
+                                }
+                            }
+                            processor.gui_show()
+                        }
+                    }
+                    #[cfg(not(all(unix, not(target_os = "macos"))))]
+                    Err("VST3 GUI not supported on this platform".to_string())
                 }
                 4 => {
                     // GUI hide
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    if let Some(ref gw) = vst3_gui_window {
+                        unsafe {
+                            x11_ffi::XUnmapWindow(gw.display, gw.window);
+                            x11_ffi::XFlush(gw.display);
+                        }
+                    }
                     processor.gui_hide();
                     Ok(())
                 }
                 _ => Err(format!("Unknown request type: {}", req)),
             };
             header.request_status.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
-            let _ = events.signal_daw();
+            // Only wake the DAW for state operations (save=1, restore=2).
+            // GUI requests (show=3, hide=4) are fire-and-forget — signalling
+            // here would corrupt the audio-completion pipe handshake.
+            if req == 1 || req == 2 {
+                let _ = events.signal_daw();
+            }
             header.request_type.store(0, Ordering::Release);
             continue;
         }
@@ -313,7 +484,7 @@ fn run_vst3(args: Vst3RunArgs) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
-                eprintln!("[oophost {}] Event error: {}", instance_id, e);
+                eprintln!("[plugin-host {}] Event error: {}", instance_id, e);
                 break;
             }
         }
@@ -323,7 +494,7 @@ fn run_vst3(args: Vst3RunArgs) {
         let num_out = header.num_output_channels.load(Ordering::Acquire) as usize;
 
         if block_size == 0 || block_size > MAX_BLOCK_SIZE {
-            eprintln!("[oophost {}] Invalid block size {}, skipping", instance_id, block_size);
+            eprintln!("[plugin-host {}] Invalid block size {}, skipping", instance_id, block_size);
             let _ = events.signal_daw();
             continue;
         }
@@ -364,12 +535,12 @@ fn run_vst3(args: Vst3RunArgs) {
         }
 
         if let Err(e) = events.signal_daw() {
-            eprintln!("[oophost {}] Failed to signal DAW: {}", instance_id, e);
+            eprintln!("[plugin-host {}] Failed to signal DAW: {}", instance_id, e);
             break;
         }
     }
 
-    eprintln!("[oophost {}] VST3 host exiting", instance_id);
+    eprintln!("[plugin-host {}] VST3 host exiting", instance_id);
 }
 
 /// Drain parameter events from the DAW-side param ring and apply them to an LV2 processor.
@@ -381,7 +552,7 @@ fn apply_lv2_param_ring(processor: &mut maolan_engine::plugins::lv2::Lv2Processo
     };
     while let Some(ev) = ring.pop() {
         if let Err(e) = processor.set_control_value(ev.param_index, ev.value) {
-            eprintln!("[oophost] LV2 set_control_value failed: {}", e);
+            eprintln!("[plugin-host] LV2 set_control_value failed: {}", e);
         }
     }
 }
@@ -419,7 +590,7 @@ fn write_lv2_echo_ring(
                 _pad: 0,
             };
             if !ring.push(ev) {
-                eprintln!("[oophost] Echo ring full, dropping parameter event");
+                eprintln!("[plugin-host] Echo ring full, dropping parameter event");
                 break;
             }
             cache.insert(port.index, current);
@@ -546,7 +717,7 @@ fn run_lv2(
     ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[oophost {}] Failed to load LV2 plugin '{}': {}", instance_id, plugin_uri, e);
+            eprintln!("[plugin-host {}] Failed to load LV2 plugin '{}': {}", instance_id, plugin_uri, e);
             return;
         }
     };
@@ -557,11 +728,11 @@ fn run_lv2(
 
     loop {
         if header.shutdown_request.load(Ordering::Acquire) != 0 {
-            eprintln!("[oophost {}] Shutdown requested", instance_id);
+            eprintln!("[plugin-host {}] Shutdown requested", instance_id);
             break;
         }
 
-        // Check for state request before waiting for audio signal.
+        // Check for state/GUI request before waiting for audio signal.
         let req = header.request_type.load(Ordering::Acquire);
         if req != 0 {
             let scratch = unsafe { scratch_ptr(ptr) };
@@ -585,10 +756,18 @@ fn run_lv2(
                         Err(e) => Err(e),
                     }
                 }
+                // GUI show/hide: LV2 has no GUI support in the plugin host yet.
+                3 => Err("LV2 GUI not yet supported".to_string()),
+                4 => Ok(()),
                 _ => Err(format!("Unknown request type: {}", req)),
             };
             header.request_status.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
-            let _ = events.signal_daw();
+            // Only wake the DAW for state operations (save=1, restore=2).
+            // GUI requests (show=3, hide=4) are fire-and-forget — signalling
+            // here would corrupt the audio-completion pipe handshake.
+            if req == 1 || req == 2 {
+                let _ = events.signal_daw();
+            }
             header.request_type.store(0, Ordering::Release);
             continue;
         }
@@ -597,7 +776,7 @@ fn run_lv2(
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
-                eprintln!("[oophost {}] Event error: {}", instance_id, e);
+                eprintln!("[plugin-host {}] Event error: {}", instance_id, e);
                 break;
             }
         }
@@ -607,7 +786,7 @@ fn run_lv2(
         let num_out = header.num_output_channels.load(Ordering::Acquire) as usize;
 
         if block_size == 0 || block_size > MAX_BLOCK_SIZE {
-            eprintln!("[oophost {}] Invalid block size {}, skipping", instance_id, block_size);
+            eprintln!("[plugin-host {}] Invalid block size {}, skipping", instance_id, block_size);
             let _ = events.signal_daw();
             continue;
         }
@@ -652,12 +831,12 @@ fn run_lv2(
         }
 
         if let Err(e) = events.signal_daw() {
-            eprintln!("[oophost {}] Failed to signal DAW: {}", instance_id, e);
+            eprintln!("[plugin-host {}] Failed to signal DAW: {}", instance_id, e);
             break;
         }
     }
 
-    eprintln!("[oophost {}] LV2 host exiting", instance_id);
+    eprintln!("[plugin-host {}] LV2 host exiting", instance_id);
 }
 
 #[cfg(test)]

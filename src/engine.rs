@@ -5028,13 +5028,13 @@ impl Engine {
                 return;
             }
             Action::ClapPlugins(_) => {}
-            Action::TrackLoadOopClapPlugin {
+            Action::TrackLoadClapPlugin {
                 ref track_name,
                 ref plugin_path,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP CLAP plugin loading")
+                    .reject_if_track_frozen(track_name, "CLAP plugin loading")
                     .await
                 {
                     return;
@@ -5049,23 +5049,23 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before loading OOP CLAP plugins",
+                        "Track '{}' is currently processing audio; stop playback before loading CLAP plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.load_oop_clap_plugin(plugin_path, instance_id) {
+                if let Err(e) = track.load_clap_plugin(plugin_path, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackUnloadOopClapPlugin {
+            Action::TrackUnloadClapPlugin {
                 ref track_name,
                 ref plugin_path,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP CLAP plugin unloading")
+                    .reject_if_track_frozen(track_name, "CLAP plugin unloading")
                     .await
                 {
                     return;
@@ -5080,23 +5080,23 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading OOP CLAP plugins",
+                        "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.unload_oop_clap_plugin(plugin_path) {
+                if let Err(e) = track.unload_clap_plugin(plugin_path) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackUnloadOopClapPluginInstance {
+            Action::TrackUnloadClapPluginInstance {
                 ref track_name,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP CLAP plugin unloading")
+                    .reject_if_track_frozen(track_name, "CLAP plugin unloading")
                     .await
                 {
                     return;
@@ -5111,18 +5111,18 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading OOP CLAP plugins",
+                        "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.unload_oop_clap_plugin_instance(instance_id) {
+                if let Err(e) = track.unload_clap_plugin_instance(instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackShowOopClapGui {
+            Action::TrackShowClapGui {
                 ref track_name,
                 instance_id,
             } => {
@@ -5133,18 +5133,18 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) = track.lock().show_oop_clap_gui(instance_id) {
+                if let Err(e) = track.lock().show_clap_gui(instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackLoadOopVst3Plugin {
+            Action::TrackLoadVst3Plugin {
                 ref track_name,
                 ref plugin_path,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP VST3 plugin loading")
+                    .reject_if_track_frozen(track_name, "VST3 plugin loading")
                     .await
                 {
                     return;
@@ -5159,23 +5159,23 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before loading OOP VST3 plugins",
+                        "Track '{}' is currently processing audio; stop playback before loading VST3 plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.load_oop_vst3_plugin(plugin_path, instance_id) {
+                if let Err(e) = track.load_vst3_plugin(plugin_path, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackUnloadOopVst3Plugin {
+            Action::TrackUnloadVst3Plugin {
                 ref track_name,
                 ref plugin_path,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP VST3 plugin unloading")
+                    .reject_if_track_frozen(track_name, "VST3 plugin unloading")
                     .await
                 {
                     return;
@@ -5190,23 +5190,23 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading OOP VST3 plugins",
+                        "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.unload_oop_vst3_plugin(plugin_path) {
+                if let Err(e) = track.unload_vst3_plugin(plugin_path) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackUnloadOopVst3PluginInstance {
+            Action::TrackUnloadVst3PluginInstance {
                 ref track_name,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP VST3 plugin unloading")
+                    .reject_if_track_frozen(track_name, "VST3 plugin unloading")
                     .await
                 {
                     return;
@@ -5221,18 +5221,18 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading OOP VST3 plugins",
+                        "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.unload_oop_vst3_plugin_instance(instance_id) {
+                if let Err(e) = track.unload_vst3_plugin_instance(instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
-            Action::TrackShowOopVst3Gui {
+            Action::TrackShowVst3Gui {
                 ref track_name,
                 instance_id,
             } => {
@@ -5243,19 +5243,19 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) = track.lock().show_oop_vst3_gui(instance_id) {
+                if let Err(e) = track.lock().show_vst3_gui(instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackLoadOopLv2Plugin {
+            Action::TrackLoadLv2Plugin {
                 ref track_name,
                 ref plugin_uri,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP LV2 plugin loading")
+                    .reject_if_track_frozen(track_name, "LV2 plugin loading")
                     .await
                 {
                     return;
@@ -5270,24 +5270,24 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before loading OOP LV2 plugins",
+                        "Track '{}' is currently processing audio; stop playback before loading LV2 plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.load_oop_lv2_plugin(plugin_uri, instance_id) {
+                if let Err(e) = track.load_lv2_plugin(plugin_uri, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackUnloadOopLv2Plugin {
+            Action::TrackUnloadLv2Plugin {
                 ref track_name,
                 ref plugin_uri,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP LV2 plugin unloading")
+                    .reject_if_track_frozen(track_name, "LV2 plugin unloading")
                     .await
                 {
                     return;
@@ -5302,24 +5302,24 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading OOP LV2 plugins",
+                        "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.unload_oop_lv2_plugin(plugin_uri) {
+                if let Err(e) = track.unload_lv2_plugin(plugin_uri) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackUnloadOopLv2PluginInstance {
+            Action::TrackUnloadLv2PluginInstance {
                 ref track_name,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "OOP LV2 plugin unloading")
+                    .reject_if_track_frozen(track_name, "LV2 plugin unloading")
                     .await
                 {
                     return;
@@ -5334,19 +5334,19 @@ impl Engine {
                 let track = track.lock();
                 if track.audio.processing {
                     self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading OOP LV2 plugins",
+                        "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
                         track_name
                     )))
                     .await;
                     return;
                 }
-                if let Err(e) = track.unload_oop_lv2_plugin_instance(instance_id) {
+                if let Err(e) = track.unload_lv2_plugin_instance(instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackShowOopLv2Gui {
+            Action::TrackShowLv2Gui {
                 ref track_name,
                 instance_id,
             } => {
@@ -5357,7 +5357,7 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) = track.lock().show_oop_lv2_gui(instance_id) {
+                if let Err(e) = track.lock().show_lv2_gui(instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -5539,7 +5539,7 @@ impl Engine {
                 Ok(track) => {
                     let plugin_path = track
                         .lock()
-                        .oop_clap_plugins
+                        .clap_plugins
                         .iter()
                         .find(|instance| instance.id == instance_id)
                         .map(|instance| instance.processor.lock().path().to_string())
@@ -6686,10 +6686,10 @@ impl Engine {
                         midi_clip_count += t.midi.clips.len();
                         #[cfg(all(unix, not(target_os = "macos")))]
                         {
-                            lv2_instance_count += t.oop_lv2_plugins.len();
+                            lv2_instance_count += t.lv2_plugins.len();
                         }
-                        vst3_instance_count += t.oop_vst3_plugins.len();
-                        clap_instance_count += t.oop_clap_plugins.len();
+                        vst3_instance_count += t.vst3_plugins.len();
+                        clap_instance_count += t.clap_plugins.len();
                     }
                     (
                         track_count,

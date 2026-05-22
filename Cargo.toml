@@ -12,8 +12,8 @@ keywords = ["audio", "midi", "vst3", "clap", "lv2"]
 categories = ["multimedia::audio"]
 
 [[bin]]
-name = "maolan-engine-oophost"
-path = "src/bin/oophost.rs"
+name = "maolan-engine-plugin-host"
+path = "src/bin/plugin_host.rs"
 
 [dependencies]
 num_cpus = "1.17.0"

@@ -1,10 +1,9 @@
-//! Out-of-process VST3 processor using `maolan-engine-oophost` IPC.
+//! Out-of-process CLAP processor using `maolan-plugin-host` IPC.
 
 use crate::audio::io::AudioIO;
+use crate::clap::{ClapMidiOutputEvent, ClapParamUpdate, ClapParameterInfo, ClapTransportInfo};
 use crate::midi::io::MidiEvent;
 use crate::mutex::UnsafeMutex;
-use crate::vst3::port::ParameterInfo;
-use crate::vst3::state::Vst3PluginState;
 use maolan_plugin_host_protocol::events::EventPair;
 use maolan_plugin_host_protocol::protocol::*;
 use maolan_plugin_host_protocol::ringbuf::RingBuffer;
@@ -16,15 +15,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
-/// Shared state for an out-of-process VST3 plugin instance.
-pub struct OopVst3Processor {
+/// Shared state for an out-of-process CLAP plugin instance.
+pub struct ClapProcessor {
     path: String,
+    plugin_id: String,
     name: String,
     audio_inputs: Vec<Arc<AudioIO>>,
     audio_outputs: Vec<Arc<AudioIO>>,
     main_audio_inputs: usize,
     main_audio_outputs: usize,
-    param_infos: Vec<ParameterInfo>,
+    param_infos: Vec<ClapParameterInfo>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
     // IPC state
@@ -37,17 +37,19 @@ pub struct OopVst3Processor {
     last_process_time: UnsafeMutex<Instant>,
 }
 
-pub type SharedOopVst3Processor = Arc<UnsafeMutex<OopVst3Processor>>;
+pub type SharedClapProcessor = Arc<UnsafeMutex<ClapProcessor>>;
 
-impl OopVst3Processor {
+impl ClapProcessor {
     pub fn new(
-        sample_rate: f64,
+        _sample_rate: f64,
         buffer_size: usize,
-        plugin_path: &str,
+        plugin_spec: &str,
         input_count: usize,
         output_count: usize,
         host_binary: PathBuf,
     ) -> Result<Self, String> {
+        let (plugin_path, plugin_id) = split_plugin_spec(plugin_spec);
+
         let audio_inputs = (0..input_count.max(1))
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
@@ -55,33 +57,25 @@ impl OopVst3Processor {
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
 
-        let instance_id = format!("oop-vst3-{}", std::process::id());
-        let (mut child, mapping, events, shm_name) = spawn_host(
-            &host_binary,
-            plugin_path,
-            &instance_id,
-            sample_rate,
-            buffer_size,
-            input_count.max(1),
-            output_count.max(1),
-        )?;
+        // Spawn the host immediately so we can query params.
+        let instance_id = format!("clap-{}", std::process::id());
+        let (mut child, mapping, events, shm_name) =
+            spawn_host(&host_binary, plugin_path, plugin_id, &instance_id)?;
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
         if !wait_for_ready(header, Duration::from_secs(10)) {
             let _ = child.kill();
-            return Err("OOP VST3 host did not signal ready".to_string());
+            return Err("host did not signal ready".to_string());
         }
 
+        // Query parameter count from host via a simple param ring echo.
+        // For now, we use a minimal stub param list.
         let param_infos = Vec::new();
-        let name = Path::new(plugin_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("OOP-VST3")
-            .to_string();
 
         Ok(Self {
-            path: plugin_path.to_string(),
-            name,
+            path: plugin_spec.to_string(),
+            plugin_id: plugin_id.to_string(),
+            name: plugin_id.to_string(),
             audio_inputs,
             audio_outputs,
             main_audio_inputs: input_count.max(1),
@@ -124,7 +118,7 @@ impl OopVst3Processor {
     }
 
     pub fn midi_input_count(&self) -> usize {
-        0
+        0 // Stub: MIDI not yet wired over IPC
     }
 
     pub fn midi_output_count(&self) -> usize {
@@ -139,7 +133,7 @@ impl OopVst3Processor {
         self.bypassed.load(Ordering::Relaxed)
     }
 
-    pub fn parameter_infos(&self) -> Vec<ParameterInfo> {
+    pub fn parameter_infos(&self) -> Vec<ClapParameterInfo> {
         self.param_infos.clone()
     }
 
@@ -153,6 +147,7 @@ impl OopVst3Processor {
 
     pub fn set_parameter_at(&self, param_id: u32, value: f64, _frame: u32) -> Result<(), String> {
         self.param_values.lock().insert(param_id, value);
+        // Write to param ring buffer if host is alive.
         if let Some(ref mapping) = self.mapping {
             let ring = unsafe {
                 let buf = param_ring_ptr(mapping.as_ptr());
@@ -166,7 +161,7 @@ impl OopVst3Processor {
                 _pad: 0,
             };
             if !ring.push(ev) {
-                tracing::warn!("OOP VST3 param ring full, dropping parameter event");
+                tracing::warn!("param ring full, dropping parameter event");
             }
         }
         Ok(())
@@ -184,81 +179,24 @@ impl OopVst3Processor {
         false
     }
 
-    pub fn snapshot_state(&self) -> Result<Vst3PluginState, String> {
-        let (mapping, events) = match (&self.mapping, &self.events) {
-            (Some(m), Some(e)) => (m, e),
-            _ => return Err("OOP VST3 processor not initialized".to_string()),
-        };
-        let ptr = mapping.as_ptr();
-        let header = unsafe { header_mut(ptr) };
-
-        // Signal host to save state.
-        header.request_type.store(1, Ordering::Release);
-        header.request_status.store(0, Ordering::Release);
-        if let Err(e) = events.signal_host() {
-            header.request_type.store(0, Ordering::Release);
-            return Err(format!("Failed to signal host for state save: {}", e));
-        }
-
-        // Wait for host to complete (up to 5 seconds).
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
-            header.request_type.store(0, Ordering::Release);
-            return Err(format!("Host did not respond to state save: {}", e));
-        }
-
-        let status = header.request_status.load(Ordering::Acquire);
-        let size = header.scratch_size.load(Ordering::Acquire) as usize;
-        if status != 1 {
-            header.request_type.store(0, Ordering::Release);
-            return Err("State save failed in host".to_string());
-        }
-
-        let scratch = unsafe { scratch_ptr(ptr) };
-        let state = deserialize_vst3_state(scratch, size)?;
-        header.request_type.store(0, Ordering::Release);
-        Ok(state)
+    pub fn snapshot_state(&self) -> Result<crate::clap::ClapPluginState, String> {
+        Err("state snapshot not yet implemented".to_string())
     }
 
-    pub fn restore_state(&self, state: &Vst3PluginState) -> Result<(), String> {
-        let (mapping, events) = match (&self.mapping, &self.events) {
-            (Some(m), Some(e)) => (m, e),
-            _ => return Err("OOP VST3 processor not initialized".to_string()),
-        };
-        let ptr = mapping.as_ptr();
-        let header = unsafe { header_mut(ptr) };
-
-        // Serialize state into scratch area.
-        let scratch = unsafe { scratch_ptr(ptr) };
-        let size = serialize_vst3_state(scratch, state)?;
-        header.scratch_size.store(size as u32, Ordering::Release);
-
-        // Signal host to restore state.
-        header.request_type.store(2, Ordering::Release);
-        header.request_status.store(0, Ordering::Release);
-        if let Err(e) = events.signal_host() {
-            header.request_type.store(0, Ordering::Release);
-            return Err(format!("Failed to signal host for state restore: {}", e));
-        }
-
-        // Wait for host to complete (up to 5 seconds).
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
-            header.request_type.store(0, Ordering::Release);
-            return Err(format!("Host did not respond to state restore: {}", e));
-        }
-
-        let status = header.request_status.load(Ordering::Acquire);
-        header.request_type.store(0, Ordering::Release);
-        if status != 1 {
-            return Err("State restore failed in host".to_string());
-        }
-        Ok(())
+    pub fn restore_state(&self, _state: &crate::clap::ClapPluginState) -> Result<(), String> {
+        Err("state restore not yet implemented".to_string())
     }
 
     pub fn process_with_audio_io(&self, frames: usize) {
-        let _ = self.process_with_midi(frames, &[]);
+        let _ = self.process_with_midi(frames, &[], ClapTransportInfo::default());
     }
 
-    pub fn process_with_midi(&self, frames: usize, _midi_in: &[MidiEvent]) -> Vec<MidiEvent> {
+    pub fn process_with_midi(
+        &self,
+        frames: usize,
+        _midi_in: &[MidiEvent],
+        _transport: ClapTransportInfo,
+    ) -> Vec<ClapMidiOutputEvent> {
         if self.bypassed.load(Ordering::Relaxed) {
             self.bypass_copy_inputs_to_outputs();
             return Vec::new();
@@ -271,7 +209,7 @@ impl OopVst3Processor {
                 match c.try_wait() {
                     Ok(Some(status)) if !status.success() => {
                         tracing::error!(
-                            "OOP VST3 plugin host crashed for '{}' ({})",
+                            "plugin host crashed for '{}' ({})",
                             self.name,
                             self.path
                         );
@@ -279,21 +217,14 @@ impl OopVst3Processor {
                         self.bypass_copy_inputs_to_outputs();
                         return Vec::new();
                     }
-                    Ok(None) => {
-                        eprintln!("[VST3 debug] host still alive");
-                    }
-                    Ok(Some(status)) => {
-                        eprintln!("[VST3 debug] host exited with success: {:?}", status);
-                    }
-                    Err(e) => {
-                        eprintln!("[VST3 debug] try_wait error: {}", e);
-                    }
+                    _ => {}
                 }
             }
         }
 
         let started = Instant::now();
 
+        // We need mapping and events to proceed.
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
             _ => {
@@ -303,6 +234,7 @@ impl OopVst3Processor {
         };
 
         let ptr = mapping.as_ptr();
+        // Configure block size and channels for this call.
         let num_in = self.audio_inputs.len();
         let num_out = self.audio_outputs.len();
         unsafe {
@@ -310,13 +242,6 @@ impl OopVst3Processor {
             h.block_size.store(frames as u32, Ordering::Release);
             h.num_input_channels.store(num_in as u32, Ordering::Release);
             h.num_output_channels.store(num_out as u32, Ordering::Release);
-            // Write default transport state (can be overridden by track later).
-            let t = transport_mut(ptr);
-            t.playhead_sample = 0;
-            t.tempo = 120.0;
-            t.numerator = 4;
-            t.denominator = 4;
-            t.flags = 1; // playing
         }
 
         // Copy input AudioIO buffers to shared memory (bus 0).
@@ -331,28 +256,21 @@ impl OopVst3Processor {
 
         // Signal host to process.
         if let Err(e) = events.signal_host() {
-            tracing::error!("Failed to signal OOP VST3 host: {e}");
+            tracing::error!("Failed to signal host: {e}");
             self.bypass_copy_inputs_to_outputs();
             return Vec::new();
         }
-        eprintln!("[VST3 debug] signal_host succeeded");
 
         // Wait for host to complete (with timeout).
         let timeout = Duration::from_millis(100);
-        match events.wait_host(timeout) {
-            Ok(()) => {
-                eprintln!("[VST3 debug] wait_host succeeded");
-            }
-            Err(e) => {
-                eprintln!(
-                    "[VST3 debug] host did not respond for '{}' ({}): {}",
-                    self.name,
-                    self.path,
-                    e
-                );
-                self.bypass_copy_inputs_to_outputs();
-                return Vec::new();
-            }
+        if let Err(e) = events.wait_host(timeout) {
+            tracing::error!(
+                "host did not respond for '{}' ({}): {e}",
+                self.name,
+                self.path
+            );
+            self.bypass_copy_inputs_to_outputs();
+            return Vec::new();
         }
 
         // Copy output shared memory (bus 1) back to AudioIO buffers.
@@ -369,7 +287,7 @@ impl OopVst3Processor {
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(20) {
             tracing::warn!(
-                "Slow OOP VST3 process '{}' ({}) took {:.3} ms for {} frames",
+                "Slow process '{}' ({}) took {:.3} ms for {} frames",
                 self.name,
                 self.path,
                 elapsed.as_secs_f64() * 1000.0,
@@ -378,7 +296,7 @@ impl OopVst3Processor {
         }
 
         *self.last_process_time.lock() = Instant::now();
-        Vec::new()
+        Vec::new() // MIDI output stub
     }
 
     fn bypass_copy_inputs_to_outputs(&self) {
@@ -399,6 +317,10 @@ impl OopVst3Processor {
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
     }
 
     pub fn name(&self) -> &str {
@@ -427,31 +349,32 @@ impl OopVst3Processor {
     pub fn ui_take_due_timers(&self) -> Vec<u32> {
         Vec::new()
     }
-    pub fn ui_take_param_updates(&self) -> Vec<(u32, f64)> {
+    pub fn ui_take_param_updates(&self) -> Vec<ClapParamUpdate> {
         Vec::new()
     }
-    pub fn ui_take_state_update(&self) -> Option<Vst3PluginState> {
+    pub fn ui_take_state_update(&self) -> Option<crate::clap::ClapPluginState> {
         None
     }
 
-    pub fn gui_info(&self) -> Result<crate::vst3::interfaces::Vst3GuiInfo, String> {
-        Err("GUI not yet supported for OOP VST3 plugins".to_string())
+    pub fn gui_info(&self) -> Result<crate::clap::ClapGuiInfo, String> {
+        Err("GUI not yet supported for CLAP plugins".to_string())
     }
 
-    pub fn gui_create(&self, _platform_type: &str) -> Result<(), String> {
-        Err("GUI not yet supported for OOP VST3 plugins".to_string())
+    pub fn gui_create(&self, _api: &str, _is_floating: bool) -> Result<(), String> {
+        Err("GUI not yet supported for CLAP plugins".to_string())
     }
 
-    pub fn gui_get_size(&self) -> Result<(i32, i32), String> {
-        Err("GUI not yet supported for OOP VST3 plugins".to_string())
+    pub fn gui_get_size(&self) -> Result<(u32, u32), String> {
+        Err("GUI not yet supported for CLAP plugins".to_string())
     }
 
-    pub fn gui_set_parent(&self, _window: usize, _platform_type: &str) -> Result<(), String> {
-        Err("GUI not yet supported for OOP VST3 plugins".to_string())
-    }
-
-    pub fn gui_on_size(&self, _width: i32, _height: i32) -> Result<(), String> {
-        Err("GUI not yet supported for OOP VST3 plugins".to_string())
+    pub fn gui_set_parent_x11(&self, window: usize) -> Result<(), String> {
+        if let Some(ref mapping) = self.mapping {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.parent_window.store(window as u32, Ordering::Release);
+            return Ok(());
+        }
+        Err("No active host to set parent window".to_string())
     }
 
     pub fn gui_show(&self) -> Result<(), String> {
@@ -480,8 +403,8 @@ impl OopVst3Processor {
 
     pub fn gui_on_timer(&self, _timer_id: u32) {}
 
-    pub fn gui_check_resize(&self) -> Option<(i32, i32)> {
-        None
+    pub fn note_names(&self) -> std::collections::HashMap<u8, String> {
+        std::collections::HashMap::new()
     }
 
     pub fn drain_echoed_parameters(&self) -> Vec<ParameterEvent> {
@@ -500,7 +423,7 @@ impl OopVst3Processor {
     }
 }
 
-impl Drop for OopVst3Processor {
+impl Drop for ClapProcessor {
     fn drop(&mut self) {
         if let Some(ref mapping) = self.mapping
             && let Some(ref events) = self.events {
@@ -525,13 +448,19 @@ impl Drop for OopVst3Processor {
     }
 }
 
-impl UnsafeMutex<OopVst3Processor> {
+impl UnsafeMutex<ClapProcessor> {
     pub fn setup_audio_ports(&self) {
         self.lock().setup_audio_ports();
     }
 
-    pub fn process_with_midi(&self, frames: usize, midi_events: &[MidiEvent]) -> Vec<MidiEvent> {
-        self.lock().process_with_midi(frames, midi_events)
+    pub fn process_with_midi(
+        &self,
+        frames: usize,
+        midi_events: &[MidiEvent],
+        transport: ClapTransportInfo,
+    ) -> Vec<ClapMidiOutputEvent> {
+        self.lock()
+            .process_with_midi(frames, midi_events, transport)
     }
 
     pub fn set_bypassed(&self, bypassed: bool) {
@@ -542,7 +471,7 @@ impl UnsafeMutex<OopVst3Processor> {
         self.lock().is_bypassed()
     }
 
-    pub fn parameter_infos(&self) -> Vec<ParameterInfo> {
+    pub fn parameter_infos(&self) -> Vec<ClapParameterInfo> {
         self.lock().parameter_infos()
     }
 
@@ -562,11 +491,11 @@ impl UnsafeMutex<OopVst3Processor> {
         self.lock().end_parameter_edit_at(param_id, frame)
     }
 
-    pub fn snapshot_state(&self) -> Result<Vst3PluginState, String> {
+    pub fn snapshot_state(&self) -> Result<crate::clap::ClapPluginState, String> {
         self.lock().snapshot_state()
     }
 
-    pub fn restore_state(&self, state: &Vst3PluginState) -> Result<(), String> {
+    pub fn restore_state(&self, state: &crate::clap::ClapPluginState) -> Result<(), String> {
         self.lock().restore_state(state)
     }
 
@@ -598,6 +527,10 @@ impl UnsafeMutex<OopVst3Processor> {
         self.lock().path().to_string()
     }
 
+    pub fn plugin_id(&self) -> String {
+        self.lock().plugin_id().to_string()
+    }
+
     pub fn name(&self) -> String {
         self.lock().name().to_string()
     }
@@ -626,32 +559,28 @@ impl UnsafeMutex<OopVst3Processor> {
         self.lock().ui_take_due_timers()
     }
 
-    pub fn ui_take_param_updates(&self) -> Vec<(u32, f64)> {
+    pub fn ui_take_param_updates(&self) -> Vec<ClapParamUpdate> {
         self.lock().ui_take_param_updates()
     }
 
-    pub fn ui_take_state_update(&self) -> Option<Vst3PluginState> {
+    pub fn ui_take_state_update(&self) -> Option<crate::clap::ClapPluginState> {
         self.lock().ui_take_state_update()
     }
 
-    pub fn gui_info(&self) -> Result<crate::vst3::interfaces::Vst3GuiInfo, String> {
+    pub fn gui_info(&self) -> Result<crate::clap::ClapGuiInfo, String> {
         self.lock().gui_info()
     }
 
-    pub fn gui_create(&self, platform_type: &str) -> Result<(), String> {
-        self.lock().gui_create(platform_type)
+    pub fn gui_create(&self, api: &str, is_floating: bool) -> Result<(), String> {
+        self.lock().gui_create(api, is_floating)
     }
 
-    pub fn gui_get_size(&self) -> Result<(i32, i32), String> {
+    pub fn gui_get_size(&self) -> Result<(u32, u32), String> {
         self.lock().gui_get_size()
     }
 
-    pub fn gui_set_parent(&self, window: usize, platform_type: &str) -> Result<(), String> {
-        self.lock().gui_set_parent(window, platform_type)
-    }
-
-    pub fn gui_on_size(&self, width: i32, height: i32) -> Result<(), String> {
-        self.lock().gui_on_size(width, height)
+    pub fn gui_set_parent_x11(&self, window: usize) -> Result<(), String> {
+        self.lock().gui_set_parent_x11(window)
     }
 
     pub fn gui_show(&self) -> Result<(), String> {
@@ -674,37 +603,31 @@ impl UnsafeMutex<OopVst3Processor> {
         self.lock().gui_on_timer(timer_id);
     }
 
-    pub fn gui_check_resize(&self) -> Option<(i32, i32)> {
-        self.lock().gui_check_resize()
+    pub fn note_names(&self) -> std::collections::HashMap<u8, String> {
+        self.lock().note_names()
     }
 }
 
-/// Locate the `maolan-engine-oophost` binary at runtime.
-pub fn find_oop_host_binary() -> Option<PathBuf> {
+/// Locate the `maolan-plugin-host` binary at runtime.
+///
+/// Search order:
+/// 1. Same directory as the current executable.
+/// 2. Workspace `target/debug` or `target/release` (development).
+/// 3. `PATH` environment variable.
+pub fn find_plugin_host_binary() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from));
 
     // 1. Same directory as current executable.
     if let Some(ref dir) = exe_dir {
-        let candidate = dir.join("maolan-engine-oophost");
+        let candidate = dir.join("maolan-plugin-host");
         if candidate.exists() {
             return Some(candidate);
         }
     }
 
-    // 2. Engine target directory (development).
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let engine_root = Path::new(&manifest);
-        for profile in ["debug", "release"] {
-            let candidate = engine_root.join("target").join(profile).join("maolan-engine-oophost");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // 3. Development workspace paths (DAW target dir).
+    // 2. Development workspace paths.
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let engine_root = Path::new(&manifest);
         for profile in ["debug", "release"] {
@@ -714,17 +637,17 @@ pub fn find_oop_host_binary() -> Option<PathBuf> {
                 .join("daw")
                 .join("target")
                 .join(profile)
-                .join("maolan-engine-oophost");
+                .join("maolan-plugin-host");
             if candidate.exists() {
                 return Some(candidate);
             }
         }
     }
 
-    // 4. PATH.
+    // 3. PATH.
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {
-            let candidate = Path::new(dir).join("maolan-engine-oophost");
+            let candidate = Path::new(dir).join("maolan-plugin-host");
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -734,14 +657,19 @@ pub fn find_oop_host_binary() -> Option<PathBuf> {
     None
 }
 
+fn split_plugin_spec(spec: &str) -> (&str, &str) {
+    if let Some(pos) = spec.rfind('#') {
+        (&spec[..pos], &spec[pos + 1..])
+    } else {
+        (spec, "")
+    }
+}
+
 fn spawn_host(
     host_binary: &PathBuf,
     plugin_path: &str,
+    plugin_id: &str,
     instance_id: &str,
-    sample_rate: f64,
-    buffer_size: usize,
-    num_inputs: usize,
-    num_outputs: usize,
 ) -> Result<(Child, ShmMapping, EventPair, String), String> {
     let pid = std::process::id();
     let shm_name = format!("/maolan-{pid}-{instance_id}");
@@ -753,24 +681,26 @@ fn spawn_host(
 
     let mut events = EventPair::new().map_err(|e| format!("failed to create pipes: {e}"))?;
 
+    let plugin_spec = if plugin_id.is_empty() {
+        plugin_path.to_string()
+    } else {
+        format!("{plugin_path}#{plugin_id}")
+    };
+
     let mut cmd = Command::new(host_binary);
-    cmd.arg("vst3")
-        .arg(plugin_path)
+    cmd.arg("clap")
+        .arg(&plugin_spec)
         .arg(&shm_name)
         .arg(instance_id)
         .arg(events.host_read_fd().to_string())
         .arg(events.host_write_fd().to_string())
-        .arg(sample_rate.to_string())
-        .arg(buffer_size.to_string())
-        .arg(num_inputs.to_string())
-        .arg(num_outputs.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
     let child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn OOP VST3 host: {e}"))?;
+        .map_err(|e| format!("failed to spawn host: {e}"))?;
 
     events.close_daw_unused();
 
@@ -788,108 +718,86 @@ fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
     false
 }
 
-/// Serialize VST3 state into scratch area. Returns bytes written or error.
-fn serialize_vst3_state(scratch: *mut u8, state: &Vst3PluginState) -> Result<usize, String> {
-    let max_len = maolan_plugin_host_protocol::protocol::SCRATCH_SIZE;
-    let mut offset = 0usize;
-
-    let plugin_id_bytes = state.plugin_id.as_bytes();
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, plugin_id_bytes.len() as u32); }
-    offset += 4;
-    if offset + plugin_id_bytes.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(plugin_id_bytes.as_ptr(), scratch.add(offset), plugin_id_bytes.len()); }
-    offset += plugin_id_bytes.len();
-
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.component_state.len() as u32); }
-    offset += 4;
-    if offset + state.component_state.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(state.component_state.as_ptr(), scratch.add(offset), state.component_state.len()); }
-    offset += state.component_state.len();
-
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.controller_state.len() as u32); }
-    offset += 4;
-    if offset + state.controller_state.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(state.controller_state.as_ptr(), scratch.add(offset), state.controller_state.len()); }
-    offset += state.controller_state.len();
-
-    Ok(offset)
-}
-
-/// Deserialize VST3 state from scratch area.
-fn deserialize_vst3_state(scratch: *const u8, size: usize) -> Result<Vst3PluginState, String> {
-    if size < 12 { return Err("scratch too small for VST3 state".to_string()); }
-    let mut offset = 0usize;
-
-    let plugin_id_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
-    offset += 4;
-    if offset + plugin_id_len > size { return Err("scratch underflow".to_string()); }
-    let mut plugin_id_bytes = vec![0u8; plugin_id_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), plugin_id_bytes.as_mut_ptr(), plugin_id_len); }
-    offset += plugin_id_len;
-    let plugin_id = String::from_utf8(plugin_id_bytes).map_err(|e| e.to_string())?;
-
-    let component_state_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
-    offset += 4;
-    if offset + component_state_len > size { return Err("scratch underflow".to_string()); }
-    let mut component_state = vec![0u8; component_state_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), component_state.as_mut_ptr(), component_state_len); }
-    offset += component_state_len;
-
-    let controller_state_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
-    offset += 4;
-    if offset + controller_state_len > size { return Err("scratch underflow".to_string()); }
-    let mut controller_state = vec![0u8; controller_state_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), controller_state.as_mut_ptr(), controller_state_len); }
-
-    Ok(Vst3PluginState {
-        plugin_id,
-        component_state,
-        controller_state,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn find_host_binary() -> PathBuf {
-        find_oop_host_binary().expect("maolan-engine-oophost binary should be built for tests")
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let workspace_root = std::path::Path::new(&manifest).parent().unwrap().join("daw");
+        workspace_root
+            .join("target")
+            .join("debug")
+            .join("maolan-plugin-host")
     }
 
     #[test]
-    fn find_oop_host_binary_locates_binary() {
-        let host_bin = find_oop_host_binary();
-        if let Some(ref path) = host_bin {
-            assert!(path.exists(), "OOP host binary should exist at {}", path.display());
-        }
-    }
-
-    #[test]
-    fn vst3_state_serialization_roundtrip() {
-        let state = Vst3PluginState {
-            plugin_id: "test.plugin.vst3".to_string(),
-            component_state: vec![1, 2, 3, 4, 5],
-            controller_state: vec![10, 20, 30],
-        };
-        let mut scratch = vec![0u8; SCRATCH_SIZE];
-        let size = serialize_vst3_state(scratch.as_mut_ptr(), &state).expect("serialize should succeed");
-        assert!(size > 0);
-        assert!(size < SCRATCH_SIZE);
-
-        let decoded = deserialize_vst3_state(scratch.as_ptr(), size).expect("deserialize should succeed");
-        assert_eq!(decoded.plugin_id, state.plugin_id);
-        assert_eq!(decoded.component_state, state.component_state);
-        assert_eq!(decoded.controller_state, state.controller_state);
-    }
-
-    #[test]
-    fn oop_vst3_processor_crash_bypass() {
+    fn clap_processor_processes_audio() {
         let host_bin = find_host_binary();
+        if !host_bin.exists() {
+            eprintln!("Skipping test: host binary not found at {}", host_bin.display());
+            return;
+        }
 
-        let processor = OopVst3Processor::new(
+        let plugin_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .parent()
+            .unwrap()
+            .join("daw")
+            .join("plugin-host")
+            .join("tests")
+            .join("test_passthrough.clap");
+
+        if !plugin_path.exists() {
+            eprintln!("Skipping test: plugin not found at {}", plugin_path.display());
+            return;
+        }
+
+        let processor = ClapProcessor::new(
+            48000.0,
+            256,
+            &format!("{}#com.maolan.test.passthrough", plugin_path.display()),
+            2,
+            2,
+            host_bin,
+        )
+        .expect("should create processor");
+
+        processor.setup_audio_ports();
+
+        // Fill input buffers with a ramp.
+        for (i, input) in processor.audio_inputs().iter().enumerate() {
+            let buf = input.buffer.lock();
+            for (j, sample) in buf.iter_mut().enumerate() {
+                *sample = (i * 1000 + j) as f32;
+            }
+            *input.finished.lock() = true;
+        }
+
+        // Process one block.
+        processor.process_with_audio_io(256);
+
+        // Verify output buffers were written (non-zero).
+        for output in processor.audio_outputs().iter() {
+            let buf = output.buffer.lock();
+            assert!(
+                buf.iter().any(|&s| s != 0.0),
+                "output buffer should contain non-zero samples"
+            );
+        }
+
+        // Processor is dropped here, which should gracefully shut down the host.
+    }
+
+    #[test]
+    fn clap_processor_crash_bypass() {
+        let host_bin = find_host_binary();
+        if !host_bin.exists() {
+            eprintln!("Skipping crash test: host binary not found");
+            return;
+        }
+
+        // Use the crash test mode.
+        let processor = ClapProcessor::new(
             48000.0,
             256,
             "__crash__",
@@ -897,7 +805,7 @@ mod tests {
             1,
             host_bin,
         )
-        .expect("should create OOP VST3 processor for crash test");
+        .expect("should create processor for crash test");
 
         processor.setup_audio_ports();
 
@@ -917,5 +825,72 @@ mod tests {
             out_buf.iter().all(|&s| s == 1.0),
             "after crash, output should be bypass copy of input"
         );
+    }
+
+    #[test]
+    fn clap_track_integration() {
+        use crate::track::Track;
+
+        let host_bin = find_host_binary();
+        if !host_bin.exists() {
+            eprintln!("Skipping track integration test: host binary not found");
+            return;
+        }
+
+        let plugin_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .parent()
+            .unwrap()
+            .join("daw")
+            .join("plugin-host")
+            .join("tests")
+            .join("test_passthrough.clap");
+
+        if !plugin_path.exists() {
+            eprintln!(
+                "Skipping track integration test: plugin not found at {}",
+                plugin_path.display()
+            );
+            return;
+        }
+
+        let mut track = Track::new(
+            "test-track".to_string(),
+            2,
+            2,
+            0,
+            0,
+            256,
+            48000.0,
+        );
+
+        track
+            .load_clap_plugin(
+                &format!("{}::com.maolan.test.passthrough", plugin_path.display()),
+                None,
+            )
+            .expect("should load CLAP plugin on track");
+
+        assert_eq!(track.clap_plugins.len(), 1);
+
+        // Fill plugin inputs with a ramp and mark them ready.
+        for input in track.clap_plugins[0].processor.audio_inputs() {
+            let buf = input.buffer.lock();
+            for (j, sample) in buf.iter_mut().enumerate() {
+                *sample = j as f32;
+            }
+            *input.finished.lock() = true;
+        }
+
+        // Process one block.
+        track.process();
+
+        // Verify the plugin's output buffers contain the passthrough signal.
+        for (ch, output) in track.clap_plugins[0].processor.audio_outputs().iter().enumerate() {
+            let buf = output.buffer.lock();
+            assert!(
+                buf.iter().any(|&s| s != 0.0),
+                "plugin output ch={ch} should contain non-zero samples after CLAP processing"
+            );
+        }
     }
 }

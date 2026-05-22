@@ -25,65 +25,65 @@ use std::{
 /// MIDI clip events: vector of (timestamp, midi_bytes) pairs
 type MidiClipEvents = Arc<Vec<(usize, Vec<u8>)>>;
 
-pub struct OopClapInstance {
+pub struct ClapInstance {
     pub id: usize,
-    pub processor: crate::clap_oop::SharedOopClapProcessor,
+    pub processor: crate::clap_proc::SharedClapProcessor,
 }
 
-impl std::fmt::Debug for OopClapInstance {
+impl std::fmt::Debug for ClapInstance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OopClapInstance")
+        f.debug_struct("ClapInstance")
             .field("id", &self.id)
-            .field("processor", &"<SharedOopClapProcessor>")
+            .field("processor", &"<SharedClapProcessor>")
             .finish()
     }
 }
 
-impl OopClapInstance {
-    fn new(id: usize, processor: crate::clap_oop::SharedOopClapProcessor) -> Self {
+impl ClapInstance {
+    fn new(id: usize, processor: crate::clap_proc::SharedClapProcessor) -> Self {
         Self { id, processor }
     }
 }
 
-pub struct OopVst3Instance {
+pub struct Vst3Instance {
     pub id: usize,
-    pub processor: crate::vst3_oop::SharedOopVst3Processor,
+    pub processor: crate::vst3_proc::SharedVst3Processor,
 }
 
-impl std::fmt::Debug for OopVst3Instance {
+impl std::fmt::Debug for Vst3Instance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OopVst3Instance")
+        f.debug_struct("Vst3Instance")
             .field("id", &self.id)
-            .field("processor", &"<SharedOopVst3Processor>")
+            .field("processor", &"<SharedVst3Processor>")
             .finish()
     }
 }
 
-impl OopVst3Instance {
-    fn new(id: usize, processor: crate::vst3_oop::SharedOopVst3Processor) -> Self {
+impl Vst3Instance {
+    fn new(id: usize, processor: crate::vst3_proc::SharedVst3Processor) -> Self {
         Self { id, processor }
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub struct OopLv2Instance {
+pub struct Lv2Instance {
     pub id: usize,
-    pub processor: crate::lv2_oop::SharedOopLv2Processor,
+    pub processor: crate::lv2_proc::SharedLv2Processor,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-impl std::fmt::Debug for OopLv2Instance {
+impl std::fmt::Debug for Lv2Instance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OopLv2Instance")
+        f.debug_struct("Lv2Instance")
             .field("id", &self.id)
-            .field("processor", &"<SharedOopLv2Processor>")
+            .field("processor", &"<SharedLv2Processor>")
             .finish()
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-impl OopLv2Instance {
-    fn new(id: usize, processor: crate::lv2_oop::SharedOopLv2Processor) -> Self {
+impl Lv2Instance {
+    fn new(id: usize, processor: crate::lv2_proc::SharedLv2Processor) -> Self {
         Self { id, processor }
     }
 }
@@ -104,10 +104,10 @@ pub(crate) struct ClipPitchShifter {
 struct ClipPluginRuntime {
     input_sources: Vec<Arc<AudioIO>>,
     outputs: Vec<Arc<AudioIO>>,
-    oop_clap_plugins: Vec<OopClapInstance>,
-    oop_vst3_plugins: Vec<OopVst3Instance>,
+    clap_plugins: Vec<ClapInstance>,
+    vst3_plugins: Vec<Vst3Instance>,
     #[cfg(all(unix, not(target_os = "macos")))]
-    oop_lv2_plugins: Vec<OopLv2Instance>,
+    lv2_plugins: Vec<Lv2Instance>,
     plugin_midi_connections: Vec<PluginGraphConnection>,
 }
 
@@ -161,35 +161,30 @@ impl ClipPluginRuntime {
                 .cloned()
                 .ok_or_else(|| format!("Invalid clip input port: {port}")),
 
-            PluginGraphNode::OopClapPluginInstance(id) => self
-                .oop_clap_plugins
+            PluginGraphNode::ClapPluginInstance(id) => self
+                .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
-                .ok_or_else(|| format!("Invalid clip OOP CLAP output port: {id}:{port}")),
-            PluginGraphNode::OopVst3PluginInstance(id) => self
-                .oop_vst3_plugins
+                .ok_or_else(|| format!("Invalid clip CLAP output port: {id}:{port}")),
+            PluginGraphNode::Vst3PluginInstance(id) => self
+                .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
-                .ok_or_else(|| format!("Invalid clip OOP VST3 output port: {id}:{port}")),
+                .ok_or_else(|| format!("Invalid clip VST3 output port: {id}:{port}")),
             #[cfg(all(unix, not(target_os = "macos")))]
-            PluginGraphNode::OopLv2PluginInstance(id) => self
-                .oop_lv2_plugins
+            PluginGraphNode::Lv2PluginInstance(id) => self
+                .lv2_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
-                .ok_or_else(|| format!("Invalid clip OOP LV2 output port: {id}:{port}")),
+                .ok_or_else(|| format!("Invalid clip LV2 output port: {id}:{port}")),
             #[cfg(not(all(unix, not(target_os = "macos"))))]
-            PluginGraphNode::OopLv2PluginInstance(_) => {
+            PluginGraphNode::Lv2PluginInstance(_) => {
                 Err("LV2 plugins are not supported on this platform".to_string())
             }
             PluginGraphNode::TrackOutput => Err("Clip output cannot be audio source".to_string()),
-            PluginGraphNode::Lv2PluginInstance(_)
-            | PluginGraphNode::Vst3PluginInstance(_)
-            | PluginGraphNode::ClapPluginInstance(_) => {
-                Err("In-process plugins are no longer supported".to_string())
-            }
         }
     }
 
@@ -201,35 +196,30 @@ impl ClipPluginRuntime {
                 .cloned()
                 .ok_or_else(|| format!("Invalid clip output port: {port}")),
 
-            PluginGraphNode::OopClapPluginInstance(id) => self
-                .oop_clap_plugins
+            PluginGraphNode::ClapPluginInstance(id) => self
+                .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
-                .ok_or_else(|| format!("Invalid clip OOP CLAP input port: {id}:{port}")),
-            PluginGraphNode::OopVst3PluginInstance(id) => self
-                .oop_vst3_plugins
+                .ok_or_else(|| format!("Invalid clip CLAP input port: {id}:{port}")),
+            PluginGraphNode::Vst3PluginInstance(id) => self
+                .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
-                .ok_or_else(|| format!("Invalid clip OOP VST3 input port: {id}:{port}")),
+                .ok_or_else(|| format!("Invalid clip VST3 input port: {id}:{port}")),
             #[cfg(all(unix, not(target_os = "macos")))]
-            PluginGraphNode::OopLv2PluginInstance(id) => self
-                .oop_lv2_plugins
+            PluginGraphNode::Lv2PluginInstance(id) => self
+                .lv2_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
-                .ok_or_else(|| format!("Invalid clip OOP LV2 input port: {id}:{port}")),
+                .ok_or_else(|| format!("Invalid clip LV2 input port: {id}:{port}")),
             #[cfg(not(all(unix, not(target_os = "macos"))))]
-            PluginGraphNode::OopLv2PluginInstance(_) => {
+            PluginGraphNode::Lv2PluginInstance(_) => {
                 Err("LV2 plugins are not supported on this platform".to_string())
             }
             PluginGraphNode::TrackInput => Err("Clip input cannot be audio target".to_string()),
-            PluginGraphNode::Lv2PluginInstance(_)
-            | PluginGraphNode::Vst3PluginInstance(_)
-            | PluginGraphNode::ClapPluginInstance(_) => {
-                Err("In-process plugins are no longer supported".to_string())
-            }
         }
     }
 
@@ -252,8 +242,8 @@ impl ClipPluginRuntime {
             *source.finished.lock() = true;
         }
 
-        // Process OOP clip plugins.
-        for instance in &self.oop_clap_plugins {
+        // Process clip plugins.
+        for instance in &self.clap_plugins {
             let processor = instance.processor.lock();
             for input in processor.audio_inputs() {
                 if input.connection_count.load(Ordering::Relaxed) > 0 {
@@ -262,7 +252,7 @@ impl ClipPluginRuntime {
             }
             processor.process_with_audio_io(request_len);
         }
-        for instance in &self.oop_vst3_plugins {
+        for instance in &self.vst3_plugins {
             let processor = instance.processor.lock();
             for input in processor.audio_inputs() {
                 if input.connection_count.load(Ordering::Relaxed) > 0 {
@@ -272,7 +262,7 @@ impl ClipPluginRuntime {
             processor.process_with_audio_io(request_len);
         }
         #[cfg(all(unix, not(target_os = "macos")))]
-        for instance in &self.oop_lv2_plugins {
+        for instance in &self.lv2_plugins {
             let processor = instance.processor.lock();
             for input in processor.audio_inputs() {
                 if input.connection_count.load(Ordering::Relaxed) > 0 {
@@ -336,18 +326,18 @@ pub struct Track {
     primary_audio_outs: usize,
     pub audio: AudioTrack,
     pub midi: MIDITrack,
-    pub oop_clap_plugins: Vec<OopClapInstance>,
-    pub oop_vst3_plugins: Vec<OopVst3Instance>,
+    pub clap_plugins: Vec<ClapInstance>,
+    pub vst3_plugins: Vec<Vst3Instance>,
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub oop_lv2_plugins: Vec<OopLv2Instance>,
+    pub lv2_plugins: Vec<Lv2Instance>,
     pub plugin_midi_connections: Vec<PluginGraphConnection>,
-    /// Parameter updates echoed back from OOP plugins during the last process cycle.
+    /// Parameter updates echoed back from plugins during the last process cycle.
     pub echoed_parameter_updates: UnsafeMutex<Vec<crate::message::Action>>,
     pub pending_hw_midi_out_events: Vec<HwMidiOutEvent>,
-    pub next_oop_clap_instance_id: usize,
-    pub next_oop_vst3_instance_id: usize,
+    pub next_clap_instance_id: usize,
+    pub next_vst3_instance_id: usize,
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub next_oop_lv2_instance_id: usize,
+    pub next_lv2_instance_id: usize,
     pub next_plugin_instance_id: usize,
     pub sample_rate: f64,
     process_block_size: usize,
@@ -418,17 +408,17 @@ impl Track {
             primary_audio_outs: audio_outs,
             audio: AudioTrack::new(audio_ins, audio_outs, buffer_size),
             midi: MIDITrack::new(midi_ins, midi_outs),
-            oop_clap_plugins: Vec::new(),
-            oop_vst3_plugins: Vec::new(),
+            clap_plugins: Vec::new(),
+            vst3_plugins: Vec::new(),
             #[cfg(all(unix, not(target_os = "macos")))]
-            oop_lv2_plugins: Vec::new(),
+            lv2_plugins: Vec::new(),
             plugin_midi_connections: Vec::new(),
             echoed_parameter_updates: UnsafeMutex::new(Vec::new()),
             pending_hw_midi_out_events: vec![],
-            next_oop_clap_instance_id: 0,
-            next_oop_vst3_instance_id: 0,
+            next_clap_instance_id: 0,
+            next_vst3_instance_id: 0,
             #[cfg(all(unix, not(target_os = "macos")))]
-            next_oop_lv2_instance_id: 0,
+            next_lv2_instance_id: 0,
             next_plugin_instance_id: 0,
             sample_rate,
             process_block_size: buffer_size.max(1),
@@ -473,7 +463,7 @@ impl Track {
         self.audio.setup();
         let mut reconfigured = false;
         for runtime in self.clip_plugin_tracks.values() {
-            for instance in &runtime.oop_clap_plugins {
+            for instance in &runtime.clap_plugins {
                 instance.processor.lock().run_host_callbacks_main_thread();
                 match instance.processor.lock().reconfigure_ports_if_needed() {
                     Ok(true) => reconfigured = true,
@@ -735,11 +725,11 @@ impl Track {
         }
 
         {
-            // Process OOP track plugins and collect echoed parameter updates.
+            // Process track plugins and collect echoed parameter updates.
             let echoed = self.echoed_parameter_updates.lock();
             echoed.clear();
             let track_name = self.name.clone();
-            for instance in &self.oop_clap_plugins {
+            for instance in &self.clap_plugins {
                 let processor = instance.processor.lock();
                 for input in processor.audio_inputs() {
                     if input.connection_count.load(Ordering::Relaxed) > 0 {
@@ -756,7 +746,7 @@ impl Track {
                     });
                 }
             }
-            for instance in &self.oop_vst3_plugins {
+            for instance in &self.vst3_plugins {
                 let processor = instance.processor.lock();
                 for input in processor.audio_inputs() {
                     if input.connection_count.load(Ordering::Relaxed) > 0 {
@@ -774,7 +764,7 @@ impl Track {
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
-            for instance in &self.oop_lv2_plugins {
+            for instance in &self.lv2_plugins {
                 let processor = instance.processor.lock();
                 for input in processor.audio_inputs() {
                     if input.connection_count.load(Ordering::Relaxed) > 0 {
@@ -1300,17 +1290,17 @@ impl Track {
             "plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
                 .and_then(|node| {
-                    matches!(node, PluginGraphNode::OopLv2PluginInstance(_)).then(|| node.clone())
+                    matches!(node, PluginGraphNode::Lv2PluginInstance(_)).then(|| node.clone())
                 }),
             "vst3_plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
                 .and_then(|node| {
-                    matches!(node, PluginGraphNode::OopVst3PluginInstance(_)).then(|| node.clone())
+                    matches!(node, PluginGraphNode::Vst3PluginInstance(_)).then(|| node.clone())
                 }),
             "clap_plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
                 .and_then(|node| {
-                    matches!(node, PluginGraphNode::OopClapPluginInstance(_)).then(|| node.clone())
+                    matches!(node, PluginGraphNode::ClapPluginInstance(_)).then(|| node.clone())
                 }),
             _ => None,
         }
@@ -1399,10 +1389,10 @@ impl Track {
         let mut runtime = ClipPluginRuntime {
             input_sources,
             outputs,
-            oop_clap_plugins: Vec::new(),
-            oop_vst3_plugins: Vec::new(),
+            clap_plugins: Vec::new(),
+            vst3_plugins: Vec::new(),
             #[cfg(all(unix, not(target_os = "macos")))]
-            oop_lv2_plugins: Vec::new(),
+            lv2_plugins: Vec::new(),
             plugin_midi_connections: Vec::new(),
         };
 
@@ -1426,11 +1416,11 @@ impl Track {
                 next_plugin_instance_id += 1;
                 match format {
                     "CLAP" | "clap" => {
-                        let host_binary = match crate::clap_oop::find_plugin_host_binary() {
+                        let host_binary = match crate::clap_proc::find_plugin_host_binary() {
                             Some(b) => b,
                             None => continue,
                         };
-                        let processor = match crate::clap_oop::OopClapProcessor::new(
+                        let processor = match crate::clap_proc::ClapProcessor::new(
                             self.sample_rate,
                             buffer_size,
                             uri,
@@ -1441,18 +1431,18 @@ impl Track {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        runtime.oop_clap_plugins.push(OopClapInstance::new(
+                        runtime.clap_plugins.push(ClapInstance::new(
                             id,
                             Arc::new(UnsafeMutex::new(processor)),
                         ));
-                        runtime_nodes.push(PluginGraphNode::OopClapPluginInstance(id));
+                        runtime_nodes.push(PluginGraphNode::ClapPluginInstance(id));
                     }
                     "VST3" | "vst3" => {
-                        let host_binary = match crate::vst3_oop::find_oop_host_binary() {
+                        let host_binary = match crate::vst3_proc::find_host_binary() {
                             Some(b) => b,
                             None => continue,
                         };
-                        let processor = match crate::vst3_oop::OopVst3Processor::new(
+                        let processor = match crate::vst3_proc::Vst3Processor::new(
                             self.sample_rate,
                             buffer_size,
                             uri,
@@ -1463,19 +1453,19 @@ impl Track {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        runtime.oop_vst3_plugins.push(OopVst3Instance::new(
+                        runtime.vst3_plugins.push(Vst3Instance::new(
                             id,
                             Arc::new(UnsafeMutex::new(processor)),
                         ));
-                        runtime_nodes.push(PluginGraphNode::OopVst3PluginInstance(id));
+                        runtime_nodes.push(PluginGraphNode::Vst3PluginInstance(id));
                     }
                     #[cfg(all(unix, not(target_os = "macos")))]
                     "LV2" | "lv2" => {
-                        let host_binary = match crate::lv2_oop::find_oop_host_binary() {
+                        let host_binary = match crate::lv2_proc::find_host_binary() {
                             Some(b) => b,
                             None => continue,
                         };
-                        let processor = match crate::lv2_oop::OopLv2Processor::new(
+                        let processor = match crate::lv2_proc::Lv2Processor::new(
                             self.sample_rate,
                             buffer_size,
                             uri,
@@ -1486,11 +1476,11 @@ impl Track {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        runtime.oop_lv2_plugins.push(OopLv2Instance::new(
+                        runtime.lv2_plugins.push(Lv2Instance::new(
                             id,
                             Arc::new(UnsafeMutex::new(processor)),
                         ));
-                        runtime_nodes.push(PluginGraphNode::OopLv2PluginInstance(id));
+                        runtime_nodes.push(PluginGraphNode::Lv2PluginInstance(id));
                     }
                     _ => {}
                 }
@@ -2256,7 +2246,7 @@ impl Track {
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub fn load_oop_lv2_plugin(&mut self, uri: &str, instance_id: Option<usize>) -> Result<(), String> {
+    pub fn load_lv2_plugin(&mut self, uri: &str, instance_id: Option<usize>) -> Result<(), String> {
         let buffer_size = self
             .audio
             .ins
@@ -2264,9 +2254,9 @@ impl Track {
             .map(|io| io.buffer.lock().len())
             .or_else(|| self.audio.outs.first().map(|io| io.buffer.lock().len()))
             .unwrap_or(0);
-        let host_binary = crate::lv2_oop::find_oop_host_binary()
-            .ok_or_else(|| "maolan-engine-oophost binary not found".to_string())?;
-        let processor = crate::lv2_oop::OopLv2Processor::new(
+        let host_binary = crate::lv2_proc::find_host_binary()
+            .ok_or_else(|| "maolan-engine-plugin-host binary not found".to_string())?;
+        let processor = crate::lv2_proc::Lv2Processor::new(
             self.sample_rate,
             buffer_size,
             uri,
@@ -2276,54 +2266,53 @@ impl Track {
         )?;
         let id = instance_id
             .filter(|&id| {
-                !self.oop_vst3_plugins.iter().any(|i| i.id == id)
-                    && !self.oop_clap_plugins.iter().any(|i| i.id == id)
+                !self.vst3_plugins.iter().any(|i| i.id == id)
+                    && !self.clap_plugins.iter().any(|i| i.id == id)
                     && !self.lv2_instance_id_exists(id)
-                    && !self.oop_lv2_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
-        self.next_oop_lv2_instance_id = self.next_oop_lv2_instance_id.max(id.saturating_add(1));
+        self.next_lv2_instance_id = self.next_lv2_instance_id.max(id.saturating_add(1));
         self.next_plugin_instance_id = self.next_plugin_instance_id.max(id.saturating_add(1));
-        self.oop_lv2_plugins.push(OopLv2Instance { id, processor: Arc::new(UnsafeMutex::new(processor)) });
+        self.lv2_plugins.push(Lv2Instance { id, processor: Arc::new(UnsafeMutex::new(processor)) });
         self.invalidate_audio_route_cache();
         Ok(())
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub fn unload_oop_lv2_plugin(&mut self, uri: &str) -> Result<(), String> {
+    pub fn unload_lv2_plugin(&mut self, uri: &str) -> Result<(), String> {
         let Some(index) = self
-            .oop_lv2_plugins
+            .lv2_plugins
             .iter()
             .position(|instance| instance.processor.lock().uri() == uri)
         else {
             return Err(format!(
-                "Track '{}' does not have OOP LV2 plugin loaded: {uri}",
+                "Track '{}' does not have LV2 plugin loaded: {uri}",
                 self.name
             ));
         };
-        self.remove_oop_lv2_instance(index);
+        self.remove_lv2_instance(index);
         Ok(())
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub fn unload_oop_lv2_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
+    pub fn unload_lv2_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
         let Some(index) = self
-            .oop_lv2_plugins
+            .lv2_plugins
             .iter()
             .position(|instance| instance.id == instance_id)
         else {
             return Err(format!(
-                "Track '{}' does not have OOP LV2 instance id: {}",
+                "Track '{}' does not have LV2 instance id: {}",
                 self.name, instance_id
             ));
         };
-        self.remove_oop_lv2_instance(index);
+        self.remove_lv2_instance(index);
         Ok(())
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn remove_oop_lv2_instance(&mut self, index: usize) {
-        let removed = self.oop_lv2_plugins.remove(index);
+    fn remove_lv2_instance(&mut self, index: usize) {
+        let removed = self.lv2_plugins.remove(index);
         for port in removed.processor.lock().audio_inputs() {
             Self::disconnect_all(port);
         }
@@ -2331,8 +2320,8 @@ impl Track {
             Self::disconnect_all(port);
         }
         self.plugin_midi_connections.retain(|conn| {
-            conn.from_node != PluginGraphNode::OopLv2PluginInstance(removed.id)
-                && conn.to_node != PluginGraphNode::OopLv2PluginInstance(removed.id)
+            conn.from_node != PluginGraphNode::Lv2PluginInstance(removed.id)
+                && conn.to_node != PluginGraphNode::Lv2PluginInstance(removed.id)
         });
         self.invalidate_audio_route_cache();
     }
@@ -2350,12 +2339,12 @@ impl Track {
     pub fn plugin_graph_plugins(&self) -> Vec<PluginGraphPlugin> {
         let mut plugins = Vec::new();
         #[cfg(all(unix, not(target_os = "macos")))]
-        for instance in &self.oop_lv2_plugins {
+        for instance in &self.lv2_plugins {
             let proc = instance.processor.lock();
             Self::push_plugin_graph_plugin(
                 &mut plugins,
                 PluginGraphPlugin {
-                    node: PluginGraphNode::OopLv2PluginInstance(instance.id),
+                    node: PluginGraphNode::Lv2PluginInstance(instance.id),
                     instance_id: instance.id,
                     format: "LV2".to_string(),
                     uri: proc.uri().to_string(),
@@ -2372,12 +2361,12 @@ impl Track {
                 },
             );
         }
-        for instance in &self.oop_vst3_plugins {
+        for instance in &self.vst3_plugins {
             let proc = instance.processor.lock();
             Self::push_plugin_graph_plugin(
                 &mut plugins,
                 PluginGraphPlugin {
-                    node: PluginGraphNode::OopVst3PluginInstance(instance.id),
+                    node: PluginGraphNode::Vst3PluginInstance(instance.id),
                     instance_id: instance.id,
                     format: "VST3".to_string(),
                     uri: proc.path().to_string(),
@@ -2394,12 +2383,12 @@ impl Track {
                 },
             );
         }
-        for instance in &self.oop_clap_plugins {
+        for instance in &self.clap_plugins {
             let proc = instance.processor.lock();
             Self::push_plugin_graph_plugin(
                 &mut plugins,
                 PluginGraphPlugin {
-                    node: PluginGraphNode::OopClapPluginInstance(instance.id),
+                    node: PluginGraphNode::ClapPluginInstance(instance.id),
                     instance_id: instance.id,
                     format: "CLAP".to_string(),
                     uri: proc.path().to_string(),
@@ -2429,7 +2418,7 @@ impl Track {
         bypassed: bool,
     ) -> Result<(), String> {
         let Some(instance) = self
-            .oop_lv2_plugins
+            .lv2_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
         else {
@@ -2450,7 +2439,7 @@ impl Track {
         param_value: f64,
     ) -> Result<(), String> {
         let Some(instance) = self
-            .oop_lv2_plugins
+            .lv2_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
         else {
@@ -2462,7 +2451,7 @@ impl Track {
         instance.processor.lock().set_parameter(index as u32, param_value)
     }
 
-    pub fn load_oop_clap_plugin(
+    pub fn load_clap_plugin(
         &mut self,
         plugin_path: &str,
         instance_id: Option<usize>,
@@ -2479,22 +2468,21 @@ impl Track {
             return Err(format!("Not a CLAP plugin path: {plugin_path}"));
         }
         if self
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .any(|plugin| plugin.processor.lock().path().eq_ignore_ascii_case(plugin_path))
         {
-            return Err(format!("OOP CLAP plugin already loaded: {plugin_path}"));
+            return Err(format!("CLAP plugin already loaded: {plugin_path}"));
         }
 
         let id = instance_id
             .filter(|&id| {
-                !self.oop_vst3_plugins.iter().any(|i| i.id == id)
-                    && !self.oop_clap_plugins.iter().any(|i| i.id == id)
+                !self.vst3_plugins.iter().any(|i| i.id == id)
+                    && !self.clap_plugins.iter().any(|i| i.id == id)
                     && !self.lv2_instance_id_exists(id)
-                    && !self.oop_lv2_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
-        self.next_oop_clap_instance_id = self.next_oop_clap_instance_id.max(id.saturating_add(1));
+        self.next_clap_instance_id = self.next_clap_instance_id.max(id.saturating_add(1));
         self.next_plugin_instance_id = self.next_plugin_instance_id.max(id.saturating_add(1));
         let buffer_size = self
             .audio
@@ -2505,9 +2493,9 @@ impl Track {
             .unwrap_or(0);
         let input_count = self.audio.ins.len().max(1);
         let output_count = self.audio.outs.len().max(1);
-        let host_binary = crate::clap_oop::find_plugin_host_binary()
+        let host_binary = crate::clap_proc::find_plugin_host_binary()
             .ok_or_else(|| "maolan-plugin-host binary not found".to_string())?;
-        let processor = Arc::new(UnsafeMutex::new(crate::clap_oop::OopClapProcessor::new(
+        let processor = Arc::new(UnsafeMutex::new(crate::clap_proc::ClapProcessor::new(
             self.sample_rate,
             buffer_size,
             plugin_path,
@@ -2515,75 +2503,75 @@ impl Track {
             output_count,
             host_binary,
         )?));
-        self.oop_clap_plugins.push(OopClapInstance::new(id, processor));
+        self.clap_plugins.push(ClapInstance::new(id, processor));
         self.invalidate_audio_route_cache();
         Ok(())
     }
 
-    pub fn unload_oop_clap_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
+    pub fn unload_clap_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
         let Some(index) = self
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .position(|instance| instance.processor.lock().path().eq_ignore_ascii_case(plugin_path))
         else {
             return Err(format!(
-                "Track '{}' does not have OOP CLAP plugin loaded: {}",
+                "Track '{}' does not have CLAP plugin loaded: {}",
                 self.name, plugin_path
             ));
         };
-        let removed_id = self.oop_clap_plugins[index].id;
-        self.oop_clap_plugins.remove(index);
-        self.prune_plugin_midi_connections(PluginGraphNode::OopClapPluginInstance(removed_id));
+        let removed_id = self.clap_plugins[index].id;
+        self.clap_plugins.remove(index);
+        self.prune_plugin_midi_connections(PluginGraphNode::ClapPluginInstance(removed_id));
         self.invalidate_audio_route_cache();
         Ok(())
     }
 
-    pub fn unload_oop_clap_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
+    pub fn unload_clap_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
         let Some(index) = self
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .position(|instance| instance.id == instance_id)
         else {
             return Err(format!(
-                "Track '{}' does not have OOP CLAP instance id: {}",
+                "Track '{}' does not have CLAP instance id: {}",
                 self.name, instance_id
             ));
         };
-        self.oop_clap_plugins.remove(index);
-        self.prune_plugin_midi_connections(PluginGraphNode::OopClapPluginInstance(instance_id));
+        self.clap_plugins.remove(index);
+        self.prune_plugin_midi_connections(PluginGraphNode::ClapPluginInstance(instance_id));
         self.invalidate_audio_route_cache();
         Ok(())
     }
 
-    pub fn show_oop_clap_gui(&self, instance_id: usize) -> Result<(), String> {
-        if let Some(instance) = self.oop_clap_plugins.iter().find(|i| i.id == instance_id) {
+    pub fn show_clap_gui(&self, instance_id: usize) -> Result<(), String> {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
             let processor = instance.processor.lock();
             processor.gui_set_parent_x11(0)?;
             return processor.gui_show();
         }
         Err(format!(
-            "Track '{}' does not have OOP CLAP instance id: {}",
+            "Track '{}' does not have CLAP instance id: {}",
             self.name, instance_id
         ))
     }
 
-    pub fn show_oop_vst3_gui(&self, instance_id: usize) -> Result<(), String> {
-        if let Some(instance) = self.oop_vst3_plugins.iter().find(|i| i.id == instance_id) {
+    pub fn show_vst3_gui(&self, instance_id: usize) -> Result<(), String> {
+        if let Some(instance) = self.vst3_plugins.iter().find(|i| i.id == instance_id) {
             return instance.processor.lock().gui_show();
         }
         Err(format!(
-            "Track '{}' does not have OOP VST3 instance id: {}",
+            "Track '{}' does not have VST3 instance id: {}",
             self.name, instance_id
         ))
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub fn show_oop_lv2_gui(&self, instance_id: usize) -> Result<(), String> {
-        if let Some(instance) = self.oop_lv2_plugins.iter().find(|i| i.id == instance_id) {
+    pub fn show_lv2_gui(&self, instance_id: usize) -> Result<(), String> {
+        if let Some(instance) = self.lv2_plugins.iter().find(|i| i.id == instance_id) {
             return instance.processor.lock().gui_show();
         }
         Err(format!(
-            "Track '{}' does not have OOP LV2 instance id: {}",
+            "Track '{}' does not have LV2 instance id: {}",
             self.name, instance_id
         ))
     }
@@ -2593,7 +2581,7 @@ impl Track {
         instance_id: usize,
         bypassed: bool,
     ) -> Result<(), String> {
-        if let Some(instance) = self.oop_clap_plugins.iter().find(|i| i.id == instance_id) {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
             instance.processor.lock().set_bypassed(bypassed);
             return Ok(());
         }
@@ -2609,7 +2597,7 @@ impl Track {
         param_id: u32,
         value: f64,
     ) -> Result<(), String> {
-        if let Some(instance) = self.oop_clap_plugins.iter().find(|i| i.id == instance_id) {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
             return instance.processor.lock().set_parameter(param_id, value);
         }
         Err(format!(
@@ -2628,7 +2616,7 @@ impl Track {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
         let instance = runtime
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
@@ -2642,7 +2630,7 @@ impl Track {
         value: f64,
         frame: u32,
     ) -> Result<(), String> {
-        if let Some(instance) = self.oop_clap_plugins.iter().find(|i| i.id == instance_id) {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
             return instance.processor.lock().set_parameter_at(param_id, value, frame);
         }
         Err(format!(
@@ -2658,7 +2646,7 @@ impl Track {
         frame: u32,
     ) -> Result<(), String> {
         let instance = self
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| {
@@ -2677,7 +2665,7 @@ impl Track {
         frame: u32,
     ) -> Result<(), String> {
         let instance = self
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| {
@@ -2694,7 +2682,7 @@ impl Track {
         instance_id: usize,
     ) -> Result<Vec<crate::clap::ClapParameterInfo>, String> {
         let instance = self
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| {
@@ -2708,7 +2696,7 @@ impl Track {
 
     pub fn get_clap_note_names(&self) -> std::collections::HashMap<u8, String> {
         let mut result = std::collections::HashMap::new();
-        for instance in &self.oop_clap_plugins {
+        for instance in &self.clap_plugins {
             for (k, v) in instance.processor.lock().note_names() {
                 result.insert(k, v);
             }
@@ -2720,7 +2708,7 @@ impl Track {
         &self,
         instance_id: usize,
     ) -> Result<crate::clap::ClapPluginState, String> {
-        if let Some(instance) = self.oop_clap_plugins.iter().find(|i| i.id == instance_id) {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
             return instance.processor.lock().snapshot_state();
         }
         Err(format!(
@@ -2737,7 +2725,7 @@ impl Track {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
         let instance = runtime
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
@@ -2750,7 +2738,7 @@ impl Track {
         instance_id: usize,
         state: &crate::clap::ClapPluginState,
     ) -> Result<(), String> {
-        if let Some(instance) = self.oop_clap_plugins.iter().find(|i| i.id == instance_id) {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
             return instance.processor.lock().restore_state(state);
         }
         Err(format!(
@@ -2768,7 +2756,7 @@ impl Track {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
         let instance = runtime
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
@@ -2776,7 +2764,7 @@ impl Track {
     }
 
     pub fn clap_snapshot_all_states(&self) -> Vec<(usize, String, crate::clap::ClapPluginState)> {
-        self.oop_clap_plugins
+        self.clap_plugins
             .iter()
             .filter_map(|instance| {
                 let proc = instance.processor.lock();
@@ -2787,7 +2775,7 @@ impl Track {
             .collect()
     }
 
-    pub fn load_oop_vst3_plugin(
+    pub fn load_vst3_plugin(
         &mut self,
         plugin_path: &str,
         instance_id: Option<usize>,
@@ -2802,9 +2790,9 @@ impl Track {
             .max(1);
         let input_count = self.audio.ins.len().max(1);
         let output_count = self.audio.outs.len().max(1);
-        let host_binary = crate::vst3_oop::find_oop_host_binary()
-            .ok_or_else(|| "maolan-engine-oophost binary not found".to_string())?;
-        let processor = crate::vst3_oop::OopVst3Processor::new(
+        let host_binary = crate::vst3_proc::find_host_binary()
+            .ok_or_else(|| "maolan-engine-plugin-host binary not found".to_string())?;
+        let processor = crate::vst3_proc::Vst3Processor::new(
             self.sample_rate,
             buffer_size,
             plugin_path,
@@ -2814,15 +2802,14 @@ impl Track {
         )?;
         let id = instance_id
             .filter(|&id| {
-                !self.oop_vst3_plugins.iter().any(|i| i.id == id)
-                    && !self.oop_clap_plugins.iter().any(|i| i.id == id)
+                !self.vst3_plugins.iter().any(|i| i.id == id)
+                    && !self.clap_plugins.iter().any(|i| i.id == id)
                     && !self.lv2_instance_id_exists(id)
-                    && !self.oop_lv2_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
-        self.next_oop_vst3_instance_id = self.next_oop_vst3_instance_id.max(id.saturating_add(1));
+        self.next_vst3_instance_id = self.next_vst3_instance_id.max(id.saturating_add(1));
         self.next_plugin_instance_id = self.next_plugin_instance_id.max(id.saturating_add(1));
-        self.oop_vst3_plugins.push(OopVst3Instance {
+        self.vst3_plugins.push(Vst3Instance {
             id,
             processor: Arc::new(UnsafeMutex::new(processor)),
         });
@@ -2830,18 +2817,18 @@ impl Track {
         Ok(())
     }
 
-    pub fn unload_oop_vst3_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
+    pub fn unload_vst3_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
         let Some(index) = self
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .position(|instance| instance.processor.lock().path().eq_ignore_ascii_case(plugin_path))
         else {
             return Err(format!(
-                "Track '{}' does not have OOP VST3 plugin loaded: {}",
+                "Track '{}' does not have VST3 plugin loaded: {}",
                 self.name, plugin_path
             ));
         };
-        let removed = self.oop_vst3_plugins.remove(index);
+        let removed = self.vst3_plugins.remove(index);
         let removed_id = removed.id;
         for port in removed.processor.lock().audio_inputs() {
             Self::disconnect_all(port);
@@ -2849,30 +2836,30 @@ impl Track {
         for port in removed.processor.lock().audio_outputs() {
             Self::disconnect_all(port);
         }
-        self.prune_plugin_midi_connections(PluginGraphNode::OopVst3PluginInstance(removed_id));
+        self.prune_plugin_midi_connections(PluginGraphNode::Vst3PluginInstance(removed_id));
         self.invalidate_audio_route_cache();
         Ok(())
     }
 
-    pub fn unload_oop_vst3_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
+    pub fn unload_vst3_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
         let Some(index) = self
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .position(|instance| instance.id == instance_id)
         else {
             return Err(format!(
-                "Track '{}' does not have OOP VST3 instance id: {}",
+                "Track '{}' does not have VST3 instance id: {}",
                 self.name, instance_id
             ));
         };
-        let removed = self.oop_vst3_plugins.remove(index);
+        let removed = self.vst3_plugins.remove(index);
         for port in removed.processor.lock().audio_inputs() {
             Self::disconnect_all(port);
         }
         for port in removed.processor.lock().audio_outputs() {
             Self::disconnect_all(port);
         }
-        self.prune_plugin_midi_connections(PluginGraphNode::OopVst3PluginInstance(instance_id));
+        self.prune_plugin_midi_connections(PluginGraphNode::Vst3PluginInstance(instance_id));
         self.invalidate_audio_route_cache();
         Ok(())
     }
@@ -2880,7 +2867,7 @@ impl Track {
     pub fn vst3_graph_plugins(&self) -> Vec<crate::message::Vst3GraphPlugin> {
         use crate::message::Vst3GraphPlugin;
 
-        self.oop_vst3_plugins
+        self.vst3_plugins
             .iter()
             .map(|instance| {
                 let proc = instance.processor.lock();
@@ -2902,7 +2889,7 @@ impl Track {
 
         let mut connections = Vec::new();
 
-        for instance in &self.oop_vst3_plugins {
+        for instance in &self.vst3_plugins {
             let proc = instance.processor.lock();
             for (port_idx, input) in proc.audio_inputs().iter().enumerate() {
                 let conns = input.connections.lock();
@@ -2958,7 +2945,7 @@ impl Track {
             }
         }
 
-        for instance in &self.oop_vst3_plugins {
+        for instance in &self.vst3_plugins {
             for (port_idx, output) in instance.processor.lock().audio_outputs().iter().enumerate() {
                 if std::ptr::eq(output.as_ref(), audio_io) {
                     return Some((Vst3GraphNode::PluginInstance(instance.id), port_idx));
@@ -2975,7 +2962,7 @@ impl Track {
         bypassed: bool,
     ) -> Result<(), String> {
         let instance = self
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .find(|i| i.id == instance_id)
             .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
@@ -2990,7 +2977,7 @@ impl Track {
         value: f32,
     ) -> Result<(), String> {
         let instance = self
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .find(|i| i.id == instance_id)
             .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
@@ -3003,7 +2990,7 @@ impl Track {
         instance_id: usize,
     ) -> Result<Vec<crate::vst3::port::ParameterInfo>, String> {
         let instance = self
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .find(|i| i.id == instance_id)
             .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
@@ -3016,7 +3003,7 @@ impl Track {
         instance_id: usize,
     ) -> Result<crate::vst3::state::Vst3PluginState, String> {
         let instance = self
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .find(|i| i.id == instance_id)
             .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
@@ -3032,7 +3019,7 @@ impl Track {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
         let instance = runtime
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip VST3 instance {} not found", instance_id))?;
@@ -3045,7 +3032,7 @@ impl Track {
         state: &crate::vst3::state::Vst3PluginState,
     ) -> Result<(), String> {
         let instance = self
-            .oop_vst3_plugins
+            .vst3_plugins
             .iter()
             .find(|i| i.id == instance_id)
             .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
@@ -3071,7 +3058,7 @@ impl Track {
                 .clone(),
             Vst3GraphNode::PluginInstance(id) => {
                 let instance = self
-                    .oop_vst3_plugins
+                    .vst3_plugins
                     .iter()
                     .find(|i| i.id == *id)
                     .ok_or("VST3 instance not found")?;
@@ -3091,7 +3078,7 @@ impl Track {
         let to_io = match to_node {
             Vst3GraphNode::PluginInstance(id) => {
                 let instance = self
-                    .oop_vst3_plugins
+                    .vst3_plugins
                     .iter()
                     .find(|i| i.id == *id)
                     .ok_or("VST3 instance not found")?;
@@ -3133,7 +3120,7 @@ impl Track {
                 .clone(),
             Vst3GraphNode::PluginInstance(id) => {
                 let instance = self
-                    .oop_vst3_plugins
+                    .vst3_plugins
                     .iter()
                     .find(|i| i.id == *id)
                     .ok_or("VST3 instance not found")?;
@@ -3153,7 +3140,7 @@ impl Track {
         let to_io = match to_node {
             Vst3GraphNode::PluginInstance(id) => {
                 let instance = self
-                    .oop_vst3_plugins
+                    .vst3_plugins
                     .iter()
                     .find(|i| i.id == *id)
                     .ok_or("VST3 instance not found")?;
@@ -3278,33 +3265,33 @@ impl Track {
             .map(|(idx, io)| (PluginGraphNode::TrackInput, idx, io.clone()))
             .collect();
         #[cfg(all(unix, not(target_os = "macos")))]
-        for instance in &self.oop_lv2_plugins {
+        for instance in &self.lv2_plugins {
             source_ports.extend(instance.processor.lock().audio_outputs().iter().enumerate().map(
                 |(idx, io)| {
                     (
-                        PluginGraphNode::OopLv2PluginInstance(instance.id),
+                        PluginGraphNode::Lv2PluginInstance(instance.id),
                         idx,
                         io.clone(),
                     )
                 },
             ));
         }
-        for instance in &self.oop_vst3_plugins {
+        for instance in &self.vst3_plugins {
             source_ports.extend(instance.processor.lock().audio_outputs().iter().enumerate().map(
                 |(idx, io)| {
                     (
-                        PluginGraphNode::OopVst3PluginInstance(instance.id),
+                        PluginGraphNode::Vst3PluginInstance(instance.id),
                         idx,
                         io.clone(),
                     )
                 },
             ));
         }
-        for instance in &self.oop_clap_plugins {
+        for instance in &self.clap_plugins {
             source_ports.extend(instance.processor.lock().audio_outputs().iter().enumerate().map(
                 |(idx, io)| {
                     (
-                        PluginGraphNode::OopClapPluginInstance(instance.id),
+                        PluginGraphNode::ClapPluginInstance(instance.id),
                         idx,
                         io.clone(),
                     )
@@ -3330,7 +3317,7 @@ impl Track {
             }
         }
         #[cfg(all(unix, not(target_os = "macos")))]
-        for instance in &self.oop_lv2_plugins {
+        for instance in &self.lv2_plugins {
             for (to_port, to_io) in instance.processor.lock().audio_inputs().iter().enumerate() {
                 for conn in to_io.connections.lock().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
@@ -3340,7 +3327,7 @@ impl Track {
                         connections.push(PluginGraphConnection {
                             from_node: from_node.clone(),
                             from_port: *from_port,
-                            to_node: PluginGraphNode::OopLv2PluginInstance(instance.id),
+                            to_node: PluginGraphNode::Lv2PluginInstance(instance.id),
                             to_port,
                             kind: Kind::Audio,
                         });
@@ -3348,7 +3335,7 @@ impl Track {
                 }
             }
         }
-        for instance in &self.oop_vst3_plugins {
+        for instance in &self.vst3_plugins {
             for (to_port, to_io) in instance.processor.lock().audio_inputs().iter().enumerate() {
                 for conn in to_io.connections.lock().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
@@ -3358,7 +3345,7 @@ impl Track {
                         connections.push(PluginGraphConnection {
                             from_node: from_node.clone(),
                             from_port: *from_port,
-                            to_node: PluginGraphNode::OopVst3PluginInstance(instance.id),
+                            to_node: PluginGraphNode::Vst3PluginInstance(instance.id),
                             to_port,
                             kind: Kind::Audio,
                         });
@@ -3366,7 +3353,7 @@ impl Track {
                 }
             }
         }
-        for instance in &self.oop_clap_plugins {
+        for instance in &self.clap_plugins {
             for (to_port, to_io) in instance.processor.lock().audio_inputs().iter().enumerate() {
                 for conn in to_io.connections.lock().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
@@ -3376,7 +3363,7 @@ impl Track {
                         connections.push(PluginGraphConnection {
                             from_node: from_node.clone(),
                             from_port: *from_port,
-                            to_node: PluginGraphNode::OopClapPluginInstance(instance.id),
+                            to_node: PluginGraphNode::ClapPluginInstance(instance.id),
                             to_port,
                             kind: Kind::Audio,
                         });
@@ -3581,13 +3568,13 @@ impl Track {
             sources.push(src.clone());
         }
         #[cfg(all(unix, not(target_os = "macos")))]
-        for instance in &self.oop_lv2_plugins {
+        for instance in &self.lv2_plugins {
             sources.extend(instance.processor.lock().audio_outputs().iter().cloned());
         }
-        for instance in &self.oop_vst3_plugins {
+        for instance in &self.vst3_plugins {
             sources.extend(instance.processor.lock().audio_outputs().iter().cloned());
         }
-        for instance in &self.oop_clap_plugins {
+        for instance in &self.clap_plugins {
             sources.extend(instance.processor.lock().audio_outputs().iter().cloned());
         }
         sources
@@ -3615,7 +3602,7 @@ impl Track {
     ) -> Result<Arc<AudioIO>, String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            self.oop_lv2_plugins
+            self.lv2_plugins
                 .iter()
                 .find(|instance| instance.id == instance_id)
                 .and_then(|instance| instance.processor.lock().audio_outputs().get(_port).cloned())
@@ -3631,7 +3618,7 @@ impl Track {
     fn lv2_audio_input_io(&self, instance_id: usize, _port: usize) -> Result<Arc<AudioIO>, String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            self.oop_lv2_plugins
+            self.lv2_plugins
                 .iter()
                 .find(|instance| instance.id == instance_id)
                 .and_then(|instance| instance.processor.lock().audio_inputs().get(_port).cloned())
@@ -3647,7 +3634,7 @@ impl Track {
     fn lv2_validate_midi_output(&self, instance_id: usize, _port: usize) -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            self.oop_lv2_plugins
+            self.lv2_plugins
                 .iter()
                 .find(|instance| instance.id == instance_id)
                 .and_then(|instance| (_port < instance.processor.lock().midi_output_count()).then_some(()))
@@ -3665,7 +3652,7 @@ impl Track {
     fn lv2_validate_midi_input(&self, instance_id: usize, _port: usize) -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            self.oop_lv2_plugins
+            self.lv2_plugins
                 .iter()
                 .find(|instance| instance.id == instance_id)
                 .and_then(|instance| (_port < instance.processor.lock().midi_input_count()).then_some(()))
@@ -3684,7 +3671,7 @@ impl Track {
         instance_id: usize,
         port: usize,
     ) -> Result<Arc<AudioIO>, String> {
-        self.oop_vst3_plugins
+        self.vst3_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
@@ -3692,7 +3679,7 @@ impl Track {
     }
 
     fn vst3_audio_input_io(&self, instance_id: usize, port: usize) -> Result<Arc<AudioIO>, String> {
-        self.oop_vst3_plugins
+        self.vst3_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
@@ -3704,7 +3691,7 @@ impl Track {
         instance_id: usize,
         port: usize,
     ) -> Result<Arc<AudioIO>, String> {
-        self.oop_clap_plugins
+        self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
@@ -3712,7 +3699,7 @@ impl Track {
     }
 
     fn clap_audio_input_io(&self, instance_id: usize, port: usize) -> Result<Arc<AudioIO>, String> {
-        self.oop_clap_plugins
+        self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
@@ -3720,7 +3707,7 @@ impl Track {
     }
 
     fn vst3_validate_midi_output(&self, instance_id: usize, port: usize) -> Result<(), String> {
-        self.oop_vst3_plugins
+        self.vst3_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| (port < instance.processor.lock().midi_output_count()).then_some(()))
@@ -3728,7 +3715,7 @@ impl Track {
     }
 
     fn clap_validate_midi_output(&self, instance_id: usize, port: usize) -> Result<(), String> {
-        self.oop_clap_plugins
+        self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| (port < instance.processor.lock().midi_output_count()).then_some(()))
@@ -3736,7 +3723,7 @@ impl Track {
     }
 
     fn vst3_validate_midi_input(&self, instance_id: usize, port: usize) -> Result<(), String> {
-        self.oop_vst3_plugins
+        self.vst3_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| (port < instance.processor.lock().midi_input_count()).then_some(()))
@@ -3744,7 +3731,7 @@ impl Track {
     }
 
     fn clap_validate_midi_input(&self, instance_id: usize, port: usize) -> Result<(), String> {
-        self.oop_clap_plugins
+        self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
             .and_then(|instance| (port < instance.processor.lock().midi_input_count()).then_some(()))
@@ -3753,21 +3740,11 @@ impl Track {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     fn lv2_instance_id_exists(&self, id: usize) -> bool {
-        self.oop_lv2_plugins.iter().any(|i| i.id == id)
+        self.lv2_plugins.iter().any(|i| i.id == id)
     }
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     fn lv2_instance_id_exists(&self, _id: usize) -> bool {
-        false
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    fn oop_lv2_instance_id_exists(&self, id: usize) -> bool {
-        self.oop_lv2_plugins.iter().any(|i| i.id == id)
-    }
-
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn oop_lv2_instance_id_exists(&self, _id: usize) -> bool {
         false
     }
 
@@ -3784,16 +3761,15 @@ impl Track {
                 .cloned()
                 .ok_or_else(|| format!("Track input port {port} not found")),
             PluginGraphNode::TrackOutput => Err("Track output node cannot be source".to_string()),
-            PluginGraphNode::OopClapPluginInstance(instance_id) => {
+            PluginGraphNode::ClapPluginInstance(instance_id) => {
                 self.clap_audio_output_io(*instance_id, port)
             }
-            PluginGraphNode::OopVst3PluginInstance(instance_id) => {
+            PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_audio_output_io(*instance_id, port)
             }
-            PluginGraphNode::OopLv2PluginInstance(instance_id) => {
+            PluginGraphNode::Lv2PluginInstance(instance_id) => {
                 self.lv2_audio_output_io(*instance_id, port)
             }
-            _ => Err("In-process plugins are no longer supported".to_string()),
         }
     }
 
@@ -3810,16 +3786,15 @@ impl Track {
                 .get(port)
                 .cloned()
                 .ok_or_else(|| format!("Track output port {port} not found")),
-            PluginGraphNode::OopClapPluginInstance(instance_id) => {
+            PluginGraphNode::ClapPluginInstance(instance_id) => {
                 self.clap_audio_input_io(*instance_id, port)
             }
-            PluginGraphNode::OopVst3PluginInstance(instance_id) => {
+            PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_audio_input_io(*instance_id, port)
             }
-            PluginGraphNode::OopLv2PluginInstance(instance_id) => {
+            PluginGraphNode::Lv2PluginInstance(instance_id) => {
                 self.lv2_audio_input_io(*instance_id, port)
             }
-            _ => Err("In-process plugins are no longer supported".to_string()),
         }
     }
 
@@ -3838,16 +3813,15 @@ impl Track {
             PluginGraphNode::TrackOutput => {
                 Err("Track output node cannot be MIDI source".to_string())
             }
-            PluginGraphNode::OopClapPluginInstance(instance_id) => {
+            PluginGraphNode::ClapPluginInstance(instance_id) => {
                 self.clap_validate_midi_output(*instance_id, port)
             }
-            PluginGraphNode::OopVst3PluginInstance(instance_id) => {
+            PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_validate_midi_output(*instance_id, port)
             }
-            PluginGraphNode::OopLv2PluginInstance(instance_id) => {
+            PluginGraphNode::Lv2PluginInstance(instance_id) => {
                 self.lv2_validate_midi_output(*instance_id, port)
             }
-            _ => Err("In-process plugins are no longer supported".to_string()),
         }
     }
 
@@ -3866,16 +3840,15 @@ impl Track {
                 .get(port)
                 .map(|_| ())
                 .ok_or_else(|| format!("Track MIDI output port {port} not found")),
-            PluginGraphNode::OopClapPluginInstance(instance_id) => {
+            PluginGraphNode::ClapPluginInstance(instance_id) => {
                 self.clap_validate_midi_input(*instance_id, port)
             }
-            PluginGraphNode::OopVst3PluginInstance(instance_id) => {
+            PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_validate_midi_input(*instance_id, port)
             }
-            PluginGraphNode::OopLv2PluginInstance(instance_id) => {
+            PluginGraphNode::Lv2PluginInstance(instance_id) => {
                 self.lv2_validate_midi_input(*instance_id, port)
             }
-            _ => Err("In-process plugins are no longer supported".to_string()),
         }
     }
 

@@ -20,13 +20,13 @@ pub mod workers;
 pub use workers::worker;
 
 pub use plugins::clap;
-pub use plugins::clap_oop;
+pub use plugins::clap_proc;
 #[cfg(all(unix, not(target_os = "macos")))]
 pub use plugins::lv2;
 #[cfg(all(unix, not(target_os = "macos")))]
-pub use plugins::lv2_oop;
+pub use plugins::lv2_proc;
 pub use plugins::vst3;
-pub use plugins::vst3_oop;
+pub use plugins::vst3_proc;
 
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;

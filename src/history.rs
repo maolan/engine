@@ -730,56 +730,47 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
-        Action::TrackLoadClapPlugin { .. } => None,
-        Action::TrackUnloadClapPlugin { .. } => None,
-        Action::TrackLoadOopClapPlugin {
+        Action::TrackLoadClapPlugin {
             track_name,
             plugin_path,
             ..
-        } => Some(Action::TrackUnloadOopClapPlugin {
+        } => Some(Action::TrackUnloadClapPlugin {
             track_name: track_name.clone(),
             plugin_path: plugin_path.clone(),
         }),
-        Action::TrackUnloadOopClapPlugin {
+        Action::TrackUnloadClapPlugin {
             track_name,
             plugin_path,
-        } => Some(Action::TrackLoadOopClapPlugin {
+        } => Some(Action::TrackLoadClapPlugin {
             track_name: track_name.clone(),
             plugin_path: plugin_path.clone(),
             instance_id: None,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
-        Action::TrackLoadLv2Plugin { .. } => None,
-        #[cfg(all(unix, not(target_os = "macos")))]
-        Action::TrackUnloadLv2PluginInstance { .. } => None,
-        Action::TrackLoadVst3Plugin { .. } => None,
-        Action::TrackUnloadVst3PluginInstance { .. } => None,
-        Action::TrackLoadOopVst3Plugin {
+        Action::TrackLoadVst3Plugin {
             track_name,
             plugin_path: _,
             ..
         } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
-            Some(Action::TrackUnloadOopVst3PluginInstance {
+            Some(Action::TrackUnloadVst3PluginInstance {
                 track_name: track_name.clone(),
-                instance_id: track.next_oop_vst3_instance_id,
+                instance_id: track.next_vst3_instance_id,
             })
         }
         #[cfg(all(unix, not(target_os = "macos")))]
-        Action::TrackLoadOopLv2Plugin {
+        Action::TrackLoadLv2Plugin {
             track_name,
             plugin_uri: _,
             ..
         } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
-            Some(Action::TrackUnloadOopLv2PluginInstance {
+            Some(Action::TrackUnloadLv2PluginInstance {
                 track_name: track_name.clone(),
-                instance_id: track.next_oop_lv2_instance_id,
+                instance_id: track.next_lv2_instance_id,
             })
         }
-        Action::TrackUnloadOopVst3PluginInstance { .. } => None,
         Action::TrackSetClapParameter {
             track_name,
             instance_id,
@@ -818,18 +809,18 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = track.lock();
             let current_bypassed = match format.as_str() {
                 "CLAP" => track
-                    .oop_clap_plugins
+                    .clap_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
                     .map(|i| i.processor.lock().is_bypassed()),
                 "VST3" => track
-                    .oop_vst3_plugins
+                    .vst3_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
                     .map(|i| i.processor.lock().is_bypassed()),
                 #[cfg(all(unix, not(target_os = "macos")))]
                 "LV2" => track
-                    .oop_lv2_plugins
+                    .lv2_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
                     .map(|i| i.processor.lock().is_bypassed()),
@@ -985,7 +976,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         return Some(actions);
     }
 
-    if let Action::TrackUnloadOopClapPlugin {
+    if let Action::TrackUnloadClapPlugin {
         track_name,
         plugin_path,
     } = action
@@ -993,13 +984,13 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
         let instance = track
-            .oop_clap_plugins
+            .clap_plugins
             .iter()
             .find(|p| p.processor.lock().path().eq_ignore_ascii_case(plugin_path))?;
         let id = instance.id;
         let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
         return Some(vec![
-            Action::TrackLoadOopClapPlugin {
+            Action::TrackLoadClapPlugin {
                 track_name: track_name.clone(),
                 plugin_path: plugin_path.clone(),
                 instance_id: Some(id),
@@ -1012,18 +1003,18 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         ]);
     }
 
-    if let Action::TrackUnloadOopVst3PluginInstance {
+    if let Action::TrackUnloadVst3PluginInstance {
         track_name,
         instance_id,
     } = action
     {
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
-        let instance = track.oop_vst3_plugins.iter().find(|p| p.id == *instance_id)?;
+        let instance = track.vst3_plugins.iter().find(|p| p.id == *instance_id)?;
         let path = instance.processor.lock().path().to_string();
         let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
         return Some(vec![
-            Action::TrackLoadOopVst3Plugin {
+            Action::TrackLoadVst3Plugin {
                 track_name: track_name.clone(),
                 plugin_path: path,
                 instance_id: Some(*instance_id),
@@ -1037,18 +1028,18 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Action::TrackUnloadOopLv2PluginInstance {
+    if let Action::TrackUnloadLv2PluginInstance {
         track_name,
         instance_id,
     } = action
     {
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
-        let instance = track.oop_lv2_plugins.iter().find(|p| p.id == *instance_id)?;
+        let instance = track.lv2_plugins.iter().find(|p| p.id == *instance_id)?;
         let uri = instance.processor.lock().uri().to_string();
         let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
         return Some(vec![
-            Action::TrackLoadOopLv2Plugin {
+            Action::TrackLoadLv2Plugin {
                 track_name: track_name.clone(),
                 plugin_uri: uri,
                 instance_id: Some(*instance_id),
@@ -1229,11 +1220,11 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 });
             }
 
-            for instance in &track.oop_vst3_plugins {
+            for instance in &track.vst3_plugins {
                 let id = instance.id;
                 let path = instance.processor.lock().path().to_string();
                 if let Ok(state) = instance.processor.lock().snapshot_state() {
-                    actions.push(Action::TrackLoadOopVst3Plugin {
+                    actions.push(Action::TrackLoadVst3Plugin {
                         track_name: track.name.clone(),
                         plugin_path: path,
                         instance_id: Some(id),
@@ -1247,7 +1238,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             }
 
             for (id, path, state) in track.clap_snapshot_all_states() {
-                actions.push(Action::TrackLoadOopClapPlugin {
+                actions.push(Action::TrackLoadClapPlugin {
                     track_name: track.name.clone(),
                     plugin_path: path,
                     instance_id: Some(id),
@@ -1260,11 +1251,11 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             }
 
             #[cfg(all(unix, not(target_os = "macos")))]
-            for instance in &track.oop_lv2_plugins {
+            for instance in &track.lv2_plugins {
                 let id = instance.id;
                 let uri = instance.processor.lock().uri().to_string();
                 if let Ok(state) = instance.processor.lock().snapshot_state() {
-                    actions.push(Action::TrackLoadOopLv2Plugin {
+                    actions.push(Action::TrackLoadLv2Plugin {
                         track_name: track.name.clone(),
                         plugin_uri: uri,
                         instance_id: Some(id),
@@ -2283,11 +2274,11 @@ mod tests {
     #[test]
     fn create_inverse_action_for_vst3_load_uses_next_runtime_instance_id() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        track.next_oop_vst3_instance_id = 42;
+        track.next_vst3_instance_id = 42;
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
-            &Action::TrackLoadOopVst3Plugin {
+            &Action::TrackLoadVst3Plugin {
                 track_name: "t".to_string(),
                 plugin_path: "/tmp/test.vst3".to_string(),
                 instance_id: None,
@@ -2297,7 +2288,7 @@ mod tests {
         .unwrap();
 
         match inverse {
-            Action::TrackUnloadOopVst3PluginInstance {
+            Action::TrackUnloadVst3PluginInstance {
                 track_name,
                 instance_id,
             } => {
@@ -2312,11 +2303,11 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     fn create_inverse_action_for_lv2_load_uses_next_runtime_instance_id() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        track.next_oop_lv2_instance_id = 5;
+        track.next_lv2_instance_id = 5;
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
-            &Action::TrackLoadOopLv2Plugin {
+            &Action::TrackLoadLv2Plugin {
                 track_name: "t".to_string(),
                 plugin_uri: "urn:test".to_string(),
                 instance_id: None,
@@ -2326,7 +2317,7 @@ mod tests {
         .unwrap();
 
         match inverse {
-            Action::TrackUnloadOopLv2PluginInstance {
+            Action::TrackUnloadLv2PluginInstance {
                 track_name,
                 instance_id,
             } => {
