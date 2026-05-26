@@ -19,14 +19,35 @@ mod track;
 pub mod workers;
 pub use workers::worker;
 
-pub use plugins::clap;
 pub use plugins::clap_proc;
 #[cfg(all(unix, not(target_os = "macos")))]
-pub use plugins::lv2;
-#[cfg(all(unix, not(target_os = "macos")))]
 pub use plugins::lv2_proc;
-pub use plugins::vst3;
 pub use plugins::vst3_proc;
+
+// Re-export plugin info/state types for backward compatibility with the DAW
+// and internal engine code.
+pub mod clap {
+    pub use crate::plugins::types::is_supported_clap_binary;
+    pub use crate::plugins::types::{
+        ClapMidiOutputEvent, ClapParameterInfo, ClapPluginInfo, ClapPluginState,
+    };
+}
+pub mod vst3 {
+    pub use crate::plugins::types::{Vst3PluginInfo, Vst3PluginState};
+    pub mod interfaces {
+        pub use crate::plugins::types::Vst3GuiInfo;
+    }
+    pub mod port {
+        pub use crate::plugins::types::ParameterInfo;
+    }
+    pub mod state {
+        pub use crate::plugins::types::Vst3PluginState;
+    }
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+pub mod lv2 {
+    pub use crate::plugins::types::Lv2PluginInfo;
+}
 
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;

@@ -1416,8 +1416,8 @@ mod tests {
 
     use crate::message::{MidiLearnBinding, TrackMidiLearnTarget};
     use crate::mutex::UnsafeMutex;
+    use crate::plugins::types::Vst3PluginState;
     use crate::track::Track;
-    use crate::vst3::Vst3PluginState;
     use std::sync::Arc;
 
     fn make_state_with_track(track: Track) -> State {

@@ -1416,7 +1416,7 @@ impl Track {
                 next_plugin_instance_id += 1;
                 match format {
                     "CLAP" | "clap" => {
-                        let host_binary = match crate::clap_proc::find_plugin_host_binary() {
+                        let host_binary = match crate::plugins::ipc::find_plugin_host_binary() {
                             Some(b) => b,
                             None => continue,
                         };
@@ -1437,7 +1437,7 @@ impl Track {
                         runtime_nodes.push(PluginGraphNode::ClapPluginInstance(id));
                     }
                     "VST3" | "vst3" => {
-                        let host_binary = match crate::vst3_proc::find_host_binary() {
+                        let host_binary = match crate::plugins::ipc::find_plugin_host_binary() {
                             Some(b) => b,
                             None => continue,
                         };
@@ -1459,7 +1459,7 @@ impl Track {
                     }
                     #[cfg(all(unix, not(target_os = "macos")))]
                     "LV2" | "lv2" => {
-                        let host_binary = match crate::lv2_proc::find_host_binary() {
+                        let host_binary = match crate::plugins::ipc::find_plugin_host_binary() {
                             Some(b) => b,
                             None => continue,
                         };
@@ -2247,8 +2247,8 @@ impl Track {
             .map(|io| io.buffer.lock().len())
             .or_else(|| self.audio.outs.first().map(|io| io.buffer.lock().len()))
             .unwrap_or(0);
-        let host_binary = crate::lv2_proc::find_host_binary()
-            .ok_or_else(|| "maolan-engine-plugin-host binary not found".to_string())?;
+        let host_binary = crate::plugins::ipc::find_plugin_host_binary()
+            .ok_or_else(|| "maolan-plugin-host binary not found".to_string())?;
         let processor = crate::lv2_proc::Lv2Processor::new(
             self.sample_rate,
             buffer_size,
@@ -2494,7 +2494,7 @@ impl Track {
             .unwrap_or(0);
         let input_count = self.audio.ins.len().max(1);
         let output_count = self.audio.outs.len().max(1);
-        let host_binary = crate::clap_proc::find_plugin_host_binary()
+        let host_binary = crate::plugins::ipc::find_plugin_host_binary()
             .ok_or_else(|| "maolan-plugin-host binary not found".to_string())?;
         let processor = Arc::new(UnsafeMutex::new(crate::clap_proc::ClapProcessor::new(
             self.sample_rate,
@@ -2802,8 +2802,8 @@ impl Track {
             .max(1);
         let input_count = self.audio.ins.len().max(1);
         let output_count = self.audio.outs.len().max(1);
-        let host_binary = crate::vst3_proc::find_host_binary()
-            .ok_or_else(|| "maolan-engine-plugin-host binary not found".to_string())?;
+        let host_binary = crate::plugins::ipc::find_plugin_host_binary()
+            .ok_or_else(|| "maolan-plugin-host binary not found".to_string())?;
         let processor = crate::vst3_proc::Vst3Processor::new(
             self.sample_rate,
             buffer_size,

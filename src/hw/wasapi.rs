@@ -3,7 +3,7 @@ use crate::hw::{common, options::HwOptions, traits};
 use crate::message::HwMidiEvent;
 use crate::midi::io::MidiEvent;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Host, HostId, SampleFormat, SampleRate, Stream, StreamConfig};
+use cpal::{Host, HostId, SampleFormat, Stream, StreamConfig};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -59,7 +59,7 @@ impl HwDriver {
             .ok_or_else(|| format!("No matching {backend_label} output device for '{device}'"))?;
         let output_cfg = select_f32_output_config(&output_device, rate)?;
 
-        let sample_rate = output_cfg.sample_rate.0 as usize;
+        let sample_rate = output_cfg.sample_rate as usize;
         let period_frames = options.period_frames.max(1);
         let output_channels = output_cfg.channels as usize;
         let audio_outs: Vec<Arc<AudioIO>> = (0..output_channels)
@@ -249,9 +249,9 @@ impl HwDriver {
                 io_port.process();
                 let src = io_port.buffer.lock();
                 let b = common::channel_balance_gain(channels, ch_idx, balance);
-                for frame in 0..frames.min(src.len()) {
+                for (frame, src_sample) in src.iter().enumerate().take(frames) {
                     let idx = frame * channels + ch_idx;
-                    interleaved[idx] = src[frame] * gain * b;
+                    interleaved[idx] = *src_sample * gain * b;
                 }
             }
         }
@@ -281,8 +281,8 @@ fn select_output_device(host: &cpal::Host, requested: &str) -> Option<cpal::Devi
     }
     let devices = host.output_devices().ok()?;
     for dev in devices {
-        if let Ok(name) = dev.name()
-            && name.eq_ignore_ascii_case(requested)
+        if let Ok(desc) = dev.description()
+            && desc.name().eq_ignore_ascii_case(requested)
         {
             return Some(dev);
         }
@@ -304,7 +304,8 @@ fn select_input_device(host: &cpal::Host, requested: &str) -> Option<cpal::Devic
     let mut fuzzy_match: Option<cpal::Device> = None;
     let requested_lc = requested.to_lowercase();
     for dev in devices {
-        if let Ok(name) = dev.name() {
+        if let Ok(desc) = dev.description() {
+            let name = desc.name();
             if name.eq_ignore_ascii_case(requested) {
                 return Some(dev);
             }
@@ -337,11 +338,11 @@ fn select_f32_output_config(
         if range.sample_format() != SampleFormat::F32 {
             continue;
         }
-        let min = range.min_sample_rate().0;
-        let max = range.max_sample_rate().0;
+        let min = range.min_sample_rate();
+        let max = range.max_sample_rate();
         let rate = requested_rate.max(1) as u32;
         let cfg = if rate >= min && rate <= max {
-            range.with_sample_rate(SampleRate(rate)).config()
+            range.with_sample_rate(rate).config()
         } else {
             range.with_max_sample_rate().config()
         };
@@ -363,11 +364,11 @@ fn select_f32_input_config(
         if range.sample_format() != SampleFormat::F32 {
             continue;
         }
-        let min = range.min_sample_rate().0;
-        let max = range.max_sample_rate().0;
+        let min = range.min_sample_rate();
+        let max = range.max_sample_rate();
         let rate = requested_rate.max(1) as u32;
         let cfg = if rate >= min && rate <= max {
-            range.with_sample_rate(SampleRate(rate)).config()
+            range.with_sample_rate(rate).config()
         } else {
             range.with_max_sample_rate().config()
         };

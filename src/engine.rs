@@ -4999,31 +4999,53 @@ impl Engine {
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::ListLv2Plugins => {
-                let plugins = {
-                    let host = crate::lv2::Lv2Host::new(48_000.0);
-                    host.list_plugins()
-                };
-                self.notify_clients(Ok(Action::Lv2Plugins(plugins))).await;
+                match crate::plugins::scan_plugins::<crate::plugins::types::Lv2PluginInfo>("lv2") {
+                    Ok(plugins) => {
+                        self.notify_clients(Ok(Action::Lv2Plugins(plugins))).await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                }
                 return;
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::Lv2Plugins(_) => {}
             Action::ListVst3Plugins => {
-                self.notify_clients(Ok(Action::Vst3Plugins(crate::vst3::list_plugins())))
-                    .await;
+                match crate::plugins::scan_plugins::<crate::plugins::types::Vst3PluginInfo>("vst3")
+                {
+                    Ok(plugins) => {
+                        self.notify_clients(Ok(Action::Vst3Plugins(plugins))).await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                }
                 return;
             }
             Action::Vst3Plugins(_) => {}
             Action::ListClapPlugins => {
-                self.notify_clients(Ok(Action::ClapPlugins(crate::clap::list_plugins())))
-                    .await;
+                match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap")
+                {
+                    Ok(plugins) => {
+                        self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                }
                 return;
             }
             Action::ListClapPluginsWithCapabilities => {
-                self.notify_clients(Ok(Action::ClapPlugins(
-                    crate::clap::list_plugins_with_capabilities(true),
-                )))
-                .await;
+                match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap")
+                {
+                    Ok(plugins) => {
+                        self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                }
                 return;
             }
             Action::ClapPlugins(_) => {}

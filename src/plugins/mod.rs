@@ -1,9 +1,35 @@
-pub mod clap;
 pub mod clap_proc;
-#[cfg(all(unix, not(target_os = "macos")))]
-pub mod lv2;
+pub mod ipc;
 #[cfg(all(unix, not(target_os = "macos")))]
 pub mod lv2_proc;
-pub mod paths;
-pub mod vst3;
+pub mod types;
 pub mod vst3_proc;
+
+pub use types::*;
+
+use serde::de::DeserializeOwned;
+
+/// Scan plugins of the given format by spawning `maolan-plugin-host --scan`.
+pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String> {
+    let host_bin = ipc::find_plugin_host_binary().ok_or("maolan-plugin-host binary not found")?;
+
+    let output = std::process::Command::new(&host_bin)
+        .arg("--scan")
+        .arg("--format")
+        .arg(format)
+        .arg("--path")
+        .arg("--system")
+        .output()
+        .map_err(|e| format!("failed to spawn plugin-host scanner: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "plugin-host scanner exited with code {:?}: {stderr}",
+            output.status.code()
+        ));
+    }
+
+    let json = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&json).map_err(|e| format!("failed to parse scan JSON: {e}"))
+}

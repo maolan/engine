@@ -10,27 +10,6 @@ pub fn has_audio_connections(port: &Arc<AudioIO>) -> bool {
         > 0
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "openbsd"))]
-pub fn fill_ports_from_interleaved(
-    ports: &[Arc<AudioIO>],
-    frames: usize,
-    connected_only: bool,
-    mut sample_at: impl FnMut(usize, usize) -> f32,
-) {
-    for (ch_idx, io_port) in ports.iter().enumerate() {
-        if connected_only && !has_audio_connections(io_port) {
-            *io_port.finished.lock() = true;
-            continue;
-        }
-        let channel_buf_lock = io_port.buffer.lock();
-        let channel_samples: &mut [f32] = &mut *channel_buf_lock;
-        for (frame, sample) in channel_samples.iter_mut().enumerate().take(frames) {
-            *sample = sample_at(ch_idx, frame);
-        }
-        *io_port.finished.lock() = true;
-    }
-}
-
 /// Fast path when the interleaved buffer is already in f32.
 #[cfg(unix)]
 pub fn fill_ports_from_interleaved_buffer(
@@ -164,6 +143,27 @@ mod tests {
     use super::*;
     use crate::audio::io::AudioIO;
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    pub fn fill_ports_from_interleaved(
+        ports: &[Arc<AudioIO>],
+        frames: usize,
+        connected_only: bool,
+        mut sample_at: impl FnMut(usize, usize) -> f32,
+    ) {
+        for (ch_idx, io_port) in ports.iter().enumerate() {
+            if connected_only && !has_audio_connections(io_port) {
+                *io_port.finished.lock() = true;
+                continue;
+            }
+            let channel_buf_lock = io_port.buffer.lock();
+            let channel_samples: &mut [f32] = &mut *channel_buf_lock;
+            for (frame, sample) in channel_samples.iter_mut().enumerate().take(frames) {
+                *sample = sample_at(ch_idx, frame);
+            }
+            *io_port.finished.lock() = true;
+        }
+    }
 
     #[test]
     fn fill_ports_from_interleaved_skips_unconnected_ports_when_requested() {

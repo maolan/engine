@@ -1,17 +1,18 @@
-//! Out-of-process VST3 processor using `maolan-engine-plugin-host` IPC.
+//! Out-of-process VST3 processor using `maolan-plugin-host` IPC.
 
 use crate::audio::io::AudioIO;
 use crate::midi::io::MidiEvent;
 use crate::mutex::UnsafeMutex;
-use crate::vst3::port::ParameterInfo;
-use crate::vst3::state::Vst3PluginState;
+use crate::plugins::ipc;
+use crate::plugins::types::ParameterInfo;
+use crate::plugins::types::Vst3PluginState;
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
@@ -56,18 +57,23 @@ impl Vst3Processor {
             .collect::<Vec<_>>();
 
         let instance_id = format!("vst3-{}", std::process::id());
-        let (mut child, mapping, events, shm_name) = spawn_host(
-            &host_binary,
-            plugin_path,
-            &instance_id,
-            sample_rate,
-            buffer_size,
-            input_count.max(1),
-            output_count.max(1),
-        )?;
+        let num_inputs = input_count.max(1);
+        let num_outputs = output_count.max(1);
+        let (mut child, mapping, events, shm_name) = ipc::spawn_host(ipc::HostSpawnArgs {
+            host_binary: &host_binary,
+            format: "vst3",
+            plugin_spec: plugin_path,
+            instance_id: &instance_id,
+            extra_args: &[
+                &sample_rate.to_string(),
+                &buffer_size.to_string(),
+                &num_inputs.to_string(),
+                &num_outputs.to_string(),
+            ],
+        })?;
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
-        if !wait_for_ready(header, Duration::from_secs(10)) {
+        if !ipc::wait_for_ready(header, Duration::from_secs(10)) {
             let _ = child.kill();
             return Err("VST3 host did not signal ready".to_string());
         }
@@ -260,7 +266,7 @@ impl Vst3Processor {
 
     pub fn process_with_midi(&self, frames: usize, _midi_in: &[MidiEvent]) -> Vec<MidiEvent> {
         if self.bypassed.load(Ordering::Relaxed) {
-            self.bypass_copy_inputs_to_outputs();
+            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
 
@@ -276,7 +282,7 @@ impl Vst3Processor {
                             self.path
                         );
                         self.crash_count.fetch_add(1, Ordering::Relaxed);
-                        self.bypass_copy_inputs_to_outputs();
+                        ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                         return Vec::new();
                     }
                     Ok(None) => {
@@ -297,7 +303,7 @@ impl Vst3Processor {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
             _ => {
-                self.bypass_copy_inputs_to_outputs();
+                ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                 return Vec::new();
             }
         };
@@ -306,11 +312,7 @@ impl Vst3Processor {
         let num_in = self.audio_inputs.len();
         let num_out = self.audio_outputs.len();
         unsafe {
-            let h = header_mut(ptr);
-            h.block_size.store(frames as u32, Ordering::Release);
-            h.num_input_channels.store(num_in as u32, Ordering::Release);
-            h.num_output_channels
-                .store(num_out as u32, Ordering::Release);
+            ipc::configure_shm_header(ptr, frames, num_in, num_out);
             // Write default transport state (can be overridden by track later).
             let t = transport_mut(ptr);
             t.playhead_sample = 0;
@@ -318,22 +320,15 @@ impl Vst3Processor {
             t.numerator = 4;
             t.denominator = 4;
             t.flags = 1; // playing
-        }
 
-        // Copy input AudioIO buffers to shared memory (bus 0).
-        for (ch, input) in self.audio_inputs.iter().enumerate() {
-            let src = input.buffer.lock();
-            let dst = unsafe { audio_channel_ptr(ptr, ch, 0) };
-            let len = frames.min(src.len());
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, len);
-            }
+            // Copy input AudioIO buffers to shared memory (bus 0).
+            ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
         }
 
         // Signal host to process.
         if let Err(e) = events.signal_host() {
             tracing::error!("Failed to signal VST3 host: {e}");
-            self.bypass_copy_inputs_to_outputs();
+            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
         eprintln!("[VST3 debug] signal_host succeeded");
@@ -349,20 +344,14 @@ impl Vst3Processor {
                     "[VST3 debug] host did not respond for '{}' ({}): {}",
                     self.name, self.path, e
                 );
-                self.bypass_copy_inputs_to_outputs();
+                ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                 return Vec::new();
             }
         }
 
         // Copy output shared memory (bus 1) back to AudioIO buffers.
-        for (ch, output) in self.audio_outputs.iter().enumerate() {
-            let dst = output.buffer.lock();
-            let src = unsafe { audio_channel_ptr(ptr, ch, 1) };
-            let len = frames.min(dst.len());
-            unsafe {
-                std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), len);
-            }
-            *output.finished.lock() = true;
+        unsafe {
+            ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
         }
 
         let elapsed = started.elapsed();
@@ -378,22 +367,6 @@ impl Vst3Processor {
 
         *self.last_process_time.lock() = Instant::now();
         Vec::new()
-    }
-
-    fn bypass_copy_inputs_to_outputs(&self) {
-        for (input, output) in self.audio_inputs.iter().zip(self.audio_outputs.iter()) {
-            let src = input.buffer.lock();
-            let dst = output.buffer.lock();
-            dst.fill(0.0);
-            for (d, s) in dst.iter_mut().zip(src.iter()) {
-                *d = *s;
-            }
-            *output.finished.lock() = true;
-        }
-        for output in self.audio_outputs.iter().skip(self.audio_inputs.len()) {
-            output.buffer.lock().fill(0.0);
-            *output.finished.lock() = true;
-        }
     }
 
     pub fn path(&self) -> &str {
@@ -433,7 +406,7 @@ impl Vst3Processor {
         None
     }
 
-    pub fn gui_info(&self) -> Result<crate::vst3::interfaces::Vst3GuiInfo, String> {
+    pub fn gui_info(&self) -> Result<crate::plugins::types::Vst3GuiInfo, String> {
         Err("GUI not yet supported for VST3 plugins".to_string())
     }
 
@@ -503,27 +476,7 @@ impl Vst3Processor {
 
 impl Drop for Vst3Processor {
     fn drop(&mut self) {
-        if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events
-        {
-            let header = unsafe { header_mut(mapping.as_ptr()) };
-            header.shutdown_request.store(1, Ordering::Release);
-            let _ = events.signal_host();
-        }
-        let mut child_opt = self.child.lock().take();
-        if let Some(mut child) = child_opt.take() {
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(2) {
-                if child.try_wait().map(|s| s.is_some()).unwrap_or(true) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
-                let _ = child.kill();
-            }
-        }
-        let _ = ShmMapping::unlink(&self.shm_name);
+        ipc::drop_host(&self.mapping, &self.events, &self.child, &self.shm_name);
     }
 }
 
@@ -636,7 +589,7 @@ impl UnsafeMutex<Vst3Processor> {
         self.lock().ui_take_state_update()
     }
 
-    pub fn gui_info(&self) -> Result<crate::vst3::interfaces::Vst3GuiInfo, String> {
+    pub fn gui_info(&self) -> Result<crate::plugins::types::Vst3GuiInfo, String> {
         self.lock().gui_info()
     }
 
@@ -679,118 +632,6 @@ impl UnsafeMutex<Vst3Processor> {
     pub fn gui_check_resize(&self) -> Option<(i32, i32)> {
         self.lock().gui_check_resize()
     }
-}
-
-/// Locate the `maolan-engine-plugin-host` binary at runtime.
-pub fn find_host_binary() -> Option<PathBuf> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(PathBuf::from));
-
-    // 1. Same directory as current executable.
-    if let Some(ref dir) = exe_dir {
-        let candidate = dir.join("maolan-engine-plugin-host");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    // 2. Engine target directory (development).
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let engine_root = Path::new(&manifest);
-        for profile in ["debug", "release"] {
-            let candidate = engine_root
-                .join("target")
-                .join(profile)
-                .join("maolan-engine-plugin-host");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // 3. Development workspace paths (DAW target dir).
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let engine_root = Path::new(&manifest);
-        for profile in ["debug", "release"] {
-            let candidate = engine_root
-                .parent()
-                .unwrap_or(Path::new(""))
-                .join("daw")
-                .join("target")
-                .join(profile)
-                .join("maolan-engine-plugin-host");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // 4. PATH.
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            let candidate = Path::new(dir).join("maolan-engine-plugin-host");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
-fn spawn_host(
-    host_binary: &PathBuf,
-    plugin_path: &str,
-    instance_id: &str,
-    sample_rate: f64,
-    buffer_size: usize,
-    num_inputs: usize,
-    num_outputs: usize,
-) -> Result<(Child, ShmMapping, EventPair, String), String> {
-    let pid = std::process::id();
-    let shm_name = format!("/maolan-{pid}-{instance_id}");
-
-    let mapping = ShmMapping::create(&shm_name, SHM_SIZE)?;
-    unsafe {
-        init_shm_layout(mapping.as_ptr(), mapping.size());
-    }
-
-    let mut events = EventPair::new().map_err(|e| format!("failed to create pipes: {e}"))?;
-
-    let mut cmd = Command::new(host_binary);
-    cmd.arg("vst3")
-        .arg(plugin_path)
-        .arg(&shm_name)
-        .arg(instance_id)
-        .arg(events.host_read_fd().to_string())
-        .arg(events.host_write_fd().to_string())
-        .arg(sample_rate.to_string())
-        .arg(buffer_size.to_string())
-        .arg(num_inputs.to_string())
-        .arg(num_outputs.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn VST3 host: {e}"))?;
-
-    events.close_daw_unused();
-
-    Ok((child, mapping, events, shm_name))
-}
-
-fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if header.ready.load(Ordering::Acquire) != 0 {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    false
 }
 
 /// Serialize VST3 state into scratch area. Returns bytes written or error.
@@ -935,8 +776,7 @@ mod tests {
     use super::*;
 
     fn find_host_binary() -> PathBuf {
-        super::find_host_binary()
-            .expect("maolan-engine-plugin-host binary should be built for tests")
+        ipc::find_plugin_host_binary().expect("maolan-plugin-host binary should be built for tests")
     }
 
     #[test]

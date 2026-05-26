@@ -13,7 +13,7 @@ impl MidiEvent {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 #[allow(clippy::upper_case_acronyms)]
 pub struct MIDIIO {
     pub connections: Vec<Arc<UnsafeMutex<Box<Self>>>>,
@@ -22,10 +22,7 @@ pub struct MIDIIO {
 
 impl MIDIIO {
     pub fn new() -> Self {
-        Self {
-            connections: vec![],
-            buffer: vec![],
-        }
+        Self::default()
     }
 
     pub fn connect(&mut self, to: Arc<UnsafeMutex<Box<Self>>>) {
