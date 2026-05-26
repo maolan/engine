@@ -4,10 +4,10 @@ use crate::audio::io::AudioIO;
 use crate::clap::{ClapMidiOutputEvent, ClapParamUpdate, ClapParameterInfo, ClapTransportInfo};
 use crate::midi::io::MidiEvent;
 use crate::mutex::UnsafeMutex;
-use maolan_plugin_host_protocol::events::EventPair;
-use maolan_plugin_host_protocol::protocol::*;
-use maolan_plugin_host_protocol::ringbuf::RingBuffer;
-use maolan_plugin_host_protocol::shm::ShmMapping;
+use maolan_plugin_protocol::events::EventPair;
+use maolan_plugin_protocol::protocol::*;
+use maolan_plugin_protocol::ringbuf::RingBuffer;
+use maolan_plugin_protocol::shm::ShmMapping;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -158,7 +158,7 @@ impl ClapProcessor {
                 param_index: param_id,
                 value: value as f32,
                 sample_offset: 0,
-                event_kind: maolan_plugin_host_protocol::PARAM_EVENT_VALUE,
+                event_kind: maolan_plugin_protocol::PARAM_EVENT_VALUE,
             };
             if !ring.push(ev) {
                 tracing::warn!("param ring full, dropping parameter event");

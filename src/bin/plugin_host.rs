@@ -1,8 +1,8 @@
 use maolan_engine::message::{Lv2PluginState, Lv2StatePortValue, Lv2StateProperty};
-use maolan_plugin_host_protocol::events::EventPair;
-use maolan_plugin_host_protocol::protocol::*;
-use maolan_plugin_host_protocol::ringbuf::RingBuffer;
-use maolan_plugin_host_protocol::shm::ShmMapping;
+use maolan_plugin_protocol::events::EventPair;
+use maolan_plugin_protocol::protocol::*;
+use maolan_plugin_protocol::ringbuf::RingBuffer;
+use maolan_plugin_protocol::shm::ShmMapping;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;

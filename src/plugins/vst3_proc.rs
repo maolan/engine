@@ -5,10 +5,10 @@ use crate::midi::io::MidiEvent;
 use crate::mutex::UnsafeMutex;
 use crate::vst3::port::ParameterInfo;
 use crate::vst3::state::Vst3PluginState;
-use maolan_plugin_host_protocol::events::EventPair;
-use maolan_plugin_host_protocol::protocol::*;
-use maolan_plugin_host_protocol::ringbuf::RingBuffer;
-use maolan_plugin_host_protocol::shm::ShmMapping;
+use maolan_plugin_protocol::events::EventPair;
+use maolan_plugin_protocol::protocol::*;
+use maolan_plugin_protocol::ringbuf::RingBuffer;
+use maolan_plugin_protocol::shm::ShmMapping;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -163,7 +163,7 @@ impl Vst3Processor {
                 param_index: param_id,
                 value: value as f32,
                 sample_offset: 0,
-                event_kind: maolan_plugin_host_protocol::PARAM_EVENT_VALUE,
+                event_kind: maolan_plugin_protocol::PARAM_EVENT_VALUE,
             };
             if !ring.push(ev) {
                 tracing::warn!("VST3 param ring full, dropping parameter event");
@@ -795,7 +795,7 @@ fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
 
 /// Serialize VST3 state into scratch area. Returns bytes written or error.
 fn serialize_vst3_state(scratch: *mut u8, state: &Vst3PluginState) -> Result<usize, String> {
-    let max_len = maolan_plugin_host_protocol::protocol::SCRATCH_SIZE;
+    let max_len = maolan_plugin_protocol::protocol::SCRATCH_SIZE;
     let mut offset = 0usize;
 
     let plugin_id_bytes = state.plugin_id.as_bytes();

@@ -638,7 +638,7 @@ dependencies = [
  "libloading 0.9.0",
  "lilv",
  "lv2_raw",
- "maolan-plugin-host-protocol",
+ "maolan-plugin-protocol",
  "midir",
  "midly",
  "nix",
@@ -654,8 +654,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "maolan-plugin-host-protocol"
-version = "0.1.0"
+name = "maolan-plugin-protocol"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f548868a627555fec07c1d58983603ec8a5ad196b7ae4da333df2d87e2f53049"
 dependencies = [
  "libc",
  "tracing",
