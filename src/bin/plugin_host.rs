@@ -39,8 +39,12 @@ mod x11_ffi {
         pub fn XMapWindow(display: *mut Display, w: Window) -> c_int;
         pub fn XUnmapWindow(display: *mut Display, w: Window) -> c_int;
         pub fn XDestroyWindow(display: *mut Display, w: Window) -> c_int;
-        pub fn XResizeWindow(display: *mut Display, w: Window, width: c_uint, height: c_uint)
-            -> c_int;
+        pub fn XResizeWindow(
+            display: *mut Display,
+            w: Window,
+            width: c_uint,
+            height: c_uint,
+        ) -> c_int;
         pub fn XFlush(display: *mut Display) -> c_int;
     }
 }
@@ -88,14 +92,15 @@ fn create_vst3_gui(
 
     let window = unsafe {
         x11_ffi::XCreateSimpleWindow(
-            display, root,
-            100, 100,          // initial position
-            800, 600,          // initial size (resized after gui_get_size)
+            display, root, 100, 100, // initial position
+            800, 600, // initial size (resized after gui_get_size)
             1, black, white,
         )
     };
     if window == 0 {
-        unsafe { x11_ffi::XCloseDisplay(display); }
+        unsafe {
+            x11_ffi::XCloseDisplay(display);
+        }
         return Err("VST3 GUI: failed to create X11 container window".to_string());
     }
 
@@ -105,7 +110,9 @@ fn create_vst3_gui(
         .and_then(|s| s.to_str())
         .unwrap_or("Plugin");
     if let Ok(cstr) = std::ffi::CString::new(title) {
-        unsafe { x11_ffi::XStoreName(display, window, cstr.as_ptr()); }
+        unsafe {
+            x11_ffi::XStoreName(display, window, cstr.as_ptr());
+        }
     }
 
     // Create the VST3 IPlugView and verify X11EmbedWindowID is supported.
@@ -118,18 +125,23 @@ fn create_vst3_gui(
     })?;
 
     // Attach the view to our container window.
-    processor.gui_set_parent(window as usize, "X11EmbedWindowID").map_err(|e| {
-        unsafe {
-            x11_ffi::XDestroyWindow(display, window);
-            x11_ffi::XCloseDisplay(display);
-        }
-        format!("VST3 GUI: gui_set_parent failed: {e}")
-    })?;
+    processor
+        .gui_set_parent(window as usize, "X11EmbedWindowID")
+        .map_err(|e| {
+            unsafe {
+                x11_ffi::XDestroyWindow(display, window);
+                x11_ffi::XCloseDisplay(display);
+            }
+            format!("VST3 GUI: gui_set_parent failed: {e}")
+        })?;
 
     // Resize container to the plugin's preferred size.
-    if let Ok((w, h)) = processor.gui_get_size() {
-        if w > 0 && h > 0 {
-            unsafe { x11_ffi::XResizeWindow(display, window, w as c_uint, h as c_uint); }
+    if let Ok((w, h)) = processor.gui_get_size()
+        && w > 0
+        && h > 0
+    {
+        unsafe {
+            x11_ffi::XResizeWindow(display, window, w as c_uint, h as c_uint);
         }
     }
 
@@ -142,7 +154,9 @@ fn create_vst3_gui(
 }
 
 fn print_usage() {
-    eprintln!("Usage: maolan-engine-plugin-host <format> <plugin-spec> <shm-name> <instance-id> <d2h-fd> <h2d-fd> <sample-rate> <buffer-size> <num-inputs> <num-outputs>");
+    eprintln!(
+        "Usage: maolan-engine-plugin-host <format> <plugin-spec> <shm-name> <instance-id> <d2h-fd> <h2d-fd> <sample-rate> <buffer-size> <num-inputs> <num-outputs>"
+    );
     eprintln!("  format: vst3 | lv2");
 }
 
@@ -182,7 +196,10 @@ fn main() {
     // Signal readiness.
     let header = unsafe { header_mut(mapping.as_ptr()) };
     header.ready.store(1, Ordering::Release);
-    eprintln!("[plugin-host {}] Ready for {} plugin {}", instance_id, format, plugin_spec);
+    eprintln!(
+        "[plugin-host {}] Ready for {} plugin {}",
+        instance_id, format, plugin_spec
+    );
 
     match plugin_spec.as_str() {
         "__test__" => {
@@ -197,11 +214,9 @@ fn main() {
             // that can cause waitpid(WNOHANG) to return 0 on some platforms
             std::process::exit(1);
         }
-        "__hang__" => {
-            loop {
-                std::thread::sleep(Duration::from_secs(60));
-            }
-        }
+        "__hang__" => loop {
+            std::thread::sleep(Duration::from_secs(60));
+        },
         _ => {}
     }
 
@@ -276,7 +291,7 @@ fn write_vst3_echo_ring(
                 param_index: param.id,
                 value: current,
                 sample_offset: 0,
-                _pad: 0,
+                event_kind: PARAM_EVENT_VALUE,
             };
             if !ring.push(ev) {
                 eprintln!("[plugin-host] Echo ring full, dropping parameter event");
@@ -288,60 +303,140 @@ fn write_vst3_echo_ring(
 }
 
 /// Serialize VST3 state into scratch area. Returns bytes written or error.
-fn serialize_vst3_state(scratch: *mut u8, state: &maolan_engine::plugins::vst3::state::Vst3PluginState) -> Result<usize, String> {
+fn serialize_vst3_state(
+    scratch: *mut u8,
+    state: &maolan_engine::plugins::vst3::state::Vst3PluginState,
+) -> Result<usize, String> {
     let max_len = SCRATCH_SIZE;
     let mut offset = 0usize;
 
     let plugin_id_bytes = state.plugin_id.as_bytes();
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, plugin_id_bytes.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            plugin_id_bytes.len() as u32,
+        );
+    }
     offset += 4;
-    if offset + plugin_id_bytes.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(plugin_id_bytes.as_ptr(), scratch.add(offset), plugin_id_bytes.len()); }
+    if offset + plugin_id_bytes.len() > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            plugin_id_bytes.as_ptr(),
+            scratch.add(offset),
+            plugin_id_bytes.len(),
+        );
+    }
     offset += plugin_id_bytes.len();
 
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.component_state.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            state.component_state.len() as u32,
+        );
+    }
     offset += 4;
-    if offset + state.component_state.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(state.component_state.as_ptr(), scratch.add(offset), state.component_state.len()); }
+    if offset + state.component_state.len() > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            state.component_state.as_ptr(),
+            scratch.add(offset),
+            state.component_state.len(),
+        );
+    }
     offset += state.component_state.len();
 
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.controller_state.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            state.controller_state.len() as u32,
+        );
+    }
     offset += 4;
-    if offset + state.controller_state.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(state.controller_state.as_ptr(), scratch.add(offset), state.controller_state.len()); }
+    if offset + state.controller_state.len() > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            state.controller_state.as_ptr(),
+            scratch.add(offset),
+            state.controller_state.len(),
+        );
+    }
     offset += state.controller_state.len();
 
     Ok(offset)
 }
 
 /// Deserialize VST3 state from scratch area.
-fn deserialize_vst3_state(scratch: *const u8, size: usize) -> Result<maolan_engine::plugins::vst3::state::Vst3PluginState, String> {
-    if size < 12 { return Err("scratch too small for VST3 state".to_string()); }
+fn deserialize_vst3_state(
+    scratch: *const u8,
+    size: usize,
+) -> Result<maolan_engine::plugins::vst3::state::Vst3PluginState, String> {
+    if size < 12 {
+        return Err("scratch too small for VST3 state".to_string());
+    }
     let mut offset = 0usize;
 
-    let plugin_id_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let plugin_id_len =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
-    if offset + plugin_id_len > size { return Err("scratch underflow".to_string()); }
+    if offset + plugin_id_len > size {
+        return Err("scratch underflow".to_string());
+    }
     let mut plugin_id_bytes = vec![0u8; plugin_id_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), plugin_id_bytes.as_mut_ptr(), plugin_id_len); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.add(offset),
+            plugin_id_bytes.as_mut_ptr(),
+            plugin_id_len,
+        );
+    }
     offset += plugin_id_len;
     let plugin_id = String::from_utf8(plugin_id_bytes).map_err(|e| e.to_string())?;
 
-    let component_state_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let component_state_len =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
-    if offset + component_state_len > size { return Err("scratch underflow".to_string()); }
+    if offset + component_state_len > size {
+        return Err("scratch underflow".to_string());
+    }
     let mut component_state = vec![0u8; component_state_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), component_state.as_mut_ptr(), component_state_len); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.add(offset),
+            component_state.as_mut_ptr(),
+            component_state_len,
+        );
+    }
     offset += component_state_len;
 
-    let controller_state_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let controller_state_len =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
-    if offset + controller_state_len > size { return Err("scratch underflow".to_string()); }
+    if offset + controller_state_len > size {
+        return Err("scratch underflow".to_string());
+    }
     let mut controller_state = vec![0u8; controller_state_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), controller_state.as_mut_ptr(), controller_state_len); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.add(offset),
+            controller_state.as_mut_ptr(),
+            controller_state_len,
+        );
+    }
 
     Ok(maolan_engine::plugins::vst3::state::Vst3PluginState {
         plugin_id,
@@ -381,7 +476,10 @@ fn run_vst3(args: Vst3RunArgs) {
     ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[plugin-host {}] Failed to load VST3 plugin '{}': {}", instance_id, plugin_path, e);
+            eprintln!(
+                "[plugin-host {}] Failed to load VST3 plugin '{}': {}",
+                instance_id, plugin_path, e
+            );
             return;
         }
     };
@@ -409,15 +507,13 @@ fn run_vst3(args: Vst3RunArgs) {
                 1 => {
                     // Save state
                     match processor.snapshot_state() {
-                        Ok(state) => {
-                            match serialize_vst3_state(scratch, &state) {
-                                Ok(size) => {
-                                    header.scratch_size.store(size as u32, Ordering::Release);
-                                    Ok(())
-                                }
-                                Err(e) => Err(e),
+                        Ok(state) => match serialize_vst3_state(scratch, &state) {
+                            Ok(size) => {
+                                header.scratch_size.store(size as u32, Ordering::Release);
+                                Ok(())
                             }
-                        }
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(e),
                     }
                 }
@@ -469,7 +565,9 @@ fn run_vst3(args: Vst3RunArgs) {
                 }
                 _ => Err(format!("Unknown request type: {}", req)),
             };
-            header.request_status.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+            header
+                .request_status
+                .store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
             // Only wake the DAW for state operations (save=1, restore=2).
             // GUI requests (show=3, hide=4) are fire-and-forget — signalling
             // here would corrupt the audio-completion pipe handshake.
@@ -494,7 +592,10 @@ fn run_vst3(args: Vst3RunArgs) {
         let num_out = header.num_output_channels.load(Ordering::Acquire) as usize;
 
         if block_size == 0 || block_size > MAX_BLOCK_SIZE {
-            eprintln!("[plugin-host {}] Invalid block size {}, skipping", instance_id, block_size);
+            eprintln!(
+                "[plugin-host {}] Invalid block size {}, skipping",
+                instance_id, block_size
+            );
             let _ = events.signal_daw();
             continue;
         }
@@ -587,7 +688,7 @@ fn write_lv2_echo_ring(
                 param_index: port.index,
                 value: current,
                 sample_offset: 0,
-                _pad: 0,
+                event_kind: PARAM_EVENT_VALUE,
             };
             if !ring.push(ev) {
                 eprintln!("[plugin-host] Echo ring full, dropping parameter event");
@@ -604,46 +705,102 @@ fn serialize_lv2_state(scratch: *mut u8, state: &Lv2PluginState) -> Result<usize
     let mut offset = 0usize;
 
     // Port values
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.port_values.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            state.port_values.len() as u32,
+        );
+    }
     offset += 4;
     for v in &state.port_values {
-        if offset + 8 > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, v.index); }
+        if offset + 8 > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::write_unaligned(scratch.add(offset) as *mut u32, v.index);
+        }
         offset += 4;
-        unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, v.value.to_bits()); }
+        unsafe {
+            std::ptr::write_unaligned(scratch.add(offset) as *mut u32, v.value.to_bits());
+        }
         offset += 4;
     }
 
     // Properties
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.properties.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            state.properties.len() as u32,
+        );
+    }
     offset += 4;
     for prop in &state.properties {
         let key_bytes = prop.key_uri.as_bytes();
-        if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, key_bytes.len() as u32); }
+        if offset + 4 > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::write_unaligned(scratch.add(offset) as *mut u32, key_bytes.len() as u32);
+        }
         offset += 4;
-        if offset + key_bytes.len() > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::copy_nonoverlapping(key_bytes.as_ptr(), scratch.add(offset), key_bytes.len()); }
+        if offset + key_bytes.len() > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(key_bytes.as_ptr(), scratch.add(offset), key_bytes.len());
+        }
         offset += key_bytes.len();
 
         let type_bytes = prop.type_uri.as_bytes();
-        if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, type_bytes.len() as u32); }
+        if offset + 4 > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::write_unaligned(scratch.add(offset) as *mut u32, type_bytes.len() as u32);
+        }
         offset += 4;
-        if offset + type_bytes.len() > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::copy_nonoverlapping(type_bytes.as_ptr(), scratch.add(offset), type_bytes.len()); }
+        if offset + type_bytes.len() > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                type_bytes.as_ptr(),
+                scratch.add(offset),
+                type_bytes.len(),
+            );
+        }
         offset += type_bytes.len();
 
-        if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, prop.flags); }
+        if offset + 4 > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::write_unaligned(scratch.add(offset) as *mut u32, prop.flags);
+        }
         offset += 4;
-        if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, prop.value.len() as u32); }
+        if offset + 4 > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::write_unaligned(scratch.add(offset) as *mut u32, prop.value.len() as u32);
+        }
         offset += 4;
-        if offset + prop.value.len() > max_len { return Err("scratch overflow".to_string()); }
-        unsafe { std::ptr::copy_nonoverlapping(prop.value.as_ptr(), scratch.add(offset), prop.value.len()); }
+        if offset + prop.value.len() > max_len {
+            return Err("scratch overflow".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                prop.value.as_ptr(),
+                scratch.add(offset),
+                prop.value.len(),
+            );
+        }
         offset += prop.value.len();
     }
 
@@ -652,54 +809,86 @@ fn serialize_lv2_state(scratch: *mut u8, state: &Lv2PluginState) -> Result<usize
 
 /// Deserialize LV2 state from scratch area.
 fn deserialize_lv2_state(scratch: *const u8, size: usize) -> Result<Lv2PluginState, String> {
-    if size < 8 { return Err("scratch too small for LV2 state".to_string()); }
+    if size < 8 {
+        return Err("scratch too small for LV2 state".to_string());
+    }
     let mut offset = 0usize;
 
-    let port_count = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let port_count =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
     let mut port_values = Vec::with_capacity(port_count);
     for _ in 0..port_count {
-        if offset + 8 > size { return Err("scratch underflow".to_string()); }
+        if offset + 8 > size {
+            return Err("scratch underflow".to_string());
+        }
         let index = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) };
         offset += 4;
         let bits = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) };
         offset += 4;
-        port_values.push(Lv2StatePortValue { index, value: f32::from_bits(bits) });
+        port_values.push(Lv2StatePortValue {
+            index,
+            value: f32::from_bits(bits),
+        });
     }
 
-    let prop_count = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let prop_count =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
     let mut properties = Vec::with_capacity(prop_count);
     for _ in 0..prop_count {
-        let key_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+        let key_len =
+            unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
         offset += 4;
-        if offset + key_len > size { return Err("scratch underflow".to_string()); }
+        if offset + key_len > size {
+            return Err("scratch underflow".to_string());
+        }
         let mut key_bytes = vec![0u8; key_len];
-        unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), key_bytes.as_mut_ptr(), key_len); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(scratch.add(offset), key_bytes.as_mut_ptr(), key_len);
+        }
         offset += key_len;
         let key_uri = String::from_utf8(key_bytes).map_err(|e| e.to_string())?;
 
-        let type_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+        let type_len =
+            unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
         offset += 4;
-        if offset + type_len > size { return Err("scratch underflow".to_string()); }
+        if offset + type_len > size {
+            return Err("scratch underflow".to_string());
+        }
         let mut type_bytes = vec![0u8; type_len];
-        unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), type_bytes.as_mut_ptr(), type_len); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(scratch.add(offset), type_bytes.as_mut_ptr(), type_len);
+        }
         offset += type_len;
         let type_uri = String::from_utf8(type_bytes).map_err(|e| e.to_string())?;
 
         let flags = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) };
         offset += 4;
-        let value_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+        let value_len =
+            unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
         offset += 4;
-        if offset + value_len > size { return Err("scratch underflow".to_string()); }
+        if offset + value_len > size {
+            return Err("scratch underflow".to_string());
+        }
         let mut value = vec![0u8; value_len];
-        unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), value.as_mut_ptr(), value_len); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(scratch.add(offset), value.as_mut_ptr(), value_len);
+        }
         offset += value_len;
 
-        properties.push(Lv2StateProperty { key_uri, type_uri, flags, value });
+        properties.push(Lv2StateProperty {
+            key_uri,
+            type_uri,
+            flags,
+            value,
+        });
     }
 
-    Ok(Lv2PluginState { port_values, properties })
+    Ok(Lv2PluginState {
+        port_values,
+        properties,
+    })
 }
 
 fn run_lv2(
@@ -717,7 +906,10 @@ fn run_lv2(
     ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[plugin-host {}] Failed to load LV2 plugin '{}': {}", instance_id, plugin_uri, e);
+            eprintln!(
+                "[plugin-host {}] Failed to load LV2 plugin '{}': {}",
+                instance_id, plugin_uri, e
+            );
             return;
         }
     };
@@ -761,7 +953,9 @@ fn run_lv2(
                 4 => Ok(()),
                 _ => Err(format!("Unknown request type: {}", req)),
             };
-            header.request_status.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+            header
+                .request_status
+                .store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
             // Only wake the DAW for state operations (save=1, restore=2).
             // GUI requests (show=3, hide=4) are fire-and-forget — signalling
             // here would corrupt the audio-completion pipe handshake.
@@ -786,7 +980,10 @@ fn run_lv2(
         let num_out = header.num_output_channels.load(Ordering::Acquire) as usize;
 
         if block_size == 0 || block_size > MAX_BLOCK_SIZE {
-            eprintln!("[plugin-host {}] Invalid block size {}, skipping", instance_id, block_size);
+            eprintln!(
+                "[plugin-host {}] Invalid block size {}, skipping",
+                instance_id, block_size
+            );
             let _ = events.signal_daw();
             continue;
         }
@@ -810,11 +1007,7 @@ fn run_lv2(
         }
 
         // Process.
-        let _midi_out = processor.process_with_audio_io(
-            block_size,
-            &[],
-            transport,
-        );
+        let _midi_out = processor.process_with_audio_io(block_size, &[], transport);
 
         // Echo parameter changes back to DAW.
         write_lv2_echo_ring(&processor, ptr, &mut lv2_param_cache);
@@ -847,24 +1040,30 @@ mod tests {
     fn lv2_state_serialization_roundtrip() {
         let state = Lv2PluginState {
             port_values: vec![
-                Lv2StatePortValue { index: 0, value: 0.5 },
-                Lv2StatePortValue { index: 1, value: 1.0 },
-            ],
-            properties: vec![
-                Lv2StateProperty {
-                    key_uri: "http://example.com/key".to_string(),
-                    type_uri: "http://example.com/type".to_string(),
-                    flags: 0,
-                    value: vec![1, 2, 3],
+                Lv2StatePortValue {
+                    index: 0,
+                    value: 0.5,
+                },
+                Lv2StatePortValue {
+                    index: 1,
+                    value: 1.0,
                 },
             ],
+            properties: vec![Lv2StateProperty {
+                key_uri: "http://example.com/key".to_string(),
+                type_uri: "http://example.com/type".to_string(),
+                flags: 0,
+                value: vec![1, 2, 3],
+            }],
         };
         let mut scratch = vec![0u8; SCRATCH_SIZE];
-        let size = serialize_lv2_state(scratch.as_mut_ptr(), &state).expect("serialize should succeed");
+        let size =
+            serialize_lv2_state(scratch.as_mut_ptr(), &state).expect("serialize should succeed");
         assert!(size > 0);
         assert!(size < SCRATCH_SIZE);
 
-        let decoded = deserialize_lv2_state(scratch.as_ptr(), size).expect("deserialize should succeed");
+        let decoded =
+            deserialize_lv2_state(scratch.as_ptr(), size).expect("deserialize should succeed");
         assert_eq!(decoded.port_values.len(), state.port_values.len());
         assert_eq!(decoded.port_values[0].index, state.port_values[0].index);
         assert_eq!(decoded.port_values[0].value, state.port_values[0].value);

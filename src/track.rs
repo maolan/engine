@@ -1431,10 +1431,9 @@ impl Track {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        runtime.clap_plugins.push(ClapInstance::new(
-                            id,
-                            Arc::new(UnsafeMutex::new(processor)),
-                        ));
+                        runtime
+                            .clap_plugins
+                            .push(ClapInstance::new(id, Arc::new(UnsafeMutex::new(processor))));
                         runtime_nodes.push(PluginGraphNode::ClapPluginInstance(id));
                     }
                     "VST3" | "vst3" => {
@@ -1453,10 +1452,9 @@ impl Track {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        runtime.vst3_plugins.push(Vst3Instance::new(
-                            id,
-                            Arc::new(UnsafeMutex::new(processor)),
-                        ));
+                        runtime
+                            .vst3_plugins
+                            .push(Vst3Instance::new(id, Arc::new(UnsafeMutex::new(processor))));
                         runtime_nodes.push(PluginGraphNode::Vst3PluginInstance(id));
                     }
                     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1476,10 +1474,9 @@ impl Track {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        runtime.lv2_plugins.push(Lv2Instance::new(
-                            id,
-                            Arc::new(UnsafeMutex::new(processor)),
-                        ));
+                        runtime
+                            .lv2_plugins
+                            .push(Lv2Instance::new(id, Arc::new(UnsafeMutex::new(processor))));
                         runtime_nodes.push(PluginGraphNode::Lv2PluginInstance(id));
                     }
                     _ => {}
@@ -1552,11 +1549,7 @@ impl Track {
             .get_mut(&runtime_key)
             .ok_or_else(|| "Missing clip plugin runtime".to_string())?;
 
-        Ok(runtime.process(
-            input_blocks,
-            request_len,
-            ClipRuntimeProcessContext {},
-        ))
+        Ok(runtime.process(input_blocks, request_len, ClipRuntimeProcessContext {}))
     }
 
     fn apply_audio_clip_fades(
@@ -2273,7 +2266,10 @@ impl Track {
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_lv2_instance_id = self.next_lv2_instance_id.max(id.saturating_add(1));
         self.next_plugin_instance_id = self.next_plugin_instance_id.max(id.saturating_add(1));
-        self.lv2_plugins.push(Lv2Instance { id, processor: Arc::new(UnsafeMutex::new(processor)) });
+        self.lv2_plugins.push(Lv2Instance {
+            id,
+            processor: Arc::new(UnsafeMutex::new(processor)),
+        });
         self.invalidate_audio_route_cache();
         Ok(())
     }
@@ -2448,7 +2444,10 @@ impl Track {
                 self.name, instance_id
             ));
         };
-        instance.processor.lock().set_parameter(index as u32, param_value)
+        instance
+            .processor
+            .lock()
+            .set_parameter(index as u32, param_value)
     }
 
     pub fn load_clap_plugin(
@@ -2467,11 +2466,13 @@ impl Track {
         if !crate::clap::is_supported_clap_binary(path) {
             return Err(format!("Not a CLAP plugin path: {plugin_path}"));
         }
-        if self
-            .clap_plugins
-            .iter()
-            .any(|plugin| plugin.processor.lock().path().eq_ignore_ascii_case(plugin_path))
-        {
+        if self.clap_plugins.iter().any(|plugin| {
+            plugin
+                .processor
+                .lock()
+                .path()
+                .eq_ignore_ascii_case(plugin_path)
+        }) {
             return Err(format!("CLAP plugin already loaded: {plugin_path}"));
         }
 
@@ -2509,11 +2510,13 @@ impl Track {
     }
 
     pub fn unload_clap_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
-        let Some(index) = self
-            .clap_plugins
-            .iter()
-            .position(|instance| instance.processor.lock().path().eq_ignore_ascii_case(plugin_path))
-        else {
+        let Some(index) = self.clap_plugins.iter().position(|instance| {
+            instance
+                .processor
+                .lock()
+                .path()
+                .eq_ignore_ascii_case(plugin_path)
+        }) else {
             return Err(format!(
                 "Track '{}' does not have CLAP plugin loaded: {}",
                 self.name, plugin_path
@@ -2631,7 +2634,10 @@ impl Track {
         frame: u32,
     ) -> Result<(), String> {
         if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.lock().set_parameter_at(param_id, value, frame);
+            return instance
+                .processor
+                .lock()
+                .set_parameter_at(param_id, value, frame);
         }
         Err(format!(
             "Track '{}' does not have CLAP instance id: {}",
@@ -2655,7 +2661,10 @@ impl Track {
                     self.name, instance_id
                 )
             })?;
-        instance.processor.lock().begin_parameter_edit_at(param_id, frame)
+        instance
+            .processor
+            .lock()
+            .begin_parameter_edit_at(param_id, frame)
     }
 
     pub fn end_clap_parameter_edit(
@@ -2674,7 +2683,10 @@ impl Track {
                     self.name, instance_id
                 )
             })?;
-        instance.processor.lock().end_parameter_edit_at(param_id, frame)
+        instance
+            .processor
+            .lock()
+            .end_parameter_edit_at(param_id, frame)
     }
 
     pub fn get_clap_parameters(
@@ -2818,11 +2830,13 @@ impl Track {
     }
 
     pub fn unload_vst3_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
-        let Some(index) = self
-            .vst3_plugins
-            .iter()
-            .position(|instance| instance.processor.lock().path().eq_ignore_ascii_case(plugin_path))
-        else {
+        let Some(index) = self.vst3_plugins.iter().position(|instance| {
+            instance
+                .processor
+                .lock()
+                .path()
+                .eq_ignore_ascii_case(plugin_path)
+        }) else {
             return Err(format!(
                 "Track '{}' does not have VST3 plugin loaded: {}",
                 self.name, plugin_path
@@ -2982,7 +2996,10 @@ impl Track {
             .find(|i| i.id == instance_id)
             .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
 
-        instance.processor.lock().set_parameter(param_id, value as f64)
+        instance
+            .processor
+            .lock()
+            .set_parameter(param_id, value as f64)
     }
 
     pub fn get_vst3_parameters(
@@ -3266,37 +3283,55 @@ impl Track {
             .collect();
         #[cfg(all(unix, not(target_os = "macos")))]
         for instance in &self.lv2_plugins {
-            source_ports.extend(instance.processor.lock().audio_outputs().iter().enumerate().map(
-                |(idx, io)| {
-                    (
-                        PluginGraphNode::Lv2PluginInstance(instance.id),
-                        idx,
-                        io.clone(),
-                    )
-                },
-            ));
+            source_ports.extend(
+                instance
+                    .processor
+                    .lock()
+                    .audio_outputs()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, io)| {
+                        (
+                            PluginGraphNode::Lv2PluginInstance(instance.id),
+                            idx,
+                            io.clone(),
+                        )
+                    }),
+            );
         }
         for instance in &self.vst3_plugins {
-            source_ports.extend(instance.processor.lock().audio_outputs().iter().enumerate().map(
-                |(idx, io)| {
-                    (
-                        PluginGraphNode::Vst3PluginInstance(instance.id),
-                        idx,
-                        io.clone(),
-                    )
-                },
-            ));
+            source_ports.extend(
+                instance
+                    .processor
+                    .lock()
+                    .audio_outputs()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, io)| {
+                        (
+                            PluginGraphNode::Vst3PluginInstance(instance.id),
+                            idx,
+                            io.clone(),
+                        )
+                    }),
+            );
         }
         for instance in &self.clap_plugins {
-            source_ports.extend(instance.processor.lock().audio_outputs().iter().enumerate().map(
-                |(idx, io)| {
-                    (
-                        PluginGraphNode::ClapPluginInstance(instance.id),
-                        idx,
-                        io.clone(),
-                    )
-                },
-            ));
+            source_ports.extend(
+                instance
+                    .processor
+                    .lock()
+                    .audio_outputs()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, io)| {
+                        (
+                            PluginGraphNode::ClapPluginInstance(instance.id),
+                            idx,
+                            io.clone(),
+                        )
+                    }),
+            );
         }
 
         let mut connections = vec![];
@@ -3605,7 +3640,14 @@ impl Track {
             self.lv2_plugins
                 .iter()
                 .find(|instance| instance.id == instance_id)
-                .and_then(|instance| instance.processor.lock().audio_outputs().get(_port).cloned())
+                .and_then(|instance| {
+                    instance
+                        .processor
+                        .lock()
+                        .audio_outputs()
+                        .get(_port)
+                        .cloned()
+                })
                 .ok_or_else(|| format!("Plugin instance {instance_id} output port {_port} missing"))
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -3637,7 +3679,9 @@ impl Track {
             self.lv2_plugins
                 .iter()
                 .find(|instance| instance.id == instance_id)
-                .and_then(|instance| (_port < instance.processor.lock().midi_output_count()).then_some(()))
+                .and_then(|instance| {
+                    (_port < instance.processor.lock().midi_output_count()).then_some(())
+                })
                 .ok_or_else(|| {
                     format!("Plugin instance {instance_id} MIDI output port {_port} missing")
                 })
@@ -3655,7 +3699,9 @@ impl Track {
             self.lv2_plugins
                 .iter()
                 .find(|instance| instance.id == instance_id)
-                .and_then(|instance| (_port < instance.processor.lock().midi_input_count()).then_some(()))
+                .and_then(|instance| {
+                    (_port < instance.processor.lock().midi_input_count()).then_some(())
+                })
                 .ok_or_else(|| {
                     format!("Plugin instance {instance_id} MIDI input port {_port} missing")
                 })
@@ -3710,7 +3756,9 @@ impl Track {
         self.vst3_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
-            .and_then(|instance| (port < instance.processor.lock().midi_output_count()).then_some(()))
+            .and_then(|instance| {
+                (port < instance.processor.lock().midi_output_count()).then_some(())
+            })
             .ok_or_else(|| format!("VST3 instance {instance_id} MIDI output port {port} missing"))
     }
 
@@ -3718,7 +3766,9 @@ impl Track {
         self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
-            .and_then(|instance| (port < instance.processor.lock().midi_output_count()).then_some(()))
+            .and_then(|instance| {
+                (port < instance.processor.lock().midi_output_count()).then_some(())
+            })
             .ok_or_else(|| format!("CLAP instance {instance_id} MIDI output port {port} missing"))
     }
 
@@ -3726,7 +3776,9 @@ impl Track {
         self.vst3_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
-            .and_then(|instance| (port < instance.processor.lock().midi_input_count()).then_some(()))
+            .and_then(|instance| {
+                (port < instance.processor.lock().midi_input_count()).then_some(())
+            })
             .ok_or_else(|| format!("VST3 instance {instance_id} MIDI input port {port} missing"))
     }
 
@@ -3734,7 +3786,9 @@ impl Track {
         self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
-            .and_then(|instance| (port < instance.processor.lock().midi_input_count()).then_some(()))
+            .and_then(|instance| {
+                (port < instance.processor.lock().midi_input_count()).then_some(())
+            })
             .ok_or_else(|| format!("CLAP instance {instance_id} MIDI input port {port} missing"))
     }
 

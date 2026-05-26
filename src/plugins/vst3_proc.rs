@@ -163,7 +163,7 @@ impl Vst3Processor {
                 param_index: param_id,
                 value: value as f32,
                 sample_offset: 0,
-                _pad: 0,
+                event_kind: maolan_plugin_host_protocol::PARAM_EVENT_VALUE,
             };
             if !ring.push(ev) {
                 tracing::warn!("VST3 param ring full, dropping parameter event");
@@ -309,7 +309,8 @@ impl Vst3Processor {
             let h = header_mut(ptr);
             h.block_size.store(frames as u32, Ordering::Release);
             h.num_input_channels.store(num_in as u32, Ordering::Release);
-            h.num_output_channels.store(num_out as u32, Ordering::Release);
+            h.num_output_channels
+                .store(num_out as u32, Ordering::Release);
             // Write default transport state (can be overridden by track later).
             let t = transport_mut(ptr);
             t.playhead_sample = 0;
@@ -346,9 +347,7 @@ impl Vst3Processor {
             Err(e) => {
                 eprintln!(
                     "[VST3 debug] host did not respond for '{}' ({}): {}",
-                    self.name,
-                    self.path,
-                    e
+                    self.name, self.path, e
                 );
                 self.bypass_copy_inputs_to_outputs();
                 return Vec::new();
@@ -456,22 +455,24 @@ impl Vst3Processor {
 
     pub fn gui_show(&self) -> Result<(), String> {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.request_type.store(3, Ordering::Release);
-                let _ = events.signal_host();
-                return Ok(());
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.request_type.store(3, Ordering::Release);
+            let _ = events.signal_host();
+            return Ok(());
+        }
         Err("No active host to show GUI".to_string())
     }
 
     pub fn gui_hide(&self) {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.request_type.store(4, Ordering::Release);
-                let _ = events.signal_host();
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.request_type.store(4, Ordering::Release);
+            let _ = events.signal_host();
+        }
     }
 
     pub fn gui_destroy(&self) {}
@@ -503,11 +504,12 @@ impl Vst3Processor {
 impl Drop for Vst3Processor {
     fn drop(&mut self) {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.shutdown_request.store(1, Ordering::Release);
-                let _ = events.signal_host();
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.shutdown_request.store(1, Ordering::Release);
+            let _ = events.signal_host();
+        }
         let mut child_opt = self.child.lock().take();
         if let Some(mut child) = child_opt.take() {
             let start = Instant::now();
@@ -697,7 +699,10 @@ pub fn find_host_binary() -> Option<PathBuf> {
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let engine_root = Path::new(&manifest);
         for profile in ["debug", "release"] {
-            let candidate = engine_root.join("target").join(profile).join("maolan-engine-plugin-host");
+            let candidate = engine_root
+                .join("target")
+                .join(profile)
+                .join("maolan-engine-plugin-host");
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -794,25 +799,70 @@ fn serialize_vst3_state(scratch: *mut u8, state: &Vst3PluginState) -> Result<usi
     let mut offset = 0usize;
 
     let plugin_id_bytes = state.plugin_id.as_bytes();
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, plugin_id_bytes.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            plugin_id_bytes.len() as u32,
+        );
+    }
     offset += 4;
-    if offset + plugin_id_bytes.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(plugin_id_bytes.as_ptr(), scratch.add(offset), plugin_id_bytes.len()); }
+    if offset + plugin_id_bytes.len() > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            plugin_id_bytes.as_ptr(),
+            scratch.add(offset),
+            plugin_id_bytes.len(),
+        );
+    }
     offset += plugin_id_bytes.len();
 
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.component_state.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            state.component_state.len() as u32,
+        );
+    }
     offset += 4;
-    if offset + state.component_state.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(state.component_state.as_ptr(), scratch.add(offset), state.component_state.len()); }
+    if offset + state.component_state.len() > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            state.component_state.as_ptr(),
+            scratch.add(offset),
+            state.component_state.len(),
+        );
+    }
     offset += state.component_state.len();
 
-    if offset + 4 > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::write_unaligned(scratch.add(offset) as *mut u32, state.controller_state.len() as u32); }
+    if offset + 4 > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::write_unaligned(
+            scratch.add(offset) as *mut u32,
+            state.controller_state.len() as u32,
+        );
+    }
     offset += 4;
-    if offset + state.controller_state.len() > max_len { return Err("scratch overflow".to_string()); }
-    unsafe { std::ptr::copy_nonoverlapping(state.controller_state.as_ptr(), scratch.add(offset), state.controller_state.len()); }
+    if offset + state.controller_state.len() > max_len {
+        return Err("scratch overflow".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            state.controller_state.as_ptr(),
+            scratch.add(offset),
+            state.controller_state.len(),
+        );
+    }
     offset += state.controller_state.len();
 
     Ok(offset)
@@ -820,29 +870,58 @@ fn serialize_vst3_state(scratch: *mut u8, state: &Vst3PluginState) -> Result<usi
 
 /// Deserialize VST3 state from scratch area.
 fn deserialize_vst3_state(scratch: *const u8, size: usize) -> Result<Vst3PluginState, String> {
-    if size < 12 { return Err("scratch too small for VST3 state".to_string()); }
+    if size < 12 {
+        return Err("scratch too small for VST3 state".to_string());
+    }
     let mut offset = 0usize;
 
-    let plugin_id_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let plugin_id_len =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
-    if offset + plugin_id_len > size { return Err("scratch underflow".to_string()); }
+    if offset + plugin_id_len > size {
+        return Err("scratch underflow".to_string());
+    }
     let mut plugin_id_bytes = vec![0u8; plugin_id_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), plugin_id_bytes.as_mut_ptr(), plugin_id_len); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.add(offset),
+            plugin_id_bytes.as_mut_ptr(),
+            plugin_id_len,
+        );
+    }
     offset += plugin_id_len;
     let plugin_id = String::from_utf8(plugin_id_bytes).map_err(|e| e.to_string())?;
 
-    let component_state_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let component_state_len =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
-    if offset + component_state_len > size { return Err("scratch underflow".to_string()); }
+    if offset + component_state_len > size {
+        return Err("scratch underflow".to_string());
+    }
     let mut component_state = vec![0u8; component_state_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), component_state.as_mut_ptr(), component_state_len); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.add(offset),
+            component_state.as_mut_ptr(),
+            component_state_len,
+        );
+    }
     offset += component_state_len;
 
-    let controller_state_len = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+    let controller_state_len =
+        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
     offset += 4;
-    if offset + controller_state_len > size { return Err("scratch underflow".to_string()); }
+    if offset + controller_state_len > size {
+        return Err("scratch underflow".to_string());
+    }
     let mut controller_state = vec![0u8; controller_state_len];
-    unsafe { std::ptr::copy_nonoverlapping(scratch.add(offset), controller_state.as_mut_ptr(), controller_state_len); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.add(offset),
+            controller_state.as_mut_ptr(),
+            controller_state_len,
+        );
+    }
 
     Ok(Vst3PluginState {
         plugin_id,
@@ -856,15 +935,18 @@ mod tests {
     use super::*;
 
     fn find_host_binary() -> PathBuf {
-        find_host_binary().expect("maolan-engine-plugin-host binary should be built for tests")
+        super::find_host_binary()
+            .expect("maolan-engine-plugin-host binary should be built for tests")
     }
 
     #[test]
     fn find_host_binary_locates_binary() {
         let host_bin = find_host_binary();
-        if let Some(ref path) = host_bin {
-            assert!(path.exists(), "plugin-host binary should exist at {}", path.display());
-        }
+        assert!(
+            host_bin.exists(),
+            "plugin-host binary should exist at {}",
+            host_bin.display()
+        );
     }
 
     #[test]
@@ -875,11 +957,13 @@ mod tests {
             controller_state: vec![10, 20, 30],
         };
         let mut scratch = vec![0u8; SCRATCH_SIZE];
-        let size = serialize_vst3_state(scratch.as_mut_ptr(), &state).expect("serialize should succeed");
+        let size =
+            serialize_vst3_state(scratch.as_mut_ptr(), &state).expect("serialize should succeed");
         assert!(size > 0);
         assert!(size < SCRATCH_SIZE);
 
-        let decoded = deserialize_vst3_state(scratch.as_ptr(), size).expect("deserialize should succeed");
+        let decoded =
+            deserialize_vst3_state(scratch.as_ptr(), size).expect("deserialize should succeed");
         assert_eq!(decoded.plugin_id, state.plugin_id);
         assert_eq!(decoded.component_state, state.component_state);
         assert_eq!(decoded.controller_state, state.controller_state);
@@ -889,15 +973,8 @@ mod tests {
     fn vst3_processor_crash_bypass() {
         let host_bin = find_host_binary();
 
-        let processor = Vst3Processor::new(
-            48000.0,
-            256,
-            "__crash__",
-            1,
-            1,
-            host_bin,
-        )
-        .expect("should create VST3 processor for crash test");
+        let processor = Vst3Processor::new(48000.0, 256, "__crash__", 1, 1, host_bin)
+            .expect("should create VST3 processor for crash test");
 
         processor.setup_audio_ports();
 

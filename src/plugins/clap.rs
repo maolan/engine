@@ -13,7 +13,6 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClapParameterInfo {
     pub id: u32,
@@ -28,7 +27,6 @@ pub struct ClapParameterInfo {
 pub struct ClapPluginState {
     pub bytes: Vec<u8>,
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClapMidiOutputEvent {
@@ -53,14 +51,11 @@ pub struct ClapGuiInfo {
     pub supports_embedded: bool,
 }
 
-
-
 #[derive(Clone, Copy, Debug)]
 pub struct ClapParamUpdate {
     pub param_id: u32,
     pub value: f64,
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClapPluginInfo {
@@ -82,7 +77,6 @@ pub struct ClapPluginCapabilities {
     pub midi_inputs: usize,
     pub midi_outputs: usize,
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -186,15 +180,6 @@ struct ClapEventHeader {
     flags: u32,
 }
 
-
-
-
-
-
-
-
-
-
 #[repr(C)]
 struct ClapAudioPortInfoRaw {
     id: u32,
@@ -262,7 +247,6 @@ struct ClapWindow {
     handle: ClapWindowHandle,
 }
 
-
 #[repr(C)]
 struct ClapHostThreadCheck {
     is_main_thread: Option<unsafe extern "C" fn(*const ClapHost) -> bool>,
@@ -318,14 +302,10 @@ struct ClapHostNotePorts {
     rescan: Option<unsafe extern "C" fn(*const ClapHost, flags: u32)>,
 }
 
-
-
 #[repr(C)]
 struct ClapHostNoteName {
     changed: Option<unsafe extern "C" fn(*const ClapHost)>,
 }
-
-
 
 #[repr(C)]
 struct ClapAudioBuffer {
@@ -348,12 +328,6 @@ struct ClapProcess {
     in_events: *const ClapInputEvents,
     out_events: *mut ClapOutputEvents,
 }
-
-
-
-
-
-
 
 #[derive(Default, Clone, Copy)]
 struct HostCallbackFlags {
@@ -378,11 +352,6 @@ struct HostRuntimeState {
     audio_ports_rescan_requested: AtomicU32,
     note_ports_rescan_requested: AtomicU32,
 }
-
-
-
-
-
 
 static HOST_THREAD_CHECK_EXT: ClapHostThreadCheck = ClapHostThreadCheck {
     is_main_thread: Some(host_is_main_thread),
@@ -618,16 +587,6 @@ unsafe extern "C" fn host_state_mark_dirty(_host: *const ClapHost) {
         state.callback_flags.lock().callback = true;
     }
 }
-
-
-
-
-
-
-
-
-
-
 
 pub fn list_plugins() -> Vec<ClapPluginInfo> {
     list_plugins_with_capabilities(false)

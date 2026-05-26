@@ -4090,13 +4090,12 @@ impl Engine {
                     .await;
                 }
             }
-            Action::BeginHistoryGroup
-                if self.history_group.is_none() => {
-                    self.history_group = Some(UndoEntry {
-                        forward_actions: vec![],
-                        inverse_actions: vec![],
-                    });
-                }
+            Action::BeginHistoryGroup if self.history_group.is_none() => {
+                self.history_group = Some(UndoEntry {
+                    forward_actions: vec![],
+                    inverse_actions: vec![],
+                });
+            }
             Action::EndHistoryGroup => {
                 if let Some(mut group) = self.history_group.take()
                     && !group.forward_actions.is_empty()

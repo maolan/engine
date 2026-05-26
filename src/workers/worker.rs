@@ -71,7 +71,11 @@ impl Worker {
                     let lo = min.min(max);
                     let hi = max.max(min);
                     let param_value = (lo + value * (hi - lo)).clamp(lo, hi);
-                    let _ = track.set_lv2_control_value(instance_id, index as usize, param_value as f64);
+                    let _ = track.set_lv2_control_value(
+                        instance_id,
+                        index as usize,
+                        param_value as f64,
+                    );
                 }
                 OfflineAutomationTarget::Vst3Parameter {
                     instance_id,

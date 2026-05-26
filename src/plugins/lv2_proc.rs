@@ -154,7 +154,7 @@ impl Lv2Processor {
                 param_index: param_id,
                 value: value as f32,
                 sample_offset: 0,
-                _pad: 0,
+                event_kind: maolan_plugin_host_protocol::PARAM_EVENT_VALUE,
             };
             if !ring.push(ev) {
                 tracing::warn!("LV2 param ring full, dropping parameter event");
@@ -204,7 +204,9 @@ impl Lv2Processor {
 
         let scratch = unsafe { scratch_ptr(ptr) };
         let mut bytes = vec![0u8; size];
-        unsafe { std::ptr::copy_nonoverlapping(scratch, bytes.as_mut_ptr(), size); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(scratch, bytes.as_mut_ptr(), size);
+        }
         header.request_type.store(0, Ordering::Release);
         Ok(bytes)
     }
@@ -219,7 +221,9 @@ impl Lv2Processor {
 
         let scratch = unsafe { scratch_ptr(ptr) };
         let size = state.len().min(SCRATCH_SIZE);
-        unsafe { std::ptr::copy_nonoverlapping(state.as_ptr(), scratch, size); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(state.as_ptr(), scratch, size);
+        }
         header.scratch_size.store(size as u32, Ordering::Release);
 
         header.request_type.store(2, Ordering::Release);
@@ -297,7 +301,8 @@ impl Lv2Processor {
             let h = header_mut(ptr);
             h.block_size.store(frames as u32, Ordering::Release);
             h.num_input_channels.store(num_in as u32, Ordering::Release);
-            h.num_output_channels.store(num_out as u32, Ordering::Release);
+            h.num_output_channels
+                .store(num_out as u32, Ordering::Release);
             // Write default transport state (can be overridden by track later).
             let t = transport_mut(ptr);
             t.playhead_sample = 0;
@@ -334,9 +339,7 @@ impl Lv2Processor {
             Err(e) => {
                 eprintln!(
                     "[LV2 debug] host did not respond for '{}' ({}): {}",
-                    self.name,
-                    self.uri,
-                    e
+                    self.name, self.uri, e
                 );
                 self.bypass_copy_inputs_to_outputs();
                 return Vec::new();
@@ -409,22 +412,24 @@ impl Lv2Processor {
 
     pub fn gui_show(&self) -> Result<(), String> {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.request_type.store(3, Ordering::Release);
-                let _ = events.signal_host();
-                return Ok(());
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.request_type.store(3, Ordering::Release);
+            let _ = events.signal_host();
+            return Ok(());
+        }
         Err("No active host to show GUI".to_string())
     }
 
     pub fn gui_hide(&self) {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.request_type.store(4, Ordering::Release);
-                let _ = events.signal_host();
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.request_type.store(4, Ordering::Release);
+            let _ = events.signal_host();
+        }
     }
 
     pub fn drain_echoed_parameters(&self) -> Vec<ParameterEvent> {
@@ -446,11 +451,12 @@ impl Lv2Processor {
 impl Drop for Lv2Processor {
     fn drop(&mut self) {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.shutdown_request.store(1, Ordering::Release);
-                let _ = events.signal_host();
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.shutdown_request.store(1, Ordering::Release);
+            let _ = events.signal_host();
+        }
         let mut child_opt = self.child.lock().take();
         if let Some(mut child) = child_opt.take() {
             let start = Instant::now();
@@ -565,7 +571,10 @@ pub fn find_host_binary() -> Option<PathBuf> {
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let engine_root = Path::new(&manifest);
         for profile in ["debug", "release"] {
-            let candidate = engine_root.join("target").join(profile).join("maolan-engine-plugin-host");
+            let candidate = engine_root
+                .join("target")
+                .join(profile)
+                .join("maolan-engine-plugin-host");
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -659,30 +668,26 @@ mod tests {
     use super::*;
 
     fn find_host_binary() -> PathBuf {
-        find_host_binary().expect("maolan-engine-plugin-host binary should be built for tests")
+        super::find_host_binary()
+            .expect("maolan-engine-plugin-host binary should be built for tests")
     }
 
     #[test]
     fn find_host_binary_locates_binary() {
         let host_bin = find_host_binary();
-        if let Some(ref path) = host_bin {
-            assert!(path.exists(), "plugin-host binary should exist at {}", path.display());
-        }
+        assert!(
+            host_bin.exists(),
+            "plugin-host binary should exist at {}",
+            host_bin.display()
+        );
     }
 
     #[test]
     fn lv2_processor_crash_bypass() {
         let host_bin = find_host_binary();
 
-        let processor = Lv2Processor::new(
-            48000.0,
-            256,
-            "__crash__",
-            1,
-            1,
-            host_bin,
-        )
-        .expect("should create LV2 processor for crash test");
+        let processor = Lv2Processor::new(48000.0, 256, "__crash__", 1, 1, host_bin)
+            .expect("should create LV2 processor for crash test");
 
         processor.setup_audio_ports();
 

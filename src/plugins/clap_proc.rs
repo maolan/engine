@@ -158,7 +158,7 @@ impl ClapProcessor {
                 param_index: param_id,
                 value: value as f32,
                 sample_offset: 0,
-                _pad: 0,
+                event_kind: maolan_plugin_host_protocol::PARAM_EVENT_VALUE,
             };
             if !ring.push(ev) {
                 tracing::warn!("param ring full, dropping parameter event");
@@ -208,11 +208,7 @@ impl ClapProcessor {
             if let Some(ref mut c) = child.as_mut() {
                 match c.try_wait() {
                     Ok(Some(status)) if !status.success() => {
-                        tracing::error!(
-                            "plugin host crashed for '{}' ({})",
-                            self.name,
-                            self.path
-                        );
+                        tracing::error!("plugin host crashed for '{}' ({})", self.name, self.path);
                         self.crash_count.fetch_add(1, Ordering::Relaxed);
                         self.bypass_copy_inputs_to_outputs();
                         return Vec::new();
@@ -241,7 +237,8 @@ impl ClapProcessor {
             let h = header_mut(ptr);
             h.block_size.store(frames as u32, Ordering::Release);
             h.num_input_channels.store(num_in as u32, Ordering::Release);
-            h.num_output_channels.store(num_out as u32, Ordering::Release);
+            h.num_output_channels
+                .store(num_out as u32, Ordering::Release);
         }
 
         // Copy input AudioIO buffers to shared memory (bus 0).
@@ -379,22 +376,24 @@ impl ClapProcessor {
 
     pub fn gui_show(&self) -> Result<(), String> {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.request_type.store(3, Ordering::Release);
-                let _ = events.signal_host();
-                return Ok(());
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.request_type.store(3, Ordering::Release);
+            let _ = events.signal_host();
+            return Ok(());
+        }
         Err("No active host to show GUI".to_string())
     }
 
     pub fn gui_hide(&self) {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.request_type.store(4, Ordering::Release);
-                let _ = events.signal_host();
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.request_type.store(4, Ordering::Release);
+            let _ = events.signal_host();
+        }
     }
 
     pub fn gui_destroy(&self) {}
@@ -426,11 +425,12 @@ impl ClapProcessor {
 impl Drop for ClapProcessor {
     fn drop(&mut self) {
         if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events {
-                let header = unsafe { header_mut(mapping.as_ptr()) };
-                header.shutdown_request.store(1, Ordering::Release);
-                let _ = events.signal_host();
-            }
+            && let Some(ref events) = self.events
+        {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.shutdown_request.store(1, Ordering::Release);
+            let _ = events.signal_host();
+        }
         let mut child_opt = self.child.lock().take();
         if let Some(mut child) = child_opt.take() {
             let start = Instant::now();
@@ -724,7 +724,10 @@ mod tests {
 
     fn find_host_binary() -> PathBuf {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let workspace_root = std::path::Path::new(&manifest).parent().unwrap().join("daw");
+        let workspace_root = std::path::Path::new(&manifest)
+            .parent()
+            .unwrap()
+            .join("daw");
         workspace_root
             .join("target")
             .join("debug")
@@ -735,7 +738,10 @@ mod tests {
     fn clap_processor_processes_audio() {
         let host_bin = find_host_binary();
         if !host_bin.exists() {
-            eprintln!("Skipping test: host binary not found at {}", host_bin.display());
+            eprintln!(
+                "Skipping test: host binary not found at {}",
+                host_bin.display()
+            );
             return;
         }
 
@@ -748,7 +754,10 @@ mod tests {
             .join("test_passthrough.clap");
 
         if !plugin_path.exists() {
-            eprintln!("Skipping test: plugin not found at {}", plugin_path.display());
+            eprintln!(
+                "Skipping test: plugin not found at {}",
+                plugin_path.display()
+            );
             return;
         }
 
@@ -797,15 +806,8 @@ mod tests {
         }
 
         // Use the crash test mode.
-        let processor = ClapProcessor::new(
-            48000.0,
-            256,
-            "__crash__",
-            1,
-            1,
-            host_bin,
-        )
-        .expect("should create processor for crash test");
+        let processor = ClapProcessor::new(48000.0, 256, "__crash__", 1, 1, host_bin)
+            .expect("should create processor for crash test");
 
         processor.setup_audio_ports();
 
@@ -853,15 +855,7 @@ mod tests {
             return;
         }
 
-        let mut track = Track::new(
-            "test-track".to_string(),
-            2,
-            2,
-            0,
-            0,
-            256,
-            48000.0,
-        );
+        let mut track = Track::new("test-track".to_string(), 2, 2, 0, 0, 256, 48000.0);
 
         track
             .load_clap_plugin(
@@ -885,7 +879,12 @@ mod tests {
         track.process();
 
         // Verify the plugin's output buffers contain the passthrough signal.
-        for (ch, output) in track.clap_plugins[0].processor.audio_outputs().iter().enumerate() {
+        for (ch, output) in track.clap_plugins[0]
+            .processor
+            .audio_outputs()
+            .iter()
+            .enumerate()
+        {
             let buf = output.buffer.lock();
             assert!(
                 buf.iter().any(|&s| s != 0.0),

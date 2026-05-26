@@ -419,7 +419,10 @@ impl Vst3Processor {
             });
         }
 
-        let transport = self.transport_info.lock().unwrap_or_else(|e| e.into_inner());
+        let transport = self
+            .transport_info
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut process_context: ProcessContext = unsafe { std::mem::zeroed() };
         process_context.sampleRate = self.sample_rate;
         process_context.tempo = transport.tempo;
