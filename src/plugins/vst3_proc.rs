@@ -78,12 +78,27 @@ impl Vst3Processor {
             return Err("VST3 host did not signal ready".to_string());
         }
 
+        let name = unsafe {
+            let mut name = None;
+            for _ in 0..50 {
+                name = maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(
+                    mapping.as_ptr(),
+                );
+                if name.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            name.unwrap_or_else(|| {
+                Path::new(plugin_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("VST3")
+                    .to_string()
+            })
+        };
+
         let param_infos = Vec::new();
-        let name = Path::new(plugin_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("VST3")
-            .to_string();
 
         Ok(Self {
             path: plugin_path.to_string(),

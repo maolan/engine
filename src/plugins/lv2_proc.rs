@@ -77,11 +77,25 @@ impl Lv2Processor {
             return Err("LV2 host did not signal ready".to_string());
         }
 
-        let name = plugin_uri
-            .rsplit_once('/')
-            .map(|(_, name)| name)
-            .unwrap_or(plugin_uri)
-            .to_string();
+        let name = unsafe {
+            let mut name = None;
+            for _ in 0..50 {
+                name = maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(
+                    mapping.as_ptr(),
+                );
+                if name.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            name.unwrap_or_else(|| {
+                plugin_uri
+                    .rsplit_once('/')
+                    .map(|(_, name)| name)
+                    .unwrap_or(plugin_uri)
+                    .to_string()
+            })
+        };
 
         Ok(Self {
             uri: plugin_uri.to_string(),

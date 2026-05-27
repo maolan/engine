@@ -81,6 +81,20 @@ impl ClapProcessor {
             return Err("host did not signal ready".to_string());
         }
 
+        let name = unsafe {
+            let mut name = None;
+            for _ in 0..50 {
+                name = maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(
+                    mapping.as_ptr(),
+                );
+                if name.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            name.unwrap_or_else(|| plugin_id.to_string())
+        };
+
         // Query parameter count from host via a simple param ring echo.
         // For now, we use a minimal stub param list.
         let param_infos = Vec::new();
@@ -88,7 +102,7 @@ impl ClapProcessor {
         Ok(Self {
             path: plugin_spec.to_string(),
             plugin_id: plugin_id.to_string(),
-            name: plugin_id.to_string(),
+            name,
             audio_inputs,
             audio_outputs,
             main_audio_inputs: input_count.max(1),

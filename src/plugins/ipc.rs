@@ -57,8 +57,11 @@ pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, 
             .arg(events.host_to_daw_name());
     }
 
-    if std::env::args().any(|a| a == "--debug") {
-        cmd.arg("--debug");
+    let parent_args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = parent_args.iter().position(|a| a == "--log-level")
+        && pos + 1 < parent_args.len()
+    {
+        cmd.arg("--log-level").arg(&parent_args[pos + 1]);
     }
 
     let child = cmd
