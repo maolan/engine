@@ -57,6 +57,10 @@ pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, 
             .arg(events.host_to_daw_name());
     }
 
+    if std::env::args().any(|a| a == "--debug") {
+        cmd.arg("--debug");
+    }
+
     let child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {} host: {e}", args.format))?;

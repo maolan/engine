@@ -2636,6 +2636,12 @@ impl Engine {
             plugin_graph_json: Some(Self::default_clip_plugin_graph_json(audio_ins, audio_outs)),
         }))
         .await;
+        if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+            tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+                tracing::debug!("Preloaded clips for track '{}' after recording", track_name);
+            });
+        }
     }
 
     async fn flush_track_recording(&mut self, track_name: &str) {
@@ -2750,7 +2756,7 @@ impl Engine {
         }
         self.notify_clients(Ok(Action::AddClip {
             name: clip_rel_name,
-            track_name,
+            track_name: track_name.clone(),
             start: rec.start_sample,
             length: clip_len_samples,
             offset: 0,
@@ -2772,6 +2778,15 @@ impl Engine {
             plugin_graph_json: None,
         }))
         .await;
+        if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+            tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+                tracing::debug!(
+                    "Preloaded clips for track '{}' after MIDI recording",
+                    track_name
+                );
+            });
+        }
     }
 
     fn write_midi_file(
@@ -3478,9 +3493,40 @@ impl Engine {
         }
     }
 
+    fn preload_track_clips_spawn(&self) {
+        let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+        for track in tracks {
+            tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+            });
+        }
+    }
+
+    async fn preload_track_clips(&self) {
+        let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+        if tracks.is_empty() {
+            return;
+        }
+        let mut handles = Vec::with_capacity(tracks.len());
+        for track in tracks {
+            handles.push(tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+            }));
+        }
+        for handle in handles {
+            if let Err(e) = handle.await {
+                tracing::warn!("Clip preload task panicked: {e}");
+            }
+        }
+    }
+
     async fn send_tracks(&mut self) -> bool {
+        if !self.playing {
+            return false;
+        }
         self.force_stalled_track_completions();
         let mut finished = true;
+        let mut dispatched = 0;
         loop {
             let next_track = {
                 let state = self.state.lock();
@@ -3499,10 +3545,19 @@ impl Engine {
             };
 
             let Some(track) = next_track else {
+                if dispatched > 0 {
+                    tracing::info!("send_tracks dispatched {} tracks", dispatched);
+                }
                 return finished;
             };
             let Some(worker_index) = self.take_ready_worker_index() else {
                 self.force_stalled_track_completions();
+                if dispatched > 0 {
+                    tracing::info!(
+                        "send_tracks dispatched {} tracks (no more workers)",
+                        dispatched
+                    );
+                }
                 return false;
             };
 
@@ -3510,6 +3565,7 @@ impl Engine {
             if t.audio.finished || t.audio.processing || !t.audio.ready() {
                 continue;
             }
+            dispatched += 1;
             t.set_transport_sample(self.transport_sample);
             t.set_loop_config(self.loop_enabled, self.loop_range_samples);
             t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
@@ -3885,6 +3941,10 @@ impl Engine {
 
         match action_to_process {
             Action::Play => {
+                tracing::info!(
+                    "Action::Play pressed, transport_sample={}",
+                    self.transport_sample
+                );
                 self.playing = true;
                 self.transport_restart_pending = true;
                 self.invalidate_track_cycle_state();
@@ -3899,9 +3959,12 @@ impl Engine {
                 }
                 self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                     .await;
+                self.preload_track_clips().await;
+                let send_result = self.send_tracks().await;
+                tracing::info!("send_tracks after Play returned finished={}", send_result);
                 if !self.awaiting_hwfinished
                     && !self.handling_hwfinished
-                    && self.send_tracks().await
+                    && send_result
                     && self.hw_worker.is_some()
                 {
                     self.transport_restart_pending = false;
@@ -3926,6 +3989,7 @@ impl Engine {
                     {
                         self.notify_clients(Err(e)).await;
                     }
+                    self.preload_track_clips().await;
                     if !self.awaiting_hwfinished
                         && !self.handling_hwfinished
                         && self.send_tracks().await
@@ -4146,6 +4210,7 @@ impl Engine {
             Action::EndSessionRestore => {
                 self.history.clear();
                 self.history_suspended = false;
+                self.preload_track_clips_spawn();
             }
             Action::Quit => {
                 self.flush_recordings().await;
@@ -6026,6 +6091,13 @@ impl Engine {
                     pitch_correction_formant_compensation,
                     plugin_graph_json: plugin_graph_json.clone(),
                 });
+                if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+                    let track_name = track_name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        track.lock().preload_clips();
+                        tracing::debug!("Preloaded clips for track '{}' after AddClip", track_name);
+                    });
+                }
             }
             Action::AddGroupedClip {
                 ref track_name,
@@ -6039,6 +6111,16 @@ impl Engine {
                     audio_clip.clone(),
                     midi_clip.clone(),
                 );
+                if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+                    let track_name = track_name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        track.lock().preload_clips();
+                        tracing::debug!(
+                            "Preloaded clips for track '{}' after AddGroupedClip",
+                            track_name
+                        );
+                    });
+                }
             }
             Action::RemoveClip {
                 ref track_name,

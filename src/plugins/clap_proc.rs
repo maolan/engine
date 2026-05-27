@@ -65,7 +65,7 @@ impl ClapProcessor {
         let plugin_spec = if plugin_id.is_empty() {
             plugin_path.to_string()
         } else {
-            format!("{plugin_path}#{plugin_id}")
+            format!("{plugin_path}::{plugin_id}")
         };
         let (mut child, mapping, events, shm_name) = ipc::spawn_host(ipc::HostSpawnArgs {
             host_binary: &host_binary,

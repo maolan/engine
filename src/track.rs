@@ -18,6 +18,7 @@ use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
@@ -681,9 +682,11 @@ impl Track {
     }
 
     pub fn process(&mut self) {
+        let t0 = std::time::Instant::now();
         for audio_in in &self.audio.ins {
             audio_in.process();
         }
+        let t1 = std::time::Instant::now();
         let frames = self
             .audio
             .ins
@@ -699,6 +702,7 @@ impl Track {
         if let Some(source) = self.ensure_metronome_source(frames) {
             self.synthesize_metronome_into(&source, frames);
         }
+        let t2 = std::time::Instant::now();
         let clip_playback_active = self.disk_monitor && self.clip_playback_enabled;
         let record_tap_input_snapshots = if self.armed && self.record_tap_enabled {
             self.audio
@@ -709,11 +713,11 @@ impl Track {
         } else {
             Vec::new()
         };
-        if clip_playback_active {
-            self.preload_audio_clip_cache();
-            self.preload_midi_clip_cache();
-        }
+        // Clip preloading is now done asynchronously before playback starts,
+        // not on the audio thread. See engine::preload_track_clips.
+        let t3 = std::time::Instant::now();
         let mut track_input_midi_events = self.collect_track_input_midi_events();
+        let t4 = std::time::Instant::now();
         if clip_playback_active {
             self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
             if !self.input_monitor {
@@ -723,6 +727,7 @@ impl Track {
             }
             self.mix_clip_audio_into_inputs();
         }
+        let t5 = std::time::Instant::now();
 
         {
             // Process track plugins and collect echoed parameter updates.
@@ -746,6 +751,7 @@ impl Track {
                     });
                 }
             }
+            let t6 = std::time::Instant::now();
             for instance in &self.vst3_plugins {
                 let processor = instance.processor.lock();
                 for input in processor.audio_inputs() {
@@ -763,6 +769,7 @@ impl Track {
                     });
                 }
             }
+            let t7 = std::time::Instant::now();
             #[cfg(all(unix, not(target_os = "macos")))]
             for instance in &self.lv2_plugins {
                 let processor = instance.processor.lock();
@@ -781,6 +788,7 @@ impl Track {
                     });
                 }
             }
+            let t8 = std::time::Instant::now();
             let _ = echoed;
 
             let _processed_midi_plugins = HashSet::<PluginGraphNode>::new();
@@ -789,6 +797,30 @@ impl Track {
                 &track_input_midi_events,
                 &midi_node_events,
             );
+            let t9 = std::time::Instant::now();
+            let total = t9.duration_since(t0).as_secs_f64() * 1000.0;
+            if total > 20.0 {
+                let clap_count = self.clap_plugins.len();
+                let vst3_count = self.vst3_plugins.len();
+                let lv2_count = self.lv2_plugins.len();
+                tracing::warn!(
+                    "Track '{}' process breakdown: total={:.1}ms audio_in={:.1}ms metronome={:.1}ms preload={:.1}ms midi_collect={:.1}ms clip_mix={:.1}ms clap_plugins(n={})={:.1}ms vst3_plugins(n={})={:.1}ms lv2_plugins(n={})={:.1}ms midi_route={:.1}ms",
+                    track_name,
+                    total,
+                    t1.duration_since(t0).as_secs_f64() * 1000.0,
+                    t2.duration_since(t1).as_secs_f64() * 1000.0,
+                    t3.duration_since(t2).as_secs_f64() * 1000.0,
+                    t4.duration_since(t3).as_secs_f64() * 1000.0,
+                    t5.duration_since(t4).as_secs_f64() * 1000.0,
+                    clap_count,
+                    t6.duration_since(t5).as_secs_f64() * 1000.0,
+                    vst3_count,
+                    t7.duration_since(t6).as_secs_f64() * 1000.0,
+                    lv2_count,
+                    t8.duration_since(t7).as_secs_f64() * 1000.0,
+                    t9.duration_since(t8).as_secs_f64() * 1000.0,
+                );
+            }
         }
 
         self.ensure_midi_route_cache();
@@ -1181,43 +1213,70 @@ impl Track {
     }
 
     fn load_audio_clip_buffer(path: &Path) -> Option<AudioClipBuffer> {
+        let open_started = std::time::Instant::now();
         let mut reader = hound::WavReader::open(path).ok()?;
+        let open_elapsed = open_started.elapsed().as_secs_f64() * 1000.0;
         let spec = reader.spec();
         let channels = spec.channels.max(1) as usize;
         let total_samples = reader.duration() as usize * channels;
-        let mut samples = Vec::with_capacity(total_samples);
-        match spec.sample_format {
+        let read_started = std::time::Instant::now();
+        let samples = match spec.sample_format {
             hound::SampleFormat::Float => {
-                samples.extend(reader.samples::<f32>().filter_map(|s| s.ok()));
+                if spec.bits_per_sample == 32 {
+                    let mut inner = reader.into_inner();
+                    let byte_count = total_samples * 4;
+                    let mut buf = vec![0u8; byte_count];
+                    inner.read_exact(&mut buf).ok()?;
+                    buf.chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect::<Vec<f32>>()
+                } else {
+                    reader.samples::<f32>().filter_map(|s| s.ok()).collect()
+                }
             }
             hound::SampleFormat::Int => match spec.bits_per_sample {
                 16 => {
-                    samples.extend(
-                        reader
-                            .samples::<i16>()
-                            .filter_map(|s| s.ok())
-                            .map(|s| s as f32 * (1.0 / 32768.0)),
-                    );
+                    let mut inner = reader.into_inner();
+                    let byte_count = total_samples * 2;
+                    let mut buf = vec![0u8; byte_count];
+                    inner.read_exact(&mut buf).ok()?;
+                    buf.chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 * (1.0 / 32768.0))
+                        .collect::<Vec<f32>>()
                 }
-                24 => {
-                    samples.extend(
-                        reader
-                            .samples::<i32>()
-                            .filter_map(|s| s.ok())
-                            .map(|s| s as f32 * (1.0 / 8_388_608.0)),
-                    );
-                }
+                24 => reader
+                    .samples::<i32>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| s as f32 * (1.0 / 8_388_608.0))
+                    .collect(),
                 32 => {
-                    samples.extend(
-                        reader
-                            .samples::<i32>()
-                            .filter_map(|s| s.ok())
-                            .map(|s| s as f32 * (1.0 / 2_147_483_648.0)),
-                    );
+                    let mut inner = reader.into_inner();
+                    let byte_count = total_samples * 4;
+                    let mut buf = vec![0u8; byte_count];
+                    inner.read_exact(&mut buf).ok()?;
+                    buf.chunks_exact(4)
+                        .map(|b| {
+                            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32
+                                * (1.0 / 2_147_483_648.0)
+                        })
+                        .collect::<Vec<f32>>()
                 }
                 _ => return None,
             },
         };
+        let read_elapsed = read_started.elapsed().as_secs_f64() * 1000.0;
+        if open_elapsed > 20.0 || read_elapsed > 20.0 {
+            tracing::warn!(
+                "Slow WAV load '{}' open={:.1}ms read={:.1}ms samples={} channels={} fmt={:?} bits={}",
+                path.display(),
+                open_elapsed,
+                read_elapsed,
+                total_samples,
+                channels,
+                spec.sample_format,
+                spec.bits_per_sample
+            );
+        }
         if samples.is_empty() {
             return None;
         }
@@ -1229,7 +1288,17 @@ impl Track {
             return Some(cached.clone());
         }
         let path = self.resolve_clip_path(clip_name);
+        let load_started = std::time::Instant::now();
         let loaded = Self::load_audio_clip_buffer(&path)?;
+        let elapsed = load_started.elapsed().as_secs_f64() * 1000.0;
+        if elapsed > 20.0 {
+            tracing::warn!(
+                "Slow load_audio_clip_buffer for '{}' ({}) took {:.1}ms",
+                clip_name,
+                path.display(),
+                elapsed
+            );
+        }
         let loaded = Arc::new(loaded);
         self.audio_clip_cache
             .insert(clip_name.to_string(), loaded.clone());
@@ -1979,8 +2048,28 @@ impl Track {
                 }
             })
             .collect();
-        for clip_name in missing {
-            let _ = self.clip_buffer(&clip_name);
+        if !missing.is_empty() {
+            let started = std::time::Instant::now();
+            for clip_name in missing {
+                let clip_started = std::time::Instant::now();
+                let result = self.clip_buffer(&clip_name);
+                let elapsed = clip_started.elapsed().as_secs_f64() * 1000.0;
+                tracing::debug!(
+                    "Preloaded clip '{}' in {:.1}ms (found={})",
+                    clip_name,
+                    elapsed,
+                    result.is_some()
+                );
+            }
+            let total = started.elapsed().as_secs_f64() * 1000.0;
+            if total > 20.0 {
+                tracing::warn!(
+                    "Slow preload_audio_clip_cache for track '{}' took {:.1}ms for {} clips",
+                    self.name,
+                    total,
+                    self.audio.clips.len()
+                );
+            }
         }
     }
 
@@ -2106,9 +2195,34 @@ impl Track {
                 }
             })
             .collect();
-        for clip_name in missing {
-            let _ = self.midi_clip_events(&clip_name);
+        if !missing.is_empty() {
+            let started = std::time::Instant::now();
+            for clip_name in missing {
+                let clip_started = std::time::Instant::now();
+                let result = self.midi_clip_events(&clip_name);
+                let elapsed = clip_started.elapsed().as_secs_f64() * 1000.0;
+                tracing::debug!(
+                    "Preloaded MIDI clip '{}' in {:.1}ms (found={})",
+                    clip_name,
+                    elapsed,
+                    result.is_some()
+                );
+            }
+            let total = started.elapsed().as_secs_f64() * 1000.0;
+            if total > 20.0 {
+                tracing::warn!(
+                    "Slow preload_midi_clip_cache for track '{}' took {:.1}ms for {} clips",
+                    self.name,
+                    total,
+                    self.midi.clips.len()
+                );
+            }
         }
+    }
+
+    pub fn preload_clips(&mut self) {
+        self.preload_audio_clip_cache();
+        self.preload_midi_clip_cache();
     }
 
     fn cycle_segments(&self, frames: usize) -> Vec<(usize, usize, usize)> {
@@ -2450,15 +2564,26 @@ impl Track {
             .set_parameter(index as u32, param_value)
     }
 
+    fn normalize_clap_path(path: &str) -> String {
+        if let Some(pos) = path.rfind("::") {
+            format!("{}::{}", &path[..pos], &path[pos + 2..])
+        } else if let Some(pos) = path.rfind('#') {
+            format!("{}::{}", &path[..pos], &path[pos + 1..])
+        } else {
+            path.to_string()
+        }
+    }
+
     pub fn load_clap_plugin(
         &mut self,
         plugin_path: &str,
         instance_id: Option<usize>,
     ) -> Result<(), String> {
-        let bundle_path = plugin_path
+        let normalized = Self::normalize_clap_path(plugin_path);
+        let bundle_path = normalized
             .split_once("::")
             .map(|(path, _)| path)
-            .unwrap_or(plugin_path);
+            .unwrap_or(&normalized);
         let path = Path::new(bundle_path);
         if !path.exists() {
             return Err(format!("CLAP plugin not found: {plugin_path}"));
@@ -2466,13 +2591,11 @@ impl Track {
         if !crate::clap::is_supported_clap_binary(path) {
             return Err(format!("Not a CLAP plugin path: {plugin_path}"));
         }
-        if self.clap_plugins.iter().any(|plugin| {
-            plugin
-                .processor
-                .lock()
-                .path()
-                .eq_ignore_ascii_case(plugin_path)
-        }) {
+        if self
+            .clap_plugins
+            .iter()
+            .any(|plugin| Self::normalize_clap_path(plugin.processor.lock().path()) == normalized)
+        {
             return Err(format!("CLAP plugin already loaded: {plugin_path}"));
         }
 
@@ -2510,12 +2633,9 @@ impl Track {
     }
 
     pub fn unload_clap_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
+        let normalized = Self::normalize_clap_path(plugin_path);
         let Some(index) = self.clap_plugins.iter().position(|instance| {
-            instance
-                .processor
-                .lock()
-                .path()
-                .eq_ignore_ascii_case(plugin_path)
+            Self::normalize_clap_path(instance.processor.lock().path()) == normalized
         }) else {
             return Err(format!(
                 "Track '{}' does not have CLAP plugin loaded: {}",
