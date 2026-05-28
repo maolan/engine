@@ -18,7 +18,6 @@ use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
@@ -1222,6 +1221,15 @@ impl Track {
         self.output_meter_linear_cache.clone()
     }
 
+    pub fn clear_output_meters(&mut self) {
+        for value in &mut self.output_meter_linear_cache {
+            *value = 0.0;
+        }
+        for value in &mut self.meter_peak_hold_linear {
+            *value = 0.0;
+        }
+    }
+
     pub fn arm(&mut self) {
         self.armed = !self.armed;
         self.update_hybrid_process_block_size();
@@ -1467,67 +1475,19 @@ impl Track {
 
     fn load_audio_clip_buffer(path: &Path) -> Option<AudioClipBuffer> {
         let open_started = std::time::Instant::now();
-        let mut reader = hound::WavReader::open(path).ok()?;
+        let (samples, channels, _sample_rate) =
+            crate::audio_codec::decode_audio_to_f32_interleaved_preferring_wav(path).ok()?;
         let open_elapsed = open_started.elapsed().as_secs_f64() * 1000.0;
-        let spec = reader.spec();
-        let channels = spec.channels.max(1) as usize;
-        let total_samples = reader.duration() as usize * channels;
         let read_started = std::time::Instant::now();
-        let samples = match spec.sample_format {
-            hound::SampleFormat::Float => {
-                if spec.bits_per_sample == 32 {
-                    let mut inner = reader.into_inner();
-                    let byte_count = total_samples * 4;
-                    let mut buf = vec![0u8; byte_count];
-                    inner.read_exact(&mut buf).ok()?;
-                    buf.chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect::<Vec<f32>>()
-                } else {
-                    reader.samples::<f32>().filter_map(|s| s.ok()).collect()
-                }
-            }
-            hound::SampleFormat::Int => match spec.bits_per_sample {
-                16 => {
-                    let mut inner = reader.into_inner();
-                    let byte_count = total_samples * 2;
-                    let mut buf = vec![0u8; byte_count];
-                    inner.read_exact(&mut buf).ok()?;
-                    buf.chunks_exact(2)
-                        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 * (1.0 / 32768.0))
-                        .collect::<Vec<f32>>()
-                }
-                24 => reader
-                    .samples::<i32>()
-                    .filter_map(|s| s.ok())
-                    .map(|s| s as f32 * (1.0 / 8_388_608.0))
-                    .collect(),
-                32 => {
-                    let mut inner = reader.into_inner();
-                    let byte_count = total_samples * 4;
-                    let mut buf = vec![0u8; byte_count];
-                    inner.read_exact(&mut buf).ok()?;
-                    buf.chunks_exact(4)
-                        .map(|b| {
-                            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32
-                                * (1.0 / 2_147_483_648.0)
-                        })
-                        .collect::<Vec<f32>>()
-                }
-                _ => return None,
-            },
-        };
         let read_elapsed = read_started.elapsed().as_secs_f64() * 1000.0;
         if open_elapsed > 20.0 || read_elapsed > 20.0 {
             tracing::warn!(
-                "Slow WAV load '{}' open={:.1}ms read={:.1}ms samples={} channels={} fmt={:?} bits={}",
+                "Slow audio load '{}' open={:.1}ms read={:.1}ms samples={} channels={}",
                 path.display(),
                 open_elapsed,
                 read_elapsed,
-                total_samples,
-                channels,
-                spec.sample_format,
-                spec.bits_per_sample
+                samples.len(),
+                channels
             );
         }
         if samples.is_empty() {

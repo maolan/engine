@@ -2666,25 +2666,8 @@ impl Engine {
             return;
         }
         let file_path = audio_dir.join(&rec.file_name);
-        let spec = hound::WavSpec {
-            channels: rec.channels as u16,
-            sample_rate: rate as u32,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let write_result = (|| {
-            let mut writer = hound::WavWriter::create(&file_path, spec)
-                .map_err(|e| std::io::Error::other(format!("Failed to create WAV writer: {e}")))?;
-            for sample in &rec.samples {
-                writer
-                    .write_sample(*sample)
-                    .map_err(|e| std::io::Error::other(format!("Failed to write sample: {e}")))?;
-            }
-            writer
-                .finalize()
-                .map_err(|e| std::io::Error::other(format!("Failed to finalize WAV: {e}")))?;
-            Ok::<(), std::io::Error>(())
-        })();
+        let write_result =
+            crate::audio_codec::write_wav_f32(&file_path, &rec.samples, rec.channels, rate as u32);
         if let Err(e) = write_result {
             self.notify_clients(Err(format!(
                 "Failed to write recording {}: {}",
@@ -3887,6 +3870,38 @@ impl Engine {
         }
     }
 
+    fn reset_meters_after_stop(&mut self) {
+        self.last_hw_out_meter_publish = None;
+        self.last_track_meter_publish = None;
+        self.hw_out_peak_hold_linear.fill(0.0);
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+        {
+            self.last_hw_out_meter_linear.clear();
+        }
+        let hw_channels = self.latest_hw_out_meter_db.len();
+        self.latest_hw_out_meter_db = Arc::new(vec![-90.0; hw_channels]);
+
+        let tracks: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = self
+            .state
+            .lock()
+            .tracks
+            .iter()
+            .map(|(name, track)| (name.clone(), track.clone()))
+            .collect();
+        self.track_meter_linear_by_track.clear();
+        let mut snapshot = Vec::with_capacity(tracks.len());
+        for (name, track) in tracks {
+            let t = track.lock();
+            t.clear_output_meters();
+            let width = t.output_meter_linear().len();
+            let zero_linear = vec![0.0; width];
+            self.track_meter_linear_by_track
+                .insert(name.clone(), zero_linear);
+            snapshot.push((name, vec![-90.0; width]));
+        }
+        self.latest_track_meter_snapshot = Arc::new(snapshot);
+    }
+
     pub fn check_if_leads_to_kind(
         &self,
         kind: Kind,
@@ -4243,6 +4258,7 @@ impl Engine {
                     self.pending_hw_midi_out_events_by_device
                         .extend(panic_events);
                 }
+                self.reset_meters_after_stop();
                 self.flush_recordings().await;
                 self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                     .await;

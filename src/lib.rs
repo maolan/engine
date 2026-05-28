@@ -1,4 +1,5 @@
 mod audio;
+mod audio_codec;
 pub mod client;
 mod engine;
 pub use engine::Engine;

@@ -71,6 +71,9 @@ pub struct Audio {
     last_overrun_count: i32,
     xrun_count: u64,
     playing: Arc<std::sync::atomic::AtomicBool>,
+    was_playing_last_cycle: bool,
+    stop_fade_remaining_frames: usize,
+    stop_fade_total_frames: usize,
 }
 
 impl Audio {
@@ -147,6 +150,16 @@ impl Audio {
         } else {
             PCM_ENABLE_OUTPUT
         };
+        unsafe { oss_set_trigger(self.dsp.as_raw_fd(), &trig) }
+            .map(|_| ())
+            .map_err(|_| std::io::Error::last_os_error())
+    }
+
+    pub fn stop_trigger(&self) -> std::io::Result<()> {
+        if (self.caps & PCM_CAP_TRIGGER) == 0 {
+            return Ok(());
+        }
+        let trig: i32 = 0;
         unsafe { oss_set_trigger(self.dsp.as_raw_fd(), &trig) }
             .map(|_| ())
             .map_err(|_| std::io::Error::last_os_error())
@@ -354,6 +367,9 @@ impl Audio {
             last_overrun_count: 0,
             xrun_count: 0,
             playing,
+            was_playing_last_cycle: false,
+            stop_fade_remaining_frames: 0,
+            stop_fade_total_frames: 0,
         };
 
         initial_audio.last_underrun_count = initial_audio.get_play_underruns();
@@ -554,8 +570,14 @@ impl Audio {
             );
         } else {
             let playing = self.playing.load(std::sync::atomic::Ordering::Relaxed);
+            if self.was_playing_last_cycle && !playing {
+                let fade_frames = self.chsamples.max(128);
+                self.stop_fade_remaining_frames = fade_frames;
+                self.stop_fade_total_frames = fade_frames;
+            }
+            self.was_playing_last_cycle = playing;
             let data_i32 = self.buffer.as_mut_slice();
-            if !playing {
+            if !playing && self.stop_fade_remaining_frames == 0 {
                 data_i32.fill(0);
             } else {
                 let scale_factor = convert_policy::F32_TO_I32_MAX;
@@ -563,6 +585,8 @@ impl Audio {
                 if !all_connected {
                     data_i32.fill(0);
                 }
+                let fade_remaining = self.stop_fade_remaining_frames;
+                let fade_total = self.stop_fade_total_frames.max(1);
                 crate::hw::ports::write_interleaved_from_ports(
                     &self.channels,
                     self.chsamples,
@@ -571,11 +595,37 @@ impl Audio {
                     !all_connected,
                     |ch_idx, frame, sample| {
                         let target_idx = frame * num_channels + ch_idx;
-                        data_i32[target_idx] = (sample.clamp(-1.0, 1.0) * scale_factor) as i32;
+                        let fade_gain = if !playing && fade_remaining > 0 {
+                            let progressed = self.chsamples.saturating_sub(fade_remaining) + frame;
+                            (1.0 - (progressed as f32 / fade_total as f32)).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        data_i32[target_idx] =
+                            (sample.clamp(-1.0, 1.0) * fade_gain * scale_factor) as i32;
                     },
                 );
+                if !playing && self.stop_fade_remaining_frames > 0 {
+                    self.stop_fade_remaining_frames = self
+                        .stop_fade_remaining_frames
+                        .saturating_sub(self.chsamples);
+                }
             }
         }
+    }
+
+    pub fn force_silence_now(&mut self) {
+        if self.input {
+            return;
+        }
+        self.buffer.fill(0);
+        for ch in &self.channels {
+            ch.buffer.lock().fill(0.0);
+        }
+        self.stop_fade_remaining_frames = 0;
+        self.stop_fade_total_frames = 0;
+        self.channel
+            .reset_buffers(self.frame_stamp, self.frame_size().max(1));
     }
 }
 

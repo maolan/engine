@@ -150,6 +150,12 @@ impl HwDriver {
     pub fn set_playing(&mut self, playing: bool) {
         self.playing
             .store(playing, std::sync::atomic::Ordering::Relaxed);
+        if playing {
+            let _ = self.playback.start_trigger();
+        } else {
+            let _ = self.playback.stop_trigger();
+            self.playback.force_silence_now();
+        }
     }
 
     fn apply_playback_prefill(&mut self) {

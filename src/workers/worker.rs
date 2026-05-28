@@ -183,32 +183,8 @@ impl Worker {
             .filter(|h| relevant_names.contains(&h.lock().name))
             .collect();
 
-        let spec = hound::WavSpec {
-            channels: channels as u16,
-            sample_rate: sample_rate as u32,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut writer = match hound::WavWriter::create(&job.output_path, spec) {
-            Ok(w) => w,
-            Err(e) => {
-                if let Some((original_level, original_balance)) = freeze_state {
-                    let t = target_track.lock();
-                    Self::restore_track_after_freeze_render(t, original_level, original_balance);
-                }
-                let _ = self
-                    .tx
-                    .send(Message::OfflineBounceFinished {
-                        result: Err(format!(
-                            "Failed to create offline bounce '{}': {e}",
-                            job.output_path
-                        )),
-                    })
-                    .await;
-                let _ = self.tx.send(Message::Ready(self.id)).await;
-                return;
-            }
-        };
+        let mut output_samples =
+            Vec::<f32>::with_capacity(job.length_samples.saturating_mul(channels.max(1)));
 
         let mut cursor = 0usize;
         let mut last_reported_progress = 0.0_f32;
@@ -218,7 +194,6 @@ impl Worker {
         let bounce_start = Instant::now();
         while cursor < job.length_samples {
             if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = writer.finalize();
                 let _ = std::fs::remove_file(&job.output_path);
                 if let Some((original_level, original_balance)) = freeze_state {
                     let t = target_track.lock();
@@ -302,41 +277,19 @@ impl Worker {
             let _block_process_elapsed = block_process_start.elapsed();
 
             let write_start = Instant::now();
-            let write_result = {
+            {
                 let t = target_track.lock();
                 let outs: Vec<_> = (0..channels)
                     .map(|ch| t.audio.outs[ch].buffer.lock())
                     .collect();
-                (|| -> Result<(), hound::Error> {
-                    for i in 0..step {
-                        for out in outs.iter().take(channels) {
-                            let sample = out.get(i).copied().unwrap_or(0.0);
-                            writer.write_sample(sample)?;
-                        }
+                for i in 0..step {
+                    for out in outs.iter().take(channels) {
+                        let sample = out.get(i).copied().unwrap_or(0.0);
+                        output_samples.push(sample);
                     }
-                    Ok(())
-                })()
-            };
-            total_write_time += write_start.elapsed();
-            if let Err(e) = write_result {
-                let _ = writer.finalize();
-                let _ = std::fs::remove_file(&job.output_path);
-                if let Some((original_level, original_balance)) = freeze_state {
-                    let t = target_track.lock();
-                    Self::restore_track_after_freeze_render(t, original_level, original_balance);
                 }
-                let _ = self
-                    .tx
-                    .send(Message::OfflineBounceFinished {
-                        result: Err(format!(
-                            "Failed to write offline bounce '{}': {e}",
-                            job.output_path
-                        )),
-                    })
-                    .await;
-                let _ = self.tx.send(Message::Ready(self.id)).await;
-                return;
             }
+            total_write_time += write_start.elapsed();
 
             cursor = cursor.saturating_add(step);
             block_count += 1;
@@ -362,7 +315,12 @@ impl Worker {
             job.track_name, bounce_elapsed, block_count, total_process_time, total_write_time
         );
 
-        if let Err(e) = writer.finalize() {
+        if let Err(e) = crate::audio_codec::write_wav_f32(
+            std::path::Path::new(&job.output_path),
+            &output_samples,
+            channels,
+            sample_rate as u32,
+        ) {
             let _ = std::fs::remove_file(&job.output_path);
             if let Some((original_level, original_balance)) = freeze_state {
                 let t = target_track.lock();
@@ -372,7 +330,7 @@ impl Worker {
                 .tx
                 .send(Message::OfflineBounceFinished {
                     result: Err(format!(
-                        "Failed to finalize offline bounce '{}': {e}",
+                        "Failed to write offline bounce '{}': {e}",
                         job.output_path
                     )),
                 })
