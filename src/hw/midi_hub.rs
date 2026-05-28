@@ -4,7 +4,9 @@ use nix::libc;
 use std::{
     fs::File,
     io::{ErrorKind, Read, Write},
+    os::fd::AsRawFd,
     os::unix::fs::OpenOptionsExt,
+    os::unix::io::RawFd,
     thread,
     time::{Duration, Instant},
 };
@@ -14,6 +16,7 @@ use tracing::error;
 pub struct MidiHub {
     inputs: Vec<MidiInputDevice>,
     outputs: Vec<MidiOutputDevice>,
+    input_waiter: Option<MidiInputWaiter>,
 }
 
 impl MidiHub {
@@ -29,6 +32,15 @@ impl MidiHub {
             .map_err(|e| format!("Failed to open MIDI device '{path}': {e}"))?;
         self.inputs
             .push(MidiInputDevice::new(path.to_string(), file));
+        if self.input_waiter.is_none() {
+            self.input_waiter = MidiInputWaiter::new().ok();
+        }
+        if let Some(waiter) = self.input_waiter.as_mut()
+            && let Some(input) = self.inputs.last()
+            && let Err(e) = waiter.add_fd(input.file.as_raw_fd())
+        {
+            error!("MIDI readiness registration failed for {}: {}", path, e);
+        }
         Ok(())
     }
 
@@ -57,6 +69,37 @@ impl MidiHub {
         out.clear();
         for input in &mut self.inputs {
             input.read_events_into(out);
+        }
+    }
+
+    pub fn read_events_blocking_into(&mut self, out: &mut Vec<HwMidiEvent>) {
+        out.clear();
+        let ready_fds = self
+            .input_waiter
+            .as_mut()
+            .and_then(|waiter| waiter.wait_ready_blocking());
+        match ready_fds {
+            Some(ready) => {
+                if ready.is_empty() {
+                    return;
+                }
+                for input in &mut self.inputs {
+                    if ready.contains(&input.file.as_raw_fd()) {
+                        input.read_events_into(out);
+                    }
+                }
+            }
+            None => {
+                for input in &mut self.inputs {
+                    input.read_events_into(out);
+                }
+            }
+        }
+    }
+
+    pub fn wake_input_waiter(&mut self) {
+        if let Some(waiter) = self.input_waiter.as_mut() {
+            waiter.wake();
         }
     }
 
@@ -92,6 +135,261 @@ struct MidiInputDevice {
     file: File,
     parser: MidiParser,
 }
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+#[derive(Debug)]
+struct MidiInputWaiter {
+    kq: i32,
+    events: Vec<libc::kevent>,
+    wake_read_fd: RawFd,
+    wake_write_fd: RawFd,
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+impl MidiInputWaiter {
+    fn new() -> Result<Self, String> {
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(format!(
+                "kqueue failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            kq,
+            events: (0..32)
+                .map(|_| unsafe { std::mem::zeroed::<libc::kevent>() })
+                .collect(),
+            wake_read_fd: -1,
+            wake_write_fd: -1,
+        })
+    }
+
+    fn add_fd(&mut self, fd: i32) -> Result<(), String> {
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        ev.ident = fd as _;
+        ev.filter = libc::EVFILT_READ;
+        ev.flags = libc::EV_ADD | libc::EV_ENABLE;
+        let rc =
+            unsafe { libc::kevent(self.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if rc < 0 {
+            return Err(format!(
+                "kevent EV_ADD failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_wake_fd(&mut self) -> Result<(), String> {
+        if self.wake_read_fd >= 0 && self.wake_write_fd >= 0 {
+            return Ok(());
+        }
+        let mut fds = [0_i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe failed: {}", std::io::Error::last_os_error()));
+        }
+        self.wake_read_fd = fds[0];
+        self.wake_write_fd = fds[1];
+        self.add_fd(self.wake_read_fd)
+    }
+
+    fn drain_wake_fd(&self) {
+        if self.wake_read_fd < 0 {
+            return;
+        }
+        let mut buf = [0_u8; 32];
+        loop {
+            let n = unsafe { libc::read(self.wake_read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            if (n as usize) < buf.len() {
+                break;
+            }
+        }
+    }
+
+    fn wait_ready_blocking(&mut self) -> Option<Vec<i32>> {
+        if self.ensure_wake_fd().is_err() {
+            return None;
+        }
+        let n = unsafe {
+            libc::kevent(
+                self.kq,
+                std::ptr::null(),
+                0,
+                self.events.as_mut_ptr(),
+                self.events.len() as i32,
+                std::ptr::null(),
+            )
+        };
+        if n < 0 {
+            return None;
+        }
+        let mut ready = Vec::with_capacity(n as usize);
+        for ev in self.events.iter().take(n as usize) {
+            let fd = ev.ident as i32;
+            if fd == self.wake_read_fd {
+                self.drain_wake_fd();
+            } else {
+                ready.push(fd);
+            }
+        }
+        Some(ready)
+    }
+
+    fn wake(&mut self) {
+        if self.ensure_wake_fd().is_err() {
+            return;
+        }
+        let one = [1_u8; 1];
+        let _ = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
+    }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+impl Drop for MidiInputWaiter {
+    fn drop(&mut self) {
+        unsafe {
+            if self.wake_read_fd >= 0 {
+                libc::close(self.wake_read_fd);
+            }
+            if self.wake_write_fd >= 0 {
+                libc::close(self.wake_write_fd);
+            }
+            libc::close(self.kq);
+        }
+    }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+unsafe impl Send for MidiInputWaiter {}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct MidiInputWaiter {
+    epfd: i32,
+    events: Vec<libc::epoll_event>,
+    wake_read_fd: RawFd,
+    wake_write_fd: RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl MidiInputWaiter {
+    fn new() -> Result<Self, String> {
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epfd < 0 {
+            return Err(format!(
+                "epoll_create1 failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            epfd,
+            events: vec![libc::epoll_event { events: 0, u64: 0 }; 32],
+            wake_read_fd: -1,
+            wake_write_fd: -1,
+        })
+    }
+
+    fn add_fd(&mut self, fd: i32) -> Result<(), String> {
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fd as u64,
+        };
+        let rc = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if rc < 0 {
+            return Err(format!(
+                "epoll_ctl ADD failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_wake_fd(&mut self) -> Result<(), String> {
+        if self.wake_read_fd >= 0 && self.wake_write_fd >= 0 {
+            return Ok(());
+        }
+        let mut fds = [0_i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe failed: {}", std::io::Error::last_os_error()));
+        }
+        self.wake_read_fd = fds[0];
+        self.wake_write_fd = fds[1];
+        self.add_fd(self.wake_read_fd)
+    }
+
+    fn drain_wake_fd(&self) {
+        if self.wake_read_fd < 0 {
+            return;
+        }
+        let mut buf = [0_u8; 32];
+        loop {
+            let n = unsafe { libc::read(self.wake_read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            if (n as usize) < buf.len() {
+                break;
+            }
+        }
+    }
+
+    fn wait_ready_blocking(&mut self) -> Option<Vec<i32>> {
+        if self.ensure_wake_fd().is_err() {
+            return None;
+        }
+        let n = unsafe {
+            libc::epoll_wait(
+                self.epfd,
+                self.events.as_mut_ptr(),
+                self.events.len() as i32,
+                -1,
+            )
+        };
+        if n < 0 {
+            return None;
+        }
+        let mut ready = Vec::with_capacity(n as usize);
+        for ev in self.events.iter().take(n as usize) {
+            let fd = ev.u64 as i32;
+            if fd == self.wake_read_fd {
+                self.drain_wake_fd();
+            } else {
+                ready.push(fd);
+            }
+        }
+        Some(ready)
+    }
+
+    fn wake(&mut self) {
+        if self.ensure_wake_fd().is_err() {
+            return;
+        }
+        let one = [1_u8; 1];
+        let _ = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MidiInputWaiter {
+    fn drop(&mut self) {
+        unsafe {
+            if self.wake_read_fd >= 0 {
+                libc::close(self.wake_read_fd);
+            }
+            if self.wake_write_fd >= 0 {
+                libc::close(self.wake_write_fd);
+            }
+            libc::close(self.epfd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for MidiInputWaiter {}
 
 #[derive(Debug)]
 struct MidiOutputDevice {
@@ -166,6 +464,29 @@ impl MidiInputDevice {
                 Ok(0) => break,
                 Ok(read) => {
                     for byte in &buf[..read] {
+                        if is_note_or_controller_status(*byte) {
+                            if let Some(data) = self.parser.feed(*byte) {
+                                out.push(HwMidiEvent {
+                                    device: self.path.clone(),
+                                    event: MidiEvent::new(0, data),
+                                });
+                            }
+                            for _ in 0..2 {
+                                let mut data = [0_u8; 1];
+                                match self.file.read(&mut data) {
+                                    Ok(1) => {
+                                        if let Some(msg) = self.parser.feed(data[0]) {
+                                            out.push(HwMidiEvent {
+                                                device: self.path.clone(),
+                                                event: MidiEvent::new(0, msg),
+                                            });
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(data) = self.parser.feed(*byte) {
                             out.push(HwMidiEvent {
                                 device: self.path.clone(),
@@ -256,6 +577,10 @@ impl MidiParser {
         }
         Some(message)
     }
+}
+
+fn is_note_or_controller_status(byte: u8) -> bool {
+    matches!(byte & 0xF0, 0x80 | 0x90 | 0xB0)
 }
 
 fn status_data_len(status: u8) -> usize {

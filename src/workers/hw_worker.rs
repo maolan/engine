@@ -6,6 +6,7 @@ use crate::{
 };
 #[cfg(unix)]
 use nix::libc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -31,7 +32,6 @@ pub struct HwWorker<B: Backend> {
     tx: Sender<Message>,
     cycle_frames: u32,
     pending_midi_out_events: Vec<HwMidiEvent>,
-    midi_in_events: Vec<HwMidiEvent>,
     pending_midi_out_sorted: bool,
 }
 
@@ -232,7 +232,6 @@ impl<B: Backend> HwWorker<B> {
             tx,
             cycle_frames,
             pending_midi_out_events: vec![],
-            midi_in_events: Vec::with_capacity(64),
             pending_midi_out_sorted: true,
         }
     }
@@ -250,6 +249,13 @@ impl<B: Backend> HwWorker<B> {
         }
         let assist_state = Arc::new((Mutex::new(AssistState::default()), Condvar::new()));
         let assist_handle = Self::start_assist_thread(self.driver.clone(), assist_state.clone());
+        let midi_stop = Arc::new(AtomicBool::new(false));
+        let midi_handle = Self::start_midi_input_thread(
+            self.midi_hub.clone(),
+            self.tx.clone(),
+            self.cycle_frames,
+            midi_stop.clone(),
+        );
         loop {
             match self.rx.recv().await {
                 Some(msg) => match msg {
@@ -268,29 +274,16 @@ impl<B: Backend> HwWorker<B> {
                             midi_hub.write_events(&self.pending_midi_out_events);
                             self.pending_midi_out_events.clear();
                         }
+                        midi_stop.store(true, Ordering::Release);
+                        {
+                            let midi_hub = self.midi_hub.lock();
+                            midi_hub.wake_input_waiter();
+                        }
+                        let _ = midi_handle.join();
                         Self::stop_assist_thread(&assist_state, assist_handle);
                         return;
                     }
                     Message::TracksFinished => {
-                        {
-                            let midi_hub = self.midi_hub.lock();
-                            midi_hub.read_events_into(&mut self.midi_in_events);
-                        }
-                        spread_hw_event_frames(&mut self.midi_in_events, self.cycle_frames);
-                        if !self.midi_in_events.is_empty() {
-                            let cap = self.midi_in_events.capacity();
-                            let out = std::mem::replace(
-                                &mut self.midi_in_events,
-                                Vec::with_capacity(cap.max(64)),
-                            );
-                            if let Err(e) = self.tx.send(Message::HWMidiEvents(out)).await {
-                                error!(
-                                    "{} worker failed to send HWMidiEvents to engine: {}",
-                                    B::LABEL,
-                                    e
-                                );
-                            }
-                        }
                         {
                             if !self.pending_midi_out_events.is_empty() {
                                 if !self.pending_midi_out_sorted {
@@ -329,11 +322,43 @@ impl<B: Backend> HwWorker<B> {
                     _ => {}
                 },
                 None => {
+                    midi_stop.store(true, Ordering::Release);
+                    {
+                        let midi_hub = self.midi_hub.lock();
+                        midi_hub.wake_input_waiter();
+                    }
+                    let _ = midi_handle.join();
                     Self::stop_assist_thread(&assist_state, assist_handle);
                     return;
                 }
             }
         }
+    }
+
+    fn start_midi_input_thread(
+        midi_hub: Arc<UnsafeMutex<B::MidiHub>>,
+        tx: Sender<Message>,
+        cycle_frames: u32,
+        stop: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut midi_in_events = Vec::with_capacity(64);
+            while !stop.load(Ordering::Acquire) {
+                {
+                    let hub = midi_hub.lock();
+                    hub.read_events_blocking_into(&mut midi_in_events);
+                }
+                if midi_in_events.is_empty() {
+                    continue;
+                }
+                spread_hw_event_frames(&mut midi_in_events, cycle_frames);
+                let cap = midi_in_events.capacity();
+                let out = std::mem::replace(&mut midi_in_events, Vec::with_capacity(cap.max(64)));
+                if tx.blocking_send(Message::HWMidiEvents(out)).is_err() {
+                    break;
+                }
+            }
+        })
     }
 
     fn start_assist_thread(

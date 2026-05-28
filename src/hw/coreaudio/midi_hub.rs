@@ -149,6 +149,12 @@ impl MidiHub {
         out.extend(queue.drain(..));
     }
 
+    pub fn read_events_blocking_into(&mut self, out: &mut Vec<HwMidiEvent>) {
+        self.read_events_into(out);
+    }
+
+    pub fn wake_input_waiter(&mut self) {}
+
     pub fn write_events(&mut self, events: &[HwMidiEvent]) {
         if events.is_empty() {
             return;

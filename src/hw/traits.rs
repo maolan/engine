@@ -9,6 +9,10 @@ pub trait HwWorkerDriver {
 
 pub trait HwMidiHub {
     fn read_events_into(&mut self, out: &mut Vec<HwMidiEvent>);
+    fn read_events_blocking_into(&mut self, out: &mut Vec<HwMidiEvent>) {
+        self.read_events_into(out);
+    }
+    fn wake_input_waiter(&mut self) {}
     fn write_events(&mut self, events: &[HwMidiEvent]);
 }
 
@@ -71,6 +75,14 @@ macro_rules! impl_hw_midi_hub_traits {
         impl $crate::hw::traits::HwMidiHub for $hub {
             fn read_events_into(&mut self, out: &mut Vec<$crate::message::HwMidiEvent>) {
                 <$hub>::read_events_into(self, out);
+            }
+
+            fn read_events_blocking_into(&mut self, out: &mut Vec<$crate::message::HwMidiEvent>) {
+                <$hub>::read_events_blocking_into(self, out);
+            }
+
+            fn wake_input_waiter(&mut self) {
+                <$hub>::wake_input_waiter(self);
             }
 
             fn write_events(&mut self, events: &[$crate::message::HwMidiEvent]) {
