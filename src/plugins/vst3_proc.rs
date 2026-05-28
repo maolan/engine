@@ -56,7 +56,7 @@ impl Vst3Processor {
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
 
-        let instance_id = format!("vst3-{}", std::process::id());
+        let instance_id = ipc::unique_instance_id("vst3");
         let num_inputs = input_count.max(1);
         let num_outputs = output_count.max(1);
         let (mut child, mapping, events, shm_name) = ipc::spawn_host(ipc::HostSpawnArgs {

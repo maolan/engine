@@ -162,6 +162,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackDisconnectVst3Audio { .. }
         | Action::TrackLoadClapPlugin { .. }
         | Action::TrackUnloadClapPlugin { .. }
+        | Action::TrackUnloadClapPluginInstance { .. }
         | Action::TrackLoadVst3Plugin { .. }
         | Action::TrackUnloadVst3PluginInstance { .. }
         | Action::TrackSetClapParameter { .. }
@@ -732,12 +733,16 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
 
         Action::TrackLoadClapPlugin {
             track_name,
-            plugin_path,
+            plugin_path: _,
             ..
-        } => Some(Action::TrackUnloadClapPlugin {
-            track_name: track_name.clone(),
-            plugin_path: plugin_path.clone(),
-        }),
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            Some(Action::TrackUnloadClapPluginInstance {
+                track_name: track_name.clone(),
+                instance_id: track.next_clap_instance_id,
+            })
+        }
         Action::TrackUnloadClapPlugin {
             track_name,
             plugin_path,
@@ -746,6 +751,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             plugin_path: plugin_path.clone(),
             instance_id: None,
         }),
+
         Action::TrackLoadVst3Plugin {
             track_name,
             plugin_path: _,
@@ -998,6 +1004,30 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             Action::TrackClapRestoreState {
                 track_name: track_name.clone(),
                 instance_id: id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
+    if let Action::TrackUnloadClapPluginInstance {
+        track_name,
+        instance_id,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let instance = track.clap_plugins.iter().find(|p| p.id == *instance_id)?;
+        let path = instance.processor.lock().path().to_string();
+        let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
+        return Some(vec![
+            Action::TrackLoadClapPlugin {
+                track_name: track_name.clone(),
+                plugin_path: path,
+                instance_id: Some(*instance_id),
+            },
+            Action::TrackClapRestoreState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
                 state: state_snapshot,
             },
         ]);

@@ -61,7 +61,7 @@ impl ClapProcessor {
             .collect::<Vec<_>>();
 
         // Spawn the host immediately so we can query params.
-        let instance_id = format!("clap-{}", std::process::id());
+        let instance_id = ipc::unique_instance_id("clap");
         let plugin_spec = if plugin_id.is_empty() {
             plugin_path.to_string()
         } else {

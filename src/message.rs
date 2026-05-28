@@ -888,6 +888,8 @@ pub enum Action {
         bits: i32,
         exclusive: bool,
         period_frames: usize,
+        realtime_frames: usize,
+        low_watermark_frames: usize,
         nperiods: usize,
         sync_mode: bool,
     },

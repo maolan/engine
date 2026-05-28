@@ -243,35 +243,7 @@ impl ClipPluginRuntime {
             *source.finished.lock() = true;
         }
 
-        // Process clip plugins.
-        for instance in &self.clap_plugins {
-            let processor = instance.processor.lock();
-            for input in processor.audio_inputs() {
-                if input.connection_count.load(Ordering::Relaxed) > 0 {
-                    input.process();
-                }
-            }
-            processor.process_with_audio_io(request_len);
-        }
-        for instance in &self.vst3_plugins {
-            let processor = instance.processor.lock();
-            for input in processor.audio_inputs() {
-                if input.connection_count.load(Ordering::Relaxed) > 0 {
-                    input.process();
-                }
-            }
-            processor.process_with_audio_io(request_len);
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        for instance in &self.lv2_plugins {
-            let processor = instance.processor.lock();
-            for input in processor.audio_inputs() {
-                if input.connection_count.load(Ordering::Relaxed) > 0 {
-                    input.process();
-                }
-            }
-            processor.process_with_audio_io(request_len);
-        }
+        self.process_plugins_in_graph_order(request_len, &[], &mut HashMap::new());
 
         let mut outputs = Vec::with_capacity(self.outputs.len());
         for output in &self.outputs {
@@ -291,6 +263,172 @@ impl ClipPluginRuntime {
             );
         }
         outputs
+    }
+
+    fn process_plugins_in_graph_order(
+        &self,
+        frames: usize,
+        track_input_events: &[Vec<MidiEvent>],
+        midi_node_events: &mut HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+    ) {
+        let mut clap_processed = vec![false; self.clap_plugins.len()];
+        let mut vst3_processed = vec![false; self.vst3_plugins.len()];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut lv2_processed = vec![false; self.lv2_plugins.len()];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut remaining = clap_processed.len() + vst3_processed.len() + lv2_processed.len();
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let mut remaining = clap_processed.len() + vst3_processed.len();
+        let mut processed_midi_plugins = HashSet::<PluginGraphNode>::new();
+
+        while remaining > 0 {
+            let mut progressed = false;
+
+            for (idx, done) in clap_processed.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let processor = self.clap_plugins[idx].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
+                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                    continue;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    track_input_events,
+                    midi_node_events,
+                );
+                let clap_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(
+                    frames,
+                    &clap_input,
+                    crate::plugins::types::ClapTransportInfo::default(),
+                );
+                for evt in outputs {
+                    midi_node_events
+                        .entry((node.clone(), evt.port))
+                        .or_default()
+                        .push(evt.event);
+                }
+                *done = true;
+                remaining = remaining.saturating_sub(1);
+                processed_midi_plugins.insert(node);
+                progressed = true;
+            }
+
+            for (idx, done) in vst3_processed.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let processor = self.vst3_plugins[idx].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
+                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                    continue;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    track_input_events,
+                    midi_node_events,
+                );
+                let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(frames, &vst3_input);
+                if !outputs.is_empty() {
+                    midi_node_events.insert((node.clone(), 0), outputs);
+                }
+                *done = true;
+                remaining = remaining.saturating_sub(1);
+                processed_midi_plugins.insert(node);
+                progressed = true;
+            }
+
+            #[cfg(all(unix, not(target_os = "macos")))]
+            for (idx, done) in lv2_processed.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let processor = self.lv2_plugins[idx].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
+                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                    continue;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    track_input_events,
+                    midi_node_events,
+                );
+                let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(frames, &lv2_input);
+                if !outputs.is_empty() {
+                    midi_node_events.insert((node.clone(), 0), outputs);
+                }
+                *done = true;
+                remaining = remaining.saturating_sub(1);
+                processed_midi_plugins.insert(node);
+                progressed = true;
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    fn plugin_midi_ready(
+        &self,
+        node: &PluginGraphNode,
+        processed: &HashSet<PluginGraphNode>,
+    ) -> bool {
+        self.plugin_midi_connections
+            .iter()
+            .filter(|conn| {
+                conn.kind == Kind::MIDI
+                    && &conn.to_node == node
+                    && matches!(
+                        conn.from_node,
+                        PluginGraphNode::ClapPluginInstance(_)
+                            | PluginGraphNode::Vst3PluginInstance(_)
+                            | PluginGraphNode::Lv2PluginInstance(_)
+                    )
+            })
+            .all(|conn| processed.contains(&conn.from_node))
+    }
+
+    fn plugin_midi_input_events(
+        &self,
+        node: &PluginGraphNode,
+        midi_inputs: usize,
+        track_input_events: &[Vec<MidiEvent>],
+        node_events: &HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+    ) -> Vec<Vec<MidiEvent>> {
+        let mut per_port = vec![Vec::new(); midi_inputs];
+        for conn in self.plugin_midi_connections.iter().filter(|conn| {
+            conn.kind == Kind::MIDI && &conn.to_node == node && conn.to_port < midi_inputs
+        }) {
+            let events_opt = if conn.from_node == PluginGraphNode::TrackInput {
+                track_input_events.get(conn.from_port)
+            } else {
+                node_events.get(&(conn.from_node.clone(), conn.from_port))
+            };
+            if let Some(events) = events_opt {
+                per_port[conn.to_port].extend_from_slice(events);
+            }
+        }
+        per_port
     }
 }
 
@@ -342,6 +480,22 @@ pub struct Track {
     pub next_plugin_instance_id: usize,
     pub sample_rate: f64,
     process_block_size: usize,
+    preferred_process_block_size: usize,
+    hybrid_device_block_frames: usize,
+    hybrid_low_watermark_frames: usize,
+    hybrid_active_outs: Vec<Vec<f32>>,
+    hybrid_refill_outs: Vec<Vec<f32>>,
+    hybrid_active_read_pos: usize,
+    hybrid_active_filled: usize,
+    hybrid_refill_filled: usize,
+    hybrid_prefetch_transport_sample: usize,
+    hybrid_last_cycle_transport_sample: Option<usize>,
+    hybrid_underflow_count: usize,
+    hybrid_reported_underflow_count: usize,
+    hybrid_refill_requested: bool,
+    hybrid_last_refill_remaining: usize,
+    force_realtime_domain: bool,
+    shared_realtime_mixed: bool,
     pub output_enabled: bool,
     pub process_epoch: usize,
     pub transport_sample: usize,
@@ -423,6 +577,22 @@ impl Track {
             next_plugin_instance_id: 0,
             sample_rate,
             process_block_size: buffer_size.max(1),
+            preferred_process_block_size: buffer_size.max(1),
+            hybrid_device_block_frames: buffer_size.max(1),
+            hybrid_low_watermark_frames: (buffer_size.max(1) * 4).max(1),
+            hybrid_active_outs: vec![vec![0.0; buffer_size.max(1)]; audio_outs],
+            hybrid_refill_outs: vec![vec![0.0; buffer_size.max(1)]; audio_outs],
+            hybrid_active_read_pos: 0,
+            hybrid_active_filled: 0,
+            hybrid_refill_filled: 0,
+            hybrid_prefetch_transport_sample: 0,
+            hybrid_last_cycle_transport_sample: None,
+            hybrid_underflow_count: 0,
+            hybrid_reported_underflow_count: 0,
+            hybrid_refill_requested: false,
+            hybrid_last_refill_remaining: 0,
+            force_realtime_domain: false,
+            shared_realtime_mixed: false,
             output_enabled: true,
             process_epoch: 0,
             transport_sample: 0,
@@ -681,7 +851,8 @@ impl Track {
         }
     }
 
-    pub fn process(&mut self) {
+    fn process_render_block(&mut self) -> usize {
+        let live_mode = self.is_realtime_domain();
         let t0 = std::time::Instant::now();
         for audio_in in &self.audio.ins {
             audio_in.process();
@@ -730,69 +901,13 @@ impl Track {
         let t5 = std::time::Instant::now();
 
         {
-            // Process track plugins and collect echoed parameter updates.
-            let echoed = self.echoed_parameter_updates.lock();
-            echoed.clear();
+            // Process track plugins according to graph dependencies and collect echoed parameters.
             let track_name = self.name.clone();
-            for instance in &self.clap_plugins {
-                let processor = instance.processor.lock();
-                for input in processor.audio_inputs() {
-                    if input.connection_count.load(Ordering::Relaxed) > 0 {
-                        input.process();
-                    }
-                }
-                processor.process_with_audio_io(frames);
-                for ev in processor.drain_echoed_parameters() {
-                    echoed.push(crate::message::Action::TrackSetClapParameter {
-                        track_name: track_name.clone(),
-                        instance_id: instance.id,
-                        param_id: ev.param_index,
-                        value: ev.value as f64,
-                    });
-                }
-            }
+            let midi_node_events =
+                self.process_track_plugins_in_graph_order(frames, &track_input_midi_events);
             let t6 = std::time::Instant::now();
-            for instance in &self.vst3_plugins {
-                let processor = instance.processor.lock();
-                for input in processor.audio_inputs() {
-                    if input.connection_count.load(Ordering::Relaxed) > 0 {
-                        input.process();
-                    }
-                }
-                processor.process_with_audio_io(frames);
-                for ev in processor.drain_echoed_parameters() {
-                    echoed.push(crate::message::Action::TrackSetVst3Parameter {
-                        track_name: track_name.clone(),
-                        instance_id: instance.id,
-                        param_id: ev.param_index,
-                        value: ev.value,
-                    });
-                }
-            }
-            let t7 = std::time::Instant::now();
-            #[cfg(all(unix, not(target_os = "macos")))]
-            for instance in &self.lv2_plugins {
-                let processor = instance.processor.lock();
-                for input in processor.audio_inputs() {
-                    if input.connection_count.load(Ordering::Relaxed) > 0 {
-                        input.process();
-                    }
-                }
-                processor.process_with_audio_io(frames);
-                for ev in processor.drain_echoed_parameters() {
-                    echoed.push(crate::message::Action::TrackSetLv2ControlValue {
-                        track_name: track_name.clone(),
-                        instance_id: instance.id,
-                        index: ev.param_index,
-                        value: ev.value,
-                    });
-                }
-            }
-            let t8 = std::time::Instant::now();
-            let _ = echoed;
-
-            let _processed_midi_plugins = HashSet::<PluginGraphNode>::new();
-            let midi_node_events = HashMap::<(PluginGraphNode, usize), Vec<MidiEvent>>::new();
+            let t7 = t6;
+            let t8 = t6;
             self.route_plugin_midi_to_track_outputs_graph(
                 &track_input_midi_events,
                 &midi_node_events,
@@ -871,7 +986,7 @@ impl Track {
             let unity_output_gain = (output_gain - 1.0).abs() <= f32::EPSILON;
             let sources = self.internal_output_routes_cache.get(out_idx);
             let has_sources = sources.is_some_and(|s| !s.is_empty());
-            out_samples.fill(0.0);
+            let mut wrote_output = false;
             if self.output_enabled
                 && let Some(sources) = sources
             {
@@ -891,12 +1006,16 @@ impl Track {
                             Self::copy_scaled_with_zero_tail(out_samples, source_buf, output_gain);
                         }
                         seeded = true;
+                        wrote_output = true;
                     } else if unity_output_gain {
                         Self::add_unity(out_samples, source_buf);
                     } else {
                         Self::add_scaled(out_samples, source_buf, output_gain);
                     }
                 }
+            }
+            if !wrote_output {
+                out_samples.fill(0.0);
             }
 
             if capture_record_tap {
@@ -948,6 +1067,138 @@ impl Track {
 
         self.audio.finished = true;
         self.audio.processing = false;
+        if live_mode {
+            self.hybrid_reset_buffers();
+        }
+        frames
+    }
+
+    pub fn process(&mut self) {
+        let live_mode = self.is_realtime_domain();
+        let cycle_frames = self
+            .audio
+            .ins
+            .first()
+            .map(|audio_in| audio_in.buffer.lock().len())
+            .or_else(|| {
+                self.audio
+                    .outs
+                    .first()
+                    .map(|audio_out| audio_out.buffer.lock().len())
+            })
+            .unwrap_or(self.hybrid_device_block_frames.max(1))
+            .max(1);
+
+        if live_mode {
+            let _ = self.process_render_block();
+            return;
+        }
+
+        self.ensure_hybrid_output_buffers(cycle_frames);
+        let expected_next_cycle = self
+            .hybrid_last_cycle_transport_sample
+            .map(|s| s.saturating_add(cycle_frames));
+        let discontinuity = expected_next_cycle.is_some_and(|next| next != self.transport_sample);
+        let large_seek = expected_next_cycle.is_some_and(|next| {
+            let a = next as isize;
+            let b = self.transport_sample as isize;
+            (a - b).unsigned_abs() > self.process_block_size
+        });
+        let loop_wrap = self.loop_enabled
+            && self.loop_range_samples.is_some_and(|(start, end)| {
+                end > start
+                    && expected_next_cycle
+                        .is_some_and(|next| next >= end && self.transport_sample <= end)
+            });
+        if discontinuity || large_seek || loop_wrap || self.hybrid_active_filled == 0 {
+            self.hybrid_prefetch_transport_sample = self.transport_sample;
+            self.hybrid_reset_buffers();
+        }
+
+        let active_remaining = self.hybrid_active_remaining();
+        let target_prefill = self
+            .preferred_process_block_size
+            .max(self.hybrid_device_block_frames)
+            .max(1);
+        let needs_refill = self.hybrid_refill_requested
+            || self.hybrid_active_filled == 0
+            || active_remaining <= self.hybrid_low_watermark_frames;
+
+        if needs_refill {
+            while self.hybrid_refill_filled < target_prefill {
+                let saved_transport = self.transport_sample;
+                self.transport_sample = self.hybrid_prefetch_transport_sample;
+                let rendered = self.process_render_block().max(1);
+                self.hybrid_append_current_outputs_to_refill(rendered);
+                self.hybrid_prefetch_transport_sample = self
+                    .hybrid_prefetch_transport_sample
+                    .saturating_add(rendered);
+                self.transport_sample = saved_transport;
+                if rendered < cycle_frames {
+                    break;
+                }
+            }
+        }
+
+        self.hybrid_swap_refill_into_active_if_needed();
+        if !self.hybrid_consume_active_to_outputs(cycle_frames) {
+            self.hybrid_underflow_count = self.hybrid_underflow_count.saturating_add(1);
+            for out in &self.audio.outs {
+                out.buffer.lock().fill(0.0);
+                *out.finished.lock() = true;
+            }
+            self.audio.finished = true;
+            self.audio.processing = false;
+        }
+        self.hybrid_last_cycle_transport_sample = Some(self.transport_sample);
+    }
+
+    pub fn try_consume_hybrid_playback_cycle(&mut self) -> bool {
+        if self.is_realtime_domain() {
+            return false;
+        }
+        let cycle_frames = self
+            .audio
+            .ins
+            .first()
+            .map(|audio_in| audio_in.buffer.lock().len())
+            .or_else(|| {
+                self.audio
+                    .outs
+                    .first()
+                    .map(|audio_out| audio_out.buffer.lock().len())
+            })
+            .unwrap_or(self.hybrid_device_block_frames.max(1))
+            .max(1);
+
+        self.ensure_hybrid_output_buffers(cycle_frames);
+        let expected_next_cycle = self
+            .hybrid_last_cycle_transport_sample
+            .map(|s| s.saturating_add(cycle_frames));
+        let discontinuity = expected_next_cycle.is_some_and(|next| next != self.transport_sample);
+        let large_seek = expected_next_cycle.is_some_and(|next| {
+            let a = next as isize;
+            let b = self.transport_sample as isize;
+            (a - b).unsigned_abs() > self.preferred_process_block_size.max(1)
+        });
+        let loop_wrap = self.loop_enabled
+            && self.loop_range_samples.is_some_and(|(start, end)| {
+                end > start
+                    && expected_next_cycle
+                        .is_some_and(|next| next >= end && self.transport_sample <= end)
+            });
+        if discontinuity || large_seek || loop_wrap {
+            self.hybrid_prefetch_transport_sample = self.transport_sample;
+            self.hybrid_reset_buffers();
+            return false;
+        }
+
+        if self.hybrid_consume_active_to_outputs(cycle_frames) {
+            self.hybrid_last_cycle_transport_sample = Some(self.transport_sample);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn name(&self) -> String {
@@ -973,6 +1224,7 @@ impl Track {
 
     pub fn arm(&mut self) {
         self.armed = !self.armed;
+        self.update_hybrid_process_block_size();
     }
 
     pub fn set_output_enabled(&mut self, enabled: bool) {
@@ -1028,6 +1280,7 @@ impl Track {
     }
     pub fn toggle_input_monitor(&mut self) {
         self.input_monitor = !self.input_monitor;
+        self.update_hybrid_process_block_size();
     }
     pub fn toggle_disk_monitor(&mut self) {
         self.disk_monitor = !self.disk_monitor;
@@ -2591,14 +2844,6 @@ impl Track {
         if !crate::clap::is_supported_clap_binary(path) {
             return Err(format!("Not a CLAP plugin path: {plugin_path}"));
         }
-        if self
-            .clap_plugins
-            .iter()
-            .any(|plugin| Self::normalize_clap_path(plugin.processor.lock().path()) == normalized)
-        {
-            return Err(format!("CLAP plugin already loaded: {plugin_path}"));
-        }
-
         let id = instance_id
             .filter(|&id| {
                 !self.vst3_plugins.iter().any(|i| i.id == id)
@@ -3323,6 +3568,181 @@ impl Track {
             .map(|io| io.buffer.lock().len())
             .or_else(|| self.audio.outs.first().map(|io| io.buffer.lock().len()))
             .unwrap_or(self.process_block_size)
+    }
+
+    fn update_hybrid_process_block_size(&mut self) {
+        let next_block_size = self.hybrid_device_block_frames.max(1);
+        if self.process_block_size != next_block_size {
+            self.process_block_size = next_block_size;
+            self.clip_plugin_tracks.clear();
+        }
+    }
+
+    pub fn configure_hybrid_timing(
+        &mut self,
+        device_block_frames: usize,
+        low_watermark_frames: usize,
+        playback_block_frames: usize,
+    ) {
+        self.hybrid_device_block_frames = device_block_frames.max(1);
+        self.hybrid_low_watermark_frames = low_watermark_frames.max(1);
+        self.preferred_process_block_size = playback_block_frames
+            .max(self.hybrid_device_block_frames)
+            .max(1);
+        self.hybrid_prefetch_transport_sample = self.transport_sample;
+        self.hybrid_refill_requested = true;
+        self.update_hybrid_process_block_size();
+    }
+
+    pub fn set_force_realtime_domain(&mut self, forced: bool) {
+        if self.force_realtime_domain != forced {
+            self.force_realtime_domain = forced;
+            self.update_hybrid_process_block_size();
+            if forced {
+                self.hybrid_reset_buffers();
+            }
+        }
+    }
+
+    pub fn set_shared_realtime_mixed(&mut self, mixed: bool) {
+        self.shared_realtime_mixed = mixed;
+    }
+
+    pub fn is_realtime_domain(&self) -> bool {
+        (self.armed && self.input_monitor) || self.force_realtime_domain
+    }
+
+    pub fn hybrid_needs_refill(&self) -> bool {
+        if self.is_realtime_domain() {
+            return false;
+        }
+        self.hybrid_refill_requested || self.hybrid_active_filled == 0
+    }
+
+    fn hybrid_reset_buffers(&mut self) {
+        self.hybrid_active_read_pos = 0;
+        self.hybrid_active_filled = 0;
+        self.hybrid_refill_filled = 0;
+        self.hybrid_last_cycle_transport_sample = None;
+        self.hybrid_refill_requested = true;
+        self.hybrid_last_refill_remaining = 0;
+    }
+
+    fn ensure_hybrid_output_buffers(&mut self, frames: usize) {
+        let channels = self.audio.outs.len();
+        let playback_capacity = self
+            .preferred_process_block_size
+            .max(self.hybrid_device_block_frames)
+            .max(1);
+        let capacity = if self.is_realtime_domain() {
+            self.hybrid_device_block_frames.max(frames).max(1)
+        } else {
+            playback_capacity.max(frames)
+        };
+        if self.hybrid_active_outs.len() != channels {
+            self.hybrid_active_outs = vec![vec![0.0; capacity]; channels];
+        }
+        if self.hybrid_refill_outs.len() != channels {
+            self.hybrid_refill_outs = vec![vec![0.0; capacity]; channels];
+        }
+        for ch in 0..channels {
+            if self.hybrid_active_outs[ch].len() != capacity {
+                self.hybrid_active_outs[ch].resize(capacity, 0.0);
+            }
+            if self.hybrid_refill_outs[ch].len() != capacity {
+                self.hybrid_refill_outs[ch].resize(capacity, 0.0);
+            }
+        }
+        self.hybrid_active_read_pos = self.hybrid_active_read_pos.min(self.hybrid_active_filled);
+        self.hybrid_active_filled = self.hybrid_active_filled.min(capacity);
+        self.hybrid_refill_filled = self.hybrid_refill_filled.min(capacity);
+    }
+
+    fn hybrid_active_remaining(&self) -> usize {
+        self.hybrid_active_filled
+            .saturating_sub(self.hybrid_active_read_pos)
+    }
+
+    fn hybrid_update_refill_request_edge(&mut self) {
+        let remaining = self.hybrid_active_remaining();
+        let threshold = self.hybrid_low_watermark_frames;
+        if remaining <= threshold && self.hybrid_last_refill_remaining > threshold {
+            self.hybrid_refill_requested = true;
+        }
+        if self.hybrid_active_filled == 0 {
+            self.hybrid_refill_requested = true;
+        }
+        self.hybrid_last_refill_remaining = remaining;
+    }
+
+    fn hybrid_append_current_outputs_to_refill(&mut self, frames: usize) {
+        if frames == 0 || self.audio.outs.is_empty() {
+            return;
+        }
+        self.ensure_hybrid_output_buffers(frames);
+        let capacity = self
+            .hybrid_refill_outs
+            .first()
+            .map(|b| b.len())
+            .unwrap_or(frames.max(1));
+        let append = frames.min(capacity.saturating_sub(self.hybrid_refill_filled));
+        if append == 0 {
+            return;
+        }
+        for ch in 0..self.audio.outs.len() {
+            let out = self.audio.outs[ch].buffer.lock();
+            self.hybrid_refill_outs[ch]
+                [self.hybrid_refill_filled..self.hybrid_refill_filled + append]
+                .copy_from_slice(&out[..append]);
+        }
+        self.hybrid_refill_filled += append;
+    }
+
+    fn hybrid_swap_refill_into_active_if_needed(&mut self) {
+        if self.hybrid_active_remaining() == 0 && self.hybrid_refill_filled > 0 {
+            std::mem::swap(&mut self.hybrid_active_outs, &mut self.hybrid_refill_outs);
+            self.hybrid_active_filled = self.hybrid_refill_filled;
+            self.hybrid_active_read_pos = 0;
+            self.hybrid_refill_filled = 0;
+            self.hybrid_refill_requested = false;
+            self.hybrid_last_refill_remaining = self.hybrid_active_remaining();
+        }
+    }
+
+    fn hybrid_consume_active_to_outputs(&mut self, frames: usize) -> bool {
+        if self.hybrid_active_remaining() < frames {
+            return false;
+        }
+        let start = self.hybrid_active_read_pos;
+        let end = start + frames;
+        for ch in 0..self.audio.outs.len() {
+            let out_io = self.audio.outs[ch].clone();
+            let out = out_io.buffer.lock();
+            out[..frames].copy_from_slice(&self.hybrid_active_outs[ch][start..end]);
+            *out_io.finished.lock() = true;
+        }
+        self.hybrid_active_read_pos = end;
+        if self.hybrid_active_read_pos >= self.hybrid_active_filled {
+            self.hybrid_active_read_pos = 0;
+            self.hybrid_active_filled = 0;
+        }
+        self.audio.finished = true;
+        self.audio.processing = false;
+        self.hybrid_update_refill_request_edge();
+        true
+    }
+
+    pub fn hybrid_take_refill_wakeup(&mut self) -> bool {
+        let requested = self.hybrid_refill_requested;
+        self.hybrid_refill_requested = false;
+        requested
+    }
+
+    pub fn take_hybrid_underflow_delta(&mut self) -> usize {
+        let total = self.hybrid_underflow_count;
+        let prev = self.hybrid_reported_underflow_count;
+        self.hybrid_reported_underflow_count = total;
+        total.saturating_sub(prev)
     }
 
     pub fn add_audio_input(&mut self) -> Result<(), String> {
@@ -4133,6 +4553,209 @@ impl Track {
         }
     }
 
+    fn process_track_plugins_in_graph_order(
+        &self,
+        frames: usize,
+        track_input_events: &[Vec<MidiEvent>],
+    ) -> HashMap<(PluginGraphNode, usize), Vec<MidiEvent>> {
+        let mut clap_processed = vec![false; self.clap_plugins.len()];
+        let mut vst3_processed = vec![false; self.vst3_plugins.len()];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut lv2_processed = vec![false; self.lv2_plugins.len()];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut remaining = clap_processed.len() + vst3_processed.len() + lv2_processed.len();
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let mut remaining = clap_processed.len() + vst3_processed.len();
+        let mut processed_midi_plugins = HashSet::<PluginGraphNode>::new();
+        let mut midi_node_events = HashMap::<(PluginGraphNode, usize), Vec<MidiEvent>>::new();
+        let echoed = self.echoed_parameter_updates.lock();
+        echoed.clear();
+        let track_name = self.name.clone();
+
+        while remaining > 0 {
+            let mut progressed = false;
+
+            for (idx, done) in clap_processed.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let processor = self.clap_plugins[idx].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
+                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                    continue;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    track_input_events,
+                    &midi_node_events,
+                );
+                let clap_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(
+                    frames,
+                    &clap_input,
+                    crate::plugins::types::ClapTransportInfo {
+                        transport_sample: self.transport_sample,
+                        playing: self.disk_monitor && self.clip_playback_enabled,
+                        loop_enabled: self.loop_enabled,
+                        loop_range_samples: self.loop_range_samples,
+                        bpm: self.tempo_bpm,
+                        tsig_num: self.tsig_num,
+                        tsig_denom: self.tsig_denom,
+                    },
+                );
+                for ev in processor.drain_echoed_parameters() {
+                    echoed.push(crate::message::Action::TrackSetClapParameter {
+                        track_name: track_name.clone(),
+                        instance_id: self.clap_plugins[idx].id,
+                        param_id: ev.param_index,
+                        value: ev.value as f64,
+                    });
+                }
+                for evt in outputs {
+                    midi_node_events
+                        .entry((node.clone(), evt.port))
+                        .or_default()
+                        .push(evt.event);
+                }
+                *done = true;
+                remaining = remaining.saturating_sub(1);
+                processed_midi_plugins.insert(node);
+                progressed = true;
+            }
+
+            for (idx, done) in vst3_processed.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let processor = self.vst3_plugins[idx].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
+                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                    continue;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    track_input_events,
+                    &midi_node_events,
+                );
+                let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(frames, &vst3_input);
+                for ev in processor.drain_echoed_parameters() {
+                    echoed.push(crate::message::Action::TrackSetVst3Parameter {
+                        track_name: track_name.clone(),
+                        instance_id: self.vst3_plugins[idx].id,
+                        param_id: ev.param_index,
+                        value: ev.value,
+                    });
+                }
+                if !outputs.is_empty() {
+                    midi_node_events.insert((node.clone(), 0), outputs);
+                }
+                *done = true;
+                remaining = remaining.saturating_sub(1);
+                processed_midi_plugins.insert(node);
+                progressed = true;
+            }
+
+            #[cfg(all(unix, not(target_os = "macos")))]
+            for (idx, done) in lv2_processed.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let processor = self.lv2_plugins[idx].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
+                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                    continue;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    track_input_events,
+                    &midi_node_events,
+                );
+                let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(frames, &lv2_input);
+                for ev in processor.drain_echoed_parameters() {
+                    echoed.push(crate::message::Action::TrackSetLv2ControlValue {
+                        track_name: track_name.clone(),
+                        instance_id: self.lv2_plugins[idx].id,
+                        index: ev.param_index,
+                        value: ev.value,
+                    });
+                }
+                if !outputs.is_empty() {
+                    midi_node_events.insert((node.clone(), 0), outputs);
+                }
+                *done = true;
+                remaining = remaining.saturating_sub(1);
+                processed_midi_plugins.insert(node);
+                progressed = true;
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+
+        midi_node_events
+    }
+
+    fn plugin_midi_ready(
+        &self,
+        node: &PluginGraphNode,
+        processed: &HashSet<PluginGraphNode>,
+    ) -> bool {
+        self.plugin_midi_connections
+            .iter()
+            .filter(|conn| {
+                conn.kind == Kind::MIDI
+                    && &conn.to_node == node
+                    && matches!(
+                        conn.from_node,
+                        PluginGraphNode::ClapPluginInstance(_)
+                            | PluginGraphNode::Vst3PluginInstance(_)
+                            | PluginGraphNode::Lv2PluginInstance(_)
+                    )
+            })
+            .all(|conn| processed.contains(&conn.from_node))
+    }
+
+    fn plugin_midi_input_events(
+        &self,
+        node: &PluginGraphNode,
+        midi_inputs: usize,
+        track_input_events: &[Vec<MidiEvent>],
+        node_events: &HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+    ) -> Vec<Vec<MidiEvent>> {
+        let mut per_port = vec![Vec::new(); midi_inputs];
+        for conn in self.plugin_midi_connections.iter().filter(|conn| {
+            conn.kind == Kind::MIDI && &conn.to_node == node && conn.to_port < midi_inputs
+        }) {
+            let events_opt = if conn.from_node == PluginGraphNode::TrackInput {
+                track_input_events.get(conn.from_port)
+            } else {
+                node_events.get(&(conn.from_node.clone(), conn.from_port))
+            };
+            if let Some(events) = events_opt {
+                per_port[conn.to_port].extend_from_slice(events);
+            }
+        }
+        per_port
+    }
+
     fn route_plugin_midi_to_track_outputs_graph(
         &self,
         track_input_events: &[Vec<MidiEvent>],
@@ -4294,6 +4917,36 @@ mod tests {
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.5);
         assert_eq!(out[1], -0.25);
+    }
+
+    #[test]
+    fn hybrid_block_size_switches_when_track_is_armed_and_monitored() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 256, 48_000.0);
+        track.configure_hybrid_timing(64, 256, 256);
+        assert_eq!(track.process_block_size, 256);
+
+        track.arm();
+        assert_eq!(track.process_block_size, 256);
+
+        track.toggle_input_monitor();
+        assert_eq!(track.process_block_size, 64);
+
+        track.toggle_input_monitor();
+        assert_eq!(track.process_block_size, 256);
+    }
+
+    #[test]
+    fn hybrid_block_size_uses_large_playback_block_on_hw_sized_buffers() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track.configure_hybrid_timing(64, 256, 64);
+        assert_eq!(track.process_block_size, 64);
+
+        track.arm();
+        track.toggle_input_monitor();
+        assert_eq!(track.process_block_size, 64);
+
+        track.toggle_input_monitor();
+        assert_eq!(track.process_block_size, 64);
     }
 
     #[test]

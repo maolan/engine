@@ -53,7 +53,7 @@ impl Lv2Processor {
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
 
-        let instance_id = format!("lv2-{}", std::process::id());
+        let instance_id = ipc::unique_instance_id("lv2");
         let sample_rate_str = sample_rate.to_string();
         let buffer_size_str = buffer_size.to_string();
         let num_inputs_str = input_count.max(1).to_string();

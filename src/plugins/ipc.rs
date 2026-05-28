@@ -8,8 +8,16 @@ use maolan_plugin_protocol::shm::ShmMapping;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a globally unique instance ID for plugin SHM naming.
+pub fn unique_instance_id(format: &str) -> String {
+    let n = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}-{}", format, std::process::id(), n)
+}
 
 /// Arguments for spawning a plugin host subprocess.
 pub struct HostSpawnArgs<'a> {

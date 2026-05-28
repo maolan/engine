@@ -15,6 +15,7 @@ pub struct Worker {
     id: usize,
     rx: Receiver<Message>,
     tx: Sender<Message>,
+    realtime_priority: i32,
 }
 
 impl Worker {
@@ -402,12 +403,12 @@ impl Worker {
     }
 
     #[cfg(unix)]
-    fn try_enable_realtime() -> Result<(), String> {
+    fn try_enable_realtime(priority: i32) -> Result<(), String> {
         let thread = unsafe { libc::pthread_self() };
         let policy = libc::SCHED_FIFO;
         let param = unsafe {
             let mut p = std::mem::zeroed::<libc::sched_param>();
-            p.sched_priority = 10;
+            p.sched_priority = priority;
             p
         };
         let rc = unsafe { libc::pthread_setschedparam(thread, policy, &param) };
@@ -419,12 +420,22 @@ impl Worker {
     }
 
     #[cfg(not(unix))]
-    fn try_enable_realtime() -> Result<(), String> {
+    fn try_enable_realtime(_priority: i32) -> Result<(), String> {
         Err("Realtime thread priority is not supported on this platform".to_string())
     }
 
-    pub async fn new(id: usize, rx: Receiver<Message>, tx: Sender<Message>) -> Worker {
-        let worker = Worker { id, rx, tx };
+    pub async fn new(
+        id: usize,
+        rx: Receiver<Message>,
+        tx: Sender<Message>,
+        realtime_priority: i32,
+    ) -> Worker {
+        let worker = Worker {
+            id,
+            rx,
+            tx,
+            realtime_priority,
+        };
         worker.send(Message::Ready(id)).await;
         worker
     }
@@ -437,7 +448,7 @@ impl Worker {
     }
 
     pub async fn work(&mut self) {
-        if let Err(e) = Self::try_enable_realtime() {
+        if let Err(e) = Self::try_enable_realtime(self.realtime_priority) {
             error!("Worker {} realtime priority not enabled: {}", self.id, e);
         }
         while let Some(message) = self.rx.recv().await {
@@ -631,6 +642,7 @@ mod tests {
             id: 7,
             rx: rx_unused,
             tx,
+            realtime_priority: 0,
         };
         let job = OfflineBounceWork {
             state: Arc::new(UnsafeMutex::new(State::default())),
@@ -664,6 +676,7 @@ mod tests {
             id: 5,
             rx: rx_unused,
             tx,
+            realtime_priority: 0,
         };
         let mut track = Track::new("track".to_string(), 1, 2, 0, 0, 4, 48_000.0);
         track.set_level(-9.0);
@@ -705,6 +718,7 @@ mod tests {
             id: 3,
             rx: rx_unused,
             tx,
+            realtime_priority: 0,
         };
         let mut track = Track::new("track".to_string(), 1, 2, 0, 0, 4, 48_000.0);
         track.set_level(-4.0);
@@ -759,6 +773,7 @@ mod tests {
             id: 2,
             rx: rx_unused,
             tx,
+            realtime_priority: 0,
         };
         let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 4, 48_000.0);
         track.set_level(-3.0);

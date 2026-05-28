@@ -65,20 +65,25 @@ impl AudioIO {
             }
             1 => {
                 let source_buf = connections[0].buffer.lock();
-                local_buf.fill(0.0);
                 simd::copy_sanitized_inplace(local_buf, source_buf);
+                if source_buf.len() < local_buf.len() {
+                    local_buf[source_buf.len()..].fill(0.0);
+                }
             }
             _ => {
-                local_buf.fill(0.0);
-                let mut first = true;
-                for source in connections.iter() {
-                    let source_buf = source.buffer.lock();
-                    if first {
-                        simd::copy_sanitized_inplace(local_buf, source_buf);
-                        first = false;
-                    } else {
-                        simd::add_sanitized_inplace(local_buf, source_buf);
+                let mut sources = connections.iter();
+                if let Some(first_source) = sources.next() {
+                    let source_buf = first_source.buffer.lock();
+                    simd::copy_sanitized_inplace(local_buf, source_buf);
+                    if source_buf.len() < local_buf.len() {
+                        local_buf[source_buf.len()..].fill(0.0);
                     }
+                } else {
+                    local_buf.fill(0.0);
+                }
+                for source in sources {
+                    let source_buf = source.buffer.lock();
+                    simd::add_sanitized_inplace(local_buf, source_buf);
                 }
             }
         }

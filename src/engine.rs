@@ -77,6 +77,12 @@ impl WorkerData {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerClass {
+    Realtime,
+    Refill,
+}
+
 #[derive(Debug, Clone)]
 struct RecordingSession {
     start_sample: usize,
@@ -132,6 +138,8 @@ struct AudioOpenRequest<'a> {
     bits: i32,
     exclusive: bool,
     period_frames: usize,
+    realtime_frames: usize,
+    low_watermark_frames: usize,
     nperiods: usize,
     sync_mode: bool,
 }
@@ -194,7 +202,9 @@ pub struct Engine {
     midi_hw_in_routes: Vec<MidiHwInRoute>,
     midi_hw_out_routes: Vec<MidiHwOutRoute>,
     midi_hw_thru_routes: Vec<MidiHwThruRoute>,
-    ready_workers: Vec<usize>,
+    worker_classes: Vec<WorkerClass>,
+    ready_realtime_workers: Vec<usize>,
+    ready_refill_workers: Vec<usize>,
     pending_requests: VecDeque<Action>,
     awaiting_hwfinished: bool,
     handling_hwfinished: bool,
@@ -242,6 +252,14 @@ pub struct Engine {
     global_midi_learn_stop: Option<crate::message::MidiLearnBinding>,
     global_midi_learn_record_toggle: Option<crate::message::MidiLearnBinding>,
     midi_cc_gate: HashMap<(String, u8, u8), bool>,
+    hybrid_low_watermark_frames: usize,
+    hybrid_realtime_frames: usize,
+    hybrid_playback_frames: usize,
+    refill_budget_per_pass: usize,
+    realtime_fallback_enabled: bool,
+    realtime_fallback_budget_per_pass: usize,
+    refill_budget_throttle_count: usize,
+    realtime_fallback_dispatch_count: usize,
 }
 
 type MidiEditParseResult = (
@@ -934,7 +952,9 @@ impl Engine {
             midi_hw_in_routes: vec![],
             midi_hw_out_routes: vec![],
             midi_hw_thru_routes: vec![],
-            ready_workers: vec![],
+            worker_classes: vec![],
+            ready_realtime_workers: vec![],
+            ready_refill_workers: vec![],
             pending_requests: VecDeque::new(),
             awaiting_hwfinished: false,
             handling_hwfinished: false,
@@ -982,6 +1002,14 @@ impl Engine {
             global_midi_learn_stop: None,
             global_midi_learn_record_toggle: None,
             midi_cc_gate: HashMap::new(),
+            hybrid_low_watermark_frames: 0,
+            hybrid_realtime_frames: 0,
+            hybrid_playback_frames: 0,
+            refill_budget_per_pass: 2,
+            realtime_fallback_enabled: true,
+            realtime_fallback_budget_per_pass: 1,
+            refill_budget_throttle_count: 0,
+            realtime_fallback_dispatch_count: 0,
         }
     }
 
@@ -1192,6 +1220,9 @@ impl Engine {
             Ok(runtime) => {
                 let input_channels = runtime.input_channels();
                 let output_channels = runtime.output_channels();
+                self.hybrid_playback_frames = request.period_frames.max(1);
+                self.hybrid_realtime_frames = request.realtime_frames.max(1);
+                self.hybrid_low_watermark_frames = request.low_watermark_frames.max(1);
                 let midi_inputs = runtime.midi_input_devices();
                 let midi_outputs = runtime.midi_output_devices();
                 let rate = runtime.sample_rate;
@@ -1218,6 +1249,8 @@ impl Engine {
                     bits: request.bits,
                     exclusive: request.exclusive,
                     period_frames: request.period_frames,
+                    realtime_frames: request.realtime_frames,
+                    low_watermark_frames: request.low_watermark_frames,
                     nperiods: request.nperiods,
                     sync_mode: request.sync_mode,
                 }))
@@ -2278,6 +2311,72 @@ impl Engine {
         upstream
     }
 
+    fn refresh_realtime_infection(&self) {
+        let state = self.state.lock();
+        let live_seeds: std::collections::HashSet<String> = state
+            .tracks
+            .iter()
+            .filter_map(|(name, track)| {
+                let t = track.lock();
+                if t.armed && t.input_monitor {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut output_owner: std::collections::HashMap<*const crate::audio::io::AudioIO, String> =
+            std::collections::HashMap::new();
+        for (name, track) in state.tracks.iter() {
+            let t = track.lock();
+            for out in &t.audio.outs {
+                output_owner.insert(std::sync::Arc::as_ptr(out), name.clone());
+            }
+        }
+
+        let mut infected = live_seeds.clone();
+        let mut mixed_nodes = std::collections::HashSet::new();
+        loop {
+            let mut changed = false;
+            for (name, track) in state.tracks.iter() {
+                let t = track.lock();
+                let mut upstream_owners = std::collections::HashSet::new();
+                for input in &t.audio.ins {
+                    for conn in input.connections.lock().iter() {
+                        if let Some(owner) = output_owner.get(&std::sync::Arc::as_ptr(conn)) {
+                            upstream_owners.insert(owner.clone());
+                        }
+                    }
+                }
+                if upstream_owners.is_empty() {
+                    continue;
+                }
+                let has_realtime = upstream_owners
+                    .iter()
+                    .any(|owner| infected.contains(owner) || live_seeds.contains(owner));
+                let has_playback = upstream_owners
+                    .iter()
+                    .any(|owner| !infected.contains(owner) && !live_seeds.contains(owner));
+                if has_realtime && has_playback {
+                    mixed_nodes.insert(name.clone());
+                }
+                if has_realtime && infected.insert(name.clone()) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for (name, track) in state.tracks.iter() {
+            let forced = infected.contains(name) && !live_seeds.contains(name);
+            let t = track.lock();
+            t.set_shared_realtime_mixed(mixed_nodes.contains(name));
+            t.set_force_realtime_domain(forced);
+        }
+    }
+
     fn apply_mute_solo_policy(&mut self) {
         let mut newly_disabled_tracks = Vec::new();
         {
@@ -2830,13 +2929,24 @@ impl Engine {
 
     pub async fn init(&mut self) {
         let max_threads = num_cpus::get();
+        let realtime_count = if max_threads > 1 { 1 } else { max_threads };
         for id in 0..max_threads {
+            let class = if id < realtime_count {
+                WorkerClass::Realtime
+            } else {
+                WorkerClass::Refill
+            };
+            let priority = match class {
+                WorkerClass::Realtime => 20,
+                WorkerClass::Refill => 8,
+            };
             let (tx, rx) = channel::<Message>(32);
             let tx_thread = self.tx.clone();
             let handler = tokio::spawn(async move {
-                let wrk = Worker::new(id, rx, tx_thread);
+                let wrk = Worker::new(id, rx, tx_thread, priority);
                 wrk.await.work().await;
             });
+            self.worker_classes.push(class);
             self.workers.push(WorkerData::new(tx.clone(), handler));
         }
     }
@@ -3524,24 +3634,62 @@ impl Engine {
         if !self.playing {
             return false;
         }
+        self.refresh_realtime_infection();
+        let mut cycle_underflows = 0usize;
+        {
+            let state = self.state.lock();
+            for track in state.tracks.values() {
+                cycle_underflows =
+                    cycle_underflows.saturating_add(track.lock().take_hybrid_underflow_delta());
+            }
+        }
+        if cycle_underflows > 0 {
+            self.refill_budget_per_pass = (self.refill_budget_per_pass + 1).min(8);
+        } else {
+            self.refill_budget_per_pass = self.refill_budget_per_pass.saturating_sub(1).max(1);
+        }
         self.force_stalled_track_completions();
         let mut finished = true;
         let mut dispatched = 0;
+        let mut refill_dispatched = 0usize;
+        let mut realtime_fallback_dispatched = 0usize;
         loop {
             let next_track = {
                 let state = self.state.lock();
-                let mut next_track = None;
+                let mut next_realtime = None;
+                let mut next_playback = None;
                 for track in state.tracks.values() {
                     let t = track.lock();
                     if t.audio.finished {
                         continue;
                     }
+                    let needs_refill_event = t.hybrid_needs_refill();
+                    if !t.is_realtime_domain()
+                        && !needs_refill_event
+                        && t.try_consume_hybrid_playback_cycle()
+                    {
+                        continue;
+                    }
                     finished = false;
-                    if next_track.is_none() && !t.audio.processing && t.audio.ready() {
-                        next_track = Some(track.clone());
+                    if t.audio.processing || !t.audio.ready() {
+                        continue;
+                    }
+                    if t.is_realtime_domain() {
+                        if next_realtime.is_none() {
+                            next_realtime = Some(track.clone());
+                        }
+                    } else if next_playback.is_none() {
+                        next_playback = Some(track.clone());
                     }
                 }
-                next_track
+                if next_realtime.is_none()
+                    && next_playback.is_some()
+                    && refill_dispatched >= self.refill_budget_per_pass
+                {
+                    self.refill_budget_throttle_count =
+                        self.refill_budget_throttle_count.saturating_add(1);
+                }
+                next_realtime.or(next_playback)
             };
 
             let Some(track) = next_track else {
@@ -3550,7 +3698,25 @@ impl Engine {
                 }
                 return finished;
             };
-            let Some(worker_index) = self.take_ready_worker_index() else {
+            let worker_class = {
+                let t = track.lock();
+                if t.is_realtime_domain() {
+                    WorkerClass::Realtime
+                } else {
+                    WorkerClass::Refill
+                }
+            };
+            let worker_index = if let Some(index) = self.take_ready_worker_index(worker_class) {
+                Some(index)
+            } else if matches!(worker_class, WorkerClass::Realtime)
+                && self.realtime_fallback_enabled
+                && realtime_fallback_dispatched < self.realtime_fallback_budget_per_pass
+            {
+                self.take_ready_worker_index(WorkerClass::Refill)
+            } else {
+                None
+            };
+            let Some(worker_index) = worker_index else {
                 self.force_stalled_track_completions();
                 if dispatched > 0 {
                     tracing::info!(
@@ -3565,10 +3731,43 @@ impl Engine {
             if t.audio.finished || t.audio.processing || !t.audio.ready() {
                 continue;
             }
+            if matches!(worker_class, WorkerClass::Refill) {
+                // Consume wakeup only when we are actually dispatching refill work.
+                let _ = t.hybrid_take_refill_wakeup();
+            }
             dispatched += 1;
+            if matches!(worker_class, WorkerClass::Refill) {
+                refill_dispatched = refill_dispatched.saturating_add(1);
+            } else if !matches!(
+                self.worker_classes
+                    .get(worker_index)
+                    .copied()
+                    .unwrap_or(WorkerClass::Realtime),
+                WorkerClass::Realtime
+            ) {
+                realtime_fallback_dispatched = realtime_fallback_dispatched.saturating_add(1);
+                self.realtime_fallback_dispatch_count =
+                    self.realtime_fallback_dispatch_count.saturating_add(1);
+            }
             t.set_transport_sample(self.transport_sample);
             t.set_loop_config(self.loop_enabled, self.loop_range_samples);
             t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
+            let low_watermark = if self.hybrid_low_watermark_frames > 0 {
+                self.hybrid_low_watermark_frames
+            } else {
+                self.current_cycle_samples().saturating_mul(4).max(1)
+            };
+            let realtime_frames = if self.hybrid_realtime_frames > 0 {
+                self.hybrid_realtime_frames
+            } else {
+                self.current_cycle_samples().max(1)
+            };
+            let playback_frames = if self.hybrid_playback_frames > 0 {
+                self.hybrid_playback_frames
+            } else {
+                self.current_cycle_samples().max(1)
+            };
+            t.configure_hybrid_timing(realtime_frames, low_watermark, playback_frames);
             t.process_epoch = self.track_process_epoch;
 
             t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
@@ -3626,14 +3825,30 @@ impl Engine {
         self.request_hw_cycle().await;
     }
 
-    fn take_ready_worker_index(&mut self) -> Option<usize> {
-        while !self.ready_workers.is_empty() {
-            let worker_index = self.ready_workers.remove(0);
+    fn take_ready_worker_index(&mut self, class: WorkerClass) -> Option<usize> {
+        let queue = match class {
+            WorkerClass::Realtime => &mut self.ready_realtime_workers,
+            WorkerClass::Refill => &mut self.ready_refill_workers,
+        };
+        while !queue.is_empty() {
+            let worker_index = queue.remove(0);
             if worker_index < self.workers.len() {
                 return Some(worker_index);
             }
         }
         None
+    }
+
+    fn push_ready_worker(&mut self, worker_index: usize) {
+        match self
+            .worker_classes
+            .get(worker_index)
+            .copied()
+            .unwrap_or(WorkerClass::Refill)
+        {
+            WorkerClass::Realtime => self.ready_realtime_workers.push(worker_index),
+            WorkerClass::Refill => self.ready_refill_workers.push(worker_index),
+        }
     }
 
     async fn publish_track_meters(&mut self) {
@@ -4214,7 +4429,8 @@ impl Engine {
             }
             Action::Quit => {
                 self.flush_recordings().await;
-                self.ready_workers.clear();
+                self.ready_realtime_workers.clear();
+                self.ready_refill_workers.clear();
                 while !self.workers.is_empty() {
                     let worker = self.workers.remove(0);
                     worker
@@ -4805,7 +5021,7 @@ impl Engine {
                     .await;
                     return;
                 }
-                let Some(worker_index) = self.take_ready_worker_index() else {
+                let Some(worker_index) = self.take_ready_worker_index(WorkerClass::Refill) else {
                     self.pending_requests
                         .push_front(Action::TrackOfflineBounce {
                             track_name,
@@ -6508,6 +6724,8 @@ impl Engine {
                 bits,
                 exclusive,
                 period_frames,
+                realtime_frames,
+                low_watermark_frames,
                 nperiods,
                 sync_mode,
             } => {
@@ -6520,6 +6738,8 @@ impl Engine {
                         bits,
                         exclusive,
                         period_frames,
+                        realtime_frames,
+                        low_watermark_frames,
                         nperiods,
                         sync_mode,
                     };
@@ -6527,7 +6747,11 @@ impl Engine {
                         return;
                     }
                 }
-                let hw_opts = Self::build_hw_options(exclusive, period_frames, nperiods, sync_mode);
+                let hw_opts =
+                    Self::build_hw_options(exclusive, realtime_frames, nperiods, sync_mode);
+                self.hybrid_playback_frames = period_frames.max(1);
+                self.hybrid_realtime_frames = realtime_frames.max(1);
+                self.hybrid_low_watermark_frames = low_watermark_frames.max(1);
                 let open_result = self
                     .open_non_jack_audio_device(
                         device,
@@ -6826,6 +7050,14 @@ impl Engine {
                     0
                 };
                 let cycle_samples = self.current_cycle_samples();
+                tracing::info!(
+                    "Hybrid diagnostics: refill_budget_per_pass={}, refill_budget_throttle_count={}, realtime_fallback_dispatch_count={}, realtime_ready={}, refill_ready={}",
+                    self.refill_budget_per_pass,
+                    self.refill_budget_throttle_count,
+                    self.realtime_fallback_dispatch_count,
+                    self.ready_realtime_workers.len(),
+                    self.ready_refill_workers.len()
+                );
                 self.notify_clients(Ok(Action::SessionDiagnosticsReport {
                     track_count,
                     frozen_track_count,
@@ -6837,7 +7069,8 @@ impl Engine {
                     clap_instance_count,
                     pending_requests: self.pending_requests.len(),
                     workers_total: self.workers.len(),
-                    workers_ready: self.ready_workers.len(),
+                    workers_ready: self.ready_realtime_workers.len()
+                        + self.ready_refill_workers.len(),
                     pending_hw_midi_events,
                     playing: self.playing,
                     transport_sample: self.transport_sample,
@@ -6945,9 +7178,7 @@ impl Engine {
     pub async fn work(&mut self) {
         while let Some(message) = self.rx.recv().await {
             match message {
-                Message::Ready(id) => {
-                    self.ready_workers.push(id);
-                }
+                Message::Ready(id) => self.push_ready_worker(id),
                 Message::Finished {
                     worker_id,
                     track_name,
@@ -6955,7 +7186,7 @@ impl Engine {
                     process_epoch,
                     parameter_updates,
                 } => {
-                    self.ready_workers.push(worker_id);
+                    self.push_ready_worker(worker_id);
                     self.track_processing_started_at.remove(&track_name);
                     if process_epoch != self.track_process_epoch {
                         if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
@@ -7606,7 +7837,7 @@ mod tests {
         engine
             .workers
             .push(WorkerData::new(worker_tx, tokio::spawn(async {})));
-        engine.ready_workers.push(0);
+        engine.ready_refill_workers.push(0);
 
         engine
             .handle_request(Action::TrackOfflineBounce {
