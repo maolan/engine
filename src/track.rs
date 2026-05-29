@@ -495,6 +495,7 @@ pub struct Track {
     hybrid_last_refill_remaining: usize,
     force_realtime_domain: bool,
     shared_realtime_mixed: bool,
+    last_render_block_silent: bool,
     pub output_enabled: bool,
     pub process_epoch: usize,
     pub transport_sample: usize,
@@ -592,6 +593,7 @@ impl Track {
             hybrid_last_refill_remaining: 0,
             force_realtime_domain: false,
             shared_realtime_mixed: false,
+            last_render_block_silent: true,
             output_enabled: true,
             process_epoch: 0,
             transport_sample: 0,
@@ -902,15 +904,44 @@ impl Track {
         {
             // Process track plugins according to graph dependencies and collect echoed parameters.
             let track_name = self.name.clone();
-            let midi_node_events =
-                self.process_track_plugins_in_graph_order(frames, &track_input_midi_events);
+            let can_skip_plugins = !live_mode
+                && self.last_render_block_silent
+                && track_input_midi_events.is_empty()
+                && self.audio.ins.iter().all(|audio_in| {
+                    let buf = audio_in.buffer.lock();
+                    buf.iter().all(|&s| s == 0.0)
+                });
+            let midi_node_events = if can_skip_plugins {
+                for instance in &self.clap_plugins {
+                    for output in instance.processor.lock().audio_outputs() {
+                        output.buffer.lock().fill(0.0);
+                    }
+                }
+                for instance in &self.vst3_plugins {
+                    for output in instance.processor.lock().audio_outputs() {
+                        output.buffer.lock().fill(0.0);
+                    }
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                for instance in &self.lv2_plugins {
+                    for output in instance.processor.lock().audio_outputs() {
+                        output.buffer.lock().fill(0.0);
+                    }
+                }
+                self.echoed_parameter_updates.lock().clear();
+                std::collections::HashMap::new()
+            } else {
+                self.process_track_plugins_in_graph_order(frames, &track_input_midi_events)
+            };
             let t6 = std::time::Instant::now();
             let t7 = t6;
             let t8 = t6;
-            self.route_plugin_midi_to_track_outputs_graph(
-                &track_input_midi_events,
-                &midi_node_events,
-            );
+            if !can_skip_plugins {
+                self.route_plugin_midi_to_track_outputs_graph(
+                    &track_input_midi_events,
+                    &midi_node_events,
+                );
+            }
             let t9 = std::time::Instant::now();
             let total = t9.duration_since(t0).as_secs_f64() * 1000.0;
             if total > 20.0 {
@@ -960,6 +991,7 @@ impl Track {
             self.meter_peak_hold_linear
                 .resize(self.audio.outs.len(), 0.0);
         }
+        let mut all_outputs_zero = true;
         for out_idx in 0..self.audio.outs.len() {
             let audio_out = self.audio.outs[out_idx].clone();
             let out_samples = audio_out.buffer.lock();
@@ -1056,6 +1088,9 @@ impl Track {
                 }
             }
             let peak_now = crate::simd::peak_abs(out_samples);
+            if peak_now > 0.0 {
+                all_outputs_zero = false;
+            }
 
             let held = self.meter_peak_hold_linear[out_idx] * 0.92;
             let next = peak_now.max(held);
@@ -1064,6 +1099,7 @@ impl Track {
             *audio_out.finished.lock() = true;
         }
 
+        self.last_render_block_silent = all_outputs_zero;
         self.audio.finished = true;
         self.audio.processing = false;
         if live_mode {
