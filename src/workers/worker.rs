@@ -406,6 +406,7 @@ impl Worker {
     }
 
     pub async fn work(&mut self) {
+        crate::enable_flush_denormals_to_zero();
         if let Err(e) = Self::try_enable_realtime(self.realtime_priority) {
             error!("Worker {} realtime priority not enabled: {}", self.id, e);
         }

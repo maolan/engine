@@ -61,6 +61,27 @@ pub fn discover_coreaudio_devices() -> Vec<String> {
         .collect()
 }
 
+/// Enables Flush-to-Zero (FTZ) and Denormals-Are-Zero (DAZ) on x86/x86_64,
+/// or flush-to-zero on aarch64. This prevents subnormal floating-point numbers
+/// from causing severe performance degradation in audio DSP code.
+pub fn enable_flush_denormals_to_zero() {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    unsafe {
+        let mut mxcsr: u32 = 0;
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr);
+        mxcsr |= 0x8040; // FTZ (1 << 15) | DAZ (1 << 6)
+        std::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mut fpcr: u64;
+        std::arch::asm!("mrs {0}, fpcr", out(reg) fpcr);
+        fpcr |= 1 << 24; // FZ bit
+        std::arch::asm!("msr fpcr, {0}", in(reg) fpcr);
+    }
+}
+
 pub fn init() -> (Sender<message::Message>, JoinHandle<()>) {
     let (tx, rx) = channel::<message::Message>(32);
     let mut engine = engine::Engine::new(rx, tx.clone());

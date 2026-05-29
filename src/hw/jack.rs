@@ -136,6 +136,7 @@ impl Process {
 
 impl ProcessHandler for Process {
     fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
+        crate::enable_flush_denormals_to_zero();
         self.copy_audio_inputs(ps);
         self.collect_midi_input(ps);
         self.copy_audio_outputs(ps);

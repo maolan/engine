@@ -199,6 +199,7 @@ unsafe extern "C" fn io_proc(
     _output_time: *const AudioTimeStamp,
     client_data: *mut std::ffi::c_void,
 ) -> OSStatus {
+    crate::enable_flush_denormals_to_zero();
     let state = &*(client_data as *const SharedIOState);
 
     let mut data = match state.mutex.lock() {

@@ -237,6 +237,7 @@ impl<B: Backend> HwWorker<B> {
     }
 
     pub async fn work(mut self) {
+        crate::enable_flush_denormals_to_zero();
         if let Err(e) = Self::lock_memory_pages() {
             error!("{} worker memory lock not enabled: {}", B::LABEL, e);
         }
@@ -342,6 +343,7 @@ impl<B: Backend> HwWorker<B> {
         stop: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
+            crate::enable_flush_denormals_to_zero();
             let mut midi_in_events = Vec::with_capacity(64);
             while !stop.load(Ordering::Acquire) {
                 {
@@ -368,6 +370,7 @@ impl<B: Backend> HwWorker<B> {
         let profile = Self::profile_enabled();
         let autonomous = Self::assist_autonomous_enabled();
         std::thread::spawn(move || {
+            crate::enable_flush_denormals_to_zero();
             if let Err(e) = Self::configure_rt_thread(B::ASSIST_THREAD_NAME, RT_PRIORITY_ASSIST) {
                 error!("{} assist realtime priority not enabled: {}", B::LABEL, e);
             }

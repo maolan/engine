@@ -95,6 +95,7 @@ impl HwDriver {
                 .build_output_stream(
                     &output_cfg,
                     move |data: &mut [f32], _| {
+                        crate::enable_flush_denormals_to_zero();
                         let channels = output_channels.max(1);
                         let callback_frames = data.len() / channels;
                         for sample in data.iter_mut() {
@@ -141,6 +142,7 @@ impl HwDriver {
                         .build_input_stream(
                             &input_cfg,
                             move |data: &[f32], _| {
+                                crate::enable_flush_denormals_to_zero();
                                 stash.extend_from_slice(data);
                                 while stash.len() >= chunk_len {
                                     let chunk: Vec<f32> = stash.drain(..chunk_len).collect();
