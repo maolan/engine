@@ -458,6 +458,9 @@ pub struct Track {
     pub midi_learn_input_monitor: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_disk_monitor: Option<crate::message::MidiLearnBinding>,
     pub vca_master: Option<String>,
+    pub is_folder: bool,
+    pub folder_open: bool,
+    pub parent_track: Option<String>,
     pub frozen: bool,
     pub midi_lane_channels: Vec<Option<u8>>,
     primary_audio_ins: usize,
@@ -557,6 +560,9 @@ impl Track {
             midi_learn_input_monitor: None,
             midi_learn_disk_monitor: None,
             vca_master: None,
+            is_folder: false,
+            folder_open: true,
+            parent_track: None,
             frozen: false,
             midi_lane_channels: vec![None; midi_ins],
             primary_audio_ins: audio_ins,
@@ -4131,6 +4137,31 @@ impl Track {
             }
         }
         self.invalidate_midi_route_cache();
+    }
+
+    pub fn connect_outputs_to_parent(&mut self, parent: &Track) {
+        for (out_idx, child_out) in self.audio.outs.iter().enumerate() {
+            if let Some(parent_in) = parent.audio.ins.get(out_idx) {
+                let already_connected = child_out
+                    .connections
+                    .lock()
+                    .iter()
+                    .any(|conn| Arc::ptr_eq(conn, parent_in));
+                if !already_connected {
+                    AudioIO::connect(child_out, parent_in);
+                }
+            }
+        }
+        self.invalidate_audio_route_cache();
+    }
+
+    pub fn disconnect_outputs_from_parent(&mut self, parent: &Track) {
+        for (out_idx, child_out) in self.audio.outs.iter().enumerate() {
+            if let Some(parent_in) = parent.audio.ins.get(out_idx) {
+                let _ = AudioIO::disconnect(child_out, parent_in);
+            }
+        }
+        self.invalidate_audio_route_cache();
     }
 
     fn internal_audio_sources(&self) -> Vec<Arc<AudioIO>> {

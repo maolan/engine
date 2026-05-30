@@ -2311,6 +2311,51 @@ impl Engine {
         upstream
     }
 
+    fn is_track_in_soloed_folder(
+        &self,
+        track: &Track,
+        tracks: &std::collections::HashMap<String, Arc<UnsafeMutex<Box<Track>>>>,
+    ) -> bool {
+        let mut current = track.parent_track.as_deref();
+        while let Some(parent_name) = current {
+            if let Some(parent) = tracks.get(parent_name) {
+                let p = parent.lock();
+                if p.soloed {
+                    return true;
+                }
+                current = p.parent_track.as_deref();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    fn folder_has_soloed_descendant(
+        &self,
+        folder_name: &str,
+        tracks: &std::collections::HashMap<String, Arc<UnsafeMutex<Box<Track>>>>,
+    ) -> bool {
+        for track in tracks.values() {
+            let t = track.lock();
+            if !t.soloed {
+                continue;
+            }
+            let mut current = t.parent_track.as_deref();
+            while let Some(parent_name) = current {
+                if parent_name == folder_name {
+                    return true;
+                }
+                if let Some(parent) = tracks.get(parent_name) {
+                    current = parent.lock().parent_track.as_deref();
+                } else {
+                    break;
+                }
+            }
+        }
+        false
+    }
+
     fn refresh_realtime_infection(&self) {
         let state = self.state.lock();
         let live_seeds: std::collections::HashSet<String> = state
@@ -2400,10 +2445,17 @@ impl Engine {
             for track in tracks.values() {
                 let t = track.lock();
                 let was_enabled = t.output_enabled;
+                let in_soloed_folder = self.is_track_in_soloed_folder(&t, tracks);
+                let folder_with_soloed_child =
+                    t.is_folder && self.folder_has_soloed_descendant(&t.name, tracks);
                 let enabled = if t.is_master {
                     !t.muted
                 } else if any_soloed {
-                    (t.soloed || upstream.contains(&t.name)) && !t.muted
+                    (t.soloed
+                        || upstream.contains(&t.name)
+                        || in_soloed_folder
+                        || folder_with_soloed_child)
+                        && !t.muted
                 } else {
                     !t.muted
                 };
@@ -4633,6 +4685,9 @@ impl Engine {
                     if other.vca_master.as_deref() == Some(old_name.as_str()) {
                         other.set_vca_master(Some(new_name.clone()));
                     }
+                    if other.parent_track.as_deref() == Some(old_name.as_str()) {
+                        other.parent_track = Some(new_name.clone());
+                    }
                 }
 
                 if let Some(recording) = self.audio_recordings.remove(old_name) {
@@ -4665,6 +4720,30 @@ impl Engine {
                 .await;
             }
             Action::RemoveTrack(ref name) => {
+                // Clean up folder children before removing the track
+                let children: Vec<String> = {
+                    let state = self.state.lock();
+                    state
+                        .tracks
+                        .iter()
+                        .filter_map(|(n, t)| {
+                            if t.lock().parent_track.as_deref() == Some(name.as_str()) {
+                                Some(n.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                };
+                if let Some(removed_track) = self.state.lock().tracks.get(name).cloned() {
+                    for child_name in children {
+                        if let Some(child) = self.state.lock().tracks.get(&child_name).cloned() {
+                            let removed = removed_track.lock();
+                            child.lock().disconnect_outputs_from_parent(&removed);
+                            child.lock().parent_track = None;
+                        }
+                    }
+                }
                 self.state.lock().tracks.remove(name);
                 self.audio_recordings.remove(name);
                 self.midi_recordings.remove(name);
@@ -4981,6 +5060,90 @@ impl Engine {
                     return;
                 }
                 track.lock().set_vca_master(master_track.clone());
+            }
+            Action::TrackSetFolder {
+                ref track_name,
+                is_folder,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                track.lock().is_folder = is_folder;
+                self.notify_clients(Ok(Action::TrackSetFolder {
+                    track_name: track_name.clone(),
+                    is_folder,
+                }))
+                .await;
+            }
+            Action::TrackSetParent {
+                ref track_name,
+                ref parent_name,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if parent_name.as_deref() == Some(track_name.as_str()) {
+                    self.notify_clients(Err("Track cannot be its own parent".to_string()))
+                        .await;
+                    return;
+                }
+                // Get old parent and disconnect
+                let old_parent = {
+                    let t = track.lock();
+                    t.parent_track.clone()
+                };
+                if let Some(ref old) = old_parent {
+                    if let Some(old_track_arc) = self.state.lock().tracks.get(old).cloned() {
+                        let old_track = old_track_arc.lock();
+                        track.lock().disconnect_outputs_from_parent(&old_track);
+                    }
+                }
+                // Connect to new parent
+                if let Some(new_parent) = parent_name {
+                    if let Some(parent_track_arc) = self.state.lock().tracks.get(new_parent).cloned() {
+                        let parent_track = parent_track_arc.lock();
+                        track.lock().connect_outputs_to_parent(&parent_track);
+                    }
+                }
+                track.lock().parent_track = parent_name.clone();
+                self.notify_clients(Ok(Action::TrackSetParent {
+                    track_name: track_name.clone(),
+                    parent_name: parent_name.clone(),
+                }))
+                .await;
+            }
+            Action::TrackToggleFolder {
+                ref track_name,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                {
+                    let t = track.lock();
+                    t.folder_open = !t.folder_open;
+                }
+                self.notify_clients(Ok(Action::TrackToggleFolder {
+                    track_name: track_name.clone(),
+                }))
+                .await;
+                // Also notify with the new open state for GUI convenience
+                self.notify_clients(Ok(Action::TrackSetFolder {
+                    track_name: track_name.clone(),
+                    is_folder: track.lock().is_folder,
+                }))
+                .await;
             }
             Action::TrackSetMidiLaneChannel {
                 ref track_name,

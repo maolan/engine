@@ -457,6 +457,17 @@ pub enum Action {
         track_name: String,
         master_track: Option<String>,
     },
+    TrackSetFolder {
+        track_name: String,
+        is_folder: bool,
+    },
+    TrackSetParent {
+        track_name: String,
+        parent_name: Option<String>,
+    },
+    TrackToggleFolder {
+        track_name: String,
+    },
     TrackSetMidiLaneChannel {
         track_name: String,
         lane: usize,
