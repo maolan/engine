@@ -496,6 +496,7 @@ pub struct Track {
     hybrid_reported_underflow_count: usize,
     hybrid_refill_requested: bool,
     hybrid_last_refill_remaining: usize,
+    hybrid_enabled: bool,
     force_realtime_domain: bool,
     shared_realtime_mixed: bool,
     last_render_block_silent: bool,
@@ -597,6 +598,7 @@ impl Track {
             hybrid_reported_underflow_count: 0,
             hybrid_refill_requested: false,
             hybrid_last_refill_remaining: 0,
+            hybrid_enabled: false,
             force_realtime_domain: false,
             shared_realtime_mixed: false,
             last_render_block_silent: true,
@@ -1130,7 +1132,7 @@ impl Track {
             .unwrap_or(self.hybrid_device_block_frames.max(1))
             .max(1);
 
-        if live_mode {
+        if live_mode || !self.hybrid_enabled || self.audio.outs.is_empty() {
             let _ = self.process_render_block();
             return;
         }
@@ -3573,7 +3575,11 @@ impl Track {
     }
 
     fn update_hybrid_process_block_size(&mut self) {
-        let next_block_size = self.hybrid_device_block_frames.max(1);
+        let next_block_size = if self.is_realtime_domain() {
+            self.hybrid_device_block_frames.max(1)
+        } else {
+            self.preferred_process_block_size.max(1)
+        };
         if self.process_block_size != next_block_size {
             self.process_block_size = next_block_size;
             self.clip_plugin_tracks.clear();
@@ -3608,6 +3614,14 @@ impl Track {
 
     pub fn set_shared_realtime_mixed(&mut self, mixed: bool) {
         self.shared_realtime_mixed = mixed;
+    }
+
+    pub fn set_hybrid_enabled(&mut self, enabled: bool) {
+        self.hybrid_enabled = enabled;
+    }
+
+    pub fn hybrid_enabled(&self) -> bool {
+        self.hybrid_enabled
     }
 
     pub fn is_realtime_domain(&self) -> bool {

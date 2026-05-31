@@ -903,6 +903,7 @@ pub enum Action {
         low_watermark_frames: usize,
         nperiods: usize,
         sync_mode: bool,
+        hybrid_enabled: bool,
     },
     JackAddAudioInputPort,
     JackRemoveAudioInputPort(usize),

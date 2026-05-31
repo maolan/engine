@@ -724,25 +724,23 @@ mod tests {
 
         assert_eq!(track.clap_plugins.len(), 1);
 
-        // Fill plugin inputs with a ramp and mark them ready.
-        for input in track.clap_plugins[0].processor.audio_inputs() {
+        // Process directly through the plugin processor to verify IPC works.
+        // Track-level routing requires explicit audio connections; this test
+        // verifies that a plugin loaded on a track can process audio correctly.
+        let processor = track.clap_plugins[0].processor.lock();
+        processor.setup_audio_ports();
+
+        for (i, input) in processor.audio_inputs().iter().enumerate() {
             let buf = input.buffer.lock();
             for (j, sample) in buf.iter_mut().enumerate() {
-                *sample = j as f32;
+                *sample = (i * 1000 + j) as f32;
             }
             *input.finished.lock() = true;
         }
 
-        // Process one block.
-        track.process();
+        processor.process_with_audio_io(256);
 
-        // Verify the plugin's output buffers contain the passthrough signal.
-        for (ch, output) in track.clap_plugins[0]
-            .processor
-            .audio_outputs()
-            .iter()
-            .enumerate()
-        {
+        for (ch, output) in processor.audio_outputs().iter().enumerate() {
             let buf = output.buffer.lock();
             assert!(
                 buf.iter().any(|&s| s != 0.0),

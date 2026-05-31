@@ -142,6 +142,7 @@ struct AudioOpenRequest<'a> {
     low_watermark_frames: usize,
     nperiods: usize,
     sync_mode: bool,
+    hybrid_enabled: bool,
 }
 
 struct ClipAddRequest<'a> {
@@ -255,6 +256,7 @@ pub struct Engine {
     hybrid_low_watermark_frames: usize,
     hybrid_realtime_frames: usize,
     hybrid_playback_frames: usize,
+    hybrid_enabled: bool,
     refill_budget_per_pass: usize,
     realtime_fallback_enabled: bool,
     realtime_fallback_budget_per_pass: usize,
@@ -1005,6 +1007,7 @@ impl Engine {
             hybrid_low_watermark_frames: 0,
             hybrid_realtime_frames: 0,
             hybrid_playback_frames: 0,
+            hybrid_enabled: false,
             refill_budget_per_pass: 2,
             realtime_fallback_enabled: true,
             realtime_fallback_budget_per_pass: 1,
@@ -1223,6 +1226,7 @@ impl Engine {
                 self.hybrid_playback_frames = request.period_frames.max(1);
                 self.hybrid_realtime_frames = request.realtime_frames.max(1);
                 self.hybrid_low_watermark_frames = request.low_watermark_frames.max(1);
+                self.hybrid_enabled = request.hybrid_enabled;
                 let midi_inputs = runtime.midi_input_devices();
                 let midi_outputs = runtime.midi_output_devices();
                 let rate = runtime.sample_rate;
@@ -1253,11 +1257,13 @@ impl Engine {
                     low_watermark_frames: request.low_watermark_frames,
                     nperiods: request.nperiods,
                     sync_mode: request.sync_mode,
+                    hybrid_enabled: request.hybrid_enabled,
                 }))
                 .await;
                 self.awaiting_hwfinished = true;
             }
             Err(e) => {
+                error!("Failed to open JACK runtime: {e}");
                 self.notify_clients(Err(e)).await;
             }
         }
@@ -2445,7 +2451,7 @@ impl Engine {
             for track in tracks.values() {
                 let t = track.lock();
                 let was_enabled = t.output_enabled;
-                let in_soloed_folder = self.is_track_in_soloed_folder(&t, tracks);
+                let in_soloed_folder = self.is_track_in_soloed_folder(t, tracks);
                 let folder_with_soloed_child =
                     t.is_folder && self.folder_has_soloed_descendant(&t.name, tracks);
                 let enabled = if t.is_master {
@@ -3699,7 +3705,8 @@ impl Engine {
                         continue;
                     }
                     let needs_refill_event = t.hybrid_needs_refill();
-                    if !t.is_realtime_domain()
+                    if self.hybrid_enabled
+                        && !t.is_realtime_domain()
                         && !needs_refill_event
                         && t.try_consume_hybrid_playback_cycle()
                     {
@@ -3741,7 +3748,11 @@ impl Engine {
                     WorkerClass::Refill
                 }
             };
-            let worker_index = if let Some(index) = self.take_ready_worker_index(worker_class) {
+            let worker_index = if !self.hybrid_enabled {
+                // When hybrid buffering is disabled, any track can use any worker.
+                self.take_ready_worker_index(WorkerClass::Realtime)
+                    .or_else(|| self.take_ready_worker_index(WorkerClass::Refill))
+            } else if let Some(index) = self.take_ready_worker_index(worker_class) {
                 Some(index)
             } else if matches!(worker_class, WorkerClass::Realtime)
                 && self.realtime_fallback_enabled
@@ -3766,7 +3777,7 @@ impl Engine {
             if t.audio.finished || t.audio.processing || !t.audio.ready() {
                 continue;
             }
-            if matches!(worker_class, WorkerClass::Refill) {
+            if self.hybrid_enabled && matches!(worker_class, WorkerClass::Refill) {
                 // Consume wakeup only when we are actually dispatching refill work.
                 let _ = t.hybrid_take_refill_wakeup();
             }
@@ -3787,22 +3798,24 @@ impl Engine {
             t.set_transport_sample(self.transport_sample);
             t.set_loop_config(self.loop_enabled, self.loop_range_samples);
             t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
-            let low_watermark = if self.hybrid_low_watermark_frames > 0 {
-                self.hybrid_low_watermark_frames
-            } else {
-                self.current_cycle_samples().saturating_mul(4).max(1)
-            };
-            let realtime_frames = if self.hybrid_realtime_frames > 0 {
-                self.hybrid_realtime_frames
-            } else {
-                self.current_cycle_samples().max(1)
-            };
-            let playback_frames = if self.hybrid_playback_frames > 0 {
-                self.hybrid_playback_frames
-            } else {
-                self.current_cycle_samples().max(1)
-            };
-            t.configure_hybrid_timing(realtime_frames, low_watermark, playback_frames);
+            if self.hybrid_enabled {
+                let low_watermark = if self.hybrid_low_watermark_frames > 0 {
+                    self.hybrid_low_watermark_frames
+                } else {
+                    self.current_cycle_samples().saturating_mul(4).max(1)
+                };
+                let realtime_frames = if self.hybrid_realtime_frames > 0 {
+                    self.hybrid_realtime_frames
+                } else {
+                    self.current_cycle_samples().max(1)
+                };
+                let playback_frames = if self.hybrid_playback_frames > 0 {
+                    self.hybrid_playback_frames
+                } else {
+                    self.current_cycle_samples().max(1)
+                };
+                t.configure_hybrid_timing(realtime_frames, low_watermark, playback_frames);
+            }
             t.process_epoch = self.track_process_epoch;
 
             t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
@@ -4580,17 +4593,13 @@ impl Engine {
                         )))),
                     );
                     if let Some(track) = tracks.get(name) {
-                        track.lock().ensure_default_audio_passthrough();
-                        track.lock().ensure_default_midi_passthrough();
-                        track
-                            .lock()
-                            .set_clip_playback_enabled(self.clip_playback_enabled);
-                        track.lock().set_transport_timing(
-                            self.tempo_bpm,
-                            self.tsig_num,
-                            self.tsig_denom,
-                        );
-                        track.lock().set_session_base_dir(self.session_dir.clone());
+                        let t = track.lock();
+                        t.ensure_default_audio_passthrough();
+                        t.ensure_default_midi_passthrough();
+                        t.set_clip_playback_enabled(self.clip_playback_enabled);
+                        t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
+                        t.set_session_base_dir(self.session_dir.clone());
+                        t.set_hybrid_enabled(self.hybrid_enabled);
                     }
                 } else {
                     self.notify_clients(Err(
@@ -4739,7 +4748,7 @@ impl Engine {
                     for child_name in children {
                         if let Some(child) = self.state.lock().tracks.get(&child_name).cloned() {
                             let removed = removed_track.lock();
-                            child.lock().disconnect_outputs_from_parent(&removed);
+                            child.lock().disconnect_outputs_from_parent(removed);
                             child.lock().parent_track = None;
                         }
                     }
@@ -5100,18 +5109,19 @@ impl Engine {
                     let t = track.lock();
                     t.parent_track.clone()
                 };
-                if let Some(ref old) = old_parent {
-                    if let Some(old_track_arc) = self.state.lock().tracks.get(old).cloned() {
-                        let old_track = old_track_arc.lock();
-                        track.lock().disconnect_outputs_from_parent(&old_track);
-                    }
+                if let Some(ref old) = old_parent
+                    && let Some(old_track_arc) = self.state.lock().tracks.get(old).cloned()
+                {
+                    let old_track = old_track_arc.lock();
+                    track.lock().disconnect_outputs_from_parent(old_track);
                 }
                 // Connect to new parent
-                if let Some(new_parent) = parent_name {
-                    if let Some(parent_track_arc) = self.state.lock().tracks.get(new_parent).cloned() {
-                        let parent_track = parent_track_arc.lock();
-                        track.lock().connect_outputs_to_parent(&parent_track);
-                    }
+                if let Some(new_parent) = parent_name
+                    && let Some(parent_track_arc) =
+                        self.state.lock().tracks.get(new_parent).cloned()
+                {
+                    let parent_track = parent_track_arc.lock();
+                    track.lock().connect_outputs_to_parent(parent_track);
                 }
                 track.lock().parent_track = parent_name.clone();
                 self.notify_clients(Ok(Action::TrackSetParent {
@@ -5120,9 +5130,7 @@ impl Engine {
                 }))
                 .await;
             }
-            Action::TrackToggleFolder {
-                ref track_name,
-            } => {
+            Action::TrackToggleFolder { ref track_name } => {
                 let track = match self.track_handle_or_err(track_name) {
                     Ok(track) => track,
                     Err(e) => {
@@ -6907,6 +6915,7 @@ impl Engine {
                 low_watermark_frames,
                 nperiods,
                 sync_mode,
+                hybrid_enabled,
             } => {
                 #[cfg(unix)]
                 {
@@ -6921,6 +6930,7 @@ impl Engine {
                         low_watermark_frames,
                         nperiods,
                         sync_mode,
+                        hybrid_enabled,
                     };
                     if self.maybe_open_jack_runtime(request).await.is_some() {
                         return;
@@ -6931,6 +6941,7 @@ impl Engine {
                 self.hybrid_playback_frames = period_frames.max(1);
                 self.hybrid_realtime_frames = realtime_frames.max(1);
                 self.hybrid_low_watermark_frames = low_watermark_frames.max(1);
+                self.hybrid_enabled = hybrid_enabled;
                 let open_result = self
                     .open_non_jack_audio_device(
                         device,
@@ -6943,8 +6954,15 @@ impl Engine {
                 match open_result {
                     Ok(()) => {}
                     Err(e) => {
+                        error!("Failed to open audio device: {e}");
                         self.notify_clients(Err(e)).await;
                         return;
+                    }
+                }
+                {
+                    let state = self.state.lock();
+                    for track in state.tracks.values() {
+                        track.lock().set_hybrid_enabled(hybrid_enabled);
                     }
                 }
                 self.finalize_open_audio_device().await;

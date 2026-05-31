@@ -58,7 +58,10 @@ impl HwDriver {
             true,
             options,
             playing.clone(),
-        )?;
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!("Failed to open OSS input '{capture_path}': {e}"))
+        })?;
         let playback = Audio::new(
             playback_path,
             &sync_key,
@@ -67,7 +70,10 @@ impl HwDriver {
             false,
             options,
             playing.clone(),
-        )?;
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!("Failed to open OSS output '{playback_path}': {e}"))
+        })?;
         let mut driver = Self {
             capture,
             playback,
