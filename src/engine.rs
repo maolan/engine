@@ -6936,8 +6936,12 @@ impl Engine {
                         return;
                     }
                 }
-                let hw_opts =
-                    Self::build_hw_options(exclusive, realtime_frames, nperiods, sync_mode);
+                let hw_period = if hybrid_enabled {
+                    realtime_frames
+                } else {
+                    period_frames
+                };
+                let hw_opts = Self::build_hw_options(exclusive, hw_period, nperiods, sync_mode);
                 self.hybrid_playback_frames = period_frames.max(1);
                 self.hybrid_realtime_frames = realtime_frames.max(1);
                 self.hybrid_low_watermark_frames = low_watermark_frames.max(1);

@@ -391,12 +391,11 @@ impl ClipPluginRuntime {
                 }
                 let is_plugin = matches!(
                     conn.from_node,
-                    PluginGraphNode::ClapPluginInstance(_)
-                        | PluginGraphNode::Vst3PluginInstance(_)
+                    PluginGraphNode::ClapPluginInstance(_) | PluginGraphNode::Vst3PluginInstance(_)
                 );
                 #[cfg(all(unix, not(target_os = "macos")))]
-                let is_plugin = is_plugin
-                    || matches!(conn.from_node, PluginGraphNode::Lv2PluginInstance(_));
+                let is_plugin =
+                    is_plugin || matches!(conn.from_node, PluginGraphNode::Lv2PluginInstance(_));
                 is_plugin
             })
             .all(|conn| processed.contains(&conn.from_node))
@@ -1611,13 +1610,13 @@ impl Track {
         match kind {
             "track_input" => Some(PluginGraphNode::TrackInput),
             "track_output" => Some(PluginGraphNode::TrackOutput),
-#[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(all(unix, not(target_os = "macos")))]
             "plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
                 .and_then(|node| {
                     matches!(node, PluginGraphNode::Lv2PluginInstance(_)).then(|| node.clone())
                 }),
-#[cfg(not(all(unix, not(target_os = "macos"))))]
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
             "plugin" => None,
             "vst3_plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
@@ -4776,12 +4775,11 @@ impl Track {
                 }
                 let is_plugin = matches!(
                     conn.from_node,
-                    PluginGraphNode::ClapPluginInstance(_)
-                        | PluginGraphNode::Vst3PluginInstance(_)
+                    PluginGraphNode::ClapPluginInstance(_) | PluginGraphNode::Vst3PluginInstance(_)
                 );
                 #[cfg(all(unix, not(target_os = "macos")))]
-                let is_plugin = is_plugin
-                    || matches!(conn.from_node, PluginGraphNode::Lv2PluginInstance(_));
+                let is_plugin =
+                    is_plugin || matches!(conn.from_node, PluginGraphNode::Lv2PluginInstance(_));
                 is_plugin
             })
             .all(|conn| processed.contains(&conn.from_node))

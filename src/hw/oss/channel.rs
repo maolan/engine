@@ -186,18 +186,17 @@ impl<'a> DuplexChannelApi<'a> {
     }
 
     fn sleep(&self) -> std::io::Result<()> {
-        // Buffer-period-aligned sleep. Wakes once per realtime fragment
-        // instead of the adaptive stepping fast-poll. Revert once kqueue
-        // sound support is available.
-        let now = self
+        let wake = self
             .capture
-            .frame_clock
-            .now()
-            .or_else(|| self.playback.frame_clock.now())
-            .unwrap_or(0);
-        let period = self.capture.chsamples as i64;
-        let next_boundary = ((now / period) + 1) * period;
-        if !self.capture.frame_clock.sleep_until_frame(next_boundary) {
+            .channel
+            .wakeup_time(self.capture, self.capture.frame_stamp)
+            .min(
+                self.playback
+                    .channel
+                    .wakeup_time(self.playback, self.playback.frame_stamp),
+            );
+        let now = self.capture.frame_stamp.max(self.playback.frame_stamp);
+        if wake > now && !self.capture.frame_clock.sleep_until_frame(wake) {
             return Err(std::io::Error::other("duplex sleep failed"));
         }
         Ok(())
