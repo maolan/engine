@@ -27,6 +27,8 @@ pub struct ClapProcessor {
     audio_outputs: Vec<Arc<AudioIO>>,
     main_audio_inputs: usize,
     main_audio_outputs: usize,
+    midi_inputs: usize,
+    midi_outputs: usize,
     param_infos: Vec<ClapParameterInfo>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
@@ -52,13 +54,6 @@ impl ClapProcessor {
         host_binary: PathBuf,
     ) -> Result<Self, String> {
         let (plugin_path, plugin_id) = split_plugin_spec(plugin_spec);
-
-        let audio_inputs = (0..input_count.max(1))
-            .map(|_| Arc::new(AudioIO::new(buffer_size)))
-            .collect::<Vec<_>>();
-        let audio_outputs = (0..output_count.max(1))
-            .map(|_| Arc::new(AudioIO::new(buffer_size)))
-            .collect::<Vec<_>>();
 
         // Spawn the host immediately so we can query params.
         let instance_id = ipc::unique_instance_id("clap");
@@ -95,6 +90,41 @@ impl ClapProcessor {
             name.unwrap_or_else(|| plugin_id.to_string())
         };
 
+        // Read port counts written by the host (with fallback to constructor params).
+        let (actual_audio_in, actual_audio_out, actual_midi_in, actual_midi_out) = unsafe {
+            let mut counts = None;
+            for _ in 0..50 {
+                counts = maolan_plugin_protocol::protocol::read_port_counts_from_scratch(
+                    mapping.as_ptr(),
+                );
+                if counts.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let result = counts.map_or_else(
+                || (input_count as u32, output_count as u32, 0, 0),
+                |(a_in, a_out, m_in, m_out)| (a_in, a_out, m_in, m_out),
+            );
+            tracing::info!(
+                plugin = %plugin_spec,
+                audio_in = result.0,
+                audio_out = result.1,
+                midi_in = result.2,
+                midi_out = result.3,
+                from_host = counts.is_some(),
+                "CLAP processor port counts"
+            );
+            result
+        };
+
+        let audio_inputs = (0..actual_audio_in as usize)
+            .map(|_| Arc::new(AudioIO::new(buffer_size)))
+            .collect::<Vec<_>>();
+        let audio_outputs = (0..actual_audio_out as usize)
+            .map(|_| Arc::new(AudioIO::new(buffer_size)))
+            .collect::<Vec<_>>();
+
         // Query parameter count from host via a simple param ring echo.
         // For now, we use a minimal stub param list.
         let param_infos = Vec::new();
@@ -105,8 +135,10 @@ impl ClapProcessor {
             name,
             audio_inputs,
             audio_outputs,
-            main_audio_inputs: input_count.max(1),
-            main_audio_outputs: output_count.max(1),
+            main_audio_inputs: actual_audio_in as usize,
+            main_audio_outputs: actual_audio_out as usize,
+            midi_inputs: actual_midi_in as usize,
+            midi_outputs: actual_midi_out as usize,
             param_infos,
             param_values: UnsafeMutex::new(HashMap::new()),
             bypassed: Arc::new(AtomicBool::new(false)),
@@ -145,11 +177,11 @@ impl ClapProcessor {
     }
 
     pub fn midi_input_count(&self) -> usize {
-        0 // Stub: MIDI not yet wired over IPC
+        self.midi_inputs
     }
 
     pub fn midi_output_count(&self) -> usize {
-        0
+        self.midi_outputs
     }
 
     pub fn set_bypassed(&self, bypassed: bool) {
