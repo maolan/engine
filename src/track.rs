@@ -2200,6 +2200,9 @@ impl Track {
             }
             return;
         }
+        if input_events.is_empty() {
+            return;
+        }
         let input_lane = clip.input_channel.min(input_events.len().saturating_sub(1));
         let clip_end = clip_start.saturating_add(clip_len);
         let Some(events) = self.midi_clip_cache.get(&clip.name) else {

@@ -256,8 +256,8 @@ impl ClapProcessor {
     pub fn process_with_midi(
         &self,
         frames: usize,
-        _midi_in: &[MidiEvent],
-        _transport: ClapTransportInfo,
+        midi_in: &[MidiEvent],
+        transport: ClapTransportInfo,
     ) -> Vec<ClapMidiOutputEvent> {
         if self.bypassed.load(Ordering::Relaxed) {
             ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
@@ -298,6 +298,35 @@ impl ClapProcessor {
                 self.audio_outputs.len(),
             );
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
+
+            // Write transport state.
+            let t = transport_mut(ptr);
+            t.playhead_sample = transport.transport_sample as u64;
+            t.tempo = transport.bpm;
+            t.numerator = transport.tsig_num as u32;
+            t.denominator = transport.tsig_denom as u32;
+            t.flags = if transport.playing { 1 } else { 0 };
+
+            // Write MIDI input events to the shared-memory ring buffer.
+            let midi_buf = midi_ring_ptr(ptr);
+            let (midi_w, midi_r) = midi_indices(ptr);
+            let midi_ring = RingBuffer::new(midi_buf, midi_w, midi_r, RING_CAPACITY);
+            if !midi_in.is_empty() {
+                eprintln!("[CLAP-PROC] {} forwarding {} MIDI events to host", self.name, midi_in.len());
+            }
+            for ev in midi_in {
+                let midi_event = maolan_plugin_protocol::protocol::MidiEvent {
+                    sample_offset: ev.frame,
+                    data: [ev.data.get(0).copied().unwrap_or(0), ev.data.get(1).copied().unwrap_or(0), ev.data.get(2).copied().unwrap_or(0)],
+                    channel: ev.data.get(0).map(|b| b & 0x0F).unwrap_or(0),
+                    flags: 0,
+                    _pad: 0,
+                };
+                if !midi_ring.push(midi_event) {
+                    tracing::warn!("MIDI input ring full for '{}' ({}), dropping event", self.name, self.path);
+                    break;
+                }
+            }
         }
 
         if let Err(e) = events.signal_host() {
@@ -321,6 +350,20 @@ impl ClapProcessor {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
         }
 
+        // Read MIDI output events from the plugin host.
+        let mut midi_out = Vec::new();
+        unsafe {
+            let midi_out_buf = midi_out_ring_ptr(ptr);
+            let (midi_out_w, midi_out_r) = midi_out_indices(ptr);
+            let midi_out_ring = RingBuffer::new(midi_out_buf, midi_out_w, midi_out_r, RING_CAPACITY);
+            while let Some(ev) = midi_out_ring.pop() {
+                midi_out.push(ClapMidiOutputEvent {
+                    port: 0,
+                    event: crate::midi::io::MidiEvent::new(ev.sample_offset, ev.data.to_vec()),
+                });
+            }
+        }
+
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(20) {
             tracing::warn!(
@@ -333,7 +376,7 @@ impl ClapProcessor {
         }
 
         *self.last_process_time.lock() = Instant::now();
-        Vec::new()
+        midi_out
     }
 
     pub fn path(&self) -> &str {
