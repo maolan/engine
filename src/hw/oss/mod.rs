@@ -193,6 +193,11 @@ impl Audio {
 
         let dsp = binding.open(path)?;
 
+        let cooked = 0_i32;
+        unsafe {
+            let _ = oss_set_cooked(dsp.as_raw_fd(), &cooked);
+        }
+
         let mut audio_info = AudioInfo::new();
         unsafe {
             oss_get_info(dsp.as_raw_fd(), &mut audio_info)
@@ -204,13 +209,8 @@ impl Audio {
             2_i32
         };
         let mut effective_rate = rate;
-        let cooked = 0_i32;
         let format = Self::negotiate_sample_format(dsp.as_raw_fd(), bits)?;
         unsafe {
-            if options.exclusive {
-                oss_set_cooked(dsp.as_raw_fd(), &cooked)
-                    .map_err(|_| std::io::Error::last_os_error())?;
-            }
             oss_set_channels(dsp.as_raw_fd(), &mut channels)
                 .map_err(|_| std::io::Error::last_os_error())?;
             oss_set_speed(dsp.as_raw_fd(), &mut effective_rate)
@@ -450,6 +450,14 @@ impl Audio {
             || !(info.ptr as usize).is_multiple_of(self.frame_size())
         {
             return None;
+        }
+        if info.bytes >= 0 {
+            let bytes = info.bytes as usize;
+            if bytes >= self.map_progress_bytes {
+                let delta = bytes - self.map_progress_bytes;
+                self.map_progress_bytes = bytes;
+                return Some(delta);
+            }
         }
         let buf_bytes = self.buffer_info.bytes as usize;
         let frag_bytes = self.buffer_info.fragsize as usize;

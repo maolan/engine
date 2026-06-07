@@ -239,14 +239,88 @@ impl ClapProcessor {
     }
 
     pub fn snapshot_state(&self) -> Result<crate::plugins::types::ClapPluginState, String> {
-        Err("state snapshot not yet implemented".to_string())
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("CLAP processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+
+        header.request_type.store(1, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for state save: {e}"));
+        }
+
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to state save: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        let size = header.scratch_size.load(Ordering::Acquire) as usize;
+        if status != 1 {
+            header.request_type.store(0, Ordering::Release);
+            return Err("State save failed in host".to_string());
+        }
+        if size > SCRATCH_SIZE {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host returned invalid CLAP state size: {size}"));
+        }
+
+        let scratch = unsafe { scratch_ptr(ptr) };
+        let mut bytes = vec![0u8; size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(scratch, bytes.as_mut_ptr(), size);
+        }
+        header.request_type.store(0, Ordering::Release);
+        Ok(crate::plugins::types::ClapPluginState { bytes })
     }
 
     pub fn restore_state(
         &self,
-        _state: &crate::plugins::types::ClapPluginState,
+        state: &crate::plugins::types::ClapPluginState,
     ) -> Result<(), String> {
-        Err("state restore not yet implemented".to_string())
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("CLAP processor not initialized".to_string()),
+        };
+        if state.bytes.len() > SCRATCH_SIZE {
+            return Err(format!(
+                "CLAP state is too large for scratch buffer: {} bytes",
+                state.bytes.len()
+            ));
+        }
+
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+        let scratch = unsafe { scratch_ptr(ptr) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(state.bytes.as_ptr(), scratch, state.bytes.len());
+        }
+        header
+            .scratch_size
+            .store(state.bytes.len() as u32, Ordering::Release);
+
+        header.request_type.store(2, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for state restore: {e}"));
+        }
+
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to state restore: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        header.request_type.store(0, Ordering::Release);
+        if status != 1 {
+            return Err("State restore failed in host".to_string());
+        }
+        Ok(())
     }
 
     pub fn process_with_audio_io(&self, frames: usize) {
@@ -312,18 +386,30 @@ impl ClapProcessor {
             let (midi_w, midi_r) = midi_indices(ptr);
             let midi_ring = RingBuffer::new(midi_buf, midi_w, midi_r, RING_CAPACITY);
             if !midi_in.is_empty() {
-                eprintln!("[CLAP-PROC] {} forwarding {} MIDI events to host", self.name, midi_in.len());
+                eprintln!(
+                    "[CLAP-PROC] {} forwarding {} MIDI events to host",
+                    self.name,
+                    midi_in.len()
+                );
             }
             for ev in midi_in {
                 let midi_event = maolan_plugin_protocol::protocol::MidiEvent {
                     sample_offset: ev.frame,
-                    data: [ev.data.get(0).copied().unwrap_or(0), ev.data.get(1).copied().unwrap_or(0), ev.data.get(2).copied().unwrap_or(0)],
+                    data: [
+                        ev.data.get(0).copied().unwrap_or(0),
+                        ev.data.get(1).copied().unwrap_or(0),
+                        ev.data.get(2).copied().unwrap_or(0),
+                    ],
                     channel: ev.data.get(0).map(|b| b & 0x0F).unwrap_or(0),
                     flags: 0,
                     _pad: 0,
                 };
                 if !midi_ring.push(midi_event) {
-                    tracing::warn!("MIDI input ring full for '{}' ({}), dropping event", self.name, self.path);
+                    tracing::warn!(
+                        "MIDI input ring full for '{}' ({}), dropping event",
+                        self.name,
+                        self.path
+                    );
                     break;
                 }
             }
@@ -355,7 +441,8 @@ impl ClapProcessor {
         unsafe {
             let midi_out_buf = midi_out_ring_ptr(ptr);
             let (midi_out_w, midi_out_r) = midi_out_indices(ptr);
-            let midi_out_ring = RingBuffer::new(midi_out_buf, midi_out_w, midi_out_r, RING_CAPACITY);
+            let midi_out_ring =
+                RingBuffer::new(midi_out_buf, midi_out_w, midi_out_r, RING_CAPACITY);
             while let Some(ev) = midi_out_ring.pop() {
                 midi_out.push(ClapMidiOutputEvent {
                     port: 0,

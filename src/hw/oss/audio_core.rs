@@ -131,7 +131,6 @@ impl DoubleBufferedChannel {
 
     pub(super) fn new_read(buffer_bytes: usize, frames: i64) -> Self {
         let mut s = Self::new_empty_read();
-        s.set_buffer(Buffer::with_size(buffer_bytes), 0);
         s.set_buffer(Buffer::with_size(buffer_bytes), frames);
         s
     }
@@ -217,7 +216,8 @@ impl DoubleBufferedChannel {
                     let loss = read.st.mark_loss(available - audio.buffer_frames());
                     read.st.mark_progress(progress, now, audio.stepping());
                     if loss > 0 {
-                        read.read_position = read.st.last_progress - audio.buffer_frames();
+                        read.read_position =
+                            (read.map_progress - audio.buffer_frames()).max(0);
                     }
                 }
             } else {
@@ -237,35 +237,36 @@ impl DoubleBufferedChannel {
             }
         }
 
-        let position = rec.end_frames - (rec.buffer.remaining() / audio.frame_size()) as i64;
-        if position < read.read_position {
-            let skip_frames = (read.read_position - position) as usize;
-            let skip = rec.buffer.advance(skip_frames * audio.frame_size());
-            if skip > 0 {
-                rec.buffer.position().fill(0);
+        if !audio.mapped {
+            let position = rec.end_frames - (rec.buffer.remaining() / audio.frame_size()) as i64;
+            if position < read.read_position {
+                let skip_frames = (read.read_position - position) as usize;
+                let skip = rec.buffer.advance(skip_frames * audio.frame_size());
+                if skip > 0 {
+                    rec.buffer.position().fill(0);
+                }
+            } else if position > read.read_position {
+                let rewind_frames = (position - read.read_position) as usize;
+                rec.buffer.rewind(rewind_frames * audio.frame_size());
             }
-        } else if position > read.read_position {
-            let rewind_frames = (position - read.read_position) as usize;
-            rec.buffer.rewind(rewind_frames * audio.frame_size());
         }
 
         if audio.mapped {
-            let cur_position =
-                rec.end_frames - (rec.buffer.remaining() / audio.frame_size()) as i64;
-            let mut oldest = read.st.last_progress - audio.buffer_frames();
-            if read.map_progress < audio.buffer_frames() {
-                oldest = read.st.last_progress - read.map_progress;
+            if read.read_position < 0 {
+                read.read_position = 0;
             }
-            if cur_position >= oldest && cur_position < read.st.last_progress && !rec.buffer.done()
-            {
-                let offset = (read.st.last_progress - cur_position) as usize;
-                let mut len = rec.buffer.remaining().min(offset * audio.frame_size());
-                let pointer = (read.map_progress as usize).saturating_sub(offset)
-                    % (audio.buffer_frames() as usize);
-                len = audio.read_map(rec.buffer.position(), pointer * audio.frame_size(), len);
+            let available_frames = read.map_progress - read.read_position;
+            if available_frames > 0 && !rec.buffer.done() {
+                let pointer =
+                    (read.read_position as usize % audio.buffer_frames() as usize)
+                        * audio.frame_size();
+                let len = rec
+                    .buffer
+                    .remaining()
+                    .min((available_frames as usize) * audio.frame_size());
+                let len = audio.read_map(rec.buffer.position(), pointer, len);
                 rec.buffer.advance(len);
-                read.read_position =
-                    rec.end_frames - (rec.buffer.remaining() / audio.frame_size()) as i64;
+                read.read_position += (len / audio.frame_size()) as i64;
             }
         } else if audio.queued_samples() > 0 && !rec.buffer.done() {
             let mut bytes_read = 0_usize;
@@ -275,7 +276,11 @@ impl DoubleBufferedChannel {
             rec.buffer.advance(bytes_read);
         }
 
-        if read.st.freewheel() && now >= rec.end_frames + read.st.balance && !rec.buffer.done() {
+        if !audio.mapped
+            && read.st.freewheel()
+            && now >= rec.end_frames + read.st.balance
+            && !rec.buffer.done()
+        {
             rec.buffer.position().fill(0);
             let advanced = rec.buffer.advance(rec.buffer.remaining());
             read.read_position += (advanced / audio.frame_size()) as i64;
@@ -350,11 +355,12 @@ impl DoubleBufferedChannel {
                 && pos >= write.st.last_progress
                 && pos < write.st.last_progress + audio.buffer_frames()
             {
-                let offset = (pos - write.st.last_progress) as usize;
                 let pointer =
-                    ((write.map_progress as usize) + offset) % audio.buffer_frames() as usize;
-                let mut len =
-                    ((audio.buffer_frames() as usize).saturating_sub(offset)) * audio.frame_size();
+                    (pos as usize) % audio.buffer_frames() as usize;
+                let ring_remaining =
+                    ((write.st.last_progress + audio.buffer_frames() - pos) as usize)
+                        .min(audio.buffer_frames() as usize);
+                let mut len = ring_remaining * audio.frame_size();
                 len = len.min(rec.buffer.remaining());
                 let written = audio.write_map(
                     Some(rec.buffer.position()),

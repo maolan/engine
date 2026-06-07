@@ -4514,15 +4514,17 @@ impl Engine {
                 self.ready_refill_workers.clear();
                 while !self.workers.is_empty() {
                     let worker = self.workers.remove(0);
-                    worker
+                    if let Err(e) = worker
                         .tx
                         .send(Message::Request(a.clone()))
                         .await
-                        .expect("Failed sending quit message to worker");
+                    {
+                        error!("Error sending quit message to worker: {e}");
+                    }
                     worker
                         .handle
                         .await
-                        .expect("Failed waiting for worker to quit");
+                        .unwrap_or_else(|e| error!("Error waiting for worker to quit: {e}"));
                 }
 
                 if let Some(worker) = self.hw_worker.take() {
@@ -4536,15 +4538,17 @@ impl Engine {
                             .lock()
                             .write_events_blocking(&panic_events, Duration::from_millis(250));
                     }
-                    worker
+                    if let Err(e) = worker
                         .tx
                         .send(Message::Request(a.clone()))
                         .await
-                        .expect("Failed sending quit message to HW worker");
+                    {
+                        error!("Error sending quit message to HW worker: {e}");
+                    }
                     worker
                         .handle
                         .await
-                        .expect("Failed waiting for HW worker to quit");
+                        .unwrap_or_else(|e| error!("Error waiting for HW worker to quit: {e}"));
                 }
                 #[cfg(unix)]
                 {

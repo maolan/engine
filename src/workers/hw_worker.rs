@@ -303,6 +303,14 @@ impl<B: Backend> HwWorker<B> {
                         }
                         if let Err(e) = Self::run_assist_cycle(&assist_state) {
                             error!("{} assist cycle error: {}", B::LABEL, e);
+                            let _ = self
+                                .tx
+                                .send(Message::Response(Err(format!(
+                                    "{} assist cycle error: {}",
+                                    B::LABEL,
+                                    e
+                                ))))
+                                .await;
                         }
                         if let Err(e) = self.tx.send(Message::HWFinished).await {
                             error!(

@@ -2220,17 +2220,85 @@ impl Track {
                 if *source_sample < source_from {
                     continue;
                 }
-                if *source_sample >= source_to {
+                let at_clip_end = *source_sample == clip.offset.saturating_add(clip_len);
+                let boundary_note_off =
+                    at_clip_end && *source_sample == source_to && Self::is_midi_note_off(data);
+                if *source_sample >= source_to && !boundary_note_off {
                     break;
                 }
                 let absolute_sample =
                     clip_start.saturating_add(source_sample.saturating_sub(clip.offset));
-                let frame_idx = out_offset.saturating_add(absolute_sample - *segment_start);
+                let mut frame_idx = out_offset.saturating_add(absolute_sample - *segment_start);
+                if boundary_note_off {
+                    frame_idx = frame_idx.min(frames.saturating_sub(1));
+                }
                 if frame_idx < frames {
                     input_events[input_lane].push(MidiEvent::new(frame_idx as u32, data.clone()));
                 }
             }
+            if to == clip_end {
+                let frame_idx = out_offset
+                    .saturating_add(clip_end.saturating_sub(*segment_start))
+                    .min(frames.saturating_sub(1));
+                for data in Self::synthetic_note_offs_at_clip_end(events, clip.offset, clip_len) {
+                    input_events[input_lane].push(MidiEvent::new(frame_idx as u32, data));
+                }
+            }
         }
+    }
+
+    fn is_midi_note_off(data: &[u8]) -> bool {
+        let Some(status) = data.first().copied() else {
+            return false;
+        };
+        match status & 0xF0 {
+            0x80 => true,
+            0x90 => data.get(2).copied().unwrap_or(0) == 0,
+            _ => false,
+        }
+    }
+
+    fn synthetic_note_offs_at_clip_end(
+        events: &[(usize, Vec<u8>)],
+        clip_offset: usize,
+        clip_len: usize,
+    ) -> Vec<Vec<u8>> {
+        let clip_end = clip_offset.saturating_add(clip_len);
+        let mut active = std::collections::BTreeSet::<(u8, u8)>::new();
+
+        for (sample, data) in events {
+            if *sample < clip_offset {
+                continue;
+            }
+            if *sample > clip_end {
+                break;
+            }
+            let Some(status) = data.first().copied() else {
+                continue;
+            };
+            let channel = status & 0x0F;
+            let Some(note) = data.get(1).copied() else {
+                continue;
+            };
+            match status & 0xF0 {
+                0x80 => {
+                    active.remove(&(channel, note));
+                }
+                0x90 => {
+                    if data.get(2).copied().unwrap_or(0) == 0 {
+                        active.remove(&(channel, note));
+                    } else {
+                        active.insert((channel, note));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        active
+            .into_iter()
+            .map(|(channel, note)| vec![0x80 | channel.min(15), note.min(127), 64])
+            .collect()
     }
 
     fn ensure_clip_plugin_runtime(
@@ -5354,6 +5422,154 @@ mod tests {
         assert_eq!(
             track.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
+        );
+    }
+
+    #[test]
+    fn midi_clip_emits_note_off_at_exact_clip_end() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.disk_monitor = true;
+        track.clip_playback_enabled = true;
+        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            8,
+        ));
+        track.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (8, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(
+            track.pending_hw_midi_out_events[0].event,
+            crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
+        );
+        assert_eq!(
+            track.pending_hw_midi_out_events[1].event,
+            crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
+        );
+    }
+
+    #[test]
+    fn midi_clip_emits_note_off_at_exact_loop_end() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.disk_monitor = true;
+        track.clip_playback_enabled = true;
+        track.loop_enabled = true;
+        track.loop_range_samples = Some((0, 8));
+        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            8,
+        ));
+        track.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (8, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(
+            track.pending_hw_midi_out_events[0].event,
+            crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
+        );
+        assert_eq!(
+            track.pending_hw_midi_out_events[1].event,
+            crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
+        );
+    }
+
+    #[test]
+    fn midi_clip_orders_loop_boundary_note_off_before_next_note_on() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
+        track.disk_monitor = true;
+        track.clip_playback_enabled = true;
+        track.transport_sample = 6;
+        track.loop_enabled = true;
+        track.loop_range_samples = Some((0, 8));
+        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            8,
+        ));
+        track.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (8, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(
+            track.pending_hw_midi_out_events[0].event,
+            crate::midi::io::MidiEvent::new(2, vec![0x80, 60, 64])
+        );
+        assert_eq!(
+            track.pending_hw_midi_out_events[1].event,
+            crate::midi::io::MidiEvent::new(2, vec![0x90, 60, 100])
+        );
+    }
+
+    #[test]
+    fn midi_clip_sends_note_off_at_clip_end_when_source_note_ends_later() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.disk_monitor = true;
+        track.clip_playback_enabled = true;
+        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            8,
+        ));
+        track.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (12, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(
+            track.pending_hw_midi_out_events[0].event,
+            crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
+        );
+        assert_eq!(
+            track.pending_hw_midi_out_events[1].event,
+            crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
+        );
+    }
+
+    #[test]
+    fn midi_clip_orders_synthetic_loop_note_off_before_next_note_on() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
+        track.disk_monitor = true;
+        track.clip_playback_enabled = true;
+        track.transport_sample = 6;
+        track.loop_enabled = true;
+        track.loop_range_samples = Some((0, 8));
+        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            8,
+        ));
+        track.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (12, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(
+            track.pending_hw_midi_out_events[0].event,
+            crate::midi::io::MidiEvent::new(2, vec![0x80, 60, 64])
+        );
+        assert_eq!(
+            track.pending_hw_midi_out_events[1].event,
+            crate::midi::io::MidiEvent::new(2, vec![0x90, 60, 100])
         );
     }
 

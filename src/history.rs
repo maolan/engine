@@ -166,6 +166,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackLoadVst3Plugin { .. }
         | Action::TrackUnloadVst3PluginInstance { .. }
         | Action::TrackSetClapParameter { .. }
+        | Action::ClipSetClapParameter { .. }
         | Action::TrackSetVst3Parameter { .. }
         | Action::TrackSetPluginBypassed { .. }
         | Action::ModifyMidiNotes { .. }
@@ -787,6 +788,24 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let snapshot = track.clap_snapshot_state(*instance_id).ok()?;
             Some(Action::TrackClapRestoreState {
                 track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: snapshot,
+            })
+        }
+        Action::ClipSetClapParameter {
+            track_name,
+            clip_idx,
+            instance_id,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let (_, snapshot) = track
+                .clip_clap_snapshot_state(*clip_idx, *instance_id)
+                .ok()?;
+            Some(Action::ClipClapRestoreState {
+                track_name: track_name.clone(),
+                clip_idx: *clip_idx,
                 instance_id: *instance_id,
                 state: snapshot,
             })
