@@ -213,6 +213,10 @@ pub struct Engine {
     transport_panic_flush_pending: bool,
     transport_restart_pending: bool,
     transport_sample: usize,
+    /// Input (capture) latency in frames — used for record-back compensation.
+    hw_input_latency_frames: usize,
+    /// Output (playback) latency in frames — used for play-ahead compensation.
+    hw_output_latency_frames: usize,
     loop_enabled: bool,
     loop_range_samples: Option<(usize, usize)>,
     metronome_enabled: bool,
@@ -964,6 +968,8 @@ impl Engine {
             transport_panic_flush_pending: false,
             transport_restart_pending: false,
             transport_sample: 0,
+            hw_input_latency_frames: 0,
+            hw_output_latency_frames: 0,
             loop_enabled: false,
             loop_range_samples: None,
             metronome_enabled: false,
@@ -1438,6 +1444,15 @@ impl Engine {
 
     fn recording_segments_for_cycle(&self, frames: usize) -> Vec<(usize, usize, usize)> {
         let segments = self.cycle_segments(frames);
+        let comp = self.hw_input_latency_frames;
+        let segments: Vec<_> = if comp > 0 {
+            segments
+                .into_iter()
+                .map(|(start, end, offset)| (start.saturating_sub(comp), end.saturating_sub(comp), offset))
+                .collect()
+        } else {
+            segments
+        };
         if !self.punch_enabled {
             return segments;
         }
@@ -1560,6 +1575,8 @@ impl Engine {
                 out_lat
             );
         }
+        self.hw_input_latency_frames = in_lat.0;
+        self.hw_output_latency_frames = out_lat.0;
         #[cfg(unix)]
         {
             self.jack_runtime = None;
@@ -3795,7 +3812,10 @@ impl Engine {
                 self.realtime_fallback_dispatch_count =
                     self.realtime_fallback_dispatch_count.saturating_add(1);
             }
-            t.set_transport_sample(self.transport_sample);
+            t.set_transport_sample(
+                self.transport_sample
+                    .saturating_add(self.hw_output_latency_frames),
+            );
             t.set_loop_config(self.loop_enabled, self.loop_range_samples);
             t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
             if self.hybrid_enabled {
