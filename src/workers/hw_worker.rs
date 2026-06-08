@@ -21,6 +21,8 @@ pub trait Backend: Send + Sync + 'static {
     const WORKER_THREAD_NAME: &'static str;
     const ASSIST_THREAD_NAME: &'static str;
     const ASSIST_AUTONOMOUS_ENV: &'static str;
+    const ASSIST_AUTONOMOUS_DEFAULT: bool = false;
+    const CYCLE_ON_WORKER_WHEN_ASSIST_AUTONOMOUS: bool = false;
     const ASSIST_STEP_REQUIRES_REQUEST_CYCLE: bool = false;
 }
 
@@ -138,7 +140,7 @@ impl<B: Backend> HwWorker<B> {
     }
 
     fn assist_autonomous_enabled() -> bool {
-        config::env_flag(B::ASSIST_AUTONOMOUS_ENV)
+        B::ASSIST_AUTONOMOUS_DEFAULT || config::env_flag(B::ASSIST_AUTONOMOUS_ENV)
     }
 
     fn configure_rt_thread(name: &str, priority: i32) -> Result<(), String> {
@@ -301,7 +303,7 @@ impl<B: Backend> HwWorker<B> {
                                 self.pending_midi_out_events.clear();
                             }
                         }
-                        if let Err(e) = Self::run_assist_cycle(&assist_state) {
+                        if let Err(e) = Self::run_assist_cycle(&self.driver, &assist_state) {
                             error!("{} assist cycle error: {}", B::LABEL, e);
                             let _ = self
                                 .tx
@@ -510,7 +512,13 @@ impl<B: Backend> HwWorker<B> {
                         break;
                     }
                     let wait_started = Instant::now();
-                    let _guard = cvar.wait(st).expect("assist condvar failed");
+                    let _guard = if autonomous {
+                        cvar.wait_timeout(st, Duration::from_micros(100))
+                            .expect("assist condvar failed")
+                            .0
+                    } else {
+                        cvar.wait(st).expect("assist condvar failed")
+                    };
                     if let Some(p) = profiler.as_mut() {
                         p.wait_count += 1;
                         p.wait_time_ns += wait_started.elapsed().as_nanos();
@@ -520,7 +528,30 @@ impl<B: Backend> HwWorker<B> {
         })
     }
 
-    fn run_assist_cycle(assist_state: &Arc<(Mutex<AssistState>, Condvar)>) -> Result<(), String> {
+    fn run_assist_cycle(
+        driver: &Arc<UnsafeMutex<B::Driver>>,
+        assist_state: &Arc<(Mutex<AssistState>, Condvar)>,
+    ) -> Result<(), String> {
+        if Self::assist_autonomous_enabled() && B::CYCLE_ON_WORKER_WHEN_ASSIST_AUTONOMOUS {
+            let (lock, cvar) = &**assist_state;
+            {
+                let mut st = lock
+                    .lock()
+                    .map_err(|_| "assist mutex poisoned".to_string())?;
+                st.init_complete = true;
+                cvar.notify_one();
+            }
+            let result = driver.lock().run_cycle_for_worker();
+            {
+                let mut st = lock
+                    .lock()
+                    .map_err(|_| "assist mutex poisoned".to_string())?;
+                st.last_error = result.as_ref().err().map(|e| e.to_string());
+                cvar.notify_one();
+            }
+            return result;
+        }
+
         let (lock, cvar) = &**assist_state;
         let mut st = lock
             .lock()

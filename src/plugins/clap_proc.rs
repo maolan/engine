@@ -102,10 +102,7 @@ impl ClapProcessor {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            let result = counts.map_or_else(
-                || (input_count as u32, output_count as u32, 0, 0),
-                |(a_in, a_out, m_in, m_out)| (a_in, a_out, m_in, m_out),
-            );
+            let result = counts.unwrap_or((input_count as u32, output_count as u32, 0, 0));
             tracing::info!(
                 plugin = %plugin_spec,
                 audio_in = result.0,
@@ -396,11 +393,11 @@ impl ClapProcessor {
                 let midi_event = maolan_plugin_protocol::protocol::MidiEvent {
                     sample_offset: ev.frame,
                     data: [
-                        ev.data.get(0).copied().unwrap_or(0),
+                        ev.data.first().copied().unwrap_or(0),
                         ev.data.get(1).copied().unwrap_or(0),
                         ev.data.get(2).copied().unwrap_or(0),
                     ],
-                    channel: ev.data.get(0).map(|b| b & 0x0F).unwrap_or(0),
+                    channel: ev.data.first().map(|b| b & 0x0F).unwrap_or(0),
                     flags: 0,
                     _pad: 0,
                 };

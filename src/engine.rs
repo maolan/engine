@@ -1450,7 +1450,9 @@ impl Engine {
         let segments: Vec<_> = if comp > 0 {
             segments
                 .into_iter()
-                .map(|(start, end, offset)| (start.saturating_sub(comp), end.saturating_sub(comp), offset))
+                .map(|(start, end, offset)| {
+                    (start.saturating_sub(comp), end.saturating_sub(comp), offset)
+                })
                 .collect()
         } else {
             segments
@@ -4548,11 +4550,7 @@ impl Engine {
                 self.ready_refill_workers.clear();
                 while !self.workers.is_empty() {
                     let worker = self.workers.remove(0);
-                    if let Err(e) = worker
-                        .tx
-                        .send(Message::Request(a.clone()))
-                        .await
-                    {
+                    if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
                         error!("Error sending quit message to worker: {e}");
                     }
                     worker
@@ -4572,11 +4570,7 @@ impl Engine {
                             .lock()
                             .write_events_blocking(&panic_events, Duration::from_millis(250));
                     }
-                    if let Err(e) = worker
-                        .tx
-                        .send(Message::Request(a.clone()))
-                        .await
-                    {
+                    if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
                         error!("Error sending quit message to HW worker: {e}");
                     }
                     worker

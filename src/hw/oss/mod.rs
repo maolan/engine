@@ -57,6 +57,7 @@ pub struct Audio {
     f32_buffer: Vec<f32>,
     pub buffer_info: BufferInfo,
     frame_size_bytes: usize,
+    fragment_bytes: usize,
     buffer_frames_cached: i64,
     caps: i32,
     mapped: bool,
@@ -135,6 +136,66 @@ impl Audio {
         }
         Err(last_errno
             .unwrap_or_else(|| std::io::Error::other("OSS setfmt failed for all fallback formats")))
+    }
+
+    fn min_fragment_bytes(frame_size: usize) -> Result<usize, std::io::Error> {
+        const MAX_FRAGMENT_BYTES: usize = 1 << 16;
+        if frame_size == 0 {
+            return Err(std::io::Error::other("OSS frame size is invalid"));
+        }
+        if frame_size > MAX_FRAGMENT_BYTES {
+            return Err(std::io::Error::other(format!(
+                "OSS frame size {frame_size} exceeds maximum fragment size {MAX_FRAGMENT_BYTES}"
+            )));
+        }
+        Ok(frame_size.next_power_of_two().min(MAX_FRAGMENT_BYTES))
+    }
+
+    fn request_fragment_layout(
+        fd: i32,
+        frame_size: usize,
+        period_frames: usize,
+    ) -> std::io::Result<usize> {
+        let fragment_bytes = Self::min_fragment_bytes(frame_size)?;
+        let period_bytes =
+            Self::period_bytes_for_fragment_grid(frame_size, period_frames, fragment_bytes)?;
+        let fragments = period_bytes.div_ceil(fragment_bytes).max(1);
+        let exponent = fragment_bytes.trailing_zeros();
+        let arg_bits = ((fragments.min(0xffff) as u32) << 16) | exponent;
+        let mut arg = arg_bits as i32;
+        if unsafe { oss_set_fragment(fd, &mut arg) }.is_err() {
+            tracing::warn!(
+                "OSS: failed to request {} byte fragments: {}",
+                fragment_bytes,
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(fragment_bytes)
+    }
+
+    fn period_bytes_for_fragment_grid(
+        frame_size: usize,
+        period_frames: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<usize> {
+        let requested_bytes = period_frames
+            .max(1)
+            .checked_mul(frame_size)
+            .ok_or_else(|| std::io::Error::other("OSS period byte size overflow"))?;
+        let min_bytes = min_bytes.max(frame_size).max(1);
+        requested_bytes
+            .max(min_bytes)
+            .checked_next_power_of_two()
+            .ok_or_else(|| std::io::Error::other("OSS period byte size overflow"))
+    }
+
+    fn period_frames_for_fragment_grid(
+        frame_size: usize,
+        period_frames: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<usize> {
+        let bytes = Self::period_bytes_for_fragment_grid(frame_size, period_frames, min_bytes)?;
+        Ok(bytes.div_ceil(frame_size).max(1))
     }
 
     pub fn fd(&self) -> i32 {
@@ -226,11 +287,10 @@ impl Audio {
             .ok_or_else(|| std::io::Error::other(format!("Unsupported format: {format:#x}")))?;
         let frame_size = (channels as usize) * bytes_per_sample;
 
-        // Do NOT call SNDCTL_DSP_SETFRAGMENT — let the OS choose the
-        // default fragment layout.  This gives many small fragments
-        // (e.g. 8 frames each on USB devices) which provides fine-grained
-        // DMA progress tracking regardless of the engine period size.
-        // Query the OS-chosen buffer layout.
+        let requested_fragment_bytes =
+            Self::request_fragment_layout(dsp.as_raw_fd(), frame_size, options.period_frames)?;
+
+        // Query the actual layout OSS accepted after SETFRAGMENT.
         let mut buffer_info = BufferInfo::new();
         unsafe {
             if input {
@@ -274,25 +334,21 @@ impl Audio {
         } else {
             0
         };
-        let chsamples = options.period_frames.max(1);
-        if ring_total_frames > 0 && chsamples > ring_total_frames {
-            return Err(std::io::Error::other(format!(
-                "OSS {}: requested period {} exceeds ring buffer ({} frames)",
-                if input { "capture" } else { "playback" },
-                chsamples,
-                ring_total_frames,
-            )));
-        }
-
         let frag_frames = if frame_size > 0 && buffer_info.fragsize > 0 {
-            buffer_info.fragsize as usize / frame_size
+            (buffer_info.fragsize as usize).div_ceil(frame_size)
         } else {
             0
         };
+        let chsamples = Self::period_frames_for_fragment_grid(
+            frame_size,
+            options.period_frames,
+            buffer_info.fragsize.max(1) as usize,
+        )?;
 
         tracing::info!(
-            "OSS {}: {} frags x {} bytes ({} frames each), ring {} frames, engine period {} frames",
+            "OSS {}: requested {} byte fragments, got {} frags x {} bytes ({} frames each), ring {} frames, engine period {} frames",
             if input { "capture" } else { "playback" },
+            requested_fragment_bytes,
             buffer_info.fragstotal,
             buffer_info.fragsize,
             frag_frames,
@@ -300,21 +356,16 @@ impl Audio {
             chsamples,
         );
 
-        // Block-size probing: the fragment size is the hardware's DMA block
-        // size.  Warn when the engine period doesn't align well with it.
+        // OSS fragment sizes are reported in bytes; frag_frames is the
+        // corresponding engine-frame count after channel/sample conversion.
         if frag_frames > 0 {
             let direction = if input { "capture" } else { "playback" };
-            if frag_frames > chsamples {
-                tracing::warn!(
-                    "OSS {}: engine period ({} frames) is smaller than hardware block size ({} frames) — \
-                     DMA will advance past one period per step, expect timing issues",
-                    direction, chsamples, frag_frames,
-                );
-            } else if chsamples % frag_frames != 0 {
+            if chsamples % frag_frames != 0 {
                 tracing::info!(
-                    "OSS {}: engine period ({} frames) is not a multiple of hardware block size ({} frames) — \
-                     for best results use a period that is a multiple of {}",
-                    direction, chsamples, frag_frames, frag_frames,
+                    "OSS {}: engine period ({} frames) is not a multiple of OSS fragment size ({} frames)",
+                    direction,
+                    chsamples,
+                    frag_frames,
                 );
             }
         }
@@ -369,6 +420,7 @@ impl Audio {
         }
 
         let buffer_frames_cached = (buffer_info.bytes as usize / frame_size) as i64;
+        let fragment_bytes = buffer_info.fragsize.max(1) as usize;
 
         let mut initial_audio = Audio {
             dsp,
@@ -383,6 +435,7 @@ impl Audio {
             f32_buffer: Vec::new(),
             buffer_info,
             frame_size_bytes: frame_size,
+            fragment_bytes,
             buffer_frames_cached,
             caps,
             mapped,
@@ -414,6 +467,11 @@ impl Audio {
 
     fn buffer_frames(&self) -> i64 {
         self.buffer_frames_cached
+    }
+
+    fn io_chunk_bytes(&self) -> usize {
+        let aligned = self.fragment_bytes - (self.fragment_bytes % self.frame_size());
+        aligned.max(self.frame_size())
     }
 
     fn stepping(&self) -> i64 {
@@ -464,13 +522,6 @@ impl Audio {
         }
     }
 
-    fn playback_prefill_frames(&self) -> i64 {
-        self.duplex_sync
-            .lock()
-            .expect("duplex sync poisoned")
-            .playback_prefill_frames
-    }
-
     fn update_map_progress_from_count(&mut self, info: &CountInfo) -> Option<usize> {
         if self.buffer_info.bytes <= 0
             || self.buffer_info.fragsize <= 0
@@ -480,14 +531,6 @@ impl Audio {
             || !(info.ptr as usize).is_multiple_of(self.frame_size())
         {
             return None;
-        }
-        if info.bytes >= 0 {
-            let bytes = info.bytes as usize;
-            if bytes >= self.map_progress_bytes {
-                let delta = bytes - self.map_progress_bytes;
-                self.map_progress_bytes = bytes;
-                return Some(delta);
-            }
         }
         let buf_bytes = self.buffer_info.bytes as usize;
         let frag_bytes = self.buffer_info.fragsize as usize;
@@ -506,11 +549,11 @@ impl Audio {
     }
 
     fn read_io(&self, dst: &mut [u8], len: usize, count: &mut usize) -> std::io::Result<()> {
-        read_nonblock(self.dsp.as_raw_fd(), dst, len, count)
+        read_nonblock(self.dsp.as_raw_fd(), dst, len, self.io_chunk_bytes(), count)
     }
 
     fn write_io(&self, src: &mut [u8], len: usize, count: &mut usize) -> std::io::Result<()> {
-        write_nonblock(self.dsp.as_raw_fd(), src, len, count)
+        write_nonblock(self.dsp.as_raw_fd(), src, len, self.io_chunk_bytes(), count)
     }
 
     fn read_map(&self, dst: &mut [u8], offset: usize, length: usize) -> usize {

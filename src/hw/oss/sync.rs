@@ -57,7 +57,6 @@ pub(super) struct DuplexSync {
     pub(super) capture_balance: Option<i64>,
     pub(super) playback_balance: Option<i64>,
     pub(super) cycle_end: i64,
-    pub(super) playback_prefill_frames: i64,
     pub(super) clock_zero: Option<libc::timespec>,
 }
 
@@ -73,7 +72,6 @@ impl DuplexSync {
             capture_balance: None,
             playback_balance: None,
             cycle_end: 0,
-            playback_prefill_frames: 0,
             clock_zero: None,
         }
     }

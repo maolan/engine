@@ -3,8 +3,8 @@ use crate::audio::io::AudioIO;
 use crate::hw::common;
 use crate::hw::latency;
 use crate::hw::options::HwOptions;
-use crate::hw::prefill;
-use std::sync::{Arc, atomic::AtomicBool};
+use crate::hw::traits::HwWorkerDriver;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 #[derive(Debug)]
 pub struct HwDriver {
@@ -15,6 +15,7 @@ pub struct HwDriver {
     input_latency_frames: usize,
     output_latency_frames: usize,
     playing: Arc<AtomicBool>,
+    assist_lock: Arc<Mutex<()>>,
 }
 
 impl Default for HwOptions {
@@ -74,7 +75,7 @@ impl HwDriver {
         .map_err(|e| {
             std::io::Error::other(format!("Failed to open OSS output '{playback_path}': {e}"))
         })?;
-        let mut driver = Self {
+        Ok(Self {
             capture,
             playback,
             nperiods: options.nperiods.max(1),
@@ -82,9 +83,8 @@ impl HwDriver {
             input_latency_frames: options.input_latency_frames,
             output_latency_frames: options.output_latency_frames,
             playing,
-        };
-        driver.apply_playback_prefill();
-        Ok(driver)
+            assist_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn input_fd(&self) -> i32 {
@@ -143,6 +143,17 @@ impl HwDriver {
         }
     }
 
+    fn run_cycle_with_assist(&mut self) -> std::io::Result<()> {
+        let assist_lock = self.assist_lock.clone();
+        let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
+        self.channel().run_cycle()
+    }
+
+    fn run_assist_step(&mut self) -> std::io::Result<bool> {
+        let assist_lock = self.assist_lock.clone();
+        self.channel().run_assist_step_with_lock(&assist_lock)
+    }
+
     pub fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {
         latency::latency_ranges(
             self.cycle_samples(),
@@ -151,17 +162,6 @@ impl HwDriver {
             self.input_latency_frames,
             self.output_latency_frames,
         )
-    }
-
-    fn apply_playback_prefill(&mut self) {
-        let prefill =
-            prefill::playback_prefill_frames(self.cycle_samples(), self.nperiods, self.sync_mode);
-        let mut sync = self
-            .capture
-            .duplex_sync
-            .lock()
-            .expect("duplex sync poisoned");
-        sync.playback_prefill_frames = prefill.max(0);
     }
 
     pub fn set_playing(&mut self, playing: bool) {
@@ -174,9 +174,25 @@ impl HwDriver {
             self.playback.force_silence_now();
         }
     }
-
 }
 
-crate::impl_hw_worker_traits_for_driver!(HwDriver);
+impl HwWorkerDriver for HwDriver {
+    fn cycle_samples(&self) -> usize {
+        self.cycle_samples()
+    }
+
+    fn sample_rate(&self) -> i32 {
+        self.sample_rate()
+    }
+
+    fn run_cycle_for_worker(&mut self) -> Result<(), String> {
+        self.run_cycle_with_assist().map_err(|e| e.to_string())
+    }
+
+    fn run_assist_step_for_worker(&mut self) -> Result<bool, String> {
+        self.run_assist_step().map_err(|e| e.to_string())
+    }
+}
+
 crate::impl_hw_device_for_driver!(HwDriver);
 crate::impl_hw_midi_hub_traits!(MidiHub);
