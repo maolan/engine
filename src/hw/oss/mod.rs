@@ -225,17 +225,12 @@ impl Audio {
         let bytes_per_sample = bytes_per_sample(format)
             .ok_or_else(|| std::io::Error::other(format!("Unsupported format: {format:#x}")))?;
         let frame_size = (channels as usize) * bytes_per_sample;
-        if !options.ignore_hwbuf {
-            let requested_frag_bytes = options.period_frames.saturating_mul(frame_size).max(1);
-            let frag_size_pow2 = requested_frag_bytes.next_power_of_two();
-            let frag_shift = frag_size_pow2.trailing_zeros() as i32;
-            let mut frg = ((options.nperiods.max(1) as i32) << 16) | (frag_shift & 0xFFFF);
-            unsafe {
-                oss_set_fragment(dsp.as_raw_fd(), &mut frg)
-                    .map_err(|_| std::io::Error::last_os_error())?;
-            }
-        }
 
+        // Do NOT call SNDCTL_DSP_SETFRAGMENT — let the OS choose the
+        // default fragment layout.  This gives many small fragments
+        // (e.g. 8 frames each on USB devices) which provides fine-grained
+        // DMA progress tracking regardless of the engine period size.
+        // Query the OS-chosen buffer layout.
         let mut buffer_info = BufferInfo::new();
         unsafe {
             if input {
@@ -274,20 +269,55 @@ impl Audio {
             }
         }
 
-        let requested_period = options.period_frames.max(1);
-        let hw_chsamples = if frame_size > 0 && buffer_info.fragsize > 0 {
-            (buffer_info.fragsize as usize) / frame_size
+        let ring_total_frames = if frame_size > 0 && buffer_info.bytes > 0 {
+            (buffer_info.bytes as usize) / frame_size
         } else {
             0
         };
-        let chsamples = if options.ignore_hwbuf
-            || hw_chsamples == 0
-            || (requested_period >= hw_chsamples && requested_period.is_multiple_of(hw_chsamples))
-        {
-            requested_period
+        let chsamples = options.period_frames.max(1);
+        if ring_total_frames > 0 && chsamples > ring_total_frames {
+            return Err(std::io::Error::other(format!(
+                "OSS {}: requested period {} exceeds ring buffer ({} frames)",
+                if input { "capture" } else { "playback" },
+                chsamples,
+                ring_total_frames,
+            )));
+        }
+
+        let frag_frames = if frame_size > 0 && buffer_info.fragsize > 0 {
+            buffer_info.fragsize as usize / frame_size
         } else {
-            hw_chsamples.max(1)
+            0
         };
+
+        tracing::info!(
+            "OSS {}: {} frags x {} bytes ({} frames each), ring {} frames, engine period {} frames",
+            if input { "capture" } else { "playback" },
+            buffer_info.fragstotal,
+            buffer_info.fragsize,
+            frag_frames,
+            ring_total_frames,
+            chsamples,
+        );
+
+        // Block-size probing: the fragment size is the hardware's DMA block
+        // size.  Warn when the engine period doesn't align well with it.
+        if frag_frames > 0 {
+            let direction = if input { "capture" } else { "playback" };
+            if frag_frames > chsamples {
+                tracing::warn!(
+                    "OSS {}: engine period ({} frames) is smaller than hardware block size ({} frames) — \
+                     DMA will advance past one period per step, expect timing issues",
+                    direction, chsamples, frag_frames,
+                );
+            } else if chsamples % frag_frames != 0 {
+                tracing::info!(
+                    "OSS {}: engine period ({} frames) is not a multiple of hardware block size ({} frames) — \
+                     for best results use a period that is a multiple of {}",
+                    direction, chsamples, frag_frames, frag_frames,
+                );
+            }
+        }
 
         let buffer_bytes = chsamples * frame_size;
         let channel = if input {

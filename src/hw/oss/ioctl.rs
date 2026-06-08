@@ -193,7 +193,6 @@ const SNDCTL_DSP_MAGIC: u8 = b'P';
 const SNDCTL_DSP_SPEED: u8 = 2;
 const SNDCTL_DSP_SETFMT: u8 = 5;
 const SNDCTL_DSP_CHANNELS: u8 = 6;
-const SNDCTL_DSP_SETFRAGMENT: u8 = 10;
 const SNDCTL_DSP_GETOSPACE: u8 = 12;
 const SNDCTL_DSP_GETISPACE: u8 = 13;
 const SNDCTL_DSP_GETCAPS: u8 = 15;
@@ -208,12 +207,6 @@ const SNDCTL_DSP_CURRENT_IPTR: u8 = 35;
 const SNDCTL_DSP_CURRENT_OPTR: u8 = 36;
 
 nix::ioctl_readwrite!(oss_set_channels, SNDCTL_DSP_MAGIC, SNDCTL_DSP_CHANNELS, i32);
-nix::ioctl_readwrite!(
-    oss_set_fragment,
-    SNDCTL_DSP_MAGIC,
-    SNDCTL_DSP_SETFRAGMENT,
-    i32
-);
 nix::ioctl_read!(
     oss_output_buffer_info,
     SNDCTL_DSP_MAGIC,

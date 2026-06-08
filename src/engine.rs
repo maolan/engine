@@ -213,9 +213,11 @@ pub struct Engine {
     transport_panic_flush_pending: bool,
     transport_restart_pending: bool,
     transport_sample: usize,
-    /// Input (capture) latency in frames — used for record-back compensation.
+    /// Input (capture) latency in frames — record-back shifts recording earlier
+    /// on the timeline by this amount.
     hw_input_latency_frames: usize,
-    /// Output (playback) latency in frames — used for play-ahead compensation.
+    /// Output (playback) latency in frames — play-ahead trims this many startup
+    /// frames from the beginning of recordings (hardware round-trip silence).
     hw_output_latency_frames: usize,
     loop_enabled: bool,
     loop_range_samples: Option<(usize, usize)>,
@@ -2740,9 +2742,23 @@ impl Engine {
         if rec.samples.is_empty() || rec.channels == 0 {
             return;
         }
+        // Play-ahead: trim the initial output-latency worth of samples from the
+        // recording. These frames are known to be hardware startup silence because
+        // the playback signal hasn't completed its round-trip through the output
+        // buffer yet. This eliminates leading silence from the WAV file.
+        let trim_frames = self.hw_output_latency_frames;
+        let trim_samples = trim_frames * rec.channels;
+        let samples = if trim_samples > 0 && rec.samples.len() > trim_samples {
+            &rec.samples[trim_samples..]
+        } else {
+            &rec.samples[..]
+        };
+        if samples.is_empty() {
+            return;
+        }
         let file_path = audio_dir.join(&rec.file_name);
         let write_result =
-            crate::audio_codec::write_wav_f32(&file_path, &rec.samples, rec.channels, rate as u32);
+            crate::audio_codec::write_wav_f32(&file_path, samples, rec.channels, rate as u32);
         if let Err(e) = write_result {
             self.notify_clients(Err(format!(
                 "Failed to write recording {}: {}",
@@ -2752,12 +2768,13 @@ impl Engine {
             .await;
             return;
         }
-        let length = rec.samples.len() / rec.channels;
+        let length = samples.len() / rec.channels;
+        let start_sample = rec.start_sample.saturating_add(trim_frames);
         let clip_rel_name = format!("audio/{}", rec.file_name);
         let clip = AudioClip::new(
             clip_rel_name.clone(),
-            rec.start_sample,
-            rec.start_sample.saturating_add(length.max(1)),
+            start_sample,
+            start_sample.saturating_add(length.max(1)),
         );
         let (audio_ins, audio_outs) = if let Some(track) = self.state.lock().tracks.get(&track_name)
         {
@@ -2772,7 +2789,7 @@ impl Engine {
         self.notify_clients(Ok(Action::AddClip {
             name: clip_rel_name,
             track_name: track_name.clone(),
-            start: rec.start_sample,
+            start: start_sample,
             length,
             offset: 0,
             input_channel: 0,
@@ -3812,10 +3829,7 @@ impl Engine {
                 self.realtime_fallback_dispatch_count =
                     self.realtime_fallback_dispatch_count.saturating_add(1);
             }
-            t.set_transport_sample(
-                self.transport_sample
-                    .saturating_add(self.hw_output_latency_frames),
-            );
+            t.set_transport_sample(self.transport_sample);
             t.set_loop_config(self.loop_enabled, self.loop_range_samples);
             t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
             if self.hybrid_enabled {

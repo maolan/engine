@@ -153,6 +153,17 @@ impl HwDriver {
         )
     }
 
+    fn apply_playback_prefill(&mut self) {
+        let prefill =
+            prefill::playback_prefill_frames(self.cycle_samples(), self.nperiods, self.sync_mode);
+        let mut sync = self
+            .capture
+            .duplex_sync
+            .lock()
+            .expect("duplex sync poisoned");
+        sync.playback_prefill_frames = prefill.max(0);
+    }
+
     pub fn set_playing(&mut self, playing: bool) {
         self.playing
             .store(playing, std::sync::atomic::Ordering::Relaxed);
@@ -164,16 +175,6 @@ impl HwDriver {
         }
     }
 
-    fn apply_playback_prefill(&mut self) {
-        let prefill =
-            prefill::playback_prefill_frames(self.cycle_samples(), self.nperiods, self.sync_mode);
-        let mut sync = self
-            .capture
-            .duplex_sync
-            .lock()
-            .expect("duplex sync poisoned");
-        sync.playback_prefill_frames = prefill.max(0);
-    }
 }
 
 crate::impl_hw_worker_traits_for_driver!(HwDriver);
