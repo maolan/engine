@@ -52,7 +52,10 @@ use crate::{
     audio::clip::AudioClip,
     audio::io::AudioIO,
     history::{History, UndoEntry, create_inverse_actions, should_record},
-    hw::{config, traits::HwDevice},
+    hw::{
+        config,
+        traits::{HwDevice, HwWorkerDriver},
+    },
     kind::Kind,
     message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
     midi::clip::MIDIClip,
@@ -212,6 +215,7 @@ pub struct Engine {
     track_process_epoch: usize,
     transport_panic_flush_pending: bool,
     transport_restart_pending: bool,
+    notified_loop_wrap_sample: Option<usize>,
     transport_sample: usize,
     /// Input (capture) latency in frames — record-back shifts recording earlier
     /// on the timeline by this amount.
@@ -969,6 +973,7 @@ impl Engine {
             track_process_epoch: 0,
             transport_panic_flush_pending: false,
             transport_restart_pending: false,
+            notified_loop_wrap_sample: None,
             transport_sample: 0,
             hw_input_latency_frames: 0,
             hw_output_latency_frames: 0,
@@ -1238,11 +1243,14 @@ impl Engine {
                 let midi_inputs = runtime.midi_input_devices();
                 let midi_outputs = runtime.midi_output_devices();
                 let rate = runtime.sample_rate;
-                self.hw_driver = None;
                 if let Some(worker) = self.hw_worker.take() {
+                    if let Some(hw) = &self.hw_driver {
+                        hw.lock().request_stop();
+                    }
                     let _ = worker.tx.send(Message::Request(Action::Quit)).await;
                     let _ = worker.handle.await;
                 }
+                self.hw_driver = None;
                 self.jack_runtime = Some(Arc::new(UnsafeMutex::new(runtime)));
                 self.publish_hw_infos(input_channels, output_channels, rate)
                     .await;
@@ -1266,6 +1274,10 @@ impl Engine {
                     nperiods: request.nperiods,
                     sync_mode: request.sync_mode,
                     hybrid_enabled: request.hybrid_enabled,
+                    actual_period_frames: request.period_frames,
+                    input_channels,
+                    output_channels,
+                    bytes_per_frame: 0,
                 }))
                 .await;
                 self.awaiting_hwfinished = true;
@@ -1324,6 +1336,30 @@ impl Engine {
             return loop_start + (sample - loop_start) % loop_len;
         }
         sample
+    }
+
+    fn scheduled_loop_wrap_for_next_cycle(&self) -> Option<(usize, usize, usize)> {
+        if !self.playing || !self.loop_enabled {
+            return None;
+        }
+        let (loop_start, loop_end) = self.loop_range_samples?;
+        if loop_end <= loop_start || self.transport_sample >= loop_end {
+            return None;
+        }
+        let cycle_samples = self.current_cycle_samples();
+        if cycle_samples == 0 {
+            return None;
+        }
+        let next = self.transport_sample.saturating_add(cycle_samples);
+        if next < loop_end {
+            return None;
+        }
+        let after_frames = loop_end.saturating_sub(self.transport_sample);
+        Some((
+            after_frames,
+            loop_start,
+            self.normalize_transport_sample(next),
+        ))
     }
 
     #[cfg(unix)]
@@ -3434,6 +3470,18 @@ impl Engine {
             return;
         }
         self.apply_hw_out_gain_and_meter().await;
+        if let Some((after_frames, loop_start, cycle_end_sample)) =
+            self.scheduled_loop_wrap_for_next_cycle()
+        {
+            self.notified_loop_wrap_sample = Some(cycle_end_sample);
+            self.notify_clients(Ok(Action::TransportPositionAt {
+                sample: loop_start,
+                after_frames,
+            }))
+            .await;
+        } else {
+            self.notified_loop_wrap_sample = None;
+        }
         if let Some(worker) = &self.hw_worker {
             if !self.pending_hw_midi_out_events_by_device.is_empty() {
                 let out_events = std::mem::take(&mut self.pending_hw_midi_out_events_by_device);
@@ -3885,7 +3933,7 @@ impl Engine {
                 let cycle_end = self
                     .transport_sample
                     .saturating_add(self.current_cycle_samples());
-                if self.transport_sample < loop_end && cycle_end > loop_end {
+                if self.transport_sample < loop_end && cycle_end >= loop_end {
                     let wrap_frame = loop_end
                         .saturating_sub(self.transport_sample)
                         .min(self.current_cycle_samples())
@@ -4133,7 +4181,7 @@ impl Engine {
         }
     }
 
-    async fn handle_request_inner(&mut self, action_to_process: Action, record_history: bool) {
+    async fn handle_request_inner(&mut self, mut action_to_process: Action, record_history: bool) {
         let a = action_to_process.clone();
         let suppress_timing_history = self.playing
             && matches!(
@@ -4278,6 +4326,7 @@ impl Engine {
                 );
                 self.playing = true;
                 self.transport_restart_pending = true;
+                self.notified_loop_wrap_sample = None;
                 self.invalidate_track_cycle_state();
                 if let Some(driver) = self.hw_driver.as_mut() {
                     driver.lock().set_playing(true);
@@ -4310,6 +4359,7 @@ impl Engine {
                 if !self.playing {
                     self.playing = true;
                     self.transport_restart_pending = true;
+                    self.notified_loop_wrap_sample = None;
                     self.invalidate_track_cycle_state();
                     if let Some(driver) = self.hw_driver.as_mut() {
                         driver.lock().set_playing(true);
@@ -4338,6 +4388,7 @@ impl Engine {
                 self.playing = false;
                 self.transport_panic_flush_pending = false;
                 self.transport_restart_pending = false;
+                self.notified_loop_wrap_sample = None;
                 self.invalidate_track_cycle_state();
                 if let Some(driver) = self.hw_driver.as_mut() {
                     driver.lock().set_playing(false);
@@ -4393,6 +4444,7 @@ impl Engine {
             }
             Action::TransportPosition(sample) => {
                 self.transport_sample = self.normalize_transport_sample(sample);
+                self.notified_loop_wrap_sample = None;
                 #[cfg(unix)]
                 if let Some(jack) = &self.jack_runtime
                     && let Err(e) = jack.lock().transport_locate(self.transport_sample)
@@ -4416,6 +4468,7 @@ impl Engine {
             }
             Action::SetLoopEnabled(enabled) => {
                 self.loop_enabled = enabled && self.loop_range_samples.is_some();
+                self.notified_loop_wrap_sample = None;
             }
             Action::SetLoopRange(range) => {
                 self.loop_range_samples = range.and_then(|(start, end)| {
@@ -4426,6 +4479,7 @@ impl Engine {
                     }
                 });
                 self.loop_enabled = self.loop_range_samples.is_some();
+                self.notified_loop_wrap_sample = None;
                 if self.loop_enabled
                     && let Some((loop_start, loop_end)) = self.loop_range_samples
                     && self.transport_sample >= loop_end
@@ -4560,6 +4614,9 @@ impl Engine {
                 }
 
                 if let Some(worker) = self.hw_worker.take() {
+                    if let Some(hw) = &self.hw_driver {
+                        hw.lock().request_stop();
+                    }
                     let mut panic_events = self.note_off_events_for_all_active_tracks();
                     panic_events.extend(self.panic_events_for_all_hw_midi_outputs());
                     if !panic_events.is_empty() {
@@ -6948,6 +7005,10 @@ impl Engine {
                 nperiods,
                 sync_mode,
                 hybrid_enabled,
+                actual_period_frames: _,
+                input_channels: _,
+                output_channels: _,
+                bytes_per_frame: _,
             } => {
                 #[cfg(unix)]
                 {
@@ -7002,6 +7063,29 @@ impl Engine {
                     }
                 }
                 self.finalize_open_audio_device().await;
+                if let Some(hw) = &self.hw_driver {
+                    let effective_action = {
+                        let hw = hw.lock();
+                        Action::OpenAudioDevice {
+                            device: device.clone(),
+                            input_device: input_device.clone(),
+                            sample_rate_hz: hw.sample_rate(),
+                            bits: hw.sample_bits(),
+                            exclusive,
+                            period_frames,
+                            realtime_frames,
+                            low_watermark_frames: low_watermark_frames.max(1),
+                            nperiods,
+                            sync_mode,
+                            hybrid_enabled,
+                            actual_period_frames: hw.cycle_samples(),
+                            input_channels: hw.input_channels(),
+                            output_channels: hw.output_channels(),
+                            bytes_per_frame: hw.frame_size_bytes(),
+                        }
+                    };
+                    action_to_process = effective_action;
+                }
             }
             Action::JackAddAudioInputPort => {
                 #[cfg(unix)]
@@ -7611,10 +7695,14 @@ impl Engine {
                             let wrapped = normalized != next;
                             self.transport_sample = normalized;
                             if wrapped {
-                                self.notify_clients(Ok(Action::TransportPosition(
-                                    self.transport_sample,
-                                )))
-                                .await;
+                                if self.notified_loop_wrap_sample == Some(self.transport_sample) {
+                                    self.notified_loop_wrap_sample = None;
+                                } else {
+                                    self.notify_clients(Ok(Action::TransportPosition(
+                                        self.transport_sample,
+                                    )))
+                                    .await;
+                                }
                             }
                         }
                     }

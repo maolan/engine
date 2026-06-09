@@ -1,24 +1,32 @@
 use super::{
     Audio, DoubleBufferedChannel, convert_in_to_i32_connected, convert_out_from_i32_interleaved,
 };
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 pub struct OSSChannel<'a> {
     pub(super) capture: &'a mut Audio,
     pub(super) playback: &'a mut Audio,
+    pub(super) stop_requested: &'a AtomicBool,
 }
 
 impl<'a> OSSChannel<'a> {
     pub fn run_cycle(&mut self) -> std::io::Result<()> {
-        DuplexChannelApi::new(self.capture, self.playback)?.run_cycle()
+        DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?.run_cycle()
     }
 
     pub fn run_cycle_with_assist(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
-        DuplexChannelApi::new(self.capture, self.playback)?.run_cycle_with_assist(assist_lock)
+        DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?
+            .run_cycle_with_assist(assist_lock)
     }
 
     pub fn run_assist_step(&mut self) -> std::io::Result<bool> {
-        let mut api = DuplexChannelApi::new(self.capture, self.playback)?;
+        let mut api = DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?;
+        if api.stop_requested() {
+            return Ok(false);
+        }
         api.check_time_and_run()?;
         if api.all_finished() {
             return Ok(false);
@@ -29,7 +37,10 @@ impl<'a> OSSChannel<'a> {
     }
 
     pub fn run_assist_step_with_lock(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<bool> {
-        let mut api = DuplexChannelApi::new(self.capture, self.playback)?;
+        let mut api = DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?;
+        if api.stop_requested() {
+            return Ok(false);
+        }
         {
             let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
             api.check_time_and_run()?;
@@ -49,11 +60,16 @@ impl<'a> OSSChannel<'a> {
 struct DuplexChannelApi<'a> {
     capture: &'a mut Audio,
     playback: &'a mut Audio,
+    stop_requested: &'a AtomicBool,
     now: i64,
 }
 
 impl<'a> DuplexChannelApi<'a> {
-    fn new(capture: &'a mut Audio, playback: &'a mut Audio) -> std::io::Result<Self> {
+    fn new(
+        capture: &'a mut Audio,
+        playback: &'a mut Audio,
+        stop_requested: &'a AtomicBool,
+    ) -> std::io::Result<Self> {
         if !capture.input || playback.input {
             return Err(std::io::Error::other(
                 "run_duplex_cycle expects (capture=input, playback=output)",
@@ -62,11 +78,13 @@ impl<'a> DuplexChannelApi<'a> {
         Ok(Self {
             capture,
             playback,
+            stop_requested,
             now: 0,
         })
     }
 
     fn run_cycle(&mut self) -> std::io::Result<()> {
+        self.check_stop()?;
         let frames = self.capture.chsamples as i64;
         let mut cycle_end = self.capture.shared_cycle_end_add(frames);
         self.check_time_and_run()?;
@@ -86,6 +104,7 @@ impl<'a> DuplexChannelApi<'a> {
         }
 
         while !self.capture.channel.finished(self.now) {
+            self.check_stop()?;
             self.sleep()?;
             self.check_time_and_run()?;
         }
@@ -115,6 +134,7 @@ impl<'a> DuplexChannelApi<'a> {
         self.check_time_and_run()?;
 
         while !self.playback.channel.finished(self.now) {
+            self.check_stop()?;
             self.sleep()?;
             self.check_time_and_run()?;
         }
@@ -214,6 +234,7 @@ impl<'a> DuplexChannelApi<'a> {
 
     fn wait_for_capture_primary(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
         loop {
+            self.check_stop()?;
             let wake = {
                 let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
                 self.update_now()?;
@@ -228,6 +249,7 @@ impl<'a> DuplexChannelApi<'a> {
 
     fn wait_for_playback_primary(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
         loop {
+            self.check_stop()?;
             let wake = {
                 let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
                 self.update_now()?;
@@ -329,11 +351,27 @@ impl<'a> DuplexChannelApi<'a> {
     }
 
     fn sleep_until(&self, wake: i64) -> std::io::Result<()> {
+        self.check_stop()?;
         let now = self.capture.frame_stamp.max(self.playback.frame_stamp);
         if wake > now && !self.capture.frame_clock.sleep_until_frame(wake) {
             return Err(std::io::Error::other("duplex sleep failed"));
         }
         Ok(())
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
+    }
+
+    fn check_stop(&self) -> std::io::Result<()> {
+        if self.stop_requested() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "OSS duplex cycle stopped",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 

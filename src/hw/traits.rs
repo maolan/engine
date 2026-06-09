@@ -3,6 +3,7 @@ use crate::message::HwMidiEvent;
 pub trait HwWorkerDriver {
     fn cycle_samples(&self) -> usize;
     fn sample_rate(&self) -> i32;
+    fn request_stop(&mut self) {}
     fn run_cycle_for_worker(&mut self) -> Result<(), String>;
     fn run_assist_step_for_worker(&mut self) -> Result<bool, String>;
 }

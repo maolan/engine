@@ -4,7 +4,10 @@ use crate::hw::common;
 use crate::hw::latency;
 use crate::hw::options::HwOptions;
 use crate::hw::traits::HwWorkerDriver;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Debug)]
 pub struct HwDriver {
@@ -15,6 +18,7 @@ pub struct HwDriver {
     input_latency_frames: usize,
     output_latency_frames: usize,
     playing: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
     assist_lock: Arc<Mutex<()>>,
 }
 
@@ -45,6 +49,7 @@ impl HwDriver {
         options: HwOptions,
     ) -> std::io::Result<Self> {
         let playing = Arc::new(AtomicBool::new(false));
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let capture_path = capture_path.unwrap_or(playback_path);
         let sync_key = if capture_path == playback_path {
             playback_path.to_string()
@@ -83,6 +88,7 @@ impl HwDriver {
             input_latency_frames: options.input_latency_frames,
             output_latency_frames: options.output_latency_frames,
             playing,
+            stop_requested,
             assist_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -109,6 +115,14 @@ impl HwDriver {
 
     pub fn cycle_samples(&self) -> usize {
         self.playback.chsamples
+    }
+
+    pub fn sample_bits(&self) -> i32 {
+        self.playback.sample_bits()
+    }
+
+    pub fn frame_size_bytes(&self) -> usize {
+        self.playback.frame_size_bytes()
     }
 
     pub fn input_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
@@ -140,6 +154,7 @@ impl HwDriver {
         OSSChannel {
             capture: &mut self.capture,
             playback: &mut self.playback,
+            stop_requested: &self.stop_requested,
         }
     }
 
@@ -165,8 +180,7 @@ impl HwDriver {
     }
 
     pub fn set_playing(&mut self, playing: bool) {
-        self.playing
-            .store(playing, std::sync::atomic::Ordering::Relaxed);
+        self.playing.store(playing, Ordering::Relaxed);
         if playing {
             let _ = self.playback.start_trigger();
         } else {
@@ -191,6 +205,11 @@ impl HwWorkerDriver for HwDriver {
 
     fn run_assist_step_for_worker(&mut self) -> Result<bool, String> {
         self.run_assist_step().map_err(|e| e.to_string())
+    }
+
+    fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = self.playback.stop_trigger();
     }
 }
 

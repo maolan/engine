@@ -263,6 +263,7 @@ impl<B: Backend> HwWorker<B> {
             match self.rx.recv().await {
                 Some(msg) => match msg {
                     Message::Request(crate::message::Action::Quit) => {
+                        self.driver.lock().request_stop();
                         if !self.pending_midi_out_events.is_empty() {
                             if !self.pending_midi_out_sorted {
                                 self.pending_midi_out_events.sort_by(|a, b| {
@@ -333,6 +334,7 @@ impl<B: Backend> HwWorker<B> {
                     _ => {}
                 },
                 None => {
+                    self.driver.lock().request_stop();
                     midi_stop.store(true, Ordering::Release);
                     {
                         let midi_hub = self.midi_hub.lock();

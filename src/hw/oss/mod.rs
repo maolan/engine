@@ -465,6 +465,16 @@ impl Audio {
         self.frame_size_bytes
     }
 
+    pub fn frame_size_bytes(&self) -> usize {
+        self.frame_size_bytes
+    }
+
+    pub fn sample_bits(&self) -> i32 {
+        bytes_per_sample(self.format)
+            .map(|bytes| (bytes * 8) as i32)
+            .unwrap_or(0)
+    }
+
     fn buffer_frames(&self) -> i64 {
         self.buffer_frames_cached
     }
