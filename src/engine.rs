@@ -92,7 +92,13 @@ struct RecordingSession {
     samples: Vec<f32>,
     channels: usize,
     file_name: String,
+    /// Incremental min/max peaks per channel per stripe (fixed-size window).
+    stripe_peaks: Vec<Vec<[f32; 2]>>,
+    /// Total frames accumulated (increments by 1 per frame, not per sample).
+    current_stripe_frames: usize,
 }
+
+const RECORDING_STRIPE_FRAMES: usize = 256;
 
 #[derive(Debug, Clone)]
 struct MidiRecordingSession {
@@ -878,11 +884,16 @@ impl Engine {
         self.session_dir.as_ref().map(|d| d.join("midi"))
     }
 
+    fn session_peaks_dir(&self) -> Option<PathBuf> {
+        self.session_dir.as_ref().map(|d| d.join("peaks"))
+    }
+
     fn ensure_session_subdirs(&self) {
         if let Some(root) = &self.session_dir {
             let _ = std::fs::create_dir_all(root.join("plugins"));
             let _ = std::fs::create_dir_all(root.join("audio"));
             let _ = std::fs::create_dir_all(root.join("midi"));
+            let _ = std::fs::create_dir_all(root.join("peaks"));
         }
     }
 
@@ -1555,7 +1566,10 @@ impl Engine {
     }
 
     fn can_schedule_hw_cycle(&self) -> bool {
-        self.hw_worker.is_some() || self.jack_runtime_is_some()
+        // Only synchronize with the hardware cycle when the transport is playing.
+        // When stopped, the OSS assist thread may be blocked on I/O after the
+        // PCM trigger was disabled, so waiting for HWFinished would deadlock.
+        self.playing && (self.hw_worker.is_some() || self.jack_runtime.is_some())
     }
 
     async fn ensure_hw_worker_running(&mut self) {
@@ -2605,6 +2619,8 @@ impl Engine {
                                 samples: Vec::with_capacity(segment_len * audio_channels * 2),
                                 channels: audio_channels,
                                 file_name: Self::next_recording_file_name(name),
+                                stripe_peaks: vec![Vec::new(); audio_channels],
+                                current_stripe_frames: 0,
                             });
                     if audio_entry.channels != audio_channels {
                         continue;
@@ -2613,9 +2629,22 @@ impl Engine {
                         let from = frame_offset.min(audio_frames);
                         let to = frame_offset.saturating_add(segment_len).min(audio_frames);
                         for frame in from..to {
+                            let is_new_stripe =
+                                entry.current_stripe_frames % RECORDING_STRIPE_FRAMES == 0;
                             for ch in 0..audio_channels {
+                                let sample = track.record_tap_outs[ch][frame].clamp(-1.0, 1.0);
+                                if is_new_stripe {
+                                    entry.stripe_peaks[ch].push([sample, sample]);
+                                } else {
+                                    let idx = entry.stripe_peaks[ch].len() - 1;
+                                    entry.stripe_peaks[ch][idx][0] =
+                                        entry.stripe_peaks[ch][idx][0].min(sample);
+                                    entry.stripe_peaks[ch][idx][1] =
+                                        entry.stripe_peaks[ch][idx][1].max(sample);
+                                }
                                 entry.samples.push(track.record_tap_outs[ch][frame]);
                             }
+                            entry.current_stripe_frames += 1;
                         }
                     }
                 }
@@ -2770,6 +2799,45 @@ impl Engine {
         }
     }
 
+    fn compute_peaks_from_stripes(
+        stripe_peaks: &[Vec<[f32; 2]>],
+        total_frames: usize,
+        channels: usize,
+    ) -> serde_json::Value {
+        const MAX_PEAK_BINS: usize = 32_768;
+        if total_frames == 0 || stripe_peaks.is_empty() {
+            return serde_json::json!({"peaks": []});
+        }
+        let target_bins = total_frames.clamp(1024, MAX_PEAK_BINS);
+        let mut peaks = vec![vec![[0.0_f32, 0.0_f32]; target_bins]; channels];
+        for (ch, channel_peaks) in peaks.iter_mut().enumerate() {
+            let mut touched = vec![false; target_bins];
+            let empty = Vec::new();
+            let channel_stripes = stripe_peaks.get(ch).unwrap_or(&empty);
+            for (stripe_idx, stripe) in channel_stripes.iter().enumerate() {
+                let stripe_start = stripe_idx * RECORDING_STRIPE_FRAMES;
+                let stripe_end = ((stripe_idx + 1) * RECORDING_STRIPE_FRAMES).min(total_frames);
+                let start_bin = (stripe_start * target_bins) / total_frames.max(1);
+                let end_bin = ((stripe_end.saturating_sub(1)) * target_bins / total_frames.max(1))
+                    .min(target_bins - 1);
+                for bin in start_bin..=end_bin {
+                    if !touched[bin] {
+                        channel_peaks[bin] = *stripe;
+                        touched[bin] = true;
+                    } else {
+                        channel_peaks[bin][0] = channel_peaks[bin][0].min(stripe[0]);
+                        channel_peaks[bin][1] = channel_peaks[bin][1].max(stripe[1]);
+                    }
+                }
+            }
+        }
+        serde_json::json!({
+            "peaks": peaks.iter().map(|ch| {
+                ch.iter().map(|pair| serde_json::json!([pair[0], pair[1]])).collect::<Vec<_>>()
+            }).collect::<Vec<_>>()
+        })
+    }
+
     async fn flush_recording_entry(
         &mut self,
         audio_dir: &Path,
@@ -2798,6 +2866,7 @@ impl Engine {
         let write_result =
             crate::audio_codec::write_wav_f32(&file_path, samples, rec.channels, rate as u32);
         if let Err(e) = write_result {
+            tracing::error!("flush_recording_entry: WAV write failed: {}", e);
             self.notify_clients(Err(format!(
                 "Failed to write recording {}: {}",
                 file_path.display(),
@@ -2805,6 +2874,26 @@ impl Engine {
             )))
             .await;
             return;
+        }
+        // Peaks were accumulated incrementally during recording via stripe_peaks.
+        // Convert stripes to binned peaks and write the file. This is O(stripes)
+        // and avoids re-reading the WAV.
+        let total_frames = rec.current_stripe_frames;
+        let peaks_json =
+            Self::compute_peaks_from_stripes(&rec.stripe_peaks, total_frames, rec.channels);
+        let peaks_file_name = format!("{}.json", rec.file_name);
+        let peaks_rel = format!("peaks/{}", peaks_file_name);
+        let peaks_path = self.session_peaks_dir().map(|d| d.join(&peaks_file_name));
+        if let Some(peaks_dir) = self.session_peaks_dir() {
+            let _ = std::fs::create_dir_all(&peaks_dir);
+        }
+        if let Some(ref path) = peaks_path
+            && let Err(e) = std::fs::write(
+                path,
+                serde_json::to_string_pretty(&peaks_json).unwrap_or_default(),
+            )
+        {
+            tracing::warn!("Failed to write peaks file {}: {}", path.display(), e);
         }
         let length = samples.len() / rec.channels;
         let start_sample = rec.start_sample.saturating_add(trim_frames);
@@ -2822,6 +2911,10 @@ impl Engine {
             track.audio.clips.push(clip.clone());
             (audio_ins, audio_outs)
         } else {
+            tracing::warn!(
+                "flush_recording_entry: track '{}' not found in engine state",
+                track_name
+            );
             (0, 0)
         };
         self.notify_clients(Ok(Action::AddClip {
@@ -2832,7 +2925,7 @@ impl Engine {
             offset: 0,
             input_channel: 0,
             muted: false,
-            peaks_file: None,
+            peaks_file: peaks_path.is_some().then_some(peaks_rel),
             kind: Kind::Audio,
             fade_enabled: clip.fade_enabled,
             fade_in_samples: clip.fade_in_samples,
@@ -3066,11 +3159,10 @@ impl Engine {
 
     async fn notify_clients(&mut self, action: Result<Action, String>) {
         self.clients.retain(|client| !client.is_closed());
-        for client in &self.clients {
-            client
-                .send(Message::Response(action.clone()))
-                .await
-                .expect("Error sending response to client");
+        for (idx, client) in self.clients.iter().enumerate() {
+            if let Err(e) = client.send(Message::Response(action.clone())).await {
+                tracing::error!("notify_clients: failed to send to client {}: {}", idx, e);
+            }
         }
     }
 
@@ -4946,9 +5038,15 @@ impl Engine {
                 }
                 if let Some(track) = self.state.lock().tracks.get(name).cloned() {
                     track.lock().arm();
-                    if !track.lock().armed && self.audio_recordings.contains_key(name) {
+                    let armed = track.lock().armed;
+                    if !armed && self.audio_recordings.contains_key(name) {
                         self.flush_track_recording(name).await;
                     }
+                } else {
+                    tracing::warn!(
+                        "TrackToggleArm for '{}' but track not found in engine",
+                        name
+                    );
                 }
             }
             Action::TrackToggleMute(ref name) => {

@@ -353,8 +353,16 @@ impl<'a> DuplexChannelApi<'a> {
     fn sleep_until(&self, wake: i64) -> std::io::Result<()> {
         self.check_stop()?;
         let now = self.capture.frame_stamp.max(self.playback.frame_stamp);
-        if wake > now && !self.capture.frame_clock.sleep_until_frame(wake) {
-            return Err(std::io::Error::other("duplex sleep failed"));
+        if wake > now {
+            if !self.capture.frame_clock.sleep_until_frame(wake) {
+                return Err(std::io::Error::other("duplex sleep failed"));
+            }
+        } else if !self.capture.playing.load(Ordering::Relaxed) {
+            // Playback is stopped. Sleep for one buffer duration to prevent
+            // run_cycle from spinning and letting cycle_end race ahead of
+            // real time, which would cause buffers to get stuck forever.
+            let frames = self.capture.chsamples as i64;
+            let _ = self.capture.frame_clock.sleep_until_frame(now + frames);
         }
         Ok(())
     }
