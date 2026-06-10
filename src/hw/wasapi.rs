@@ -138,11 +138,14 @@ impl HwDriver {
                 let chunk_len = period_frames.saturating_mul(input_channels.max(1));
                 let input_stream = {
                     let mut stash: Vec<f32> = Vec::with_capacity(chunk_len.saturating_mul(2));
+                    let mut input_cb_count = 0usize;
                     input_device
                         .build_input_stream(
                             &input_cfg,
                             move |data: &[f32], _| {
                                 crate::enable_flush_denormals_to_zero();
+                                input_cb_count += 1;
+                                let non_zero = data.iter().filter(|&&s| s.abs() > 0.0001).count();
                                 stash.extend_from_slice(data);
                                 while stash.len() >= chunk_len {
                                     let chunk: Vec<f32> = stash.drain(..chunk_len).collect();
@@ -354,52 +357,54 @@ fn select_f32_output_config(
     device: &cpal::Device,
     requested_rate: i32,
 ) -> Result<StreamConfig, String> {
-    let mut selected = None;
-    let ranges = device
+    let ranges: Vec<_> = device
         .supported_output_configs()
-        .map_err(|e| format!("Failed to query output stream configs: {e}"))?;
-    for range in ranges {
-        if range.sample_format() != SampleFormat::F32 {
-            continue;
-        }
-        let min = range.min_sample_rate();
-        let max = range.max_sample_rate();
-        let rate = requested_rate.max(1) as u32;
-        let cfg = if rate >= min && rate <= max {
-            range.with_sample_rate(rate).config()
-        } else {
-            range.with_max_sample_rate().config()
-        };
-        selected = Some(cfg);
-        break;
+        .map_err(|e| format!("Failed to query output stream configs: {e}"))?
+        .filter(|r| r.sample_format() == SampleFormat::F32)
+        .collect();
+
+    let rate = requested_rate.max(1) as u32;
+
+    // Prefer a config range that actually contains the requested rate.
+    if let Some(range) = ranges.iter().find(|r| {
+        let min = r.min_sample_rate();
+        let max = r.max_sample_rate();
+        rate >= min && rate <= max
+    }) {
+        return Ok(range.with_sample_rate(rate).config());
     }
-    selected.ok_or_else(|| "No F32 WASAPI output stream configuration was found".to_string())
+
+    // Fall back to the first available F32 config at its max rate.
+    ranges
+        .first()
+        .map(|r| r.with_max_sample_rate().config())
+        .ok_or_else(|| "No F32 WASAPI output stream configuration was found".to_string())
 }
 
 fn select_f32_input_config(
     device: &cpal::Device,
     requested_rate: i32,
 ) -> Result<StreamConfig, String> {
-    let mut selected = None;
-    let ranges = device
+    let ranges: Vec<_> = device
         .supported_input_configs()
-        .map_err(|e| format!("Failed to query input stream configs: {e}"))?;
-    for range in ranges {
-        if range.sample_format() != SampleFormat::F32 {
-            continue;
-        }
-        let min = range.min_sample_rate();
-        let max = range.max_sample_rate();
-        let rate = requested_rate.max(1) as u32;
-        let cfg = if rate >= min && rate <= max {
-            range.with_sample_rate(rate).config()
-        } else {
-            range.with_max_sample_rate().config()
-        };
-        selected = Some(cfg);
-        break;
+        .map_err(|e| format!("Failed to query input stream configs: {e}"))?
+        .filter(|r| r.sample_format() == SampleFormat::F32)
+        .collect();
+
+    let rate = requested_rate.max(1) as u32;
+
+    if let Some(range) = ranges.iter().find(|r| {
+        let min = r.min_sample_rate();
+        let max = r.max_sample_rate();
+        rate >= min && rate <= max
+    }) {
+        return Ok(range.with_sample_rate(rate).config());
     }
-    selected.ok_or_else(|| "No F32 WASAPI input stream configuration was found".to_string())
+
+    ranges
+        .first()
+        .map(|r| r.with_max_sample_rate().config())
+        .ok_or_else(|| "No F32 WASAPI input stream configuration was found".to_string())
 }
 
 pub fn list_midi_input_devices() -> Vec<String> {
