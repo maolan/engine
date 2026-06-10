@@ -34,7 +34,7 @@ pub struct HwDriver {
     input_rx: Option<Receiver<Vec<f32>>>,
     output_tx: SyncSender<Vec<f32>>,
     cycle_tick_rx: Receiver<()>,
-    latest_input: Vec<f32>,
+    input_queue: Vec<f32>,
     audio_ins: Vec<Arc<AudioIO>>,
     audio_outs: Vec<Arc<AudioIO>>,
     output_gain_linear: f32,
@@ -168,7 +168,7 @@ impl HwDriver {
             input_rx,
             output_tx,
             cycle_tick_rx,
-            latest_input: vec![0.0; period_frames.saturating_mul(input_channels.max(1))],
+            input_queue: Vec::new(),
             audio_ins,
             audio_outs,
             output_gain_linear: 1.0,
@@ -235,18 +235,32 @@ impl HwDriver {
         let input_channels = self.input_channels.max(1);
         if let Some(rx) = &self.input_rx {
             while let Ok(chunk) = rx.try_recv() {
-                self.latest_input = chunk;
+                self.input_queue.extend_from_slice(&chunk);
             }
         }
+
+        let needed_samples = input_frames.saturating_mul(input_channels);
+        let have_samples = self.input_queue.len();
+        let have_frames = have_samples / input_channels;
+        let consume_frames = have_frames.min(input_frames);
+        let consume_samples = consume_frames.saturating_mul(input_channels);
 
         for (ch_idx, io_port) in self.audio_ins.iter().enumerate() {
             let dst = io_port.buffer.lock();
             for frame in 0..input_frames.min(dst.len()) {
                 let src_idx = frame * input_channels + ch_idx;
-                let sample = self.latest_input.get(src_idx).copied().unwrap_or(0.0);
+                let sample = if src_idx < consume_samples {
+                    self.input_queue[src_idx]
+                } else {
+                    0.0
+                };
                 dst[frame] = sample;
             }
             *io_port.finished.lock() = true;
+        }
+
+        if consume_samples > 0 {
+            self.input_queue.drain(..consume_samples);
         }
 
         let frames = self.period_frames;
