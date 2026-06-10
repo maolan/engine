@@ -197,6 +197,14 @@ impl HwDriver {
         self.period_frames
     }
 
+    pub fn sample_bits(&self) -> i32 {
+        32
+    }
+
+    pub fn frame_size_bytes(&self) -> usize {
+        self.output_channels * 4
+    }
+
     pub fn input_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
         self.audio_ins.get(idx).cloned()
     }

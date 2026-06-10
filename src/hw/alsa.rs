@@ -53,6 +53,7 @@ pub struct HwDriver {
     playback_buffer_i32: Vec<i32>,
     playback_f32_buffer: Vec<f32>,
     playing: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
     xrun_count: u64,
 }
 
@@ -154,6 +155,7 @@ impl HwDriver {
             playback_buffer_i32: vec![0; period * channels_out],
             playback_f32_buffer: vec![0.0; period * channels_out],
             playing: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
             xrun_count: 0,
         };
         driver.prefill_playback();
@@ -166,6 +168,36 @@ impl HwDriver {
 
     pub fn set_playing(&mut self, playing: bool) {
         self.playing.store(playing, Ordering::Relaxed);
+        if playing {
+            if self.capture.state() != State::Running {
+                let _ = self.capture.prepare();
+                let _ = self.capture.start();
+            }
+            if self.playback.state() != State::Running {
+                let _ = self.playback.prepare();
+                let _ = self.playback.start();
+            }
+        } else {
+            self.force_silence_now();
+        }
+    }
+
+    fn force_silence_now(&mut self) {
+        self.capture_buffer_i8.fill(0);
+        self.capture_buffer_i16.fill(0);
+        self.capture_buffer_i32.fill(0);
+        self.capture_temp_i32.fill(0);
+        self.capture_f32_buffer.fill(0.0);
+        self.playback_buffer_i8.fill(0);
+        self.playback_buffer_i16.fill(0);
+        self.playback_buffer_i32.fill(0);
+        self.playback_f32_buffer.fill(0.0);
+        for ch in &self.audio_ins {
+            ch.buffer.lock().fill(0.0);
+        }
+        for ch in &self.audio_outs {
+            ch.buffer.lock().fill(0.0);
+        }
     }
 
     fn prefill_playback(&mut self) {
@@ -209,6 +241,14 @@ impl HwDriver {
 
     pub fn cycle_samples(&self) -> usize {
         self.period_frames
+    }
+
+    pub fn sample_bits(&self) -> i32 {
+        self.playback_format.bits()
+    }
+
+    pub fn frame_size_bytes(&self) -> usize {
+        self.channels_out * (self.playback_format.bits() as usize / 8)
     }
 
     pub fn input_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
@@ -609,20 +649,43 @@ impl HwDriver {
         )
     }
 
-    pub fn channel(&mut self) -> OSSChannel<'_> {
-        OSSChannel { driver: self }
+    pub fn channel(&mut self) -> AlsaChannel<'_> {
+        AlsaChannel { driver: self }
     }
 }
 
-crate::impl_hw_worker_traits_for_driver!(HwDriver);
+impl crate::hw::traits::HwWorkerDriver for HwDriver {
+    fn cycle_samples(&self) -> usize {
+        self.cycle_samples()
+    }
+
+    fn sample_rate(&self) -> i32 {
+        self.sample_rate()
+    }
+
+    fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = self.capture.drop();
+        let _ = self.playback.drop();
+    }
+
+    fn run_cycle_for_worker(&mut self) -> Result<(), String> {
+        self.channel().run_cycle().map_err(|e| e.to_string())
+    }
+
+    fn run_assist_step_for_worker(&mut self) -> Result<bool, String> {
+        self.channel().run_assist_step().map_err(|e| e.to_string())
+    }
+}
+
 crate::impl_hw_device_for_driver!(HwDriver);
 crate::impl_hw_midi_hub_traits!(MidiHub);
 
-pub struct OSSChannel<'a> {
+pub struct AlsaChannel<'a> {
     driver: &'a mut HwDriver,
 }
 
-impl<'a> OSSChannel<'a> {
+impl<'a> AlsaChannel<'a> {
     pub fn run_cycle(&mut self) -> std::io::Result<()> {
         self.driver.run_cycle().map_err(std::io::Error::other)
     }
@@ -709,6 +772,15 @@ enum SampleFormat {
 }
 
 impl SampleFormat {
+    fn bits(self) -> i32 {
+        match self {
+            SampleFormat::S8 => 8,
+            SampleFormat::S16LE | SampleFormat::S16BE => 16,
+            SampleFormat::S24LE | SampleFormat::S24BE => 24,
+            SampleFormat::S32LE | SampleFormat::S32BE => 32,
+        }
+    }
+
     fn alsa_format(self) -> Format {
         match self {
             SampleFormat::S8 => Format::S8,

@@ -50,14 +50,14 @@ pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, 
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
-    for arg in args.extra_args {
-        cmd.arg(arg);
-    }
-
     #[cfg(unix)]
     {
         cmd.arg(events.host_read_fd().to_string())
             .arg(events.host_write_fd().to_string());
+    }
+
+    for arg in args.extra_args {
+        cmd.arg(arg);
     }
     #[cfg(windows)]
     {

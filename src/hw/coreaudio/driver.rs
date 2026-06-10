@@ -120,6 +120,14 @@ impl HwDriver {
         self.cycle_samples
     }
 
+    pub fn sample_bits(&self) -> i32 {
+        32
+    }
+
+    pub fn frame_size_bytes(&self) -> usize {
+        self.output_channels.len() * 4
+    }
+
     pub fn input_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
         self.input_channels.get(idx).cloned()
     }
