@@ -1569,7 +1569,7 @@ impl Engine {
         // Only synchronize with the hardware cycle when the transport is playing.
         // When stopped, the OSS assist thread may be blocked on I/O after the
         // PCM trigger was disabled, so waiting for HWFinished would deadlock.
-        self.playing && (self.hw_worker.is_some() || self.jack_runtime.is_some())
+        self.playing && (self.hw_worker.is_some() || self.jack_runtime_is_some())
     }
 
     async fn ensure_hw_worker_running(&mut self) {
