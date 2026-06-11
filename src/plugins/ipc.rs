@@ -148,13 +148,19 @@ pub fn drop_host(
 /// 2. Workspace `target/debug` or `target/release` (development).
 /// 3. `PATH` environment variable.
 pub fn find_plugin_host_binary() -> Option<PathBuf> {
+    let host_name = if cfg!(windows) {
+        "maolan-plugin-host.exe"
+    } else {
+        "maolan-plugin-host"
+    };
+
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from));
 
     // 1. Same directory as current executable.
     if let Some(ref dir) = exe_dir {
-        let candidate = dir.join("maolan-plugin-host");
+        let candidate = dir.join(host_name);
         if candidate.exists() {
             tracing::info!(path = %candidate.display(), "Using plugin-host from exe directory");
             return Some(candidate);
@@ -172,7 +178,7 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
                 .join("daw")
                 .join("target")
                 .join(profile)
-                .join("maolan-plugin-host");
+                .join(host_name);
             if candidate.exists() {
                 tracing::info!(path = %candidate.display(), "Using plugin-host from daw workspace target");
                 return Some(candidate);
@@ -186,7 +192,7 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
                 .join("plugin-host")
                 .join("target")
                 .join(profile)
-                .join("maolan-plugin-host");
+                .join(host_name);
             if candidate.exists() {
                 tracing::info!(path = %candidate.display(), "Using plugin-host from plugin-host crate target");
                 return Some(candidate);
@@ -196,8 +202,12 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
 
     // 3. PATH.
     if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            let candidate = Path::new(dir).join("maolan-plugin-host");
+        #[cfg(windows)]
+        let path_sep = ';';
+        #[cfg(not(windows))]
+        let path_sep = ':';
+        for dir in path_var.split(path_sep) {
+            let candidate = Path::new(dir).join(host_name);
             if candidate.exists() {
                 tracing::info!(path = %candidate.display(), "Using plugin-host from PATH");
                 return Some(candidate);
