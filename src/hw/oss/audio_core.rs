@@ -349,8 +349,7 @@ impl DoubleBufferedChannel {
                 if rc.is_ok() {
                     let delta = audio.update_map_progress_from_count(&info).unwrap_or(0);
                     let mut progress = (delta / audio.frame_size()) as i64;
-                    // FreeBSD sometimes reports a bogus extra buffer cycle
-                    // at playback start (sosso workaround).
+
                     if progress > audio.buffer_frames()
                         && (now - write.st.last_processing) < audio.buffer_frames() / 2
                     {

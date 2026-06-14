@@ -365,7 +365,6 @@ fn select_f32_output_config(
 
     let rate = requested_rate.max(1) as u32;
 
-    // Prefer a config range that actually contains the requested rate.
     if let Some(range) = ranges.iter().find(|r| {
         let min = r.min_sample_rate();
         let max = r.max_sample_rate();
@@ -374,7 +373,6 @@ fn select_f32_output_config(
         return Ok(range.with_sample_rate(rate).config());
     }
 
-    // Fall back to the first available F32 config at its max rate.
     ranges
         .first()
         .map(|r| r.with_max_sample_rate().config())

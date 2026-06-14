@@ -19,7 +19,6 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 use tracing::error;
 
-/// Hardware device information: (input_channels, output_channels, sample_rate, latency_ranges)
 type HwDeviceInfo = (usize, usize, usize, ((usize, usize), (usize, usize)));
 
 #[cfg(target_os = "linux")]
@@ -92,9 +91,9 @@ struct RecordingSession {
     samples: Vec<f32>,
     channels: usize,
     file_name: String,
-    /// Incremental min/max peaks per channel per stripe (fixed-size window).
+
     stripe_peaks: Vec<Vec<[f32; 2]>>,
-    /// Total frames accumulated (increments by 1 per frame, not per sample).
+
     current_stripe_frames: usize,
 }
 
@@ -223,11 +222,9 @@ pub struct Engine {
     transport_restart_pending: bool,
     notified_loop_wrap_sample: Option<usize>,
     transport_sample: usize,
-    /// Input (capture) latency in frames — record-back shifts recording earlier
-    /// on the timeline by this amount.
+
     hw_input_latency_frames: usize,
-    /// Output (playback) latency in frames — play-ahead trims this many startup
-    /// frames from the beginning of recordings (hardware round-trip silence).
+
     hw_output_latency_frames: usize,
     loop_enabled: bool,
     loop_range_samples: Option<(usize, usize)>,
@@ -1566,9 +1563,6 @@ impl Engine {
     }
 
     fn can_schedule_hw_cycle(&self) -> bool {
-        // Only synchronize with the hardware cycle when the transport is playing.
-        // When stopped, the OSS assist thread may be blocked on I/O after the
-        // PCM trigger was disabled, so waiting for HWFinished would deadlock.
         self.playing && (self.hw_worker.is_some() || self.jack_runtime_is_some())
     }
 
@@ -2848,10 +2842,7 @@ impl Engine {
         if rec.samples.is_empty() || rec.channels == 0 {
             return;
         }
-        // Play-ahead: trim the initial output-latency worth of samples from the
-        // recording. These frames are known to be hardware startup silence because
-        // the playback signal hasn't completed its round-trip through the output
-        // buffer yet. This eliminates leading silence from the WAV file.
+
         let trim_frames = self.hw_output_latency_frames;
         let trim_samples = trim_frames * rec.channels;
         let samples = if trim_samples > 0 && rec.samples.len() > trim_samples {
@@ -2875,9 +2866,7 @@ impl Engine {
             .await;
             return;
         }
-        // Peaks were accumulated incrementally during recording via stripe_peaks.
-        // Convert stripes to binned peaks and write the file. This is O(stripes)
-        // and avoids re-reading the WAV.
+
         let total_frames = rec.current_stripe_frames;
         let peaks_json =
             Self::compute_peaks_from_stripes(&rec.stripe_peaks, total_frames, rec.channels);
@@ -3925,7 +3914,6 @@ impl Engine {
                 }
             };
             let worker_index = if !self.hybrid_enabled {
-                // When hybrid buffering is disabled, any track can use any worker.
                 self.take_ready_worker_index(WorkerClass::Realtime)
                     .or_else(|| self.take_ready_worker_index(WorkerClass::Refill))
             } else if let Some(index) = self.take_ready_worker_index(worker_class) {
@@ -3954,7 +3942,6 @@ impl Engine {
                 continue;
             }
             if self.hybrid_enabled && matches!(worker_class, WorkerClass::Refill) {
-                // Consume wakeup only when we are actually dispatching refill work.
                 let _ = t.hybrid_take_refill_wakeup();
             }
             dispatched += 1;
@@ -4910,7 +4897,6 @@ impl Engine {
                 .await;
             }
             Action::RemoveTrack(ref name) => {
-                // Clean up folder children before removing the track
                 let children: Vec<String> = {
                     let state = self.state.lock();
                     state
@@ -5291,7 +5277,7 @@ impl Engine {
                         .await;
                     return;
                 }
-                // Get old parent and disconnect
+
                 let old_parent = {
                     let t = track.lock();
                     t.parent_track.clone()
@@ -5302,7 +5288,7 @@ impl Engine {
                     let old_track = old_track_arc.lock();
                     track.lock().disconnect_outputs_from_parent(old_track);
                 }
-                // Connect to new parent
+
                 if let Some(new_parent) = parent_name
                     && let Some(parent_track_arc) =
                         self.state.lock().tracks.get(new_parent).cloned()
@@ -5333,7 +5319,7 @@ impl Engine {
                     track_name: track_name.clone(),
                 }))
                 .await;
-                // Also notify with the new open state for GUI convenience
+
                 self.notify_clients(Ok(Action::TrackSetFolder {
                     track_name: track_name.clone(),
                     is_folder: track.lock().is_folder,

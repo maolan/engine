@@ -9,7 +9,6 @@ pub use types::*;
 
 use serde::de::DeserializeOwned;
 
-/// Scan plugins of the given format by spawning `maolan-plugin-host --scan`.
 pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String> {
     let host_bin = ipc::find_plugin_host_binary().ok_or("maolan-plugin-host binary not found")?;
 

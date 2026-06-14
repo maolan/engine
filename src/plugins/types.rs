@@ -1,14 +1,6 @@
-//! Pure data types for plugin metadata and state.
-//!
-//! This module contains no FFI or plugin-loading code; it exists so the
-//! engine can refer to plugin info / state types without linking against
-//! `libloading`, `vst3`, `lilv`, or `lv2_raw`.
-
 use crate::midi::io::MidiEvent;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-
-// ─── CLAP types ───
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClapParameterInfo {
@@ -80,8 +72,6 @@ pub fn is_supported_clap_binary(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("clap"))
 }
 
-// ─── VST3 types ───
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vst3PluginInfo {
     pub id: String,
@@ -119,8 +109,6 @@ pub struct Vst3GuiInfo {
     pub has_gui: bool,
     pub size: Option<(i32, i32)>,
 }
-
-// ─── LV2 types ───
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Lv2PluginInfo {

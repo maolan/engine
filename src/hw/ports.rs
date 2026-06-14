@@ -10,7 +10,6 @@ pub fn has_audio_connections(port: &Arc<AudioIO>) -> bool {
         > 0
 }
 
-/// Fast path when the interleaved buffer is already in f32.
 #[cfg(unix)]
 pub fn fill_ports_from_interleaved_buffer(
     ports: &[Arc<AudioIO>],

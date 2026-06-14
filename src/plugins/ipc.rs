@@ -1,5 +1,3 @@
-//! Shared IPC helpers for out-of-process plugin processors.
-
 use crate::audio::io::AudioIO;
 use crate::mutex::UnsafeMutex;
 use maolan_plugin_protocol::events::EventPair;
@@ -13,13 +11,11 @@ use std::time::{Duration, Instant};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a globally unique instance ID for plugin SHM naming.
 pub fn unique_instance_id(format: &str) -> String {
     let n = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
     format!("{}-{}-{}", format, std::process::id(), n)
 }
 
-/// Arguments for spawning a plugin host subprocess.
 pub struct HostSpawnArgs<'a> {
     pub host_binary: &'a Path,
     pub format: &'a str,
@@ -28,7 +24,6 @@ pub struct HostSpawnArgs<'a> {
     pub extra_args: &'a [&'a str],
 }
 
-/// Spawn the unified `maolan-plugin-host` binary and set up SHM + event pipes.
 pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, String), String> {
     let pid = std::process::id();
     let shm_name = format!("/maolan-{pid}-{}", args.instance_id);
@@ -81,7 +76,6 @@ pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, 
     Ok((child, mapping, events, shm_name))
 }
 
-/// Poll the SHM ready flag until it becomes non-zero or `timeout` elapses.
 pub fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -93,7 +87,6 @@ pub fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
     false
 }
 
-/// Copy input buffers to output buffers when the plugin host is bypassed or crashed.
 pub fn bypass_copy_inputs_to_outputs(inputs: &[Arc<AudioIO>], outputs: &[Arc<AudioIO>]) {
     for (input, output) in inputs.iter().zip(outputs.iter()) {
         let src = input.buffer.lock();
@@ -111,7 +104,6 @@ pub fn bypass_copy_inputs_to_outputs(inputs: &[Arc<AudioIO>], outputs: &[Arc<Aud
     }
 }
 
-/// Shared shutdown logic for the `Drop` impl of all OOP processors.
 pub fn drop_host(
     mapping: &Option<ShmMapping>,
     events: &Option<EventPair>,
@@ -141,12 +133,6 @@ pub fn drop_host(
     let _ = ShmMapping::unlink(shm_name);
 }
 
-/// Locate the `maolan-plugin-host` binary at runtime.
-///
-/// Search order:
-/// 1. Same directory as the current executable.
-/// 2. Workspace `target/debug` or `target/release` (development).
-/// 3. `PATH` environment variable.
 pub fn find_plugin_host_binary() -> Option<PathBuf> {
     let host_name = if cfg!(windows) {
         "maolan-plugin-host.exe"
@@ -158,7 +144,6 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from));
 
-    // 1. Same directory as current executable.
     if let Some(ref dir) = exe_dir {
         let candidate = dir.join(host_name);
         if candidate.exists() {
@@ -167,11 +152,9 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
         }
     }
 
-    // 2. Development workspace paths.
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let engine_root = Path::new(&manifest);
         for profile in ["debug", "release"] {
-            // Primary workspace target directory (build from daw/)
             let candidate = engine_root
                 .parent()
                 .unwrap_or(Path::new(""))
@@ -184,7 +167,6 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
                 return Some(candidate);
             }
 
-            // Crate-specific target directory (build from daw/plugin-host/)
             let candidate = engine_root
                 .parent()
                 .unwrap_or(Path::new(""))
@@ -200,7 +182,6 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
         }
     }
 
-    // 3. PATH.
     if let Ok(path_var) = std::env::var("PATH") {
         #[cfg(windows)]
         let path_sep = ';';
@@ -219,10 +200,11 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
     None
 }
 
-/// Copy input AudioIO buffers to shared memory (bus 0).
-///
 /// # Safety
-/// `ptr` must be a valid pointer to the start of the plugin-host SHM region.
+///
+/// `ptr` must point to a valid, initialized shared-memory layout with enough
+/// space for the configured number of input channels and `frames` samples.
+/// `frames` must not exceed the block size reserved in that layout.
 pub unsafe fn copy_inputs_to_shm(inputs: &[Arc<AudioIO>], ptr: *mut u8, frames: usize) {
     for (ch, input) in inputs.iter().enumerate() {
         let src = input.buffer.lock();
@@ -234,10 +216,11 @@ pub unsafe fn copy_inputs_to_shm(inputs: &[Arc<AudioIO>], ptr: *mut u8, frames: 
     }
 }
 
-/// Copy output shared memory (bus 1) back to AudioIO buffers.
-///
 /// # Safety
-/// `ptr` must be a valid pointer to the start of the plugin-host SHM region.
+///
+/// `ptr` must point to a valid, initialized shared-memory layout with enough
+/// space for the configured number of output channels and `frames` samples.
+/// Each output buffer must be writable and at least `frames` elements long.
 pub unsafe fn copy_outputs_from_shm(outputs: &[Arc<AudioIO>], ptr: *mut u8, frames: usize) {
     for (ch, output) in outputs.iter().enumerate() {
         let dst = output.buffer.lock();
@@ -250,10 +233,10 @@ pub unsafe fn copy_outputs_from_shm(outputs: &[Arc<AudioIO>], ptr: *mut u8, fram
     }
 }
 
-/// Set the standard SHM header fields for a processing block.
-///
 /// # Safety
-/// `ptr` must be a valid pointer to the start of the plugin-host SHM region.
+///
+/// `ptr` must point to a valid, initialized shared-memory layout whose header
+/// can safely be written to.
 pub unsafe fn configure_shm_header(ptr: *mut u8, frames: usize, num_in: usize, num_out: usize) {
     unsafe {
         let h = header_mut(ptr);
@@ -264,8 +247,6 @@ pub unsafe fn configure_shm_header(ptr: *mut u8, frames: usize, num_in: usize, n
     }
 }
 
-/// Generate `UnsafeMutex<Processor>` forwarding methods that are identical
-/// across all out-of-process plugin formats (CLAP, VST3, LV2).
 #[macro_export]
 macro_rules! impl_ipc_processor_wrapper {
     ($processor:ty) => {

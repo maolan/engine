@@ -116,7 +116,6 @@ impl Default for History {
     }
 }
 
-/// Check if an action should be recorded in history
 pub fn should_record(action: &Action) -> bool {
     match action {
         Action::SetTempo(_)
@@ -188,8 +187,6 @@ pub fn should_record(action: &Action) -> bool {
     }
 }
 
-/// Create an inverse action that will undo the given action
-/// Returns None if the action cannot be inverted
 pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
     match action {
         Action::AddTrack { name, .. } => Some(Action::RemoveTrack(name.clone())),

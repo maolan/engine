@@ -20,7 +20,6 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-/// MIDI clip events: vector of (timestamp, midi_bytes) pairs
 type MidiClipEvents = Arc<Vec<(usize, Vec<u8>)>>;
 
 pub struct ClapInstance {
@@ -466,7 +465,7 @@ pub struct Track {
     #[cfg(all(unix, not(target_os = "macos")))]
     pub lv2_plugins: Vec<Lv2Instance>,
     pub plugin_midi_connections: Vec<PluginGraphConnection>,
-    /// Parameter updates echoed back from plugins during the last process cycle.
+
     pub echoed_parameter_updates: UnsafeMutex<Vec<crate::message::Action>>,
     pub pending_hw_midi_out_events: Vec<HwMidiOutEvent>,
     pub next_clap_instance_id: usize,
@@ -887,8 +886,7 @@ impl Track {
         } else {
             Vec::new()
         };
-        // Clip preloading is now done asynchronously before playback starts,
-        // not on the audio thread. See engine::preload_track_clips.
+
         let t3 = std::time::Instant::now();
         let mut track_input_midi_events = self.collect_track_input_midi_events();
         let t4 = std::time::Instant::now();
@@ -904,7 +902,6 @@ impl Track {
         let t5 = std::time::Instant::now();
 
         {
-            // Process track plugins according to graph dependencies and collect echoed parameters.
             let track_name = self.name.clone();
             let can_skip_plugins = !live_mode
                 && self.last_render_block_silent

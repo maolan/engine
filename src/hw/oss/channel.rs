@@ -358,9 +358,6 @@ impl<'a> DuplexChannelApi<'a> {
                 return Err(std::io::Error::other("duplex sleep failed"));
             }
         } else if !self.capture.playing.load(Ordering::Relaxed) {
-            // Playback is stopped. Sleep for one buffer duration to prevent
-            // run_cycle from spinning and letting cycle_end race ahead of
-            // real time, which would cause buffers to get stuck forever.
             let frames = self.capture.chsamples as i64;
             let _ = self.capture.frame_clock.sleep_until_frame(now + frames);
         }

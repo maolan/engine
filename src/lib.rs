@@ -25,8 +25,6 @@ pub use plugins::clap_proc;
 pub use plugins::lv2_proc;
 pub use plugins::vst3_proc;
 
-// Re-export plugin info/state types for backward compatibility with the DAW
-// and internal engine code.
 pub mod clap {
     pub use crate::plugins::types::is_supported_clap_binary;
     pub use crate::plugins::types::{
@@ -61,15 +59,12 @@ pub fn discover_coreaudio_devices() -> Vec<String> {
         .collect()
 }
 
-/// Enables Flush-to-Zero (FTZ) and Denormals-Are-Zero (DAZ) on x86/x86_64,
-/// or flush-to-zero on aarch64. This prevents subnormal floating-point numbers
-/// from causing severe performance degradation in audio DSP code.
 pub fn enable_flush_denormals_to_zero() {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
         let mut mxcsr: u32 = 0;
         std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr);
-        mxcsr |= 0x8040; // FTZ (1 << 15) | DAZ (1 << 6)
+        mxcsr |= 0x8040;
         std::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr);
     }
 
@@ -77,7 +72,7 @@ pub fn enable_flush_denormals_to_zero() {
     unsafe {
         let mut fpcr: u64;
         std::arch::asm!("mrs {0}, fpcr", out(reg) fpcr);
-        fpcr |= 1 << 24; // FZ bit
+        fpcr |= 1 << 24;
         std::arch::asm!("msr fpcr, {0}", in(reg) fpcr);
     }
 }

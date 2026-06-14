@@ -1,5 +1,3 @@
-//! Out-of-process VST3 processor using `maolan-plugin-host` IPC.
-
 use crate::audio::io::AudioIO;
 use crate::midi::io::MidiEvent;
 use crate::mutex::UnsafeMutex;
@@ -17,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
-/// Shared state for an out-of-process VST3 plugin instance.
 pub struct Vst3Processor {
     path: String,
     name: String,
@@ -28,12 +25,12 @@ pub struct Vst3Processor {
     param_infos: Vec<ParameterInfo>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
-    // IPC state
+
     child: UnsafeMutex<Option<Child>>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
-    // Crash recovery
+
     crash_count: AtomicU32,
     last_process_time: UnsafeMutex<Instant>,
 }
@@ -213,7 +210,6 @@ impl Vst3Processor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
-        // Signal host to save state.
         header.request_type.store(1, Ordering::Release);
         header.request_status.store(0, Ordering::Release);
         if let Err(e) = events.signal_host() {
@@ -221,7 +217,6 @@ impl Vst3Processor {
             return Err(format!("Failed to signal host for state save: {}", e));
         }
 
-        // Wait for host to complete (up to 5 seconds).
         if let Err(e) = events.wait_host(Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to state save: {}", e));
@@ -248,12 +243,10 @@ impl Vst3Processor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
-        // Serialize state into scratch area.
         let scratch = unsafe { scratch_ptr(ptr) };
         let size = serialize_vst3_state(scratch, state)?;
         header.scratch_size.store(size as u32, Ordering::Release);
 
-        // Signal host to restore state.
         header.request_type.store(2, Ordering::Release);
         header.request_status.store(0, Ordering::Release);
         if let Err(e) = events.signal_host() {
@@ -261,7 +254,6 @@ impl Vst3Processor {
             return Err(format!("Failed to signal host for state restore: {}", e));
         }
 
-        // Wait for host to complete (up to 5 seconds).
         if let Err(e) = events.wait_host(Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to state restore: {}", e));
@@ -285,7 +277,6 @@ impl Vst3Processor {
             return Vec::new();
         }
 
-        // Check if host process has crashed.
         {
             let child = self.child.lock();
             if let Some(ref mut c) = child.as_mut() {
@@ -300,15 +291,9 @@ impl Vst3Processor {
                         ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                         return Vec::new();
                     }
-                    Ok(None) => {
-                        eprintln!("[VST3 debug] host still alive");
-                    }
-                    Ok(Some(status)) => {
-                        eprintln!("[VST3 debug] host exited with success: {:?}", status);
-                    }
-                    Err(e) => {
-                        eprintln!("[VST3 debug] try_wait error: {}", e);
-                    }
+                    Ok(None) => {}
+                    Ok(Some(_status)) => {}
+                    Err(_e) => {}
                 }
             }
         }
@@ -328,43 +313,32 @@ impl Vst3Processor {
         let num_out = self.audio_outputs.len();
         unsafe {
             ipc::configure_shm_header(ptr, frames, num_in, num_out);
-            // Write default transport state (can be overridden by track later).
+
             let t = transport_mut(ptr);
             t.playhead_sample = 0;
             t.tempo = 120.0;
             t.numerator = 4;
             t.denominator = 4;
-            t.flags = 1; // playing
+            t.flags = 1;
 
-            // Copy input AudioIO buffers to shared memory (bus 0).
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
         }
 
-        // Signal host to process.
         if let Err(e) = events.signal_host() {
             tracing::error!("Failed to signal VST3 host: {e}");
             ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
-        eprintln!("[VST3 debug] signal_host succeeded");
 
-        // Wait for host to complete (with timeout).
         let timeout = Duration::from_millis(100);
         match events.wait_host(timeout) {
-            Ok(()) => {
-                eprintln!("[VST3 debug] wait_host succeeded");
-            }
-            Err(e) => {
-                eprintln!(
-                    "[VST3 debug] host did not respond for '{}' ({}): {}",
-                    self.name, self.path, e
-                );
+            Ok(()) => {}
+            Err(_e) => {
                 ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                 return Vec::new();
             }
         }
 
-        // Copy output shared memory (bus 1) back to AudioIO buffers.
         unsafe {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
         }
@@ -649,7 +623,6 @@ impl UnsafeMutex<Vst3Processor> {
     }
 }
 
-/// Serialize VST3 state into scratch area. Returns bytes written or error.
 fn serialize_vst3_state(scratch: *mut u8, state: &Vst3PluginState) -> Result<usize, String> {
     let max_len = maolan_plugin_protocol::protocol::SCRATCH_SIZE;
     let mut offset = 0usize;
@@ -724,7 +697,6 @@ fn serialize_vst3_state(scratch: *mut u8, state: &Vst3PluginState) -> Result<usi
     Ok(offset)
 }
 
-/// Deserialize VST3 state from scratch area.
 fn deserialize_vst3_state(scratch: *const u8, size: usize) -> Result<Vst3PluginState, String> {
     if size < 12 {
         return Err("scratch too small for VST3 state".to_string());
@@ -833,17 +805,14 @@ mod tests {
 
         processor.setup_audio_ports();
 
-        // Fill input buffer.
         {
             let buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
             *processor.audio_inputs()[0].finished.lock() = true;
         }
 
-        // First process should trigger the crash; subsequent calls should bypass.
         processor.process_with_audio_io(256);
 
-        // After crash, output should be a copy of input (bypass).
         let out_buf = processor.audio_outputs()[0].buffer.lock();
         assert!(
             out_buf.iter().all(|&s| s == 1.0),

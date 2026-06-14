@@ -290,7 +290,6 @@ impl Audio {
         let requested_fragment_bytes =
             Self::request_fragment_layout(dsp.as_raw_fd(), frame_size, options.period_frames)?;
 
-        // Query the actual layout OSS accepted after SETFRAGMENT.
         let mut buffer_info = BufferInfo::new();
         unsafe {
             if input {
@@ -356,8 +355,6 @@ impl Audio {
             chsamples,
         );
 
-        // OSS fragment sizes are reported in bytes; frag_frames is the
-        // corresponding engine-frame count after channel/sample conversion.
         if frag_frames > 0 {
             let direction = if input { "capture" } else { "playback" };
             if chsamples % frag_frames != 0 {

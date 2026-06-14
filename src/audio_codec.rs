@@ -33,9 +33,7 @@ pub fn decode_audio_to_f32_interleaved_preferring_wav(
     {
         match decode_wav_fallback(path) {
             Ok(ok) => return Ok(ok),
-            Err(_wav_err) => {
-                // Fall through to FFmpeg path below.
-            }
+            Err(_wav_err) => {}
         }
     }
     decode_audio_to_f32_interleaved_sync(path)

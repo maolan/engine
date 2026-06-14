@@ -1,10 +1,3 @@
-//! Portable SIMD helper routines for buffer math.
-//!
-//! Uses runtime CPU feature detection to dispatch:
-//! - AVX (`f32x8`) on x86_64/x86 when available
-//! - SSE intrinsics as fallback on x86_64/x86
-//! - Scalar loops on all other architectures
-
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -15,7 +8,6 @@ mod x86 {
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 use x86::*;
 
-/// dst[i] += src[i]
 pub fn add_inplace(dst: &mut [f32], src: &[f32]) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -31,7 +23,6 @@ pub fn add_inplace(dst: &mut [f32], src: &[f32]) {
     add_inplace_scalar(dst, src);
 }
 
-/// dst[i] *= gain
 pub fn mul_inplace(dst: &mut [f32], gain: f32) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -47,7 +38,6 @@ pub fn mul_inplace(dst: &mut [f32], gain: f32) {
     mul_inplace_scalar(dst, gain);
 }
 
-/// dst[i] += src[i] * gain
 pub fn add_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -67,7 +57,6 @@ pub fn add_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
     add_scaled_inplace_scalar(dst, src, gain);
 }
 
-/// dst[i] = src[i] * gain
 pub fn copy_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -83,7 +72,6 @@ pub fn copy_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
     copy_scaled_inplace_scalar(dst, src, gain);
 }
 
-/// dst[i] += sanitize_finite(src[i])
 pub fn add_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -99,7 +87,6 @@ pub fn add_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
     add_sanitized_inplace_scalar(dst, src);
 }
 
-/// dst[i] = sanitize_finite(src[i])
 pub fn copy_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -115,7 +102,6 @@ pub fn copy_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
     copy_sanitized_inplace_scalar(dst, src);
 }
 
-/// Replace NaN / ±Inf with 0.0 in place.
 pub fn sanitize_finite_inplace(buf: &mut [f32]) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -131,7 +117,6 @@ pub fn sanitize_finite_inplace(buf: &mut [f32]) {
     sanitize_finite_inplace_scalar(buf);
 }
 
-/// Horizontal max of abs(buf[i]).
 pub fn peak_abs(buf: &[f32]) -> f32 {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -145,7 +130,6 @@ pub fn peak_abs(buf: &[f32]) -> f32 {
     peak_abs_scalar(buf)
 }
 
-/// Clamp every element to [min, max].
 pub fn clamp_inplace(buf: &mut [f32], min: f32, max: f32) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -592,8 +576,6 @@ unsafe fn clamp_inplace_avx(buf: &mut [f32], min: f32, max: f32) {
     }
 }
 
-/// Convert i32 samples to f32 and scale by `gain`.
-/// `dst` must be at least as long as `src`.
 pub fn convert_i32_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -652,8 +634,6 @@ unsafe fn convert_i32_to_f32_avx(src: &[i32], dst: &mut [f32], gain: f32) {
     }
 }
 
-/// Convert i16 samples to f32 and scale by `gain`.
-/// `dst` must be at least as long as `src`.
 pub fn convert_i16_to_f32(src: &[i16], dst: &mut [f32], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -728,8 +708,6 @@ unsafe fn convert_i16_to_f32_avx2(src: &[i16], dst: &mut [f32], gain: f32) {
     }
 }
 
-/// Convert i8 samples to f32 and scale by `gain`.
-/// `dst` must be at least as long as `src`.
 pub fn convert_i8_to_f32(src: &[i8], dst: &mut [f32], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -795,9 +773,6 @@ unsafe fn convert_i8_to_f32_avx2(src: &[i8], dst: &mut [f32], gain: f32) {
     }
 }
 
-/// Convert i32 samples with lower 24 bits valid to f32 and scale by `gain`.
-/// Sign-extends the lower 24 bits of each i32 before conversion.
-/// `dst` must be at least as long as `src`.
 pub fn convert_i24_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -878,9 +853,6 @@ unsafe fn convert_i24_to_f32_avx2(src: &[i32], dst: &mut [f32], gain: f32) {
     }
 }
 
-/// Convert f32 samples to i32 and scale by `gain`, masking to lower 24 bits.
-/// Uses truncation toward zero (matching Rust `as i32`).
-/// `dst` must be at least as long as `src`.
 pub fn convert_f32_to_i24(src: &[f32], dst: &mut [i32], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -950,9 +922,6 @@ unsafe fn convert_f32_to_i24_avx(src: &[f32], dst: &mut [i32], gain: f32) {
     }
 }
 
-/// Convert f32 samples to i32 and scale by `gain`.
-/// Uses truncation toward zero (matching Rust `as i32`).
-/// `dst` must be at least as long as `src`.
 pub fn convert_f32_to_i32(src: &[f32], dst: &mut [i32], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -1015,9 +984,6 @@ unsafe fn convert_f32_to_i32_avx(src: &[f32], dst: &mut [i32], gain: f32) {
     }
 }
 
-/// Convert f32 samples to i16 and scale by `gain`.
-/// Uses truncation toward zero (matching Rust `as i16`).
-/// `dst` must be at least as long as `src`.
 pub fn convert_f32_to_i16(src: &[f32], dst: &mut [i16], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -1094,9 +1060,6 @@ unsafe fn convert_f32_to_i16_avx(src: &[f32], dst: &mut [i16], gain: f32) {
     }
 }
 
-/// Convert f32 samples to i8 and scale by `gain`.
-/// Uses truncation toward zero (matching Rust `as i8`).
-/// `dst` must be at least as long as `src`.
 pub fn convert_f32_to_i8(src: &[f32], dst: &mut [i8], gain: f32) {
     let n = src.len().min(dst.len());
     if n == 0 {
@@ -1167,8 +1130,6 @@ unsafe fn convert_f32_to_i8_avx(src: &[f32], dst: &mut [i8], gain: f32) {
     }
 }
 
-/// Apply a sine-based fade-in gain ramp in place: `gain = sin(t * π/2)`.
-/// `t` for sample `i` is `(start_t + i as f32 * dt).clamp(0.0, 1.0)`.
 pub fn apply_fade_in_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
@@ -1187,8 +1148,6 @@ pub fn apply_fade_in_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
     }
 }
 
-/// Apply a cosine-based fade-out gain ramp in place: `gain = cos(t * π/2)`.
-/// `t` for sample `i` is `(start_t + i as f32 * dt).clamp(0.0, 1.0)`.
 pub fn apply_fade_out_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {

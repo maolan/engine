@@ -1,5 +1,3 @@
-//! Out-of-process LV2 processor using `maolan-plugin-host` IPC.
-
 use crate::audio::io::AudioIO;
 use crate::midi::io::MidiEvent;
 use crate::mutex::UnsafeMutex;
@@ -15,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
-/// Shared state for an out-of-process LV2 plugin instance.
 pub struct Lv2Processor {
     uri: String,
     name: String,
@@ -25,12 +22,12 @@ pub struct Lv2Processor {
     main_audio_outputs: usize,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
-    // IPC state
+
     child: UnsafeMutex<Option<Child>>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
-    // Crash recovery
+
     crash_count: AtomicU32,
     last_process_time: UnsafeMutex<Instant>,
 }
@@ -278,7 +275,6 @@ impl Lv2Processor {
             return Vec::new();
         }
 
-        // Check if host process has crashed.
         {
             let child = self.child.lock();
             if let Some(ref mut c) = child.as_mut() {
@@ -293,15 +289,9 @@ impl Lv2Processor {
                         ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                         return Vec::new();
                     }
-                    Ok(Some(status)) => {
-                        eprintln!("[LV2 debug] host exited with success: {:?}", status);
-                    }
-                    Ok(None) => {
-                        eprintln!("[LV2 debug] host still alive");
-                    }
-                    Err(e) => {
-                        eprintln!("[LV2 debug] try_wait error: {}", e);
-                    }
+                    Ok(Some(_status)) => {}
+                    Ok(None) => {}
+                    Err(_e) => {}
                 }
             }
         }
@@ -321,43 +311,32 @@ impl Lv2Processor {
         let num_out = self.audio_outputs.len();
         unsafe {
             ipc::configure_shm_header(ptr, frames, num_in, num_out);
-            // Write default transport state (can be overridden by track later).
+
             let t = transport_mut(ptr);
             t.playhead_sample = 0;
             t.tempo = 120.0;
             t.numerator = 4;
             t.denominator = 4;
-            t.flags = 1; // playing
+            t.flags = 1;
 
-            // Copy input AudioIO buffers to shared memory (bus 0).
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
         }
 
-        // Signal host to process.
         if let Err(e) = events.signal_host() {
             tracing::error!("Failed to signal LV2 host: {e}");
             ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
-        eprintln!("[LV2 debug] signal_host succeeded");
 
-        // Wait for host to complete (with timeout).
         let timeout = Duration::from_millis(100);
         match events.wait_host(timeout) {
-            Ok(()) => {
-                eprintln!("[LV2 debug] wait_host succeeded");
-            }
-            Err(e) => {
-                eprintln!(
-                    "[LV2 debug] host did not respond for '{}' ({}): {}",
-                    self.name, self.uri, e
-                );
+            Ok(()) => {}
+            Err(_e) => {
                 ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                 return Vec::new();
             }
         }
 
-        // Copy output shared memory (bus 1) back to AudioIO buffers.
         unsafe {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
         }
@@ -521,17 +500,14 @@ mod tests {
 
         processor.setup_audio_ports();
 
-        // Fill input buffer.
         {
             let buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
             *processor.audio_inputs()[0].finished.lock() = true;
         }
 
-        // First process should trigger the crash; subsequent calls should bypass.
         processor.process_with_audio_io(256);
 
-        // After crash, output should be a copy of input (bypass).
         let out_buf = processor.audio_outputs()[0].buffer.lock();
         let first_few: Vec<f32> = out_buf.iter().take(10).copied().collect();
         assert!(

@@ -1,5 +1,3 @@
-//! Out-of-process CLAP processor using `maolan-plugin-host` IPC.
-
 use crate::audio::io::AudioIO;
 use crate::midi::io::MidiEvent;
 use crate::mutex::UnsafeMutex;
@@ -18,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
-/// Shared state for an out-of-process CLAP plugin instance.
 pub struct ClapProcessor {
     path: String,
     plugin_id: String,
@@ -32,12 +29,12 @@ pub struct ClapProcessor {
     param_infos: Vec<ClapParameterInfo>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
-    // IPC state
+
     child: UnsafeMutex<Option<Child>>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
-    // Crash recovery
+
     crash_count: AtomicU32,
     last_process_time: UnsafeMutex<Instant>,
 }
@@ -55,7 +52,6 @@ impl ClapProcessor {
     ) -> Result<Self, String> {
         let (plugin_path, plugin_id) = split_plugin_spec(plugin_spec);
 
-        // Spawn the host immediately so we can query params.
         let instance_id = ipc::unique_instance_id("clap");
         let plugin_spec = if plugin_id.is_empty() {
             plugin_path.to_string()
@@ -90,7 +86,6 @@ impl ClapProcessor {
             name.unwrap_or_else(|| plugin_id.to_string())
         };
 
-        // Read port counts written by the host (with fallback to constructor params).
         let (actual_audio_in, actual_audio_out, actual_midi_in, actual_midi_out) = unsafe {
             let mut counts = None;
             for _ in 0..50 {
@@ -122,8 +117,6 @@ impl ClapProcessor {
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
 
-        // Query parameter count from host via a simple param ring echo.
-        // For now, we use a minimal stub param list.
         let param_infos = Vec::new();
 
         Ok(Self {
@@ -203,7 +196,7 @@ impl ClapProcessor {
 
     pub fn set_parameter_at(&self, param_id: u32, value: f64, _frame: u32) -> Result<(), String> {
         self.param_values.lock().insert(param_id, value);
-        // Write to param ring buffer if host is alive.
+
         if let Some(ref mapping) = self.mapping {
             let ring = unsafe {
                 let buf = param_ring_ptr(mapping.as_ptr());
@@ -370,7 +363,6 @@ impl ClapProcessor {
             );
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
 
-            // Write transport state.
             let t = transport_mut(ptr);
             t.playhead_sample = transport.transport_sample as u64;
             t.tempo = transport.bpm;
@@ -378,17 +370,9 @@ impl ClapProcessor {
             t.denominator = transport.tsig_denom as u32;
             t.flags = if transport.playing { 1 } else { 0 };
 
-            // Write MIDI input events to the shared-memory ring buffer.
             let midi_buf = midi_ring_ptr(ptr);
             let (midi_w, midi_r) = midi_indices(ptr);
             let midi_ring = RingBuffer::new(midi_buf, midi_w, midi_r, RING_CAPACITY);
-            if !midi_in.is_empty() {
-                eprintln!(
-                    "[CLAP-PROC] {} forwarding {} MIDI events to host",
-                    self.name,
-                    midi_in.len()
-                );
-            }
             for ev in midi_in {
                 let midi_event = maolan_plugin_protocol::protocol::MidiEvent {
                     sample_offset: ev.frame,
@@ -433,7 +417,6 @@ impl ClapProcessor {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
         }
 
-        // Read MIDI output events from the plugin host.
         let mut midi_out = Vec::new();
         unsafe {
             let midi_out_buf = midi_out_ring_ptr(ptr);
@@ -718,14 +701,7 @@ impl UnsafeMutex<ClapProcessor> {
     }
 }
 
-/// Locate the `maolan-plugin-host` binary at runtime.
-///
-/// Search order:
-/// 1. Same directory as the current executable.
-/// 2. Workspace `target/debug` or `target/release` (development).
-/// 3. `PATH` environment variable.
 fn split_plugin_spec(spec: &str) -> (&str, &str) {
-    // CLAP scanner uses "path::id"; host protocol uses "path#id".
     if let Some(pos) = spec.rfind("::") {
         (&spec[..pos], &spec[pos + 2..])
     } else if let Some(pos) = spec.rfind('#') {
@@ -755,10 +731,6 @@ mod tests {
     fn clap_processor_processes_audio() {
         let host_bin = find_host_binary();
         if !host_bin.exists() {
-            eprintln!(
-                "Skipping test: host binary not found at {}",
-                host_bin.display()
-            );
             return;
         }
 
@@ -771,10 +743,6 @@ mod tests {
             .join("test_passthrough.clap");
 
         if !plugin_path.exists() {
-            eprintln!(
-                "Skipping test: plugin not found at {}",
-                plugin_path.display()
-            );
             return;
         }
 
@@ -790,7 +758,6 @@ mod tests {
 
         processor.setup_audio_ports();
 
-        // Fill input buffers with a ramp.
         for (i, input) in processor.audio_inputs().iter().enumerate() {
             let buf = input.buffer.lock();
             for (j, sample) in buf.iter_mut().enumerate() {
@@ -799,10 +766,8 @@ mod tests {
             *input.finished.lock() = true;
         }
 
-        // Process one block.
         processor.process_with_audio_io(256);
 
-        // Verify output buffers were written (non-zero).
         for output in processor.audio_outputs().iter() {
             let buf = output.buffer.lock();
             assert!(
@@ -810,35 +775,28 @@ mod tests {
                 "output buffer should contain non-zero samples"
             );
         }
-
-        // Processor is dropped here, which should gracefully shut down the host.
     }
 
     #[test]
     fn clap_processor_crash_bypass() {
         let host_bin = find_host_binary();
         if !host_bin.exists() {
-            eprintln!("Skipping crash test: host binary not found");
             return;
         }
 
-        // Use the crash test mode.
         let processor = ClapProcessor::new(48000.0, 256, "__crash__", 1, 1, host_bin)
             .expect("should create processor for crash test");
 
         processor.setup_audio_ports();
 
-        // Fill input buffer.
         {
             let buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
             *processor.audio_inputs()[0].finished.lock() = true;
         }
 
-        // First process should trigger the crash; subsequent calls should bypass.
         processor.process_with_audio_io(256);
 
-        // After crash, output should be a copy of input (bypass).
         let out_buf = processor.audio_outputs()[0].buffer.lock();
         assert!(
             out_buf.iter().all(|&s| s == 1.0),
@@ -852,7 +810,6 @@ mod tests {
 
         let host_bin = find_host_binary();
         if !host_bin.exists() {
-            eprintln!("Skipping track integration test: host binary not found");
             return;
         }
 
@@ -865,10 +822,6 @@ mod tests {
             .join("test_passthrough.clap");
 
         if !plugin_path.exists() {
-            eprintln!(
-                "Skipping track integration test: plugin not found at {}",
-                plugin_path.display()
-            );
             return;
         }
 
@@ -883,9 +836,6 @@ mod tests {
 
         assert_eq!(track.clap_plugins.len(), 1);
 
-        // Process directly through the plugin processor to verify IPC works.
-        // Track-level routing requires explicit audio connections; this test
-        // verifies that a plugin loaded on a track can process audio correctly.
         let processor = track.clap_plugins[0].processor.lock();
         processor.setup_audio_ports();
 
