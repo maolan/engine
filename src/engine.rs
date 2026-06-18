@@ -3148,11 +3148,31 @@ impl Engine {
 
     async fn notify_clients(&mut self, action: Result<Action, String>) {
         self.clients.retain(|client| !client.is_closed());
-        for (idx, client) in self.clients.iter().enumerate() {
-            if let Err(e) = client.send(Message::Response(action.clone())).await {
-                tracing::error!("notify_clients: failed to send to client {}: {}", idx, e);
-            }
+        for client in self.clients.iter() {
+            if client
+                .send(Message::Response(action.clone()))
+                .await
+                .is_err()
+            {}
         }
+    }
+
+    fn spawn_plugin_host_stderr_reader(&self, stderr: std::process::ChildStderr, source: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line
+                    && !line.is_empty()
+                {
+                    let _ = tx.blocking_send(Message::Request(Action::Log {
+                        source: source.clone(),
+                        message: line,
+                    }));
+                }
+            }
+        });
     }
 
     fn set_osc_enabled_with<F>(&mut self, enabled: bool, start_server: F) -> Result<(), String>
@@ -4195,6 +4215,10 @@ impl Engine {
 
     async fn handle_request(&mut self, a: Action) {
         match a {
+            Action::Log { source, message } => {
+                self.notify_clients(Ok(Action::Log { source, message }))
+                    .await;
+            }
             Action::Undo => {
                 let actions = match self.history.undo() {
                     Some(actions) => actions,
@@ -5721,6 +5745,24 @@ impl Engine {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
+                self.notify_clients(Ok(Action::Log {
+                    source: "engine".to_string(),
+                    message: format!("CLAP plugin loaded on track '{track_name}': {plugin_path}"),
+                }))
+                .await;
+                if let Some(instance) = track.clap_plugins.last()
+                    && let Some(stderr) = instance.processor.lock().take_stderr()
+                {
+                    let source = format!("clap:{plugin_path}");
+                    self.spawn_plugin_host_stderr_reader(stderr, source);
+                    self.notify_clients(Ok(Action::Log {
+                        source: "engine".to_string(),
+                        message: format!(
+                            "Attached stderr reader for CLAP plugin on track '{track_name}'"
+                        ),
+                    }))
+                    .await;
+                }
             }
             Action::TrackUnloadClapPlugin {
                 ref track_name,
@@ -5830,6 +5872,12 @@ impl Engine {
                 if let Err(e) = track.load_vst3_plugin(plugin_path, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
+                }
+                if let Some(instance) = track.vst3_plugins.last()
+                    && let Some(stderr) = instance.processor.lock().take_stderr()
+                {
+                    let source = format!("vst3:{plugin_path}");
+                    self.spawn_plugin_host_stderr_reader(stderr, source);
                 }
             }
             Action::TrackUnloadVst3Plugin {
@@ -5941,6 +5989,12 @@ impl Engine {
                 if let Err(e) = track.load_lv2_plugin(plugin_uri, instance_id) {
                     self.notify_clients(Err(e)).await;
                     return;
+                }
+                if let Some(instance) = track.lv2_plugins.last()
+                    && let Some(stderr) = instance.processor.lock().take_stderr()
+                {
+                    let source = format!("lv2:{plugin_uri}");
+                    self.spawn_plugin_host_stderr_reader(stderr, source);
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -7631,6 +7685,7 @@ impl Engine {
                     | Action::OpenMidiOutputDevice(_)
                     | Action::RequestMeterSnapshot
                     | Action::Quit
+                    | Action::Log { .. }
                     | Action::Play
                     | Action::Pause
                     | Action::Stop

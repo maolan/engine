@@ -4,7 +4,7 @@ use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::shm::ShmMapping;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -24,7 +24,9 @@ pub struct HostSpawnArgs<'a> {
     pub extra_args: &'a [&'a str],
 }
 
-pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, String), String> {
+pub fn spawn_host(
+    args: HostSpawnArgs,
+) -> Result<(Child, ShmMapping, EventPair, String, Option<ChildStderr>), String> {
     let pid = std::process::id();
     let shm_name = format!("/maolan-{pid}-{}", args.instance_id);
 
@@ -43,7 +45,7 @@ pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, 
         .arg(args.instance_id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
 
     #[cfg(unix)]
     {
@@ -67,13 +69,14 @@ pub fn spawn_host(args: HostSpawnArgs) -> Result<(Child, ShmMapping, EventPair, 
         cmd.arg("--log-level").arg(&parent_args[pos + 1]);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {} host: {e}", args.format))?;
+    let stderr = child.stderr.take();
 
     events.close_daw_unused();
 
-    Ok((child, mapping, events, shm_name))
+    Ok((child, mapping, events, shm_name, stderr))
 }
 
 pub fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
@@ -139,6 +142,15 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
     } else {
         "maolan-plugin-host"
     };
+
+    if let Ok(override_path) = std::env::var("MAOLAN_PLUGIN_HOST") {
+        let candidate = PathBuf::from(override_path);
+        if candidate.exists() {
+            tracing::info!(path = %candidate.display(), "Using plugin-host from MAOLAN_PLUGIN_HOST");
+            return Some(candidate);
+        }
+        tracing::warn!(path = %candidate.display(), "MAOLAN_PLUGIN_HOST points to a missing file");
+    }
 
     let exe_dir = std::env::current_exe()
         .ok()

@@ -278,6 +278,10 @@ pub enum GlobalMidiLearnTarget {
 #[derive(Clone, Debug)]
 pub enum Action {
     Quit,
+    Log {
+        source: String,
+        message: String,
+    },
     Play,
     Pause,
     Stop,

@@ -7,10 +7,8 @@ use std::{
     os::fd::AsRawFd,
     os::unix::fs::OpenOptionsExt,
     os::unix::io::RawFd,
-    thread,
     time::{Duration, Instant},
 };
-use tracing::error;
 
 #[derive(Debug, Default)]
 pub struct MidiHub {
@@ -37,10 +35,8 @@ impl MidiHub {
         }
         if let Some(waiter) = self.input_waiter.as_mut()
             && let Some(input) = self.inputs.last()
-            && let Err(e) = waiter.add_fd(input.file.as_raw_fd())
-        {
-            error!("MIDI readiness registration failed for {}: {}", path, e);
-        }
+            && waiter.add_fd(input.file.as_raw_fd()).is_err()
+        {}
         Ok(())
     }
 
@@ -411,10 +407,7 @@ impl MidiOutputDevice {
             if midi_event.data.is_empty() {
                 continue;
             }
-            if let Err(err) = self.file.write_all(&midi_event.data) {
-                if err.kind() != ErrorKind::WouldBlock {
-                    error!("MIDI write error on {}: {}", self.path, err);
-                }
+            if self.file.write_all(&midi_event.data).is_err() {
                 break;
             }
         }
@@ -430,16 +423,36 @@ impl MidiOutputDevice {
                 continue;
             }
             let deadline = Instant::now() + timeout;
-            loop {
-                match self.file.write_all(&midi_event.data) {
-                    Ok(()) => break,
-                    Err(err)
-                        if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
-                    {
-                        thread::sleep(Duration::from_millis(1));
+            let mut data = &midi_event.data[..];
+            while !data.is_empty() {
+                match self.file.write(data) {
+                    Ok(0) => {
+                        break;
                     }
-                    Err(err) => {
-                        error!("Blocking MIDI write error on {}: {}", self.path, err);
+                    Ok(n) => {
+                        data = &data[n..];
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let mut pfd = libc::pollfd {
+                            fd: self.file.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+                        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+                        if rc < 0 {
+                            break;
+                        }
+                        if rc == 0 || (pfd.revents & libc::POLLOUT) == 0 {
+                            // Timeout or device not ready; stop trying this event
+                            break;
+                        }
+                    }
+                    Err(_) => {
                         break;
                     }
                 }
@@ -496,8 +509,7 @@ impl MidiInputDevice {
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    error!("MIDI read error on {}: {}", self.path, err);
+                Err(_) => {
                     break;
                 }
             }

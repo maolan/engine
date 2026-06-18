@@ -163,13 +163,7 @@ impl Audio {
         let exponent = fragment_bytes.trailing_zeros();
         let arg_bits = ((fragments.min(0xffff) as u32) << 16) | exponent;
         let mut arg = arg_bits as i32;
-        if unsafe { oss_set_fragment(fd, &mut arg) }.is_err() {
-            tracing::warn!(
-                "OSS: failed to request {} byte fragments: {}",
-                fragment_bytes,
-                std::io::Error::last_os_error()
-            );
-        }
+        unsafe { oss_set_fragment(fd, &mut arg) }?;
         Ok(fragment_bytes)
     }
 
@@ -287,7 +281,7 @@ impl Audio {
             .ok_or_else(|| std::io::Error::other(format!("Unsupported format: {format:#x}")))?;
         let frame_size = (channels as usize) * bytes_per_sample;
 
-        let requested_fragment_bytes =
+        let _requested_fragment_bytes =
             Self::request_fragment_layout(dsp.as_raw_fd(), frame_size, options.period_frames)?;
 
         let mut buffer_info = BufferInfo::new();
@@ -328,7 +322,7 @@ impl Audio {
             }
         }
 
-        let ring_total_frames = if frame_size > 0 && buffer_info.bytes > 0 {
+        let _ring_total_frames = if frame_size > 0 && buffer_info.bytes > 0 {
             (buffer_info.bytes as usize) / frame_size
         } else {
             0
@@ -344,27 +338,9 @@ impl Audio {
             buffer_info.fragsize.max(1) as usize,
         )?;
 
-        tracing::info!(
-            "OSS {}: requested {} byte fragments, got {} frags x {} bytes ({} frames each), ring {} frames, engine period {} frames",
-            if input { "capture" } else { "playback" },
-            requested_fragment_bytes,
-            buffer_info.fragstotal,
-            buffer_info.fragsize,
-            frag_frames,
-            ring_total_frames,
-            chsamples,
-        );
-
         if frag_frames > 0 {
-            let direction = if input { "capture" } else { "playback" };
-            if chsamples % frag_frames != 0 {
-                tracing::info!(
-                    "OSS {}: engine period ({} frames) is not a multiple of OSS fragment size ({} frames)",
-                    direction,
-                    chsamples,
-                    frag_frames,
-                );
-            }
+            let _direction = if input { "capture" } else { "playback" };
+            if chsamples % frag_frames != 0 {}
         }
 
         let buffer_bytes = chsamples * frame_size;
@@ -612,17 +588,10 @@ impl Audio {
                 || current_overruns > self.last_overrun_count)
         {
             self.xrun_count += 1;
-            let delta_underruns = current_underruns - self.last_underrun_count;
-            let delta_overruns = current_overruns - self.last_overrun_count;
+            let _delta_underruns = current_underruns - self.last_underrun_count;
+            let _delta_overruns = current_overruns - self.last_overrun_count;
             self.last_underrun_count = current_underruns;
             self.last_overrun_count = current_overruns;
-
-            tracing::warn!(
-                "OSS hardware xrun detected (#{}, underruns +{}, overruns +{})",
-                self.xrun_count,
-                delta_underruns,
-                delta_overruns
-            );
 
             return self.chsamples as i64;
         }

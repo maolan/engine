@@ -143,11 +143,6 @@ impl SharedIOState {
         );
         if gap > 0 {
             data.xrun_count += 1;
-            tracing::warn!(
-                "CoreAudio xrun detected (#{}, gap {} frames)",
-                data.xrun_count,
-                gap
-            );
 
             ports::fill_ports_from_interleaved(input_ports, frames, false, |_, _| 0.0);
 
@@ -357,12 +352,7 @@ impl IoProcHandle {
                 client_ptr,
             )
         };
-        if overload_status != kAudioHardwareNoError as OSStatus {
-            tracing::warn!(
-                "Failed to register overload listener (status {}); xrun detection may be limited",
-                overload_status
-            );
-        }
+        if overload_status != kAudioHardwareNoError as OSStatus {}
 
         Ok(IoProcHandle {
             device_id,

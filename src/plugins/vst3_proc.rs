@@ -10,7 +10,7 @@ use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ChildStderr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ pub struct Vst3Processor {
     bypassed: Arc<AtomicBool>,
 
     child: UnsafeMutex<Option<Child>>,
+    stderr: UnsafeMutex<Option<ChildStderr>>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
@@ -56,7 +57,7 @@ impl Vst3Processor {
         let instance_id = ipc::unique_instance_id("vst3");
         let num_inputs = input_count.max(1);
         let num_outputs = output_count.max(1);
-        let (mut child, mapping, events, shm_name) = ipc::spawn_host(ipc::HostSpawnArgs {
+        let (mut child, mapping, events, shm_name, stderr) = ipc::spawn_host(ipc::HostSpawnArgs {
             host_binary: &host_binary,
             format: "vst3",
             plugin_spec: plugin_path,
@@ -76,23 +77,14 @@ impl Vst3Processor {
         }
 
         let name = unsafe {
-            let mut name = None;
-            for _ in 0..50 {
-                name = maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(
-                    mapping.as_ptr(),
-                );
-                if name.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            name.unwrap_or_else(|| {
-                Path::new(plugin_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("VST3")
-                    .to_string()
-            })
+            maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(mapping.as_ptr())
+                .unwrap_or_else(|| {
+                    Path::new(plugin_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("VST3")
+                        .to_string()
+                })
         };
 
         let param_infos = Vec::new();
@@ -108,6 +100,7 @@ impl Vst3Processor {
             param_values: UnsafeMutex::new(HashMap::new()),
             bypassed: Arc::new(AtomicBool::new(false)),
             child: UnsafeMutex::new(Some(child)),
+            stderr: UnsafeMutex::new(stderr),
             mapping: Some(mapping),
             events: Some(events),
             shm_name,
@@ -183,9 +176,7 @@ impl Vst3Processor {
                 sample_offset: 0,
                 event_kind: maolan_plugin_protocol::PARAM_EVENT_VALUE,
             };
-            if !ring.push(ev) {
-                tracing::warn!("VST3 param ring full, dropping parameter event");
-            }
+            if !ring.push(ev) {}
         }
         Ok(())
     }
@@ -282,23 +273,16 @@ impl Vst3Processor {
             if let Some(ref mut c) = child.as_mut() {
                 match c.try_wait() {
                     Ok(Some(status)) if !status.success() => {
-                        tracing::error!(
-                            "VST3 plugin host crashed for '{}' ({})",
-                            self.name,
-                            self.path
-                        );
                         self.crash_count.fetch_add(1, Ordering::Relaxed);
                         ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                         return Vec::new();
                     }
                     Ok(None) => {}
                     Ok(Some(_status)) => {}
-                    Err(_e) => {}
+                    Err(_) => {}
                 }
             }
         }
-
-        let started = Instant::now();
 
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
@@ -324,8 +308,7 @@ impl Vst3Processor {
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
         }
 
-        if let Err(e) = events.signal_host() {
-            tracing::error!("Failed to signal VST3 host: {e}");
+        if events.signal_host().is_err() {
             ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
@@ -333,7 +316,7 @@ impl Vst3Processor {
         let timeout = Duration::from_millis(100);
         match events.wait_host(timeout) {
             Ok(()) => {}
-            Err(_e) => {
+            Err(_) => {
                 ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                 return Vec::new();
             }
@@ -341,17 +324,6 @@ impl Vst3Processor {
 
         unsafe {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
-        }
-
-        let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(20) {
-            tracing::warn!(
-                "Slow VST3 process '{}' ({}) took {:.3} ms for {} frames",
-                self.name,
-                self.path,
-                elapsed.as_secs_f64() * 1000.0,
-                frames
-            );
         }
 
         *self.last_process_time.lock() = Instant::now();
@@ -364,6 +336,10 @@ impl Vst3Processor {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn take_stderr(&self) -> Option<ChildStderr> {
+        self.stderr.lock().take()
     }
 
     pub fn begin_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {

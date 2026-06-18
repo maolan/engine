@@ -11,7 +11,7 @@ use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, ChildStderr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ pub struct ClapProcessor {
     bypassed: Arc<AtomicBool>,
 
     child: UnsafeMutex<Option<Child>>,
+    stderr: UnsafeMutex<Option<ChildStderr>>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
@@ -58,7 +59,7 @@ impl ClapProcessor {
         } else {
             format!("{plugin_path}::{plugin_id}")
         };
-        let (mut child, mapping, events, shm_name) = ipc::spawn_host(ipc::HostSpawnArgs {
+        let (mut child, mapping, events, shm_name, stderr) = ipc::spawn_host(ipc::HostSpawnArgs {
             host_binary: &host_binary,
             format: "clap",
             plugin_spec: &plugin_spec,
@@ -73,41 +74,15 @@ impl ClapProcessor {
         }
 
         let name = unsafe {
-            let mut name = None;
-            for _ in 0..50 {
-                name = maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(
-                    mapping.as_ptr(),
-                );
-                if name.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            name.unwrap_or_else(|| plugin_id.to_string())
+            maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(mapping.as_ptr())
+                .unwrap_or_else(|| plugin_id.to_string())
         };
 
         let (actual_audio_in, actual_audio_out, actual_midi_in, actual_midi_out) = unsafe {
-            let mut counts = None;
-            for _ in 0..50 {
-                counts = maolan_plugin_protocol::protocol::read_port_counts_from_scratch(
-                    mapping.as_ptr(),
-                );
-                if counts.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let result = counts.unwrap_or((input_count as u32, output_count as u32, 0, 0));
-            tracing::info!(
-                plugin = %plugin_spec,
-                audio_in = result.0,
-                audio_out = result.1,
-                midi_in = result.2,
-                midi_out = result.3,
-                from_host = counts.is_some(),
-                "CLAP processor port counts"
-            );
-            result
+            let counts =
+                maolan_plugin_protocol::protocol::read_port_counts_from_scratch(mapping.as_ptr());
+
+            counts.unwrap_or((input_count as u32, output_count as u32, 0, 0))
         };
 
         let audio_inputs = (0..actual_audio_in as usize)
@@ -133,6 +108,7 @@ impl ClapProcessor {
             param_values: UnsafeMutex::new(HashMap::new()),
             bypassed: Arc::new(AtomicBool::new(false)),
             child: UnsafeMutex::new(Some(child)),
+            stderr: UnsafeMutex::new(stderr),
             mapping: Some(mapping),
             events: Some(events),
             shm_name,
@@ -209,9 +185,7 @@ impl ClapProcessor {
                 sample_offset: 0,
                 event_kind: maolan_plugin_protocol::PARAM_EVENT_VALUE,
             };
-            if !ring.push(ev) {
-                tracing::warn!("param ring full, dropping parameter event");
-            }
+            if !ring.push(ev) {}
         }
         Ok(())
     }
@@ -333,7 +307,6 @@ impl ClapProcessor {
             if let Some(ref mut c) = child.as_mut() {
                 match c.try_wait() {
                     Ok(Some(status)) if !status.success() => {
-                        tracing::error!("plugin host crashed for '{}' ({})", self.name, self.path);
                         self.crash_count.fetch_add(1, Ordering::Relaxed);
                         ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                         return Vec::new();
@@ -342,8 +315,6 @@ impl ClapProcessor {
                 }
             }
         }
-
-        let started = Instant::now();
 
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
@@ -386,29 +357,18 @@ impl ClapProcessor {
                     _pad: 0,
                 };
                 if !midi_ring.push(midi_event) {
-                    tracing::warn!(
-                        "MIDI input ring full for '{}' ({}), dropping event",
-                        self.name,
-                        self.path
-                    );
                     break;
                 }
             }
         }
 
-        if let Err(e) = events.signal_host() {
-            tracing::error!("Failed to signal host: {e}");
+        if events.signal_host().is_err() {
             ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
 
         let timeout = Duration::from_millis(100);
-        if let Err(e) = events.wait_host(timeout) {
-            tracing::error!(
-                "host did not respond for '{}' ({}): {e}",
-                self.name,
-                self.path
-            );
+        if events.wait_host(timeout).is_err() {
             ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
@@ -431,17 +391,6 @@ impl ClapProcessor {
             }
         }
 
-        let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(20) {
-            tracing::warn!(
-                "Slow process '{}' ({}) took {:.3} ms for {} frames",
-                self.name,
-                self.path,
-                elapsed.as_secs_f64() * 1000.0,
-                frames
-            );
-        }
-
         *self.last_process_time.lock() = Instant::now();
         midi_out
     }
@@ -456,6 +405,10 @@ impl ClapProcessor {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn take_stderr(&self) -> Option<ChildStderr> {
+        self.stderr.lock().take()
     }
 
     pub fn begin_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {

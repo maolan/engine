@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc::Sender;
-use tracing::{error, info, warn};
 
 #[cfg(test)]
 use std::net::SocketAddr;
@@ -39,7 +38,12 @@ impl OscServer {
         socket
             .set_read_timeout(Some(Duration::from_millis(250)))
             .map_err(|e| format!("Failed to configure OSC socket timeout: {e}"))?;
+        #[cfg(test)]
         let listen_addr = socket
+            .local_addr()
+            .map_err(|e| format!("Failed to read OSC socket address: {e}"))?;
+        #[cfg(not(test))]
+        socket
             .local_addr()
             .map_err(|e| format!("Failed to read OSC socket address: {e}"))?;
 
@@ -47,27 +51,23 @@ impl OscServer {
         let stop_thread = stop.clone();
         let handle = thread::spawn(move || {
             let mut buf = [0_u8; 2048];
-            info!("OSC server listening on {listen_addr}");
             while !stop_thread.load(Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok((len, _)) => {
                         if let Some(action) = parse_osc_action(&buf[..len])
-                            && let Err(err) = tx.blocking_send(Message::Request(action))
+                            && tx.blocking_send(Message::Request(action)).is_err()
                         {
-                            error!("Failed to forward OSC action to engine: {err}");
                             break;
                         }
                     }
                     Err(err)
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(err) => {
-                        error!("OSC receive error: {err}");
+                    Err(_) => {
                         break;
                     }
                 }
             }
-            info!("OSC server stopped");
         });
 
         Ok(Self {
@@ -85,10 +85,8 @@ impl OscServer {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take()
-            && let Err(err) = handle.join()
-        {
-            warn!("Failed to join OSC thread: {:?}", err);
+        if let Some(handle) = self.handle.take() {
+            drop(handle.join());
         }
     }
 }

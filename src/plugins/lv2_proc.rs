@@ -8,7 +8,7 @@ use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, ChildStderr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
@@ -24,6 +24,7 @@ pub struct Lv2Processor {
     bypassed: Arc<AtomicBool>,
 
     child: UnsafeMutex<Option<Child>>,
+    stderr: UnsafeMutex<Option<ChildStderr>>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
@@ -55,7 +56,7 @@ impl Lv2Processor {
         let buffer_size_str = buffer_size.to_string();
         let num_inputs_str = input_count.max(1).to_string();
         let num_outputs_str = output_count.max(1).to_string();
-        let (mut child, mapping, events, shm_name) = ipc::spawn_host(ipc::HostSpawnArgs {
+        let (mut child, mapping, events, shm_name, stderr) = ipc::spawn_host(ipc::HostSpawnArgs {
             host_binary: &host_binary,
             format: "lv2",
             plugin_spec: plugin_uri,
@@ -75,23 +76,14 @@ impl Lv2Processor {
         }
 
         let name = unsafe {
-            let mut name = None;
-            for _ in 0..50 {
-                name = maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(
-                    mapping.as_ptr(),
-                );
-                if name.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            name.unwrap_or_else(|| {
-                plugin_uri
-                    .rsplit_once('/')
-                    .map(|(_, name)| name)
-                    .unwrap_or(plugin_uri)
-                    .to_string()
-            })
+            maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(mapping.as_ptr())
+                .unwrap_or_else(|| {
+                    plugin_uri
+                        .rsplit_once('/')
+                        .map(|(_, name)| name)
+                        .unwrap_or(plugin_uri)
+                        .to_string()
+                })
         };
 
         Ok(Self {
@@ -104,6 +96,7 @@ impl Lv2Processor {
             param_values: UnsafeMutex::new(HashMap::new()),
             bypassed: Arc::new(AtomicBool::new(false)),
             child: UnsafeMutex::new(Some(child)),
+            stderr: UnsafeMutex::new(stderr),
             mapping: Some(mapping),
             events: Some(events),
             shm_name,
@@ -175,9 +168,7 @@ impl Lv2Processor {
                 sample_offset: 0,
                 event_kind: maolan_plugin_protocol::PARAM_EVENT_VALUE,
             };
-            if !ring.push(ev) {
-                tracing::warn!("LV2 param ring full, dropping parameter event");
-            }
+            if !ring.push(ev) {}
         }
         Ok(())
     }
@@ -280,23 +271,16 @@ impl Lv2Processor {
             if let Some(ref mut c) = child.as_mut() {
                 match c.try_wait() {
                     Ok(Some(status)) if !status.success() => {
-                        tracing::error!(
-                            "LV2 plugin host crashed for '{}' ({})",
-                            self.name,
-                            self.uri
-                        );
                         self.crash_count.fetch_add(1, Ordering::Relaxed);
                         ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                         return Vec::new();
                     }
                     Ok(Some(_status)) => {}
                     Ok(None) => {}
-                    Err(_e) => {}
+                    Err(_) => {}
                 }
             }
         }
-
-        let started = Instant::now();
 
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
@@ -322,8 +306,7 @@ impl Lv2Processor {
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
         }
 
-        if let Err(e) = events.signal_host() {
-            tracing::error!("Failed to signal LV2 host: {e}");
+        if events.signal_host().is_err() {
             ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
             return Vec::new();
         }
@@ -331,7 +314,7 @@ impl Lv2Processor {
         let timeout = Duration::from_millis(100);
         match events.wait_host(timeout) {
             Ok(()) => {}
-            Err(_e) => {
+            Err(_) => {
                 ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
                 return Vec::new();
             }
@@ -339,17 +322,6 @@ impl Lv2Processor {
 
         unsafe {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
-        }
-
-        let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(20) {
-            tracing::warn!(
-                "Slow LV2 process '{}' ({}) took {:.3} ms for {} frames",
-                self.name,
-                self.uri,
-                elapsed.as_secs_f64() * 1000.0,
-                frames
-            );
         }
 
         *self.last_process_time.lock() = Instant::now();
@@ -362,6 +334,10 @@ impl Lv2Processor {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn take_stderr(&self) -> Option<ChildStderr> {
+        self.stderr.lock().take()
     }
 
     pub fn begin_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {

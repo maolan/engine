@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct Worker {
@@ -190,8 +189,6 @@ impl Worker {
         let mut last_reported_progress = 0.0_f32;
         let mut total_process_time = Duration::ZERO;
         let mut total_write_time = Duration::ZERO;
-        let mut block_count = 0usize;
-        let bounce_start = Instant::now();
         while cursor < job.length_samples {
             if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = std::fs::remove_file(&job.output_path);
@@ -223,7 +220,6 @@ impl Worker {
                 t.set_record_tap_enabled(false);
             }
 
-            let block_process_start = Instant::now();
             loop {
                 let mut all_finished = true;
                 let mut progressed = false;
@@ -274,7 +270,6 @@ impl Worker {
                     break;
                 }
             }
-            let _block_process_elapsed = block_process_start.elapsed();
 
             let write_start = Instant::now();
             {
@@ -292,7 +287,6 @@ impl Worker {
             total_write_time += write_start.elapsed();
 
             cursor = cursor.saturating_add(step);
-            block_count += 1;
             let progress = (cursor as f32 / job.length_samples as f32).clamp(0.0, 1.0);
 
             if progress - last_reported_progress >= 0.01 || cursor >= job.length_samples {
@@ -309,11 +303,6 @@ impl Worker {
                     .await;
             }
         }
-        let bounce_elapsed = bounce_start.elapsed();
-        info!(
-            "Bounce '{}' — total: {:?}, blocks: {}, process: {:?}, write: {:?}",
-            job.track_name, bounce_elapsed, block_count, total_process_time, total_write_time
-        );
 
         if let Err(e) = crate::audio_codec::write_wav_f32(
             std::path::Path::new(&job.output_path),
@@ -407,9 +396,7 @@ impl Worker {
 
     pub async fn work(&mut self) {
         crate::enable_flush_denormals_to_zero();
-        if let Err(e) = Self::try_enable_realtime(self.realtime_priority) {
-            error!("Worker {} realtime priority not enabled: {}", self.id, e);
-        }
+        let _ = Self::try_enable_realtime(self.realtime_priority);
         while let Some(message) = self.rx.recv().await {
             match message {
                 Message::Request(Action::Quit) => {
@@ -419,16 +406,7 @@ impl Worker {
                     let (track_name, output_linear, process_epoch, parameter_updates) = {
                         let track = t.lock();
                         let process_epoch = track.process_epoch;
-                        let started = Instant::now();
                         track.process();
-                        let elapsed = started.elapsed();
-                        if elapsed.as_millis() > 20 {
-                            tracing::warn!(
-                                "Slow track process '{}' took {:.3} ms",
-                                track.name,
-                                elapsed.as_secs_f64() * 1000.0
-                            );
-                        }
                         track.audio.processing = false;
                         let updates = std::mem::take(track.echoed_parameter_updates.lock());
                         (
@@ -438,7 +416,7 @@ impl Worker {
                             updates,
                         )
                     };
-                    match self
+                    let _ = self
                         .tx
                         .send(Message::Finished {
                             worker_id: self.id,
@@ -447,13 +425,7 @@ impl Worker {
                             process_epoch,
                             parameter_updates,
                         })
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("Error while sending Finished: {}", e);
-                        }
-                    }
+                        .await;
                 }
                 Message::ProcessOfflineBounce(job) => {
                     self.process_offline_bounce(job).await;

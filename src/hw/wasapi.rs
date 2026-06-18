@@ -123,7 +123,7 @@ impl HwDriver {
                             frames_since_tick -= period_frames;
                         }
                     },
-                    move |e| error!("{backend_label} output stream error: {e}"),
+                    move |e| (),
                     None,
                 )
                 .map_err(|e| format!("Failed to build {backend_label} output stream: {e}"))?
@@ -138,21 +138,18 @@ impl HwDriver {
                 let chunk_len = period_frames.saturating_mul(input_channels.max(1));
                 let input_stream = {
                     let mut stash: Vec<f32> = Vec::with_capacity(chunk_len.saturating_mul(2));
-                    let mut input_cb_count = 0usize;
                     input_device
                         .build_input_stream(
                             &input_cfg,
                             move |data: &[f32], _| {
                                 crate::enable_flush_denormals_to_zero();
-                                input_cb_count += 1;
-                                let non_zero = data.iter().filter(|&&s| s.abs() > 0.0001).count();
                                 stash.extend_from_slice(data);
                                 while stash.len() >= chunk_len {
                                     let chunk: Vec<f32> = stash.drain(..chunk_len).collect();
                                     let _ = input_tx.try_send(chunk);
                                 }
                             },
-                            move |e| error!("{backend_label} input stream error: {e}"),
+                            move |e| (),
                             None,
                         )
                         .map_err(|e| format!("Failed to build {backend_label} input stream: {e}"))?
@@ -242,7 +239,6 @@ impl HwDriver {
             }
         }
 
-        let needed_samples = input_frames.saturating_mul(input_channels);
         let have_samples = self.input_queue.len();
         let have_frames = have_samples / input_channels;
         let consume_frames = have_frames.min(input_frames);

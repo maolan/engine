@@ -111,8 +111,6 @@ impl MidiHub {
                             "Failed to connect CoreMIDI source '{raw_name}': {e:?}"
                         ));
                     }
-
-                    info!("CoreMIDI input connected: {raw_name}");
                 }
                 Err(e) => {
                     return Err(format!("Failed to create CoreMIDI input port: {e:?}"));
@@ -135,7 +133,6 @@ impl MidiHub {
         let dest = find_destination_by_name(raw_name)
             .ok_or_else(|| format!("CoreMIDI destination not found: {raw_name}"))?;
 
-        info!("CoreMIDI output connected: {raw_name}");
         self.output_destinations.push((raw_name.to_string(), dest));
         Ok(())
     }
@@ -175,9 +172,7 @@ impl MidiHub {
                 }
 
                 let packet_buf = PacketBuffer::new(0, &event.event.data);
-                if let Err(e) = output_port.send(destination, &packet_buf) {
-                    error!("CoreMIDI write error on {dest_name}: {e:?}");
-                }
+                if let Err(e) = output_port.send(destination, &packet_buf) {}
             }
         }
     }
