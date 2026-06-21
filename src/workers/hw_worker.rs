@@ -35,6 +35,27 @@ pub struct HwWorker<B: Backend> {
     cycle_frames: u32,
     pending_midi_out_events: Vec<HwMidiEvent>,
     pending_midi_out_sorted: bool,
+    midi_stop: Arc<AtomicBool>,
+    assist_state: Arc<(Mutex<AssistState>, Condvar)>,
+}
+
+impl<B: Backend> Drop for HwWorker<B> {
+    fn drop(&mut self) {
+        self.driver.lock().request_stop();
+        self.midi_stop.store(true, Ordering::Release);
+        {
+            let midi_hub = self.midi_hub.lock();
+            midi_hub.wake_input_waiter();
+            midi_hub.close_input_waiter();
+        }
+        {
+            let (lock, cvar) = &*self.assist_state;
+            if let Ok(mut st) = lock.lock() {
+                st.shutdown = true;
+                cvar.notify_one();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -235,6 +256,8 @@ impl<B: Backend> HwWorker<B> {
             cycle_frames,
             pending_midi_out_events: vec![],
             pending_midi_out_sorted: true,
+            midi_stop: Arc::new(AtomicBool::new(false)),
+            assist_state: Arc::new((Mutex::new(AssistState::default()), Condvar::new())),
         }
     }
 
@@ -250,20 +273,65 @@ impl<B: Backend> HwWorker<B> {
         unsafe {
             libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
         }
-        let assist_state = Arc::new((Mutex::new(AssistState::default()), Condvar::new()));
-        let assist_handle = Self::start_assist_thread(self.driver.clone(), assist_state.clone());
-        let midi_stop = Arc::new(AtomicBool::new(false));
+        let assist_handle =
+            Self::start_assist_thread(self.driver.clone(), self.assist_state.clone());
         let midi_handle = Self::start_midi_input_thread(
             self.midi_hub.clone(),
             self.tx.clone(),
             self.cycle_frames,
-            midi_stop.clone(),
+            self.midi_stop.clone(),
         );
         loop {
-            match self.rx.recv().await {
-                Some(msg) => match msg {
-                    Message::Request(crate::message::Action::Quit) => {
-                        self.driver.lock().request_stop();
+            let msg = match self.rx.recv().await {
+                Some(msg) => msg,
+                None => {
+                    self.driver.lock().request_stop();
+                    self.midi_stop.store(true, Ordering::Release);
+                    {
+                        let midi_hub = self.midi_hub.lock();
+                        midi_hub.wake_input_waiter();
+                    }
+                    let _ = midi_handle.join();
+                    {
+                        let midi_hub = self.midi_hub.lock();
+                        midi_hub.close_input_waiter();
+                    }
+                    Self::stop_assist_thread(&self.assist_state, assist_handle);
+                    return;
+                }
+            };
+            match msg {
+                Message::Request(crate::message::Action::Quit) => {
+                    self.driver.lock().request_stop();
+                    if !self.pending_midi_out_events.is_empty() {
+                        if !self.pending_midi_out_sorted {
+                            self.pending_midi_out_events.sort_by(|a, b| {
+                                a.event
+                                    .frame
+                                    .cmp(&b.event.frame)
+                                    .then_with(|| a.device.cmp(&b.device))
+                            });
+                            self.pending_midi_out_sorted = true;
+                        }
+                        let midi_hub = self.midi_hub.lock();
+                        midi_hub.write_events(&self.pending_midi_out_events);
+                        self.pending_midi_out_events.clear();
+                    }
+                    self.midi_stop.store(true, Ordering::Release);
+                    {
+                        let midi_hub = self.midi_hub.lock();
+                        midi_hub.wake_input_waiter();
+                    }
+                    let _ = midi_handle.join();
+                    {
+                        let midi_hub = self.midi_hub.lock();
+                        midi_hub.close_input_waiter();
+                    }
+                    Self::stop_assist_thread(&self.assist_state, assist_handle);
+                    return;
+                }
+                Message::TracksFinished => {
+                    {
                         if !self.pending_midi_out_events.is_empty() {
                             if !self.pending_midi_out_sorted {
                                 self.pending_midi_out_events.sort_by(|a, b| {
@@ -278,72 +346,35 @@ impl<B: Backend> HwWorker<B> {
                             midi_hub.write_events(&self.pending_midi_out_events);
                             self.pending_midi_out_events.clear();
                         }
-                        midi_stop.store(true, Ordering::Release);
-                        {
-                            let midi_hub = self.midi_hub.lock();
-                            midi_hub.wake_input_waiter();
-                        }
-                        let _ = midi_handle.join();
-                        Self::stop_assist_thread(&assist_state, assist_handle);
-                        return;
                     }
-                    Message::TracksFinished => {
-                        {
-                            if !self.pending_midi_out_events.is_empty() {
-                                if !self.pending_midi_out_sorted {
-                                    self.pending_midi_out_events.sort_by(|a, b| {
-                                        a.event
-                                            .frame
-                                            .cmp(&b.event.frame)
-                                            .then_with(|| a.device.cmp(&b.device))
-                                    });
-                                    self.pending_midi_out_sorted = true;
-                                }
-                                let midi_hub = self.midi_hub.lock();
-                                midi_hub.write_events(&self.pending_midi_out_events);
-                                self.pending_midi_out_events.clear();
-                            }
-                        }
-                        if let Err(e) = Self::run_assist_cycle(&self.driver, &assist_state) {
-                            error!("{} assist cycle error: {}", B::LABEL, e);
-                            let _ = self
-                                .tx
-                                .send(Message::Response(Err(format!(
-                                    "{} assist cycle error: {}",
-                                    B::LABEL,
-                                    e
-                                ))))
-                                .await;
-                        }
-                        if let Err(e) = self.tx.send(Message::HWFinished).await {
-                            error!(
-                                "{} worker failed to send HWFinished to engine: {}",
+                    if let Err(e) = Self::run_assist_cycle(&self.driver, &self.assist_state) {
+                        error!("{} assist cycle error: {}", B::LABEL, e);
+                        let _ = self
+                            .tx
+                            .send(Message::Response(Err(format!(
+                                "{} assist cycle error: {}",
                                 B::LABEL,
                                 e
-                            );
-                        }
+                            ))))
+                            .await;
                     }
-                    Message::HWMidiOutEvents(mut events) => {
-                        self.pending_midi_out_events.append(&mut events);
-                        self.pending_midi_out_sorted = false;
+                    if let Err(e) = self.tx.send(Message::HWFinished).await {
+                        error!(
+                            "{} worker failed to send HWFinished to engine: {}",
+                            B::LABEL,
+                            e
+                        );
                     }
-                    Message::ClearHWMidiOutEvents => {
-                        self.pending_midi_out_events.clear();
-                        self.pending_midi_out_sorted = true;
-                    }
-                    _ => {}
-                },
-                None => {
-                    self.driver.lock().request_stop();
-                    midi_stop.store(true, Ordering::Release);
-                    {
-                        let midi_hub = self.midi_hub.lock();
-                        midi_hub.wake_input_waiter();
-                    }
-                    let _ = midi_handle.join();
-                    Self::stop_assist_thread(&assist_state, assist_handle);
-                    return;
                 }
+                Message::HWMidiOutEvents(mut events) => {
+                    self.pending_midi_out_events.append(&mut events);
+                    self.pending_midi_out_sorted = false;
+                }
+                Message::ClearHWMidiOutEvents => {
+                    self.pending_midi_out_events.clear();
+                    self.pending_midi_out_sorted = true;
+                }
+                _ => {}
             }
         }
     }
@@ -358,9 +389,19 @@ impl<B: Backend> HwWorker<B> {
             crate::enable_flush_denormals_to_zero();
             let mut midi_in_events = Vec::with_capacity(64);
             while !stop.load(Ordering::Acquire) {
+                let ready_fds = {
+                    let hub = midi_hub.lock();
+                    hub.wait_ready_blocking()
+                };
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 {
                     let hub = midi_hub.lock();
-                    hub.read_events_blocking_into(&mut midi_in_events);
+                    hub.read_events_for_fds(
+                        ready_fds.as_deref().unwrap_or(&[]),
+                        &mut midi_in_events,
+                    );
                 }
                 if midi_in_events.is_empty() {
                     continue;
@@ -534,7 +575,9 @@ impl<B: Backend> HwWorker<B> {
         driver: &Arc<UnsafeMutex<B::Driver>>,
         assist_state: &Arc<(Mutex<AssistState>, Condvar)>,
     ) -> Result<(), String> {
-        if Self::assist_autonomous_enabled() && B::CYCLE_ON_WORKER_WHEN_ASSIST_AUTONOMOUS {
+        let autonomous =
+            Self::assist_autonomous_enabled() && B::CYCLE_ON_WORKER_WHEN_ASSIST_AUTONOMOUS;
+        if autonomous {
             let (lock, cvar) = &**assist_state;
             {
                 let mut st = lock

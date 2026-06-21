@@ -13,7 +13,14 @@ pub trait HwMidiHub {
     fn read_events_blocking_into(&mut self, out: &mut Vec<HwMidiEvent>) {
         self.read_events_into(out);
     }
+    fn wait_ready_blocking(&mut self) -> Option<Vec<i32>> {
+        None
+    }
+    fn read_events_for_fds(&mut self, _ready_fds: &[i32], out: &mut Vec<HwMidiEvent>) {
+        self.read_events_into(out);
+    }
     fn wake_input_waiter(&mut self) {}
+    fn close_input_waiter(&mut self) {}
     fn write_events(&mut self, events: &[HwMidiEvent]);
 }
 
@@ -82,8 +89,24 @@ macro_rules! impl_hw_midi_hub_traits {
                 <$hub>::read_events_blocking_into(self, out);
             }
 
+            fn wait_ready_blocking(&mut self) -> Option<Vec<i32>> {
+                <$hub>::wait_ready_blocking(self)
+            }
+
+            fn read_events_for_fds(
+                &mut self,
+                ready_fds: &[i32],
+                out: &mut Vec<$crate::message::HwMidiEvent>,
+            ) {
+                <$hub>::read_events_for_fds(self, ready_fds, out)
+            }
+
             fn wake_input_waiter(&mut self) {
                 <$hub>::wake_input_waiter(self);
+            }
+
+            fn close_input_waiter(&mut self) {
+                <$hub>::close_input_waiter(self);
             }
 
             fn write_events(&mut self, events: &[$crate::message::HwMidiEvent]) {

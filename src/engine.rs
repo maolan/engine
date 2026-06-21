@@ -4703,6 +4703,7 @@ impl Engine {
             }
             Action::Quit => {
                 self.flush_recordings().await;
+                self.notify_clients(Ok(Action::Quit)).await;
                 self.ready_realtime_workers.clear();
                 self.ready_refill_workers.clear();
                 while !self.workers.is_empty() {
@@ -4742,6 +4743,8 @@ impl Engine {
                 {
                     self.jack_runtime = None;
                 }
+                self.osc_server = None;
+                return;
             }
             Action::AddTrack {
                 ref name,

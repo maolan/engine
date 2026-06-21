@@ -68,34 +68,41 @@ impl MidiHub {
         }
     }
 
-    pub fn read_events_blocking_into(&mut self, out: &mut Vec<HwMidiEvent>) {
-        out.clear();
-        let ready_fds = self
-            .input_waiter
+    pub fn wait_ready_blocking(&mut self) -> Option<Vec<i32>> {
+        self.input_waiter
             .as_mut()
-            .and_then(|waiter| waiter.wait_ready_blocking());
+            .and_then(|waiter| waiter.wait_ready_blocking())
+    }
+
+    pub fn read_events_for_fds(&mut self, ready_fds: &[i32], out: &mut Vec<HwMidiEvent>) {
+        out.clear();
+        if ready_fds.is_empty() {
+            return;
+        }
+        for input in &mut self.inputs {
+            if ready_fds.contains(&input.file.as_raw_fd()) {
+                input.read_events_into(out);
+            }
+        }
+    }
+
+    pub fn read_events_blocking_into(&mut self, out: &mut Vec<HwMidiEvent>) {
+        let ready_fds = self.wait_ready_blocking();
         match ready_fds {
-            Some(ready) => {
-                if ready.is_empty() {
-                    return;
-                }
-                for input in &mut self.inputs {
-                    if ready.contains(&input.file.as_raw_fd()) {
-                        input.read_events_into(out);
-                    }
-                }
-            }
-            None => {
-                for input in &mut self.inputs {
-                    input.read_events_into(out);
-                }
-            }
+            Some(ready) => self.read_events_for_fds(&ready, out),
+            None => self.read_events_into(out),
         }
     }
 
     pub fn wake_input_waiter(&mut self) {
         if let Some(waiter) = self.input_waiter.as_mut() {
             waiter.wake();
+        }
+    }
+
+    pub fn close_input_waiter(&mut self) {
+        if let Some(waiter) = self.input_waiter.as_mut() {
+            waiter.close();
         }
     }
 
@@ -242,20 +249,29 @@ impl MidiInputWaiter {
         let one = [1_u8; 1];
         let _ = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
     }
+
+    fn close(&mut self) {
+        unsafe {
+            if self.kq >= 0 {
+                libc::close(self.kq);
+                self.kq = -1;
+            }
+            if self.wake_read_fd >= 0 {
+                libc::close(self.wake_read_fd);
+                self.wake_read_fd = -1;
+            }
+            if self.wake_write_fd >= 0 {
+                libc::close(self.wake_write_fd);
+                self.wake_write_fd = -1;
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
 impl Drop for MidiInputWaiter {
     fn drop(&mut self) {
-        unsafe {
-            if self.wake_read_fd >= 0 {
-                libc::close(self.wake_read_fd);
-            }
-            if self.wake_write_fd >= 0 {
-                libc::close(self.wake_write_fd);
-            }
-            libc::close(self.kq);
-        }
+        self.close();
     }
 }
 
@@ -367,20 +383,29 @@ impl MidiInputWaiter {
         let one = [1_u8; 1];
         let _ = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
     }
+
+    fn close(&mut self) {
+        unsafe {
+            if self.epfd >= 0 {
+                libc::close(self.epfd);
+                self.epfd = -1;
+            }
+            if self.wake_read_fd >= 0 {
+                libc::close(self.wake_read_fd);
+                self.wake_read_fd = -1;
+            }
+            if self.wake_write_fd >= 0 {
+                libc::close(self.wake_write_fd);
+                self.wake_write_fd = -1;
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for MidiInputWaiter {
     fn drop(&mut self) {
-        unsafe {
-            if self.wake_read_fd >= 0 {
-                libc::close(self.wake_read_fd);
-            }
-            if self.wake_write_fd >= 0 {
-                libc::close(self.wake_write_fd);
-            }
-            libc::close(self.epfd);
-        }
+        self.close();
     }
 }
 
