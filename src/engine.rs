@@ -241,6 +241,7 @@ pub struct Engine {
     playing: bool,
     clip_playback_enabled: bool,
     record_enabled: bool,
+    step_recording_enabled: bool,
     session_dir: Option<PathBuf>,
     hw_out_level_db: f32,
     hw_out_balance: f32,
@@ -1000,6 +1001,7 @@ impl Engine {
             playing: false,
             clip_playback_enabled: true,
             record_enabled: false,
+            step_recording_enabled: false,
             session_dir: None,
             hw_out_level_db: 0.0,
             hw_out_balance: 0.0,
@@ -4643,6 +4645,9 @@ impl Engine {
                     .await;
                 }
             }
+            Action::SetStepRecording(enabled) => {
+                self.step_recording_enabled = enabled;
+            }
             Action::BeginHistoryGroup if self.history_group.is_none() => {
                 self.history_group = Some(UndoEntry {
                     forward_actions: vec![],
@@ -7704,6 +7709,8 @@ impl Engine {
                     | Action::SetOscEnabled(_)
                     | Action::SetClipPlaybackEnabled(_)
                     | Action::SetRecordEnabled(_)
+                    | Action::SetStepRecording(_)
+                    | Action::StepRecordMidiNote { .. }
                     | Action::SetSessionPath(_)
                     | Action::ClearHistory
                     | Action::BeginSessionRestore
@@ -7881,6 +7888,20 @@ impl Engine {
                                 let value = hw_event.event.data[2];
                                 self.handle_incoming_hw_cc(&hw_event.device, channel, cc, value)
                                     .await;
+                            }
+                            if self.step_recording_enabled && status & 0xF0 == 0x90 {
+                                let channel = status & 0x0F;
+                                let pitch = hw_event.event.data[1];
+                                let velocity = hw_event.event.data[2];
+                                if velocity > 0 {
+                                    self.notify_clients(Ok(Action::StepRecordMidiNote {
+                                        device: hw_event.device.clone(),
+                                        channel,
+                                        pitch,
+                                        velocity,
+                                    }))
+                                    .await;
+                                }
                             }
                         }
                         self.pending_hw_midi_events_by_device

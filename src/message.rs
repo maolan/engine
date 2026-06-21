@@ -547,6 +547,13 @@ pub enum Action {
         clip_index: usize,
         notes: Vec<(usize, MidiNoteData)>,
     },
+    SetStepRecording(bool),
+    StepRecordMidiNote {
+        device: String,
+        channel: u8,
+        pitch: u8,
+        velocity: u8,
+    },
     SetMidiSysExEvents {
         track_name: String,
         clip_index: usize,
