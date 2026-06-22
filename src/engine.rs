@@ -5503,6 +5503,27 @@ impl Engine {
                 };
                 track.lock().clear_default_passthrough();
             }
+            Action::TrackClearPlugins { ref track_name } => {
+                if self
+                    .reject_if_track_frozen(track_name, "plugin graph editing")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                track.lock().clear_plugins();
+                self.notify_clients(Ok(Action::Log {
+                    source: "engine".to_string(),
+                    message: format!("Cleared plugins from track '{track_name}'"),
+                }))
+                .await;
+            }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::ClipSetLv2PluginState { ref track_name, .. } => {
                 self.notify_clients(Err(format!(

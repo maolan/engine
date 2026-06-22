@@ -563,6 +563,9 @@ pub enum Action {
     TrackClearDefaultPassthrough {
         track_name: String,
     },
+    TrackClearPlugins {
+        track_name: String,
+    },
     #[cfg(all(unix, not(target_os = "macos")))]
     TrackSetLv2PluginState {
         track_name: String,

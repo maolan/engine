@@ -2828,7 +2828,7 @@ impl Track {
                     instance_id: instance.id,
                     format: "CLAP".to_string(),
                     uri: proc.path().to_string(),
-                    plugin_id: proc.path().to_string(),
+                    plugin_id: proc.plugin_id().to_string(),
                     name: proc.name().to_string(),
                     main_audio_inputs: proc.main_audio_input_count(),
                     main_audio_outputs: proc.main_audio_output_count(),
@@ -3314,6 +3314,27 @@ impl Track {
         self.prune_plugin_midi_connections(PluginGraphNode::Vst3PluginInstance(instance_id));
         self.invalidate_audio_route_cache();
         Ok(())
+    }
+
+    pub fn clear_plugins(&mut self) {
+        let clap_ids: Vec<usize> = self.clap_plugins.iter().map(|i| i.id).collect();
+        for id in clap_ids {
+            let _ = self.unload_clap_plugin_instance(id);
+        }
+        let vst3_ids: Vec<usize> = self.vst3_plugins.iter().map(|i| i.id).collect();
+        for id in vst3_ids {
+            let _ = self.unload_vst3_plugin_instance(id);
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let lv2_ids: Vec<usize> = self.lv2_plugins.iter().map(|i| i.id).collect();
+            for id in lv2_ids {
+                let _ = self.unload_lv2_plugin_instance(id);
+            }
+        }
+        self.plugin_midi_connections.clear();
+        self.invalidate_audio_route_cache();
+        self.invalidate_midi_route_cache();
     }
 
     pub fn vst3_graph_plugins(&self) -> Vec<crate::message::Vst3GraphPlugin> {
