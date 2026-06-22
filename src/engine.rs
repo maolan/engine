@@ -6107,6 +6107,171 @@ impl Engine {
                     return;
                 }
             }
+            Action::TrackSetPluginResourceDir {
+                ref track_name,
+                instance_id,
+                ref format,
+                ref directory,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let dir = std::path::Path::new(directory);
+                let result = if format.eq_ignore_ascii_case("CLAP") {
+                    track.lock().set_clap_plugin_resource_dir(instance_id, dir)
+                } else if format.eq_ignore_ascii_case("LV2") {
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    {
+                        track.lock().set_lv2_plugin_resource_dir(instance_id, dir)
+                    }
+                    #[cfg(not(all(unix, not(target_os = "macos"))))]
+                    Err("LV2 is not supported on this platform".to_string())
+                } else {
+                    Err(format!(
+                        "Unsupported plugin format for resource dir: {format}"
+                    ))
+                };
+                if let Err(e) = result {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackClapFileReferences {
+                ref track_name,
+                instance_id,
+                refs: _,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => {
+                    let refs = track.lock().clap_file_references(instance_id).unwrap_or_else(|e| {
+                        tracing::warn!(track_name = %track_name, instance_id, error = %e, "Failed to enumerate CLAP file references");
+                        Vec::new()
+                    });
+                    self.notify_clients(Ok(Action::TrackClapFileReferences {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        refs,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Action::TrackUpdateClapFileReference {
+                ref track_name,
+                instance_id,
+                index,
+                ref path,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) = track
+                    .lock()
+                    .update_clap_file_reference(instance_id, index, path)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::ClipSetPluginResourceDir {
+                ref track_name,
+                clip_idx,
+                instance_id,
+                ref format,
+                ref directory,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let dir = std::path::Path::new(directory);
+                let track = track.lock();
+                let result = if format.eq_ignore_ascii_case("CLAP") {
+                    track.clip_set_clap_plugin_resource_dir(clip_idx, instance_id, dir)
+                } else if format.eq_ignore_ascii_case("LV2") {
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    {
+                        track.clip_set_lv2_plugin_resource_dir(clip_idx, instance_id, dir)
+                    }
+                    #[cfg(not(all(unix, not(target_os = "macos"))))]
+                    Err("LV2 is not supported on this platform".to_string())
+                } else {
+                    Err(format!(
+                        "Unsupported plugin format for resource dir: {format}"
+                    ))
+                };
+                if let Err(e) = result {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::ClipClapFileReferences {
+                ref track_name,
+                clip_idx,
+                instance_id,
+                refs: _,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => {
+                    let track = track.lock();
+                    let refs = track
+                        .clip_clap_file_references(clip_idx, instance_id)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                track_name = %track_name,
+                                clip_idx,
+                                instance_id,
+                                error = %e,
+                                "Failed to enumerate clip CLAP file references"
+                            );
+                            Vec::new()
+                        });
+                    self.notify_clients(Ok(Action::ClipClapFileReferences {
+                        track_name: track_name.clone(),
+                        clip_idx,
+                        instance_id,
+                        refs,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Action::ClipUpdateClapFileReference {
+                ref track_name,
+                clip_idx,
+                instance_id,
+                index,
+                ref path,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    track
+                        .lock()
+                        .clip_update_clap_file_reference(clip_idx, instance_id, index, path)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
             Action::TrackSetClapParameter {
                 ref track_name,
                 instance_id,

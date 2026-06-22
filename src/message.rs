@@ -822,6 +822,43 @@ pub enum Action {
         track_name: String,
         instance_id: usize,
     },
+    TrackSetPluginResourceDir {
+        track_name: String,
+        instance_id: usize,
+        format: String,
+        directory: String,
+    },
+    TrackClapFileReferences {
+        track_name: String,
+        instance_id: usize,
+        refs: Vec<(u32, String)>,
+    },
+    TrackUpdateClapFileReference {
+        track_name: String,
+        instance_id: usize,
+        index: u32,
+        path: String,
+    },
+    ClipSetPluginResourceDir {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        format: String,
+        directory: String,
+    },
+    ClipClapFileReferences {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        refs: Vec<(u32, String)>,
+    },
+    ClipUpdateClapFileReference {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        index: u32,
+        path: String,
+    },
     TrackGetVst3Graph {
         track_name: String,
     },

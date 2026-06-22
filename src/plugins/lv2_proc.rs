@@ -256,6 +256,40 @@ impl Lv2Processor {
         Ok(())
     }
 
+    pub fn set_resource_directory(&self, dir: &std::path::Path) -> Result<(), String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("LV2 processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+        let path_str = dir.to_string_lossy().to_string();
+        unsafe {
+            write_resource_directory_to_scratch(ptr, &path_str)
+                .map_err(|e| format!("Failed to write resource directory: {e}"))?;
+        }
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        header.request_type.store(5, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for resource directory: {e}"));
+        }
+
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to resource directory: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        header.request_type.store(0, Ordering::Release);
+        if status != 1 {
+            return Err("Resource directory update failed in host".to_string());
+        }
+        Ok(())
+    }
+
     pub fn process_with_audio_io(&self, frames: usize) {
         let _ = self.process_with_midi(frames, &[]);
     }

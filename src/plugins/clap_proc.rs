@@ -287,6 +287,111 @@ impl ClapProcessor {
         Ok(())
     }
 
+    pub fn set_resource_directory(&self, dir: &std::path::Path) -> Result<(), String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("CLAP processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+        let path_str = dir.to_string_lossy().to_string();
+        tracing::info!(path = %path_str, "CLAP processor writing resource directory to scratch");
+        unsafe {
+            write_resource_directory_to_scratch(ptr, &path_str)
+                .map_err(|e| format!("Failed to write resource directory: {e}"))?;
+        }
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        header.request_type.store(5, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for resource directory: {e}"));
+        }
+
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to resource directory: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        header.request_type.store(0, Ordering::Release);
+        if status != 1 {
+            return Err("Resource directory update failed in host".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn file_references(
+        &self,
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::FileReference>, String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("CLAP processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+
+        header.request_type.store(6, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for file references: {e}"));
+        }
+
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to file references: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        if status != 1 {
+            header.request_type.store(0, Ordering::Release);
+            return Err("File references enumeration failed in host".to_string());
+        }
+
+        let paths = unsafe { read_file_references_from_scratch(ptr) }
+            .ok_or("Failed to read file references from scratch")?;
+        header.request_type.store(0, Ordering::Release);
+        Ok(paths)
+    }
+
+    pub fn update_file_reference(&self, index: u32, path: &str) -> Result<(), String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("CLAP processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+        unsafe {
+            write_file_reference_update_to_scratch(ptr, index, path)
+                .map_err(|e| format!("Failed to write file-reference update: {e}"))?;
+        }
+
+        header.request_type.store(7, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!(
+                "Failed to signal host for file-reference update: {e}"
+            ));
+        }
+
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!(
+                "Host did not respond to file-reference update: {e}"
+            ));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        header.request_type.store(0, Ordering::Release);
+        if status != 1 {
+            return Err("File-reference update failed in host".to_string());
+        }
+        Ok(())
+    }
+
     pub fn process_with_audio_io(&self, frames: usize) {
         let _ = self.process_with_midi(frames, &[], ClapTransportInfo::default());
     }

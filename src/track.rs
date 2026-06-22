@@ -3225,6 +3225,132 @@ impl Track {
             .collect()
     }
 
+    pub fn set_clap_plugin_resource_dir(
+        &self,
+        instance_id: usize,
+        dir: &std::path::Path,
+    ) -> Result<(), String> {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
+            return instance.processor.lock().set_resource_directory(dir);
+        }
+        Err(format!(
+            "Track '{}' does not have CLAP instance id: {}",
+            self.name, instance_id
+        ))
+    }
+
+    pub fn set_lv2_plugin_resource_dir(
+        &self,
+        instance_id: usize,
+        dir: &std::path::Path,
+    ) -> Result<(), String> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(instance) = self.lv2_plugins.iter().find(|i| i.id == instance_id) {
+            return instance.processor.lock().set_resource_directory(dir);
+        }
+        Err(format!(
+            "Track '{}' does not have LV2 instance id: {}",
+            self.name, instance_id
+        ))
+    }
+
+    pub fn clap_file_references(
+        &self,
+        instance_id: usize,
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::FileReference>, String> {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
+            return instance.processor.lock().file_references();
+        }
+        Err(format!(
+            "Track '{}' does not have CLAP instance id: {}",
+            self.name, instance_id
+        ))
+    }
+
+    pub fn update_clap_file_reference(
+        &self,
+        instance_id: usize,
+        index: u32,
+        path: &str,
+    ) -> Result<(), String> {
+        if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
+            return instance.processor.lock().update_file_reference(index, path);
+        }
+        Err(format!(
+            "Track '{}' does not have CLAP instance id: {}",
+            self.name, instance_id
+        ))
+    }
+
+    pub fn clip_set_clap_plugin_resource_dir(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        dir: &std::path::Path,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
+        instance.processor.lock().set_resource_directory(dir)
+    }
+
+    pub fn clip_set_lv2_plugin_resource_dir(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        dir: &std::path::Path,
+    ) -> Result<(), String> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let channels = self.audio.ins.len().max(1);
+            let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+            let instance = runtime
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == instance_id)
+                .ok_or_else(|| format!("Clip LV2 instance {} not found", instance_id))?;
+            instance.processor.lock().set_resource_directory(dir)
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        Err("LV2 is not supported on this platform".to_string())
+    }
+
+    pub fn clip_clap_file_references(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::FileReference>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
+        instance.processor.lock().file_references()
+    }
+
+    pub fn clip_update_clap_file_reference(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        index: u32,
+        path: &str,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
+        instance.processor.lock().update_file_reference(index, path)
+    }
+
     pub fn load_vst3_plugin(
         &mut self,
         plugin_path: &str,
