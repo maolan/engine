@@ -6,6 +6,18 @@ pub trait HwWorkerDriver {
     fn request_stop(&mut self) {}
     fn run_cycle_for_worker(&mut self) -> Result<(), String>;
     fn run_assist_step_for_worker(&mut self) -> Result<bool, String>;
+
+    /// File descriptors for async I/O via kqueue/AsyncFd.
+    /// When both return `Some`, the HW worker uses an async select loop
+    /// instead of the blocking assist thread.
+    #[cfg(unix)]
+    fn capture_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+    #[cfg(unix)]
+    fn playback_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
 }
 
 pub trait HwMidiHub {

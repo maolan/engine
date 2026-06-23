@@ -190,6 +190,7 @@ impl OssSyncGroup {
 }
 
 const SNDCTL_DSP_MAGIC: u8 = b'P';
+const SNDCTL_DSP_HALT: u8 = 0;
 const SNDCTL_DSP_SPEED: u8 = 2;
 const SNDCTL_DSP_SETFMT: u8 = 5;
 const SNDCTL_DSP_CHANNELS: u8 = 6;
@@ -207,6 +208,7 @@ const SNDCTL_DSP_COOKEDMODE: u8 = 30;
 const SNDCTL_DSP_CURRENT_IPTR: u8 = 35;
 const SNDCTL_DSP_CURRENT_OPTR: u8 = 36;
 
+nix::ioctl_none!(oss_halt, SNDCTL_DSP_MAGIC, SNDCTL_DSP_HALT);
 nix::ioctl_readwrite!(oss_set_channels, SNDCTL_DSP_MAGIC, SNDCTL_DSP_CHANNELS, i32);
 nix::ioctl_readwrite!(
     oss_set_fragment,

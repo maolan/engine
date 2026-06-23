@@ -130,6 +130,39 @@ impl MidiHub {
             .map(|output| output.path.clone())
             .collect()
     }
+
+    /// Explicitly close all MIDI fds so they don't block during
+    /// exit(0) which skips Rust destructors.
+    ///
+    /// On FreeBSD, closing a MIDI device fd can block for seconds
+    /// while the kernel drains pending buffers (similar to OSS audio
+    /// CHN_TIMEOUT).  We swap each device File with /dev/null, then
+    /// drop the real device Files in a detached thread.  The thread
+    /// is killed when the process calls exit(0), avoiding the drain.
+    pub fn close_all(&mut self) {
+        let mut old_files: Vec<File> = Vec::new();
+        if let Ok(devnull) = File::open("/dev/null") {
+            for input in &mut self.inputs {
+                if let Ok(dn) = devnull.try_clone() {
+                    old_files.push(std::mem::replace(&mut input.file, dn));
+                }
+            }
+            for output in &mut self.outputs {
+                if let Ok(dn) = devnull.try_clone() {
+                    old_files.push(std::mem::replace(&mut output.file, dn));
+                }
+            }
+        }
+        self.inputs.clear();
+        self.outputs.clear();
+        self.input_waiter = None;
+
+        if !old_files.is_empty() {
+            std::thread::spawn(move || {
+                drop(old_files);
+            });
+        }
+    }
 }
 
 #[derive(Debug)]

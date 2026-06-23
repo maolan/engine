@@ -273,6 +273,96 @@ impl<B: Backend> HwWorker<B> {
         unsafe {
             libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
         }
+
+        #[cfg(unix)]
+        {
+            let has_fds = self.driver.lock().capture_fd().is_some()
+                && self.driver.lock().playback_fd().is_some();
+            if has_fds {
+                self.work_async().await;
+                return;
+            }
+        }
+
+        self.work_legacy().await;
+    }
+
+    #[cfg(unix)]
+    async fn work_async(&mut self) {
+        let midi_handle = Self::start_midi_input_thread(
+            self.midi_hub.clone(),
+            self.tx.clone(),
+            self.cycle_frames,
+            self.midi_stop.clone(),
+        );
+        let mut cycle_running = false;
+        let (cycle_tx, mut cycle_rx) = tokio::sync::mpsc::channel::<Result<(), String>>(1);
+        loop {
+            tokio::select! {
+                msg = self.rx.recv() => {
+                    let msg = match msg {
+                        Some(m) => m,
+                        None => {
+                            self.driver.lock().request_stop();
+                            if cycle_running {
+                                let _ = cycle_rx.recv().await;
+                            }
+                            self.shutdown_channel_closed(midi_handle);
+                            return;
+                        }
+                    };
+                    match msg {
+                        Message::Request(crate::message::Action::Quit) => {
+                            self.driver.lock().request_stop();
+                            if cycle_running {
+                                // Wait for the in-flight cycle to finish so the
+                                // spawn_blocking task releases the driver before
+                                // exit(0) closes the fds.
+                                let _ = cycle_rx.recv().await;
+                            }
+                            self.shutdown_quit(midi_handle);
+                            return;
+                        }
+                        Message::TracksFinished => {
+                            self.flush_pending_midi_out();
+                            if !cycle_running {
+                                cycle_running = true;
+                                let driver = self.driver.clone();
+                                let tx = cycle_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = driver.lock().run_cycle_for_worker();
+                                    let _ = tx.blocking_send(result);
+                                });
+                            }
+                        }
+                        Message::HWMidiOutEvents(mut events) => {
+                            self.pending_midi_out_events.append(&mut events);
+                            self.pending_midi_out_sorted = false;
+                        }
+                        Message::ClearHWMidiOutEvents => {
+                            self.pending_midi_out_events.clear();
+                            self.pending_midi_out_sorted = true;
+                        }
+                        _ => {}
+                    }
+                }
+                result = cycle_rx.recv(), if cycle_running => {
+                    cycle_running = false;
+                    if let Some(Err(e)) = result {
+                        error!("{} cycle error: {}", B::LABEL, e);
+                        let _ = self.tx.send(Message::Response(Err(format!(
+                            "{} cycle error: {}", B::LABEL, e
+                        )))).await;
+                    }
+                    if let Err(e) = self.tx.send(Message::HWFinished).await {
+                        error!("{} worker failed to send HWFinished: {}", B::LABEL, e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn work_legacy(&mut self) {
         let assist_handle =
             Self::start_assist_thread(self.driver.clone(), self.assist_state.clone());
         let midi_handle = Self::start_midi_input_thread(
@@ -286,67 +376,23 @@ impl<B: Backend> HwWorker<B> {
                 Some(msg) => msg,
                 None => {
                     self.driver.lock().request_stop();
-                    self.midi_stop.store(true, Ordering::Release);
-                    {
-                        let midi_hub = self.midi_hub.lock();
-                        midi_hub.wake_input_waiter();
-                    }
-                    let _ = midi_handle.join();
-                    {
-                        let midi_hub = self.midi_hub.lock();
-                        midi_hub.close_input_waiter();
-                    }
+                    self.shutdown_midi(midi_handle);
                     Self::stop_assist_thread(&self.assist_state, assist_handle);
+                    self.driver.lock().request_stop();
                     return;
                 }
             };
             match msg {
                 Message::Request(crate::message::Action::Quit) => {
                     self.driver.lock().request_stop();
-                    if !self.pending_midi_out_events.is_empty() {
-                        if !self.pending_midi_out_sorted {
-                            self.pending_midi_out_events.sort_by(|a, b| {
-                                a.event
-                                    .frame
-                                    .cmp(&b.event.frame)
-                                    .then_with(|| a.device.cmp(&b.device))
-                            });
-                            self.pending_midi_out_sorted = true;
-                        }
-                        let midi_hub = self.midi_hub.lock();
-                        midi_hub.write_events(&self.pending_midi_out_events);
-                        self.pending_midi_out_events.clear();
-                    }
-                    self.midi_stop.store(true, Ordering::Release);
-                    {
-                        let midi_hub = self.midi_hub.lock();
-                        midi_hub.wake_input_waiter();
-                    }
-                    let _ = midi_handle.join();
-                    {
-                        let midi_hub = self.midi_hub.lock();
-                        midi_hub.close_input_waiter();
-                    }
+                    self.flush_pending_midi_out();
+                    self.shutdown_midi(midi_handle);
                     Self::stop_assist_thread(&self.assist_state, assist_handle);
+                    self.driver.lock().request_stop();
                     return;
                 }
                 Message::TracksFinished => {
-                    {
-                        if !self.pending_midi_out_events.is_empty() {
-                            if !self.pending_midi_out_sorted {
-                                self.pending_midi_out_events.sort_by(|a, b| {
-                                    a.event
-                                        .frame
-                                        .cmp(&b.event.frame)
-                                        .then_with(|| a.device.cmp(&b.device))
-                                });
-                                self.pending_midi_out_sorted = true;
-                            }
-                            let midi_hub = self.midi_hub.lock();
-                            midi_hub.write_events(&self.pending_midi_out_events);
-                            self.pending_midi_out_events.clear();
-                        }
-                    }
+                    self.flush_pending_midi_out();
                     if let Err(e) = Self::run_assist_cycle(&self.driver, &self.assist_state) {
                         error!("{} assist cycle error: {}", B::LABEL, e);
                         let _ = self
@@ -377,6 +423,50 @@ impl<B: Backend> HwWorker<B> {
                 _ => {}
             }
         }
+    }
+
+    fn flush_pending_midi_out(&mut self) {
+        if self.pending_midi_out_events.is_empty() {
+            return;
+        }
+        if !self.pending_midi_out_sorted {
+            self.pending_midi_out_events.sort_by(|a, b| {
+                a.event
+                    .frame
+                    .cmp(&b.event.frame)
+                    .then_with(|| a.device.cmp(&b.device))
+            });
+            self.pending_midi_out_sorted = true;
+        }
+        let midi_hub = self.midi_hub.lock();
+        midi_hub.write_events(&self.pending_midi_out_events);
+        self.pending_midi_out_events.clear();
+    }
+
+    fn shutdown_midi(&mut self, midi_handle: JoinHandle<()>) {
+        self.midi_stop.store(true, Ordering::Release);
+        {
+            let midi_hub = self.midi_hub.lock();
+            midi_hub.wake_input_waiter();
+        }
+        let _ = midi_handle.join();
+        {
+            let midi_hub = self.midi_hub.lock();
+            midi_hub.close_input_waiter();
+        }
+    }
+
+    fn shutdown_quit(&mut self, midi_handle: JoinHandle<()>) {
+        self.driver.lock().request_stop();
+        self.flush_pending_midi_out();
+        self.shutdown_midi(midi_handle);
+        self.driver.lock().request_stop();
+    }
+
+    fn shutdown_channel_closed(&mut self, midi_handle: JoinHandle<()>) {
+        self.driver.lock().request_stop();
+        self.shutdown_midi(midi_handle);
+        self.driver.lock().request_stop();
     }
 
     fn start_midi_input_thread(

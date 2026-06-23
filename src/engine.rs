@@ -292,7 +292,6 @@ impl Engine {
     const METRONOME_TRACK: &'static str = "metronome";
     const METRONOME_DEFAULT_LEVEL_DB: f32 = -10.0;
     const MIDI_CC_ALL_SOUND_OFF: u8 = 120;
-    const MIDI_CC_ALL_NOTES_OFF: u8 = 123;
     const MIDI_CC_SUSTAIN_PEDAL: u8 = 64;
 
     fn default_clip_plugin_graph_json(audio_ins: usize, audio_outs: usize) -> serde_json::Value {
@@ -409,26 +408,18 @@ impl Engine {
     }
 
     fn panic_events_for_all_hw_midi_outputs(&self) -> Vec<HwMidiEvent> {
-        let devices = {
-            let midi_hub = self.midi_hub.lock();
-            midi_hub.output_devices()
-        };
-        let mut events = Vec::with_capacity(devices.len() * 16 * 3);
-        for device in devices {
-            for channel in 0..16_u8 {
-                events.push(HwMidiEvent {
-                    device: device.clone(),
-                    event: MidiEvent::new(0, vec![0xB0 | channel, Self::MIDI_CC_SUSTAIN_PEDAL, 0]),
-                });
-                events.push(HwMidiEvent {
-                    device: device.clone(),
-                    event: MidiEvent::new(0, vec![0xB0 | channel, Self::MIDI_CC_ALL_SOUND_OFF, 0]),
-                });
-                events.push(HwMidiEvent {
-                    device: device.clone(),
-                    event: MidiEvent::new(0, vec![0xB0 | channel, Self::MIDI_CC_ALL_NOTES_OFF, 0]),
-                });
+        let mut active_channels = std::collections::HashSet::<(String, u8)>::new();
+        for active in self.active_hw_notes_by_track.values() {
+            for (device, channel, _pitch) in active {
+                active_channels.insert((device.clone(), *channel));
             }
+        }
+        let mut events = Vec::with_capacity(active_channels.len());
+        for (device, channel) in active_channels {
+            events.push(HwMidiEvent {
+                device,
+                event: MidiEvent::new(0, vec![0xB0 | channel, Self::MIDI_CC_ALL_SOUND_OFF, 0]),
+            });
         }
         events
     }
@@ -4728,6 +4719,46 @@ impl Engine {
             }
             Action::Quit => {
                 self.flush_recordings().await;
+                // Stop the HW worker before notifying the GUI so the
+                // OSS audio channels are halted and closed from the
+                // worker's own thread. The GUI calls exit(0) upon
+                // receiving the Quit response, which skips Rust
+                // destructors. Without this, the kernel's dsp_close
+                // drains pending audio buffers for up to CHN_TIMEOUT
+                // (5s) during process teardown.
+                if let Some(worker) = self.hw_worker.take() {
+                    if let Some(hw) = &self.hw_driver {
+                        hw.lock().request_stop();
+                    }
+                    // Send MIDI panic (All Sound Off) for any active
+                    // notes before stopping the worker.
+                    let panic_events = self.panic_events_for_all_hw_midi_outputs();
+                    if !panic_events.is_empty() {
+                        let _ = worker
+                            .tx
+                            .send(Message::HWMidiOutEvents(panic_events))
+                            .await;
+                    }
+                    // Send Quit to the worker so it stops its audio
+                    // cycle loop and releases the driver.
+                    if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
+                        error!("Error sending quit message to HW worker: {e}");
+                    }
+                    worker
+                        .handle
+                        .await
+                        .unwrap_or_else(|e| error!("Error waiting for HW worker to quit: {e}"));
+                }
+                // Explicitly close audio and MIDI fds before sending
+                // the Quit response. The GUI calls exit(0) upon
+                // receiving it, which skips destructors — any
+                // still-open device fd would trigger the kernel's
+                // 5-second drain during process teardown.
+                if let Some(hw) = &self.hw_driver {
+                    hw.lock().close_fds();
+                }
+                self.midi_hub.lock().close_all();
+                self.hw_driver = None;
                 self.notify_clients(Ok(Action::Quit)).await;
                 self.ready_realtime_workers.clear();
                 self.ready_refill_workers.clear();
@@ -4740,29 +4771,6 @@ impl Engine {
                         .handle
                         .await
                         .unwrap_or_else(|e| error!("Error waiting for worker to quit: {e}"));
-                }
-
-                if let Some(worker) = self.hw_worker.take() {
-                    if let Some(hw) = &self.hw_driver {
-                        hw.lock().request_stop();
-                    }
-                    let mut panic_events = self.note_off_events_for_all_active_tracks();
-                    panic_events.extend(self.panic_events_for_all_hw_midi_outputs());
-                    if !panic_events.is_empty() {
-                        if let Err(e) = worker.tx.send(Message::ClearHWMidiOutEvents).await {
-                            error!("Error clearing HW MIDI queue during quit {e}");
-                        }
-                        self.midi_hub
-                            .lock()
-                            .write_events_blocking(&panic_events, Duration::from_millis(250));
-                    }
-                    if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
-                        error!("Error sending quit message to HW worker: {e}");
-                    }
-                    worker
-                        .handle
-                        .await
-                        .unwrap_or_else(|e| error!("Error waiting for HW worker to quit: {e}"));
                 }
                 #[cfg(unix)]
                 {

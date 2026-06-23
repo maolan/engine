@@ -220,6 +220,21 @@ impl Audio {
             .map_err(|_| std::io::Error::last_os_error())
     }
 
+    pub fn halt(&self) -> std::io::Result<()> {
+        unsafe { oss_halt(self.dsp.as_raw_fd()) }
+            .map(|_| ())
+            .map_err(|_| std::io::Error::last_os_error())
+    }
+
+    /// Halt the device and explicitly close the fd so the kernel
+    /// cannot drain pending buffers during process exit.
+    pub fn close_fd(&mut self) {
+        let _ = self.halt();
+        if let Ok(devnull) = File::open("/dev/null") {
+            drop(std::mem::replace(&mut self.dsp, devnull));
+        }
+    }
+
     pub fn new(
         path: &str,
         sync_key: &str,
@@ -688,6 +703,11 @@ impl Audio {
 
 impl Drop for Audio {
     fn drop(&mut self) {
+        // Reset the OSS channel to discard pending buffers. Without this,
+        // the kernel's dsp_close() calls chn_flush() on playback channels
+        // which drains remaining audio data — sleeping up to CHN_TIMEOUT
+        // (5 seconds by default) before actually closing the fd.
+        let _ = self.halt();
         if self.mapped && !self.map.is_null() && self.buffer_info.bytes > 0 {
             unsafe {
                 let _ = libc::munmap(self.map, self.buffer_info.bytes as usize);

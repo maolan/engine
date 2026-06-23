@@ -188,6 +188,11 @@ impl HwDriver {
             self.playback.force_silence_now();
         }
     }
+
+    pub fn close_fds(&mut self) {
+        self.capture.close_fd();
+        self.playback.close_fd();
+    }
 }
 
 impl HwWorkerDriver for HwDriver {
@@ -210,6 +215,18 @@ impl HwWorkerDriver for HwDriver {
     fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         let _ = self.playback.stop_trigger();
+        let _ = self.playback.halt();
+        let _ = self.capture.halt();
+    }
+
+    #[cfg(unix)]
+    fn capture_fd(&self) -> Option<std::os::fd::RawFd> {
+        Some(self.capture.fd())
+    }
+
+    #[cfg(unix)]
+    fn playback_fd(&self) -> Option<std::os::fd::RawFd> {
+        Some(self.playback.fd())
     }
 }
 
