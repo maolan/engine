@@ -16,6 +16,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
+fn wait_for_host_request_complete(
+    header: &ShmHeader,
+    events: &EventPair,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    loop {
+        // The host sets request_status before signalling and clears request_type
+        // after signalling. Check either condition so we don't miss the response
+        // if request_type is still non-zero when the wake-up arrives.
+        if header.request_type.load(Ordering::Acquire) == 0
+            || header.request_status.load(Ordering::Acquire) != 0
+        {
+            return Ok(());
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err("Host did not respond to request".to_string());
+        }
+        if let Err(e) = events.wait_host(timeout - elapsed) {
+            return Err(format!("Host did not respond to request: {e}"));
+        }
+    }
+}
+
 pub struct ClapProcessor {
     path: String,
     plugin_id: String,
@@ -202,6 +227,14 @@ impl ClapProcessor {
         false
     }
 
+    pub fn take_state_dirty(&self) -> bool {
+        let header = match self.mapping.as_ref() {
+            Some(m) => unsafe { header_mut(m.as_ptr()) },
+            None => return false,
+        };
+        header.state_dirty.swap(0, Ordering::Acquire) != 0
+    }
+
     pub fn snapshot_state(&self) -> Result<crate::plugins::types::ClapPluginState, String> {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
@@ -217,7 +250,7 @@ impl ClapProcessor {
             return Err(format!("Failed to signal host for state save: {e}"));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to state save: {e}"));
         }
@@ -274,7 +307,7 @@ impl ClapProcessor {
             return Err(format!("Failed to signal host for state restore: {e}"));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to state restore: {e}"));
         }
@@ -295,7 +328,6 @@ impl ClapProcessor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
         let path_str = dir.to_string_lossy().to_string();
-        tracing::info!(path = %path_str, "CLAP processor writing resource directory to scratch");
         unsafe {
             write_resource_directory_to_scratch(ptr, &path_str)
                 .map_err(|e| format!("Failed to write resource directory: {e}"))?;
@@ -309,7 +341,7 @@ impl ClapProcessor {
             return Err(format!("Failed to signal host for resource directory: {e}"));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to resource directory: {e}"));
         }
@@ -339,7 +371,7 @@ impl ClapProcessor {
             return Err(format!("Failed to signal host for file references: {e}"));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to file references: {e}"));
         }
@@ -377,7 +409,7 @@ impl ClapProcessor {
             ));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!(
                 "Host did not respond to file-reference update: {e}"
@@ -684,6 +716,10 @@ impl UnsafeMutex<ClapProcessor> {
         state: &crate::plugins::types::ClapPluginState,
     ) -> Result<(), String> {
         self.lock().restore_state(state)
+    }
+
+    pub fn take_state_dirty(&self) -> bool {
+        self.lock().take_state_dirty()
     }
 
     pub fn path(&self) -> String {

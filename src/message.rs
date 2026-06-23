@@ -751,6 +751,15 @@ pub enum Action {
         plugin_path: String,
         state: crate::clap::ClapPluginState,
     },
+    TrackClapStateDirty {
+        track_name: String,
+        instance_id: usize,
+    },
+    ClipClapStateDirty {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
     TrackClapRestoreState {
         track_name: String,
         instance_id: usize,

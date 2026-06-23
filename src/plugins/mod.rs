@@ -12,12 +12,15 @@ use serde::de::DeserializeOwned;
 pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String> {
     let host_bin = ipc::find_plugin_host_binary().ok_or("maolan-plugin-host binary not found")?;
 
-    let output = std::process::Command::new(&host_bin)
-        .arg("--scan")
+    let mut cmd = std::process::Command::new(&host_bin);
+    cmd.arg("--scan")
         .arg("--format")
         .arg(format)
         .arg("--path")
-        .arg("--system")
+        .arg("--system");
+    ipc::append_parent_log_level(&mut cmd);
+
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn plugin-host scanner: {e}"))?;
 

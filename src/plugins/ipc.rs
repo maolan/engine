@@ -62,12 +62,7 @@ pub fn spawn_host(
             .arg(events.host_to_daw_name());
     }
 
-    let parent_args: Vec<String> = std::env::args().collect();
-    if let Some(pos) = parent_args.iter().position(|a| a == "--log-level")
-        && pos + 1 < parent_args.len()
-    {
-        cmd.arg("--log-level").arg(&parent_args[pos + 1]);
-    }
+    append_parent_log_level(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -77,6 +72,15 @@ pub fn spawn_host(
     events.close_daw_unused();
 
     Ok((child, mapping, events, shm_name, stderr))
+}
+
+pub fn append_parent_log_level(cmd: &mut Command) {
+    let parent_args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = parent_args.iter().position(|a| a == "--log-level")
+        && pos + 1 < parent_args.len()
+    {
+        cmd.arg("--log-level").arg(&parent_args[pos + 1]);
+    }
 }
 
 pub fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {

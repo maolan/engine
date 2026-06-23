@@ -4120,6 +4120,26 @@ impl Engine {
         }
     }
 
+    async fn publish_clap_state_dirty(&mut self) {
+        let tracks: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = self
+            .state
+            .lock()
+            .tracks
+            .iter()
+            .map(|(name, track)| (name.clone(), track.clone()))
+            .collect();
+        for (track_name, track) in &tracks {
+            let dirty = track.lock().take_dirty_clap_instances();
+            for instance_id in dirty {
+                self.notify_clients(Ok(Action::TrackClapStateDirty {
+                    track_name: track_name.clone(),
+                    instance_id,
+                }))
+                .await;
+            }
+        }
+    }
+
     fn reset_meters_after_stop(&mut self) {
         self.last_hw_out_meter_publish = None;
         self.last_track_meter_publish = None;
@@ -6499,6 +6519,8 @@ impl Engine {
             },
             Action::TrackClapStateSnapshot { .. } => {}
             Action::ClipClapStateSnapshot { .. } => {}
+            Action::TrackClapStateDirty { .. } => {}
+            Action::ClipClapStateDirty { .. } => {}
             Action::TrackClapRestoreState {
                 ref track_name,
                 instance_id,
@@ -6572,14 +6594,27 @@ impl Engine {
                         return;
                     }
                 };
-                for (instance_id, plugin_path, state) in track.lock().clap_snapshot_all_states() {
-                    self.notify_clients(Ok(Action::TrackClapStateSnapshot {
-                        track_name: track_name.clone(),
-                        instance_id,
-                        plugin_path,
-                        state,
-                    }))
-                    .await;
+                let instances: Vec<_> = {
+                    let locked = track.lock();
+                    locked
+                        .clap_plugins
+                        .iter()
+                        .map(|i| (i.id, i.processor.lock().path().to_string()))
+                        .collect()
+                };
+                for (instance_id, plugin_path) in instances {
+                    match track.lock().clap_snapshot_state(instance_id) {
+                        Ok(state) => {
+                            self.notify_clients(Ok(Action::TrackClapStateSnapshot {
+                                track_name: track_name.clone(),
+                                instance_id,
+                                plugin_path,
+                                state,
+                            }))
+                            .await;
+                        }
+                        Err(_e) => {}
+                    }
                 }
                 self.notify_clients(Ok(Action::TrackSnapshotAllClapStatesDone {
                     track_name: track_name.clone(),
@@ -7860,80 +7895,83 @@ impl Engine {
                     self.clients.push(s);
                 }
 
-                Message::Request(a) => match a {
-                    Action::TrackOfflineBounceCancel { track_name } => {
-                        if let Some(job) = self.offline_bounce_jobs.get(&track_name) {
-                            job.cancel.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    Action::TrackOfflineBounceCancelAll => {
-                        for job in self.offline_bounce_jobs.values() {
-                            job.cancel.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    _ if !self.offline_bounce_jobs.is_empty() => {
-                        self.pending_requests.push_back(a);
-                    }
-                    Action::OpenAudioDevice { .. }
-                    | Action::OpenMidiInputDevice(_)
-                    | Action::OpenMidiOutputDevice(_)
-                    | Action::RequestMeterSnapshot
-                    | Action::Quit
-                    | Action::Log { .. }
-                    | Action::Play
-                    | Action::Pause
-                    | Action::Stop
-                    | Action::TransportPosition(_)
-                    | Action::JumpToEnd
-                    | Action::SetLoopEnabled(_)
-                    | Action::SetLoopRange(_)
-                    | Action::SetPunchEnabled(_)
-                    | Action::SetPunchRange(_)
-                    | Action::SetMetronomeEnabled(_)
-                    | Action::SetTempo(_)
-                    | Action::SetTimeSignature { .. }
-                    | Action::SetOscEnabled(_)
-                    | Action::SetClipPlaybackEnabled(_)
-                    | Action::SetRecordEnabled(_)
-                    | Action::SetStepRecording(_)
-                    | Action::StepRecordMidiNote { .. }
-                    | Action::SetSessionPath(_)
-                    | Action::ClearHistory
-                    | Action::BeginSessionRestore
-                    | Action::PianoKey { .. }
-                    | Action::ModifyMidiNotes { .. }
-                    | Action::ModifyMidiControllers { .. }
-                    | Action::DeleteMidiControllers { .. }
-                    | Action::InsertMidiControllers { .. }
-                    | Action::DeleteMidiNotes { .. }
-                    | Action::InsertMidiNotes { .. }
-                    | Action::SetMidiSysExEvents { .. } => {
-                        self.handle_request(a).await;
-                    }
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    Action::ListLv2Plugins => {
-                        self.handle_request(a).await;
-                    }
-                    Action::ListVst3Plugins => {
-                        self.handle_request(a).await;
-                    }
-                    Action::ListClapPlugins => {
-                        self.handle_request(a).await;
-                    }
-                    Action::ListClapPluginsWithCapabilities => {
-                        self.handle_request(a).await;
-                    }
-                    _ => {
-                        self.pending_requests.push_back(a);
-                        if self.can_schedule_hw_cycle() {
-                            self.request_hw_cycle().await;
-                        } else {
-                            while let Some(next) = self.pending_requests.pop_front() {
-                                self.handle_request(next).await;
+                Message::Request(a) => {
+                    match a {
+                        Action::TrackOfflineBounceCancel { track_name } => {
+                            if let Some(job) = self.offline_bounce_jobs.get(&track_name) {
+                                job.cancel.store(true, Ordering::Relaxed);
                             }
                         }
-                    }
-                },
+                        Action::TrackOfflineBounceCancelAll => {
+                            for job in self.offline_bounce_jobs.values() {
+                                job.cancel.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        _ if !self.offline_bounce_jobs.is_empty() => {
+                            self.pending_requests.push_back(a);
+                        }
+                        Action::OpenAudioDevice { .. }
+                        | Action::OpenMidiInputDevice(_)
+                        | Action::OpenMidiOutputDevice(_)
+                        | Action::RequestMeterSnapshot
+                        | Action::Quit
+                        | Action::Log { .. }
+                        | Action::Play
+                        | Action::Pause
+                        | Action::Stop
+                        | Action::TransportPosition(_)
+                        | Action::JumpToEnd
+                        | Action::SetLoopEnabled(_)
+                        | Action::SetLoopRange(_)
+                        | Action::SetPunchEnabled(_)
+                        | Action::SetPunchRange(_)
+                        | Action::SetMetronomeEnabled(_)
+                        | Action::SetTempo(_)
+                        | Action::SetTimeSignature { .. }
+                        | Action::SetOscEnabled(_)
+                        | Action::SetClipPlaybackEnabled(_)
+                        | Action::SetRecordEnabled(_)
+                        | Action::SetStepRecording(_)
+                        | Action::StepRecordMidiNote { .. }
+                        | Action::SetSessionPath(_)
+                        | Action::ClearHistory
+                        | Action::BeginSessionRestore
+                        | Action::PianoKey { .. }
+                        | Action::ModifyMidiNotes { .. }
+                        | Action::ModifyMidiControllers { .. }
+                        | Action::DeleteMidiControllers { .. }
+                        | Action::InsertMidiControllers { .. }
+                        | Action::DeleteMidiNotes { .. }
+                        | Action::InsertMidiNotes { .. }
+                        | Action::SetMidiSysExEvents { .. } => {
+                            self.handle_request(a).await;
+                        }
+                        #[cfg(all(unix, not(target_os = "macos")))]
+                        Action::ListLv2Plugins => {
+                            self.handle_request(a).await;
+                        }
+                        Action::ListVst3Plugins => {
+                            self.handle_request(a).await;
+                        }
+                        Action::ListClapPlugins => {
+                            self.handle_request(a).await;
+                        }
+                        Action::ListClapPluginsWithCapabilities => {
+                            self.handle_request(a).await;
+                        }
+                        _ => {
+                            self.pending_requests.push_back(a);
+                            if self.can_schedule_hw_cycle() {
+                                self.request_hw_cycle().await;
+                            } else {
+                                while let Some(next) = self.pending_requests.pop_front() {
+                                    self.handle_request(next).await;
+                                }
+                            }
+                        }
+                    };
+                    self.publish_clap_state_dirty().await;
+                }
                 Message::OfflineBounceFinished { result } => {
                     if let Ok(Action::TrackOfflineBounce { track_name, .. }) = &result {
                         self.offline_bounce_jobs.remove(track_name);
@@ -7997,6 +8035,7 @@ impl Engine {
                         }
                     }
                     self.publish_track_meters().await;
+                    self.publish_clap_state_dirty().await;
                     for track_name in reconfigured_tracks {
                         let track = self.state.lock().tracks.get(&track_name).cloned();
                         if let Some(track) = track {

@@ -3225,6 +3225,19 @@ impl Track {
             .collect()
     }
 
+    pub fn take_dirty_clap_instances(&self) -> Vec<usize> {
+        self.clap_plugins
+            .iter()
+            .filter_map(|instance| {
+                if instance.processor.take_state_dirty() {
+                    Some(instance.id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn set_clap_plugin_resource_dir(
         &self,
         instance_id: usize,
