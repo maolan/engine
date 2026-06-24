@@ -3,7 +3,7 @@ use crate::clap::{ClapParameterInfo, ClapPluginInfo};
 use crate::lv2::Lv2PluginInfo;
 use crate::midi::io::MidiEvent;
 use crate::vst3::Vst3PluginInfo;
-use crate::{kind::Kind, mutex::UnsafeMutex, track::Track};
+use crate::{kind::Kind, modulator::Modulator, mutex::UnsafeMutex, track::Track};
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc::Sender;
 
@@ -304,6 +304,7 @@ pub enum Action {
     SetOscEnabled(bool),
     SetClipPlaybackEnabled(bool),
     SetRecordEnabled(bool),
+    SetModulators(Vec<Modulator>),
     SetSessionPath(String),
     BeginHistoryGroup,
     EndHistoryGroup,

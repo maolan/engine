@@ -276,6 +276,8 @@ pub struct Engine {
     realtime_fallback_budget_per_pass: usize,
     refill_budget_throttle_count: usize,
     realtime_fallback_dispatch_count: usize,
+    modulators: Vec<crate::modulator::Modulator>,
+    modulator_values: Option<Arc<std::collections::HashMap<usize, f32>>>,
 }
 
 type MidiEditParseResult = (
@@ -1027,6 +1029,8 @@ impl Engine {
             realtime_fallback_budget_per_pass: 1,
             refill_budget_throttle_count: 0,
             realtime_fallback_dispatch_count: 0,
+            modulators: Vec::new(),
+            modulator_values: None,
         }
     }
 
@@ -1048,6 +1052,115 @@ impl Engine {
         self.hw_driver_cycle_samples()
             .or_else(|| self.jack_cycle_samples())
             .unwrap_or(0)
+    }
+
+    fn sample_rate(&self) -> f64 {
+        if let Some(hw) = &self.hw_driver {
+            hw.lock().sample_rate() as f64
+        } else {
+            #[cfg(unix)]
+            {
+                self.jack_runtime
+                    .as_ref()
+                    .map(|j| j.lock().sample_rate as f64)
+                    .unwrap_or(48_000.0)
+            }
+            #[cfg(not(unix))]
+            {
+                48_000.0
+            }
+        }
+    }
+
+    fn compute_modulator_values(&self, sample: usize) -> Arc<std::collections::HashMap<usize, f32>> {
+        let sample_rate = self.sample_rate();
+        let values: std::collections::HashMap<usize, f32> = self
+            .modulators
+            .iter()
+            .filter(|m| m.enabled)
+            .map(|m| (m.id, m.value_at(sample, sample_rate)))
+            .collect();
+        Arc::new(values)
+    }
+
+    fn apply_modulators(&mut self, sample: usize) -> Vec<Action> {
+        use crate::modulator::ModulatorTarget;
+        let values = self.compute_modulator_values(sample);
+        self.modulator_values = Some(values.clone());
+        let mut echoes = Vec::new();
+        let mut per_track: std::collections::HashMap<
+            String,
+            (Option<f32>, Option<f32>),
+        > = std::collections::HashMap::new();
+        for m in &self.modulators {
+            if !m.enabled {
+                continue;
+            }
+            let Some(&value) = values.get(&m.id) else {
+                continue;
+            };
+            for target in &m.targets {
+                let (min, max) = match target {
+                    ModulatorTarget::TrackVolume { min, max, .. }
+                    | ModulatorTarget::TrackBalance { min, max, .. }
+                    | ModulatorTarget::HwOutVolume { min, max }
+                    | ModulatorTarget::HwOutBalance { min, max } => (*min, *max),
+                };
+                let effective = min + value * (max - min);
+                let clamped = effective.clamp(min.min(max), min.max(max));
+                match target {
+                    ModulatorTarget::TrackVolume { track_name, .. } => {
+                        let entry = per_track.entry(track_name.clone()).or_default();
+                        entry.0 = Some(clamped);
+                    }
+                    ModulatorTarget::TrackBalance { track_name, .. } => {
+                        let entry = per_track.entry(track_name.clone()).or_default();
+                        entry.1 = Some(clamped);
+                    }
+                    ModulatorTarget::HwOutVolume { .. } => {
+                        if (self.hw_out_level_db - clamped).abs() > f32::EPSILON {
+                            self.hw_out_level_db = clamped;
+                            echoes.push(Action::TrackAutomationLevel(
+                                "hw:out".to_string(),
+                                clamped,
+                            ));
+                        }
+                    }
+                    ModulatorTarget::HwOutBalance { .. } => {
+                        let next = clamped.clamp(-1.0, 1.0);
+                        if (self.hw_out_balance - next).abs() > f32::EPSILON {
+                            self.hw_out_balance = next;
+                            echoes.push(Action::TrackAutomationBalance(
+                                "hw:out".to_string(),
+                                next,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for (track_name, (level, balance)) in per_track {
+            if let Some(level) = level {
+                if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+                    let t = track.lock();
+                    if (t.level() - level).abs() > f32::EPSILON {
+                        t.set_level(level);
+                        echoes.push(Action::TrackAutomationLevel(track_name.clone(), level));
+                    }
+                }
+            }
+            if let Some(balance) = balance {
+                if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+                    let t = track.lock();
+                    let next = balance.clamp(-1.0, 1.0);
+                    if (t.balance - next).abs() > f32::EPSILON {
+                        t.set_balance(next);
+                        echoes.push(Action::TrackAutomationBalance(track_name.clone(), next));
+                    }
+                }
+            }
+        }
+        echoes
     }
 
     fn session_end_sample(&self) -> usize {
@@ -4456,6 +4569,12 @@ impl Engine {
                 self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                     .await;
                 self.preload_track_clips().await;
+                {
+                    let echoes = self.apply_modulators(self.transport_sample);
+                    for action in echoes {
+                        self.notify_clients(Ok(action)).await;
+                    }
+                }
                 let send_result = self.send_tracks().await;
                 tracing::info!("send_tracks after Play returned finished={}", send_result);
                 if !self.awaiting_hwfinished
@@ -4561,6 +4680,12 @@ impl Engine {
             Action::TransportPosition(sample) => {
                 self.transport_sample = self.normalize_transport_sample(sample);
                 self.notified_loop_wrap_sample = None;
+                {
+                    let echoes = self.apply_modulators(self.transport_sample);
+                    for action in echoes {
+                        self.notify_clients(Ok(action)).await;
+                    }
+                }
                 #[cfg(unix)]
                 if let Some(jack) = &self.jack_runtime
                     && let Err(e) = jack.lock().transport_locate(self.transport_sample)
@@ -4656,6 +4781,13 @@ impl Engine {
                     .await;
                 }
             }
+            Action::SetModulators(ref modulators) => {
+                self.modulators = modulators.clone();
+                let echoes = self.apply_modulators(self.transport_sample);
+                for action in echoes {
+                    self.notify_clients(Ok(action)).await;
+                }
+            }
             Action::SetStepRecording(enabled) => {
                 self.step_recording_enabled = enabled;
             }
@@ -4734,10 +4866,7 @@ impl Engine {
                     // notes before stopping the worker.
                     let panic_events = self.panic_events_for_all_hw_midi_outputs();
                     if !panic_events.is_empty() {
-                        let _ = worker
-                            .tx
-                            .send(Message::HWMidiOutEvents(panic_events))
-                            .await;
+                        let _ = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await;
                     }
                     // Send Quit to the worker so it stops its audio
                     // cycle loop and releases the driver.
@@ -5029,7 +5158,10 @@ impl Engine {
                 }
             }
             Action::TrackAutomationLevel(ref name, level) => {
-                if let Some(track) = self.state.lock().tracks.get(name) {
+                tracing::debug!(%name, level, "engine received TrackAutomationLevel");
+                if name == "hw:out" {
+                    self.hw_out_level_db = level;
+                } else if let Some(track) = self.state.lock().tracks.get(name) {
                     let previous = track.lock().level();
                     track.lock().set_level(level);
                     let delta = level - previous;
@@ -5049,7 +5181,9 @@ impl Engine {
                 }
             }
             Action::TrackAutomationBalance(ref name, balance) => {
-                if let Some(track) = self.state.lock().tracks.get(name) {
+                if name == "hw:out" {
+                    self.hw_out_balance = balance.clamp(-1.0, 1.0);
+                } else if let Some(track) = self.state.lock().tracks.get(name) {
                     track.lock().set_balance(balance);
                 }
             }
@@ -8086,6 +8220,12 @@ impl Engine {
                                     .await;
                                 }
                             }
+                        }
+                    }
+                    {
+                        let echoes = self.apply_modulators(self.transport_sample);
+                        for action in echoes {
+                            self.notify_clients(Ok(action)).await;
                         }
                     }
                     if self.send_tracks().await && self.hw_worker.is_some() {

@@ -5574,11 +5574,15 @@ mod tests {
 
         track.process();
 
-        assert_eq!(track.pending_hw_midi_out_events.len(), 1);
+        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
         assert_eq!(track.pending_hw_midi_out_events[0].port, 0);
         assert_eq!(
             track.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
+        );
+        assert_eq!(
+            track.pending_hw_midi_out_events[1].event,
+            crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
         );
     }
 

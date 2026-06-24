@@ -510,6 +510,22 @@ impl ClapProcessor {
             return Vec::new();
         }
 
+        {
+            let child = self.child.lock();
+            if let Some(ref mut c) = child.as_mut() {
+                if let Ok(Some(status)) = c.try_wait() {
+                    if !status.success() {
+                        self.crash_count.fetch_add(1, Ordering::Relaxed);
+                        ipc::bypass_copy_inputs_to_outputs(
+                            &self.audio_inputs,
+                            &self.audio_outputs,
+                        );
+                        return Vec::new();
+                    }
+                }
+            }
+        }
+
         unsafe {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
         }
@@ -888,6 +904,9 @@ mod tests {
             buf.fill(1.0);
             *processor.audio_inputs()[0].finished.lock() = true;
         }
+
+        // Give the aborted host a moment to be reaped so the crash is visible.
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         processor.process_with_audio_io(256);
 
