@@ -6,19 +6,14 @@ pub enum ModulatorController {
     Balance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ModulatorShape {
+    #[default]
     Sine,
     Triangle,
     Saw,
     Square,
     SampleHold,
-}
-
-impl Default for ModulatorShape {
-    fn default() -> Self {
-        Self::Sine
-    }
 }
 
 impl std::fmt::Display for ModulatorShape {

@@ -350,9 +350,20 @@ impl DoubleBufferedChannel {
                     let delta = audio.update_map_progress_from_count(&info).unwrap_or(0);
                     let mut progress = (delta / audio.frame_size()) as i64;
 
+                    // FreeBSD sometimes reports a bogus extra buffer cycle at
+                    // playback start. Detect start by the transition from not
+                    // playing last cycle to playing now, in addition to the
+                    // short-time heuristic used during continuous cycling.
+                    let is_playback_start = !audio.was_playing_last_cycle
+                        && audio.playing.load(std::sync::atomic::Ordering::Relaxed);
                     if progress > audio.buffer_frames()
-                        && (now - write.st.last_processing) < audio.buffer_frames() / 2
+                        && (is_playback_start
+                            || (now - write.st.last_processing) < audio.buffer_frames() / 2)
                     {
+                        let bogus_frames = progress - (progress % audio.buffer_frames());
+                        let bogus_bytes = (bogus_frames as usize) * audio.frame_size();
+                        audio.map_progress_bytes =
+                            audio.map_progress_bytes.saturating_sub(bogus_bytes);
                         progress %= audio.buffer_frames();
                     }
                     if progress > 0 {

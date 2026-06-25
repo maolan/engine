@@ -512,17 +512,13 @@ impl ClapProcessor {
 
         {
             let child = self.child.lock();
-            if let Some(ref mut c) = child.as_mut() {
-                if let Ok(Some(status)) = c.try_wait() {
-                    if !status.success() {
-                        self.crash_count.fetch_add(1, Ordering::Relaxed);
-                        ipc::bypass_copy_inputs_to_outputs(
-                            &self.audio_inputs,
-                            &self.audio_outputs,
-                        );
-                        return Vec::new();
-                    }
-                }
+            if let Some(ref mut c) = child.as_mut()
+                && let Ok(Some(status)) = c.try_wait()
+                && !status.success()
+            {
+                self.crash_count.fetch_add(1, Ordering::Relaxed);
+                ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+                return Vec::new();
             }
         }
 

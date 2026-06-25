@@ -1072,7 +1072,10 @@ impl Engine {
         }
     }
 
-    fn compute_modulator_values(&self, sample: usize) -> Arc<std::collections::HashMap<usize, f32>> {
+    fn compute_modulator_values(
+        &self,
+        sample: usize,
+    ) -> Arc<std::collections::HashMap<usize, f32>> {
         let sample_rate = self.sample_rate();
         let values: std::collections::HashMap<usize, f32> = self
             .modulators
@@ -1088,10 +1091,8 @@ impl Engine {
         let values = self.compute_modulator_values(sample);
         self.modulator_values = Some(values.clone());
         let mut echoes = Vec::new();
-        let mut per_track: std::collections::HashMap<
-            String,
-            (Option<f32>, Option<f32>),
-        > = std::collections::HashMap::new();
+        let mut per_track: std::collections::HashMap<String, (Option<f32>, Option<f32>)> =
+            std::collections::HashMap::new();
         for m in &self.modulators {
             if !m.enabled {
                 continue;
@@ -1120,43 +1121,38 @@ impl Engine {
                     ModulatorTarget::HwOutVolume { .. } => {
                         if (self.hw_out_level_db - clamped).abs() > f32::EPSILON {
                             self.hw_out_level_db = clamped;
-                            echoes.push(Action::TrackAutomationLevel(
-                                "hw:out".to_string(),
-                                clamped,
-                            ));
+                            echoes
+                                .push(Action::TrackAutomationLevel("hw:out".to_string(), clamped));
                         }
                     }
                     ModulatorTarget::HwOutBalance { .. } => {
                         let next = clamped.clamp(-1.0, 1.0);
                         if (self.hw_out_balance - next).abs() > f32::EPSILON {
                             self.hw_out_balance = next;
-                            echoes.push(Action::TrackAutomationBalance(
-                                "hw:out".to_string(),
-                                next,
-                            ));
+                            echoes.push(Action::TrackAutomationBalance("hw:out".to_string(), next));
                         }
                     }
                 }
             }
         }
         for (track_name, (level, balance)) in per_track {
-            if let Some(level) = level {
-                if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
-                    let t = track.lock();
-                    if (t.level() - level).abs() > f32::EPSILON {
-                        t.set_level(level);
-                        echoes.push(Action::TrackAutomationLevel(track_name.clone(), level));
-                    }
+            if let Some(level) = level
+                && let Some(track) = self.state.lock().tracks.get(&track_name).cloned()
+            {
+                let t = track.lock();
+                if (t.level() - level).abs() > f32::EPSILON {
+                    t.set_level(level);
+                    echoes.push(Action::TrackAutomationLevel(track_name.clone(), level));
                 }
             }
-            if let Some(balance) = balance {
-                if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
-                    let t = track.lock();
-                    let next = balance.clamp(-1.0, 1.0);
-                    if (t.balance - next).abs() > f32::EPSILON {
-                        t.set_balance(next);
-                        echoes.push(Action::TrackAutomationBalance(track_name.clone(), next));
-                    }
+            if let Some(balance) = balance
+                && let Some(track) = self.state.lock().tracks.get(&track_name).cloned()
+            {
+                let t = track.lock();
+                let next = balance.clamp(-1.0, 1.0);
+                if (t.balance - next).abs() > f32::EPSILON {
+                    t.set_balance(next);
+                    echoes.push(Action::TrackAutomationBalance(track_name.clone(), next));
                 }
             }
         }
@@ -8714,5 +8710,132 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn play_stop_play_keeps_clip_output_audible() {
+        use crate::audio::clip::AudioClip;
+        use crate::audio_codec::write_wav_f32;
+
+        let (engine_tx, engine_rx) = channel(16);
+        let mut engine = Engine::new(engine_rx, engine_tx);
+        let state = engine.state();
+        let (client_tx, mut client_rx) = channel(16);
+        engine.clients.push(client_tx);
+        engine.init().await;
+
+        let tmp_dir = std::env::temp_dir().join("maolan_play_stop_play_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let wav_path = tmp_dir.join("tone.wav");
+        let sample_rate = 48_000u32;
+        let clip_samples = sample_rate as usize;
+        let mut samples = Vec::with_capacity(clip_samples);
+        for i in 0..clip_samples {
+            let phase = i as f32 / sample_rate as f32 * 2.0 * std::f32::consts::PI * 440.0;
+            samples.push(phase.sin() * 0.5);
+        }
+        write_wav_f32(&wav_path, &samples, 1, sample_rate).expect("write wav");
+
+        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 1024, sample_rate as f64);
+        let mut clip = AudioClip::new(wav_path.to_string_lossy().to_string(), 0, clip_samples);
+        clip.fade_enabled = false;
+        track.audio.clips.push(clip);
+        track.session_base_dir = Some(tmp_dir.clone());
+        insert_track(&mut engine, track);
+
+        let tx = engine.tx.clone();
+        let work_handle = tokio::spawn(async move {
+            engine.work().await;
+        });
+
+        // Wait for worker tasks to start up and send Ready messages.
+        tokio::time::sleep(TokioDuration::from_millis(100)).await;
+
+        async fn drain_responses(
+            client_rx: &mut tokio::sync::mpsc::Receiver<Message>,
+            count: usize,
+        ) {
+            for _ in 0..count {
+                let _ = tokio::time::timeout(TokioDuration::from_secs(2), client_rx.recv()).await;
+            }
+        }
+
+        async fn wait_for_track_processed(
+            client_rx: &mut tokio::sync::mpsc::Receiver<Message>,
+            state: &Arc<UnsafeMutex<State>>,
+        ) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let msg =
+                    tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;
+                if let Ok(Some(Message::Response(Ok(Action::TransportPosition(_)))))
+                | Ok(Some(Message::Response(Ok(Action::Play)))) = msg
+                {
+                    let track_deadline = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < track_deadline {
+                        if state
+                            .lock()
+                            .tracks
+                            .get("track")
+                            .map(|t| t.lock().audio.finished)
+                            .unwrap_or(false)
+                        {
+                            return true;
+                        }
+                        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+                    }
+                }
+            }
+            false
+        }
+
+        tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
+            .await
+            .unwrap();
+        tx.send(Message::Request(Action::Play)).await.unwrap();
+        assert!(
+            wait_for_track_processed(&mut client_rx, &state).await,
+            "track did not process on first play"
+        );
+        let first_peak = {
+            let state = state.lock();
+            let track = state.tracks.get("track").expect("track").lock();
+            let input = track.audio.ins[0].buffer.lock();
+            crate::simd::peak_abs(input)
+        };
+        assert!(
+            first_peak > 0.001,
+            "expected audible input on first play, got {first_peak}"
+        );
+
+        tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
+            .await
+            .unwrap();
+        tx.send(Message::Request(Action::Stop)).await.unwrap();
+        drain_responses(&mut client_rx, 2).await;
+
+        tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
+            .await
+            .unwrap();
+        tx.send(Message::Request(Action::Play)).await.unwrap();
+        assert!(
+            wait_for_track_processed(&mut client_rx, &state).await,
+            "track did not process on second play"
+        );
+        let second_peak = {
+            let state = state.lock();
+            let track = state.tracks.get("track").expect("track").lock();
+            let input = track.audio.ins[0].buffer.lock();
+            crate::simd::peak_abs(input)
+        };
+        assert!(
+            second_peak > 0.001,
+            "expected audible input on second play after stop, got {second_peak}"
+        );
+
+        let _ = tx.send(Message::Request(Action::Quit)).await;
+        tokio::time::sleep(TokioDuration::from_millis(200)).await;
+        work_handle.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

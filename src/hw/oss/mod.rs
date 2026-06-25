@@ -696,6 +696,7 @@ impl Audio {
         }
         self.stop_fade_remaining_frames = 0;
         self.stop_fade_total_frames = 0;
+        self.was_playing_last_cycle = false;
         self.channel
             .reset_buffers(self.frame_stamp, self.frame_size().max(1));
     }
