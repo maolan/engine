@@ -166,6 +166,10 @@ impl HwDriver {
         Self::new_with_options(device, None, rate, bits, HwOptions::default())
     }
 
+    pub fn close_fds(&mut self) {
+        // ALSA does not need explicit fd closing before process exit.
+    }
+
     pub fn set_playing(&mut self, playing: bool) {
         self.playing.store(playing, Ordering::Relaxed);
         if playing {
