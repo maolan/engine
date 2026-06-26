@@ -54,7 +54,10 @@ pub struct OfflineAutomationPoint {
 pub enum OfflineAutomationTarget {
     Volume,
     Balance,
-    Mute,
+    MidiCc {
+        channel: u8,
+        cc: u8,
+    },
     #[cfg(all(unix, not(target_os = "macos")))]
     Lv2Parameter {
         instance_id: usize,
@@ -425,7 +428,12 @@ pub enum Action {
     TrackBalance(String, f32),
     TrackAutomationLevel(String, f32),
     TrackAutomationBalance(String, f32),
-    TrackAutomationMute(String, bool),
+    TrackMidiCc {
+        track_name: String,
+        channel: u8,
+        cc: u8,
+        value: u8,
+    },
     TrackMeters {
         track_name: String,
         output_db: Vec<f32>,

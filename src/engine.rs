@@ -1091,8 +1091,20 @@ impl Engine {
         let values = self.compute_modulator_values(sample);
         self.modulator_values = Some(values.clone());
         let mut echoes = Vec::new();
-        let mut per_track: std::collections::HashMap<String, (Option<f32>, Option<f32>)> =
-            std::collections::HashMap::new();
+        let mut per_track: HashMap<String, (Option<f32>, Option<f32>)> = HashMap::new();
+        let mut clap_params: HashMap<(String, usize, u32), f64> = HashMap::new();
+        let mut vst3_params: HashMap<(String, usize, u32), f32> = HashMap::new();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut lv2_params: HashMap<(String, usize, u32), f32> = HashMap::new();
+        let mut midi_cc_events: HashMap<String, Vec<MidiEvent>> = HashMap::new();
+
+        let map_f32 = |value: f32, min: f32, max: f32| -> f32 {
+            crate::modulator::map_value(value, min, max)
+        };
+        let map_f64 = |value: f32, min: f64, max: f64| -> f64 {
+            crate::modulator::map_value_f64(value, min, max)
+        };
+
         for m in &self.modulators {
             if !m.enabled {
                 continue;
@@ -1101,36 +1113,84 @@ impl Engine {
                 continue;
             };
             for target in &m.targets {
-                let (min, max) = match target {
-                    ModulatorTarget::TrackVolume { min, max, .. }
-                    | ModulatorTarget::TrackBalance { min, max, .. }
-                    | ModulatorTarget::HwOutVolume { min, max }
-                    | ModulatorTarget::HwOutBalance { min, max } => (*min, *max),
-                };
-                let effective = min + value * (max - min);
-                let clamped = effective.clamp(min.min(max), min.max(max));
                 match target {
-                    ModulatorTarget::TrackVolume { track_name, .. } => {
-                        let entry = per_track.entry(track_name.clone()).or_default();
-                        entry.0 = Some(clamped);
+                    ModulatorTarget::TrackVolume {
+                        track_name,
+                        min,
+                        max,
+                    } => {
+                        let clamped = map_f32(value, *min, *max);
+                        per_track.entry(track_name.clone()).or_default().0 = Some(clamped);
                     }
-                    ModulatorTarget::TrackBalance { track_name, .. } => {
-                        let entry = per_track.entry(track_name.clone()).or_default();
-                        entry.1 = Some(clamped);
+                    ModulatorTarget::TrackBalance {
+                        track_name,
+                        min,
+                        max,
+                    } => {
+                        let clamped = map_f32(value, *min, *max);
+                        per_track.entry(track_name.clone()).or_default().1 = Some(clamped);
                     }
-                    ModulatorTarget::HwOutVolume { .. } => {
+                    ModulatorTarget::HwOutVolume { min, max } => {
+                        let clamped = map_f32(value, *min, *max);
                         if (self.hw_out_level_db - clamped).abs() > f32::EPSILON {
                             self.hw_out_level_db = clamped;
                             echoes
                                 .push(Action::TrackAutomationLevel("hw:out".to_string(), clamped));
                         }
                     }
-                    ModulatorTarget::HwOutBalance { .. } => {
-                        let next = clamped.clamp(-1.0, 1.0);
+                    ModulatorTarget::HwOutBalance { min, max } => {
+                        let next = map_f32(value, *min, *max).clamp(-1.0, 1.0);
                         if (self.hw_out_balance - next).abs() > f32::EPSILON {
                             self.hw_out_balance = next;
                             echoes.push(Action::TrackAutomationBalance("hw:out".to_string(), next));
                         }
+                    }
+                    ModulatorTarget::ClapParameter {
+                        track_name,
+                        instance_id,
+                        param_id,
+                        min,
+                        max,
+                    } => {
+                        let param_value = map_f64(value, *min, *max);
+                        clap_params
+                            .insert((track_name.clone(), *instance_id, *param_id), param_value);
+                    }
+                    ModulatorTarget::Vst3Parameter {
+                        track_name,
+                        instance_id,
+                        param_id,
+                        min,
+                        max,
+                    } => {
+                        let param_value = map_f32(value, *min, *max);
+                        vst3_params
+                            .insert((track_name.clone(), *instance_id, *param_id), param_value);
+                    }
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    ModulatorTarget::Lv2Parameter {
+                        track_name,
+                        instance_id,
+                        index,
+                        min,
+                        max,
+                    } => {
+                        let param_value = map_f32(value, *min, *max);
+                        lv2_params.insert((track_name.clone(), *instance_id, *index), param_value);
+                    }
+                    ModulatorTarget::MidiCc {
+                        track_name,
+                        channel,
+                        cc,
+                    } => {
+                        let cc_value = (value * 127.0).round() as u8;
+                        midi_cc_events
+                            .entry(track_name.clone())
+                            .or_default()
+                            .push(MidiEvent::new(
+                                0,
+                                vec![0xB0 | (*channel).min(15), (*cc).min(127), cc_value],
+                            ));
                     }
                 }
             }
@@ -1156,6 +1216,61 @@ impl Engine {
                 }
             }
         }
+
+        for (track_name, events) in midi_cc_events {
+            if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+                track.lock().pending_modulator_midi_events.extend(events);
+            }
+        }
+
+        let state = self.state.lock();
+        for ((track_name, instance_id, param_id), value) in clap_params {
+            if let Some(track) = state.tracks.get(&track_name).cloned()
+                && track
+                    .lock()
+                    .set_clap_parameter(instance_id, param_id, value)
+                    .is_ok()
+            {
+                echoes.push(Action::TrackSetClapParameter {
+                    track_name,
+                    instance_id,
+                    param_id,
+                    value,
+                });
+            }
+        }
+        for ((track_name, instance_id, param_id), value) in vst3_params {
+            if let Some(track) = state.tracks.get(&track_name).cloned()
+                && track
+                    .lock()
+                    .set_vst3_parameter(instance_id, param_id, value)
+                    .is_ok()
+            {
+                echoes.push(Action::TrackSetVst3Parameter {
+                    track_name,
+                    instance_id,
+                    param_id,
+                    value,
+                });
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for ((track_name, instance_id, index), value) in lv2_params {
+            if let Some(track) = state.tracks.get(&track_name).cloned()
+                && track
+                    .lock()
+                    .set_lv2_control_value(instance_id, index as usize, f64::from(value))
+                    .is_ok()
+            {
+                echoes.push(Action::TrackSetLv2ControlValue {
+                    track_name,
+                    instance_id,
+                    index,
+                    value,
+                });
+            }
+        }
+
         echoes
     }
 
@@ -5183,19 +5298,20 @@ impl Engine {
                     track.lock().set_balance(balance);
                 }
             }
-            Action::TrackAutomationMute(ref name, muted) => {
-                if let Some(track) = self.state.lock().tracks.get(name) {
-                    track.lock().set_muted(muted);
-                    for follower_name in self.vca_followers(name) {
-                        if let Some(follower) = self.state.lock().tracks.get(&follower_name) {
-                            follower.lock().set_muted(muted);
-                            self.notify_clients(Ok(Action::TrackAutomationMute(
-                                follower_name.clone(),
-                                muted,
-                            )))
-                            .await;
-                        }
-                    }
+            Action::TrackMidiCc {
+                ref track_name,
+                channel,
+                cc,
+                value,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track
+                        .lock()
+                        .pending_automation_midi_events
+                        .push(MidiEvent::new(
+                            0,
+                            vec![0xB0 | channel.min(15), cc.min(127), value.min(127)],
+                        ));
                 }
             }
             Action::RequestMeterSnapshot => {

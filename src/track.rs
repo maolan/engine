@@ -468,6 +468,8 @@ pub struct Track {
 
     pub echoed_parameter_updates: UnsafeMutex<Vec<crate::message::Action>>,
     pub pending_hw_midi_out_events: Vec<HwMidiOutEvent>,
+    pub pending_modulator_midi_events: Vec<MidiEvent>,
+    pub pending_automation_midi_events: Vec<MidiEvent>,
     pub next_clap_instance_id: usize,
     pub next_vst3_instance_id: usize,
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -570,6 +572,8 @@ impl Track {
             plugin_midi_connections: Vec::new(),
             echoed_parameter_updates: UnsafeMutex::new(Vec::new()),
             pending_hw_midi_out_events: vec![],
+            pending_modulator_midi_events: vec![],
+            pending_automation_midi_events: vec![],
             next_clap_instance_id: 0,
             next_vst3_instance_id: 0,
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -972,6 +976,8 @@ impl Track {
 
         self.ensure_midi_route_cache();
         self.route_track_inputs_to_track_outputs(&track_input_midi_events);
+        self.route_modulator_midi_to_track_outputs();
+        self.route_automation_midi_to_track_outputs();
         self.collect_hw_midi_output_events();
         self.dispatch_track_output_midi_to_connected_inputs();
         self.clear_local_midi_inputs();
@@ -4802,6 +4808,32 @@ impl Track {
                     out.lock().buffer.extend_from_slice(events);
                 }
             }
+        }
+    }
+
+    fn route_modulator_midi_to_track_outputs(&mut self) {
+        if self.pending_modulator_midi_events.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.pending_modulator_midi_events);
+        if !self.output_enabled {
+            return;
+        }
+        for out in &self.midi.outs {
+            out.lock().buffer.extend_from_slice(&events);
+        }
+    }
+
+    fn route_automation_midi_to_track_outputs(&mut self) {
+        if self.pending_automation_midi_events.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.pending_automation_midi_events);
+        if !self.output_enabled {
+            return;
+        }
+        for out in &self.midi.outs {
+            out.lock().buffer.extend_from_slice(&events);
         }
     }
 

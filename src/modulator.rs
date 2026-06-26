@@ -48,14 +48,45 @@ pub enum ModulatorTarget {
         min: f32,
         max: f32,
     },
+    ClapParameter {
+        track_name: String,
+        instance_id: usize,
+        param_id: u32,
+        min: f64,
+        max: f64,
+    },
+    Vst3Parameter {
+        track_name: String,
+        instance_id: usize,
+        param_id: u32,
+        min: f32,
+        max: f32,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Lv2Parameter {
+        track_name: String,
+        instance_id: usize,
+        index: u32,
+        min: f32,
+        max: f32,
+    },
+    MidiCc {
+        track_name: String,
+        channel: u8,
+        cc: u8,
+    },
 }
 
 impl ModulatorTarget {
     pub fn track_name(&self) -> Option<&str> {
         match self {
-            Self::TrackVolume { track_name, .. } | Self::TrackBalance { track_name, .. } => {
-                Some(track_name)
-            }
+            Self::TrackVolume { track_name, .. }
+            | Self::TrackBalance { track_name, .. }
+            | Self::ClapParameter { track_name, .. }
+            | Self::Vst3Parameter { track_name, .. }
+            | Self::MidiCc { track_name, .. } => Some(track_name),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::Lv2Parameter { track_name, .. } => Some(track_name),
             Self::HwOutVolume { .. } | Self::HwOutBalance { .. } => None,
         }
     }
@@ -71,6 +102,27 @@ pub struct Modulator {
     pub bipolar: bool,
     pub enabled: bool,
     pub targets: Vec<ModulatorTarget>,
+}
+
+/// Map a normalized modulator value in `[0, 1]` to a target range.
+/// When `min <= max` the output increases with the modulator value.
+/// When `min > max` the output is reversed (decreases as the modulator value increases).
+pub fn map_value(value: f32, min: f32, max: f32) -> f32 {
+    if min <= max {
+        (min + value * (max - min)).clamp(min, max)
+    } else {
+        (max + (1.0 - value) * (min - max)).clamp(max, min)
+    }
+}
+
+/// `map_value` for `f64` target ranges.
+pub fn map_value_f64(value: f32, min: f64, max: f64) -> f64 {
+    let value = f64::from(value);
+    if min <= max {
+        (min + value * (max - min)).clamp(min, max)
+    } else {
+        (max + (1.0 - value) * (min - max)).clamp(max, min)
+    }
 }
 
 impl Modulator {
@@ -119,5 +171,39 @@ impl Modulator {
             }
         };
         ((raw + 1.0) / 2.0).clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_value_maps_forward_range() {
+        assert!((map_value(0.0, 0.0, 100.0) - 0.0).abs() < f32::EPSILON);
+        assert!((map_value(1.0, 0.0, 100.0) - 100.0).abs() < f32::EPSILON);
+        assert!((map_value(0.5, 0.0, 100.0) - 50.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn map_value_reverses_when_min_greater_than_max() {
+        assert!((map_value(0.0, 100.0, 0.0) - 100.0).abs() < f32::EPSILON);
+        assert!((map_value(1.0, 100.0, 0.0) - 0.0).abs() < f32::EPSILON);
+        assert!((map_value(0.5, 100.0, 0.0) - 50.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn map_value_clamps_out_of_range() {
+        assert!((map_value(-0.5, 0.0, 100.0) - 0.0).abs() < f32::EPSILON);
+        assert!((map_value(1.5, 0.0, 100.0) - 100.0).abs() < f32::EPSILON);
+        assert!((map_value(-0.5, 100.0, 0.0) - 100.0).abs() < f32::EPSILON);
+        assert!((map_value(1.5, 100.0, 0.0) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn map_value_f64_reverses_when_min_greater_than_max() {
+        assert!((map_value_f64(0.0, 1.0, 0.0) - 1.0).abs() < f64::EPSILON);
+        assert!((map_value_f64(1.0, 1.0, 0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((map_value_f64(0.5, 1.0, 0.0) - 0.5).abs() < f64::EPSILON);
     }
 }

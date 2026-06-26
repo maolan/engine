@@ -1,6 +1,9 @@
-use crate::message::{
-    Action, Message, OfflineAutomationLane, OfflineAutomationPoint, OfflineAutomationTarget,
-    OfflineBounceWork,
+use crate::{
+    message::{
+        Action, Message, OfflineAutomationLane, OfflineAutomationPoint, OfflineAutomationTarget,
+        OfflineBounceWork,
+    },
+    midi::io::MidiEvent,
 };
 #[cfg(unix)]
 use nix::libc;
@@ -58,8 +61,12 @@ impl Worker {
             };
             match lane.target {
                 OfflineAutomationTarget::Volume | OfflineAutomationTarget::Balance => {}
-                OfflineAutomationTarget::Mute => {
-                    track.set_muted(value >= 0.5);
+                OfflineAutomationTarget::MidiCc { channel, cc } => {
+                    let cc_value = (value * 127.0).round() as u8;
+                    track.pending_automation_midi_events.push(MidiEvent::new(
+                        0,
+                        vec![0xB0 | channel.min(15), cc.min(127), cc_value],
+                    ));
                 }
                 #[cfg(all(unix, not(target_os = "macos")))]
                 OfflineAutomationTarget::Lv2Parameter {
@@ -488,7 +495,7 @@ mod tests {
 
     #[test]
     fn freeze_automation_ignores_volume_and_balance_lanes() {
-        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 2, 0, 1, 64, 48_000.0);
         let lanes = vec![
             OfflineAutomationLane {
                 target: OfflineAutomationTarget::Volume,
@@ -505,7 +512,7 @@ mod tests {
                 }],
             },
             OfflineAutomationLane {
-                target: OfflineAutomationTarget::Mute,
+                target: OfflineAutomationTarget::MidiCc { channel: 0, cc: 7 },
                 points: vec![OfflineAutomationPoint {
                     sample: 0,
                     value: 1.0,
@@ -517,7 +524,11 @@ mod tests {
 
         assert_eq!(track.level(), 0.0);
         assert_eq!(track.balance, 0.0);
-        assert!(track.muted);
+        assert_eq!(track.pending_automation_midi_events.len(), 1);
+        assert_eq!(
+            track.pending_automation_midi_events[0].data,
+            vec![0xB0, 7, 127]
+        );
     }
 
     #[test]
@@ -541,10 +552,10 @@ mod tests {
     }
 
     #[test]
-    fn freeze_automation_applies_interpolated_mute_lane() {
-        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+    fn freeze_automation_applies_interpolated_midi_cc_lane() {
+        let mut track = Track::new("track".to_string(), 1, 1, 0, 1, 64, 48_000.0);
         let lanes = vec![OfflineAutomationLane {
-            target: OfflineAutomationTarget::Mute,
+            target: OfflineAutomationTarget::MidiCc { channel: 0, cc: 7 },
             points: vec![
                 OfflineAutomationPoint {
                     sample: 0,
@@ -558,11 +569,13 @@ mod tests {
         }];
 
         Worker::apply_freeze_automation_at_sample(&mut track, 5, &lanes);
-        assert!(track.muted);
+        assert_eq!(track.pending_automation_midi_events.len(), 1);
+        assert_eq!(track.pending_automation_midi_events[0].data[2], 64);
 
-        track.set_muted(false);
+        track.pending_automation_midi_events.clear();
         Worker::apply_freeze_automation_at_sample(&mut track, 2, &lanes);
-        assert!(!track.muted);
+        assert_eq!(track.pending_automation_midi_events.len(), 1);
+        assert_eq!(track.pending_automation_midi_events[0].data[2], 25);
     }
 
     #[tokio::test]
