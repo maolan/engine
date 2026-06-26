@@ -8954,4 +8954,74 @@ mod tests {
         work_handle.abort();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn modulator_sets_track_volume() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("vol-track".to_string(), 0, 2, 0, 0, 128, 48_000.0);
+        insert_track(&mut engine, track);
+
+        engine.modulators = vec![crate::modulator::Modulator {
+            id: 1,
+            name: "LFO".to_string(),
+            shape: crate::modulator::ModulatorShape::Sine,
+            rate_hz: 1.0,
+            phase: 0.0,
+            enabled: true,
+            targets: vec![crate::modulator::ModulatorTarget::TrackVolume {
+                track_name: "vol-track".to_string(),
+                min: -90.0,
+                max: 20.0,
+            }],
+        }];
+
+        // At sample 12000 (1/4 period at 48kHz/1Hz), sine value maps to 1.0 -> max 20 dB.
+        let echoes = engine.apply_modulators(12_000);
+        let track = engine.state.lock().tracks["vol-track"].lock();
+        assert!(
+            (track.level() - 20.0).abs() < 0.01,
+            "expected 20 dB, got {}",
+            track.level()
+        );
+        assert!(
+            echoes
+                .iter()
+                .any(|a| matches!(a, Action::TrackAutomationLevel(name, _) if name == "vol-track"))
+        );
+    }
+
+    #[test]
+    fn modulator_sets_track_balance() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("pan-track".to_string(), 0, 2, 0, 0, 128, 48_000.0);
+        insert_track(&mut engine, track);
+
+        engine.modulators = vec![crate::modulator::Modulator {
+            id: 1,
+            name: "LFO".to_string(),
+            shape: crate::modulator::ModulatorShape::Sine,
+            rate_hz: 1.0,
+            phase: 0.0,
+            enabled: true,
+            targets: vec![crate::modulator::ModulatorTarget::TrackBalance {
+                track_name: "pan-track".to_string(),
+                min: -1.0,
+                max: 1.0,
+            }],
+        }];
+
+        // At sample 12000 (1/4 period), sine value maps to 1.0 -> max balance 1.0.
+        let echoes = engine.apply_modulators(12_000);
+        let track = engine.state.lock().tracks["pan-track"].lock();
+        assert!(
+            (track.balance - 1.0).abs() < 0.01,
+            "expected balance 1.0, got {}",
+            track.balance
+        );
+        assert!(
+            echoes.iter().any(
+                |a| matches!(a, Action::TrackAutomationBalance(name, _) if name == "pan-track")
+            )
+        );
+    }
 }

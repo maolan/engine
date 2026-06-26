@@ -99,7 +99,6 @@ pub struct Modulator {
     pub shape: ModulatorShape,
     pub rate_hz: f32,
     pub phase: f32,
-    pub bipolar: bool,
     pub enabled: bool,
     pub targets: Vec<ModulatorTarget>,
 }
@@ -133,14 +132,13 @@ impl Modulator {
             shape: ModulatorShape::default(),
             rate_hz: 1.0,
             phase: 0.0,
-            bipolar: false,
             enabled: true,
             targets: Vec::new(),
         }
     }
 
     /// Evaluate the modulator at a given transport sample and sample rate.
-    /// Returns a normalized value in `[0, 1]` regardless of the `bipolar` flag.
+    /// Returns a normalized value in `[0, 1]`.
     pub fn value_at(&self, sample: usize, sample_rate: f64) -> f32 {
         let cycles = sample as f64 / sample_rate * self.rate_hz as f64 + self.phase as f64;
         let phase = cycles.rem_euclid(1.0) as f32;
