@@ -205,11 +205,23 @@ impl HwWorkerDriver for HwDriver {
     }
 
     fn run_cycle_for_worker(&mut self) -> Result<(), String> {
-        self.run_cycle_with_assist().map_err(|e| e.to_string())
+        self.run_cycle_with_assist().or_else(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                Ok(())
+            } else {
+                Err(e.to_string())
+            }
+        })
     }
 
     fn run_assist_step_for_worker(&mut self) -> Result<bool, String> {
-        self.run_assist_step().map_err(|e| e.to_string())
+        self.run_assist_step().or_else(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(e.to_string())
+            }
+        })
     }
 
     fn request_stop(&mut self) {

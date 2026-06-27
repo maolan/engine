@@ -28,7 +28,7 @@ wide = "1.4.0"
 alsa = { version = "0.11.0" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.2", features = ["ioctl"] }
+nix = { version = "0.31.2", features = ["ioctl", "poll"] }
 jack = "0.13.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]

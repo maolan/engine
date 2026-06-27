@@ -5,9 +5,10 @@ use crate::midi::io::MidiEvent;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Host, HostId, SampleFormat, Stream, StreamConfig};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::error;
 
 const MIDI_IN_PREFIX: &str = "winmidi:in:";
@@ -44,6 +45,7 @@ pub struct HwDriver {
     input_channels: usize,
     output_channels: usize,
     playing: bool,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl HwDriver {
@@ -86,6 +88,7 @@ impl HwDriver {
 
         let (output_tx, output_rx) = mpsc::sync_channel::<Vec<f32>>(8);
         let (cycle_tick_tx, cycle_tick_rx) = mpsc::sync_channel::<()>(8);
+        let stop_requested = Arc::new(AtomicBool::new(false));
 
         let output_stream = {
             let mut pending = Vec::<f32>::new();
@@ -178,6 +181,7 @@ impl HwDriver {
             input_channels,
             output_channels,
             playing: false,
+            stop_requested,
         })
     }
 
@@ -227,9 +231,26 @@ impl HwDriver {
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
-        self.cycle_tick_rx
-            .recv_timeout(Duration::from_millis(500))
-            .map_err(|_| "Timed out waiting for WASAPI callback".to_string())?;
+        let tick_deadline = Instant::now() + Duration::from_millis(500);
+        let mut ticked = false;
+        while Instant::now() < tick_deadline {
+            if self.stop_requested.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match self.cycle_tick_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) => {
+                    ticked = true;
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("WASAPI callback channel disconnected".to_string());
+                }
+            }
+        }
+        if !ticked {
+            return Err("Timed out waiting for WASAPI callback".to_string());
+        }
 
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
@@ -586,6 +607,14 @@ impl traits::HwWorkerDriver for HwDriver {
 
     fn sample_rate(&self) -> i32 {
         self.sample_rate()
+    }
+
+    fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = self.output_stream.pause();
+        if let Some(stream) = &self.input_stream {
+            let _ = stream.pause();
+        }
     }
 
     fn run_cycle_for_worker(&mut self) -> Result<(), String> {

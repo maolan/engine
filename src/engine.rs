@@ -79,12 +79,6 @@ impl WorkerData {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkerClass {
-    Realtime,
-    Refill,
-}
-
 #[derive(Debug, Clone)]
 struct RecordingSession {
     start_sample: usize,
@@ -146,11 +140,8 @@ struct AudioOpenRequest<'a> {
     bits: i32,
     exclusive: bool,
     period_frames: usize,
-    realtime_frames: usize,
-    low_watermark_frames: usize,
     nperiods: usize,
     sync_mode: bool,
-    hybrid_enabled: bool,
 }
 
 struct ClipAddRequest<'a> {
@@ -211,9 +202,7 @@ pub struct Engine {
     midi_hw_in_routes: Vec<MidiHwInRoute>,
     midi_hw_out_routes: Vec<MidiHwOutRoute>,
     midi_hw_thru_routes: Vec<MidiHwThruRoute>,
-    worker_classes: Vec<WorkerClass>,
-    ready_realtime_workers: Vec<usize>,
-    ready_refill_workers: Vec<usize>,
+    ready_workers: Vec<usize>,
     pending_requests: VecDeque<Action>,
     awaiting_hwfinished: bool,
     handling_hwfinished: bool,
@@ -267,15 +256,6 @@ pub struct Engine {
     global_midi_learn_stop: Option<crate::message::MidiLearnBinding>,
     global_midi_learn_record_toggle: Option<crate::message::MidiLearnBinding>,
     midi_cc_gate: HashMap<(String, u8, u8), bool>,
-    hybrid_low_watermark_frames: usize,
-    hybrid_realtime_frames: usize,
-    hybrid_playback_frames: usize,
-    hybrid_enabled: bool,
-    refill_budget_per_pass: usize,
-    realtime_fallback_enabled: bool,
-    realtime_fallback_budget_per_pass: usize,
-    refill_budget_throttle_count: usize,
-    realtime_fallback_dispatch_count: usize,
     modulators: Vec<crate::modulator::Modulator>,
     modulator_values: Option<Arc<std::collections::HashMap<usize, f32>>>,
 }
@@ -966,9 +946,7 @@ impl Engine {
             midi_hw_in_routes: vec![],
             midi_hw_out_routes: vec![],
             midi_hw_thru_routes: vec![],
-            worker_classes: vec![],
-            ready_realtime_workers: vec![],
-            ready_refill_workers: vec![],
+            ready_workers: vec![],
             pending_requests: VecDeque::new(),
             awaiting_hwfinished: false,
             handling_hwfinished: false,
@@ -1020,15 +998,6 @@ impl Engine {
             global_midi_learn_stop: None,
             global_midi_learn_record_toggle: None,
             midi_cc_gate: HashMap::new(),
-            hybrid_low_watermark_frames: 0,
-            hybrid_realtime_frames: 0,
-            hybrid_playback_frames: 0,
-            hybrid_enabled: false,
-            refill_budget_per_pass: 2,
-            realtime_fallback_enabled: true,
-            realtime_fallback_budget_per_pass: 1,
-            refill_budget_throttle_count: 0,
-            realtime_fallback_dispatch_count: 0,
             modulators: Vec::new(),
             modulator_values: None,
         }
@@ -1461,10 +1430,6 @@ impl Engine {
             Ok(runtime) => {
                 let input_channels = runtime.input_channels();
                 let output_channels = runtime.output_channels();
-                self.hybrid_playback_frames = request.period_frames.max(1);
-                self.hybrid_realtime_frames = request.realtime_frames.max(1);
-                self.hybrid_low_watermark_frames = request.low_watermark_frames.max(1);
-                self.hybrid_enabled = request.hybrid_enabled;
                 let midi_inputs = runtime.midi_input_devices();
                 let midi_outputs = runtime.midi_output_devices();
                 let rate = runtime.sample_rate;
@@ -1494,11 +1459,8 @@ impl Engine {
                     bits: request.bits,
                     exclusive: request.exclusive,
                     period_frames: request.period_frames,
-                    realtime_frames: request.realtime_frames,
-                    low_watermark_frames: request.low_watermark_frames,
                     nperiods: request.nperiods,
                     sync_mode: request.sync_mode,
-                    hybrid_enabled: request.hybrid_enabled,
                     actual_period_frames: request.period_frames,
                     input_channels,
                     output_channels,
@@ -3383,24 +3345,13 @@ impl Engine {
 
     pub async fn init(&mut self) {
         let max_threads = num_cpus::get();
-        let realtime_count = if max_threads > 1 { 1 } else { max_threads };
         for id in 0..max_threads {
-            let class = if id < realtime_count {
-                WorkerClass::Realtime
-            } else {
-                WorkerClass::Refill
-            };
-            let priority = match class {
-                WorkerClass::Realtime => 20,
-                WorkerClass::Refill => 8,
-            };
             let (tx, rx) = channel::<Message>(32);
             let tx_thread = self.tx.clone();
             let handler = tokio::spawn(async move {
-                let wrk = Worker::new(id, rx, tx_thread, priority);
+                let wrk = Worker::new(id, rx, tx_thread, 8);
                 wrk.await.work().await;
             });
-            self.worker_classes.push(class);
             self.workers.push(WorkerData::new(tx.clone(), handler));
         }
     }
@@ -4120,62 +4071,27 @@ impl Engine {
             return false;
         }
         self.refresh_realtime_infection();
-        let mut cycle_underflows = 0usize;
-        {
-            let state = self.state.lock();
-            for track in state.tracks.values() {
-                cycle_underflows =
-                    cycle_underflows.saturating_add(track.lock().take_hybrid_underflow_delta());
-            }
-        }
-        if cycle_underflows > 0 {
-            self.refill_budget_per_pass = (self.refill_budget_per_pass + 1).min(8);
-        } else {
-            self.refill_budget_per_pass = self.refill_budget_per_pass.saturating_sub(1).max(1);
-        }
         self.force_stalled_track_completions();
         let mut finished = true;
         let mut dispatched = 0;
-        let mut refill_dispatched = 0usize;
-        let mut realtime_fallback_dispatched = 0usize;
         loop {
             let next_track = {
                 let state = self.state.lock();
-                let mut next_realtime = None;
-                let mut next_playback = None;
+                let mut next = None;
                 for track in state.tracks.values() {
                     let t = track.lock();
                     if t.audio.finished {
-                        continue;
-                    }
-                    let needs_refill_event = t.hybrid_needs_refill();
-                    if self.hybrid_enabled
-                        && !t.is_realtime_domain()
-                        && !needs_refill_event
-                        && t.try_consume_hybrid_playback_cycle()
-                    {
                         continue;
                     }
                     finished = false;
                     if t.audio.processing || !t.audio.ready() {
                         continue;
                     }
-                    if t.is_realtime_domain() {
-                        if next_realtime.is_none() {
-                            next_realtime = Some(track.clone());
-                        }
-                    } else if next_playback.is_none() {
-                        next_playback = Some(track.clone());
+                    if next.is_none() {
+                        next = Some(track.clone());
                     }
                 }
-                if next_realtime.is_none()
-                    && next_playback.is_some()
-                    && refill_dispatched >= self.refill_budget_per_pass
-                {
-                    self.refill_budget_throttle_count =
-                        self.refill_budget_throttle_count.saturating_add(1);
-                }
-                next_realtime.or(next_playback)
+                next
             };
 
             let Some(track) = next_track else {
@@ -4184,28 +4100,7 @@ impl Engine {
                 }
                 return finished;
             };
-            let worker_class = {
-                let t = track.lock();
-                if t.is_realtime_domain() {
-                    WorkerClass::Realtime
-                } else {
-                    WorkerClass::Refill
-                }
-            };
-            let worker_index = if !self.hybrid_enabled {
-                self.take_ready_worker_index(WorkerClass::Realtime)
-                    .or_else(|| self.take_ready_worker_index(WorkerClass::Refill))
-            } else if let Some(index) = self.take_ready_worker_index(worker_class) {
-                Some(index)
-            } else if matches!(worker_class, WorkerClass::Realtime)
-                && self.realtime_fallback_enabled
-                && realtime_fallback_dispatched < self.realtime_fallback_budget_per_pass
-            {
-                self.take_ready_worker_index(WorkerClass::Refill)
-            } else {
-                None
-            };
-            let Some(worker_index) = worker_index else {
+            let Some(worker_index) = self.take_ready_worker_index() else {
                 self.force_stalled_track_completions();
                 if dispatched > 0 {
                     tracing::info!(
@@ -4220,44 +4115,10 @@ impl Engine {
             if t.audio.finished || t.audio.processing || !t.audio.ready() {
                 continue;
             }
-            if self.hybrid_enabled && matches!(worker_class, WorkerClass::Refill) {
-                let _ = t.hybrid_take_refill_wakeup();
-            }
             dispatched += 1;
-            if matches!(worker_class, WorkerClass::Refill) {
-                refill_dispatched = refill_dispatched.saturating_add(1);
-            } else if !matches!(
-                self.worker_classes
-                    .get(worker_index)
-                    .copied()
-                    .unwrap_or(WorkerClass::Realtime),
-                WorkerClass::Realtime
-            ) {
-                realtime_fallback_dispatched = realtime_fallback_dispatched.saturating_add(1);
-                self.realtime_fallback_dispatch_count =
-                    self.realtime_fallback_dispatch_count.saturating_add(1);
-            }
             t.set_transport_sample(self.transport_sample);
             t.set_loop_config(self.loop_enabled, self.loop_range_samples);
             t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
-            if self.hybrid_enabled {
-                let low_watermark = if self.hybrid_low_watermark_frames > 0 {
-                    self.hybrid_low_watermark_frames
-                } else {
-                    self.current_cycle_samples().saturating_mul(4).max(1)
-                };
-                let realtime_frames = if self.hybrid_realtime_frames > 0 {
-                    self.hybrid_realtime_frames
-                } else {
-                    self.current_cycle_samples().max(1)
-                };
-                let playback_frames = if self.hybrid_playback_frames > 0 {
-                    self.hybrid_playback_frames
-                } else {
-                    self.current_cycle_samples().max(1)
-                };
-                t.configure_hybrid_timing(realtime_frames, low_watermark, playback_frames);
-            }
             t.process_epoch = self.track_process_epoch;
 
             t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
@@ -4315,13 +4176,9 @@ impl Engine {
         self.request_hw_cycle().await;
     }
 
-    fn take_ready_worker_index(&mut self, class: WorkerClass) -> Option<usize> {
-        let queue = match class {
-            WorkerClass::Realtime => &mut self.ready_realtime_workers,
-            WorkerClass::Refill => &mut self.ready_refill_workers,
-        };
-        while !queue.is_empty() {
-            let worker_index = queue.remove(0);
+    fn take_ready_worker_index(&mut self) -> Option<usize> {
+        while !self.ready_workers.is_empty() {
+            let worker_index = self.ready_workers.remove(0);
             if worker_index < self.workers.len() {
                 return Some(worker_index);
             }
@@ -4330,15 +4187,7 @@ impl Engine {
     }
 
     fn push_ready_worker(&mut self, worker_index: usize) {
-        match self
-            .worker_classes
-            .get(worker_index)
-            .copied()
-            .unwrap_or(WorkerClass::Refill)
-        {
-            WorkerClass::Realtime => self.ready_realtime_workers.push(worker_index),
-            WorkerClass::Refill => self.ready_refill_workers.push(worker_index),
-        }
+        self.ready_workers.push(worker_index);
     }
 
     async fn publish_track_meters(&mut self) {
@@ -5042,8 +4891,7 @@ impl Engine {
                 self.midi_hub.lock().close_all();
                 self.hw_driver = None;
                 self.notify_clients(Ok(Action::Quit)).await;
-                self.ready_realtime_workers.clear();
-                self.ready_refill_workers.clear();
+                self.ready_workers.clear();
                 while !self.workers.is_empty() {
                     let worker = self.workers.remove(0);
                     if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
@@ -5109,7 +4957,6 @@ impl Engine {
                         t.set_clip_playback_enabled(self.clip_playback_enabled);
                         t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
                         t.set_session_base_dir(self.session_dir.clone());
-                        t.set_hybrid_enabled(self.hybrid_enabled);
                     }
                 } else {
                     self.notify_clients(Err(
@@ -5751,7 +5598,7 @@ impl Engine {
                     .await;
                     return;
                 }
-                let Some(worker_index) = self.take_ready_worker_index(WorkerClass::Refill) else {
+                let Some(worker_index) = self.take_ready_worker_index() else {
                     self.pending_requests
                         .push_front(Action::TrackOfflineBounce {
                             track_name,
@@ -7685,15 +7532,9 @@ impl Engine {
                 bits,
                 exclusive,
                 period_frames,
-                realtime_frames,
-                low_watermark_frames,
                 nperiods,
                 sync_mode,
-                hybrid_enabled,
-                actual_period_frames: _,
-                input_channels: _,
-                output_channels: _,
-                bytes_per_frame: _,
+                ..
             } => {
                 #[cfg(unix)]
                 {
@@ -7704,26 +7545,14 @@ impl Engine {
                         bits,
                         exclusive,
                         period_frames,
-                        realtime_frames,
-                        low_watermark_frames,
                         nperiods,
                         sync_mode,
-                        hybrid_enabled,
                     };
                     if self.maybe_open_jack_runtime(request).await.is_some() {
                         return;
                     }
                 }
-                let hw_period = if hybrid_enabled {
-                    realtime_frames
-                } else {
-                    period_frames
-                };
-                let hw_opts = Self::build_hw_options(exclusive, hw_period, nperiods, sync_mode);
-                self.hybrid_playback_frames = period_frames.max(1);
-                self.hybrid_realtime_frames = realtime_frames.max(1);
-                self.hybrid_low_watermark_frames = low_watermark_frames.max(1);
-                self.hybrid_enabled = hybrid_enabled;
+                let hw_opts = Self::build_hw_options(exclusive, period_frames, nperiods, sync_mode);
                 let open_result = self
                     .open_non_jack_audio_device(
                         device,
@@ -7741,12 +7570,6 @@ impl Engine {
                         return;
                     }
                 }
-                {
-                    let state = self.state.lock();
-                    for track in state.tracks.values() {
-                        track.lock().set_hybrid_enabled(hybrid_enabled);
-                    }
-                }
                 self.finalize_open_audio_device().await;
                 if let Some(hw) = &self.hw_driver {
                     let effective_action = {
@@ -7758,11 +7581,8 @@ impl Engine {
                             bits: hw.sample_bits(),
                             exclusive,
                             period_frames,
-                            realtime_frames,
-                            low_watermark_frames: low_watermark_frames.max(1),
                             nperiods,
                             sync_mode,
-                            hybrid_enabled,
                             actual_period_frames: hw.cycle_samples(),
                             input_channels: hw.input_channels(),
                             output_channels: hw.output_channels(),
@@ -8052,14 +7872,6 @@ impl Engine {
                     0
                 };
                 let cycle_samples = self.current_cycle_samples();
-                tracing::info!(
-                    "Hybrid diagnostics: refill_budget_per_pass={}, refill_budget_throttle_count={}, realtime_fallback_dispatch_count={}, realtime_ready={}, refill_ready={}",
-                    self.refill_budget_per_pass,
-                    self.refill_budget_throttle_count,
-                    self.realtime_fallback_dispatch_count,
-                    self.ready_realtime_workers.len(),
-                    self.ready_refill_workers.len()
-                );
                 self.notify_clients(Ok(Action::SessionDiagnosticsReport {
                     track_count,
                     frozen_track_count,
@@ -8071,8 +7883,7 @@ impl Engine {
                     clap_instance_count,
                     pending_requests: self.pending_requests.len(),
                     workers_total: self.workers.len(),
-                    workers_ready: self.ready_realtime_workers.len()
-                        + self.ready_refill_workers.len(),
+                    workers_ready: self.ready_workers.len(),
                     pending_hw_midi_events,
                     playing: self.playing,
                     transport_sample: self.transport_sample,
@@ -8870,7 +8681,7 @@ mod tests {
         engine
             .workers
             .push(WorkerData::new(worker_tx, tokio::spawn(async {})));
-        engine.ready_refill_workers.push(0);
+        engine.ready_workers.push(0);
 
         engine
             .handle_request(Action::TrackOfflineBounce {

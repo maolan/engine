@@ -479,21 +479,6 @@ pub struct Track {
     pub next_plugin_instance_id: usize,
     pub sample_rate: f64,
     process_block_size: usize,
-    preferred_process_block_size: usize,
-    hybrid_device_block_frames: usize,
-    hybrid_low_watermark_frames: usize,
-    hybrid_active_outs: Vec<Vec<f32>>,
-    hybrid_refill_outs: Vec<Vec<f32>>,
-    hybrid_active_read_pos: usize,
-    hybrid_active_filled: usize,
-    hybrid_refill_filled: usize,
-    hybrid_prefetch_transport_sample: usize,
-    hybrid_last_cycle_transport_sample: Option<usize>,
-    hybrid_underflow_count: usize,
-    hybrid_reported_underflow_count: usize,
-    hybrid_refill_requested: bool,
-    hybrid_last_refill_remaining: usize,
-    hybrid_enabled: bool,
     force_realtime_domain: bool,
     shared_realtime_mixed: bool,
     last_render_block_silent: bool,
@@ -585,21 +570,6 @@ impl Track {
             next_plugin_instance_id: 0,
             sample_rate,
             process_block_size: buffer_size.max(1),
-            preferred_process_block_size: buffer_size.max(1),
-            hybrid_device_block_frames: buffer_size.max(1),
-            hybrid_low_watermark_frames: (buffer_size.max(1) * 4).max(1),
-            hybrid_active_outs: vec![vec![0.0; buffer_size.max(1)]; audio_outs],
-            hybrid_refill_outs: vec![vec![0.0; buffer_size.max(1)]; audio_outs],
-            hybrid_active_read_pos: 0,
-            hybrid_active_filled: 0,
-            hybrid_refill_filled: 0,
-            hybrid_prefetch_transport_sample: 0,
-            hybrid_last_cycle_transport_sample: None,
-            hybrid_underflow_count: 0,
-            hybrid_reported_underflow_count: 0,
-            hybrid_refill_requested: false,
-            hybrid_last_refill_remaining: 0,
-            hybrid_enabled: false,
             force_realtime_domain: false,
             shared_realtime_mixed: false,
             last_render_block_silent: true,
@@ -1128,138 +1098,11 @@ impl Track {
         self.last_render_block_silent = all_outputs_zero;
         self.audio.finished = true;
         self.audio.processing = false;
-        if live_mode {
-            self.hybrid_reset_buffers();
-        }
         frames
     }
 
     pub fn process(&mut self) {
-        let live_mode = self.is_realtime_domain();
-        let cycle_frames = self
-            .audio
-            .ins
-            .first()
-            .map(|audio_in| audio_in.buffer.lock().len())
-            .or_else(|| {
-                self.audio
-                    .outs
-                    .first()
-                    .map(|audio_out| audio_out.buffer.lock().len())
-            })
-            .unwrap_or(self.hybrid_device_block_frames.max(1))
-            .max(1);
-
-        if live_mode || !self.hybrid_enabled || self.audio.outs.is_empty() {
-            let _ = self.process_render_block();
-            return;
-        }
-
-        self.ensure_hybrid_output_buffers(cycle_frames);
-        let expected_next_cycle = self
-            .hybrid_last_cycle_transport_sample
-            .map(|s| s.saturating_add(cycle_frames));
-        let discontinuity = expected_next_cycle.is_some_and(|next| next != self.transport_sample);
-        let large_seek = expected_next_cycle.is_some_and(|next| {
-            let a = next as isize;
-            let b = self.transport_sample as isize;
-            (a - b).unsigned_abs() > self.process_block_size
-        });
-        let loop_wrap = self.loop_enabled
-            && self.loop_range_samples.is_some_and(|(start, end)| {
-                end > start
-                    && expected_next_cycle
-                        .is_some_and(|next| next >= end && self.transport_sample <= end)
-            });
-        if discontinuity || large_seek || loop_wrap || self.hybrid_active_filled == 0 {
-            self.hybrid_prefetch_transport_sample = self.transport_sample;
-            self.hybrid_reset_buffers();
-        }
-
-        let active_remaining = self.hybrid_active_remaining();
-        let target_prefill = self
-            .preferred_process_block_size
-            .max(self.hybrid_device_block_frames)
-            .max(1);
-        let needs_refill = self.hybrid_refill_requested
-            || self.hybrid_active_filled == 0
-            || active_remaining <= self.hybrid_low_watermark_frames;
-
-        if needs_refill {
-            while self.hybrid_refill_filled < target_prefill {
-                let saved_transport = self.transport_sample;
-                self.transport_sample = self.hybrid_prefetch_transport_sample;
-                let rendered = self.process_render_block().max(1);
-                self.hybrid_append_current_outputs_to_refill(rendered);
-                self.hybrid_prefetch_transport_sample = self
-                    .hybrid_prefetch_transport_sample
-                    .saturating_add(rendered);
-                self.transport_sample = saved_transport;
-                if rendered < cycle_frames {
-                    break;
-                }
-            }
-        }
-
-        self.hybrid_swap_refill_into_active_if_needed();
-        if !self.hybrid_consume_active_to_outputs(cycle_frames) {
-            self.hybrid_underflow_count = self.hybrid_underflow_count.saturating_add(1);
-            for out in &self.audio.outs {
-                out.buffer.lock().fill(0.0);
-                *out.finished.lock() = true;
-            }
-            self.audio.finished = true;
-            self.audio.processing = false;
-        }
-        self.hybrid_last_cycle_transport_sample = Some(self.transport_sample);
-    }
-
-    pub fn try_consume_hybrid_playback_cycle(&mut self) -> bool {
-        if self.is_realtime_domain() {
-            return false;
-        }
-        let cycle_frames = self
-            .audio
-            .ins
-            .first()
-            .map(|audio_in| audio_in.buffer.lock().len())
-            .or_else(|| {
-                self.audio
-                    .outs
-                    .first()
-                    .map(|audio_out| audio_out.buffer.lock().len())
-            })
-            .unwrap_or(self.hybrid_device_block_frames.max(1))
-            .max(1);
-
-        self.ensure_hybrid_output_buffers(cycle_frames);
-        let expected_next_cycle = self
-            .hybrid_last_cycle_transport_sample
-            .map(|s| s.saturating_add(cycle_frames));
-        let discontinuity = expected_next_cycle.is_some_and(|next| next != self.transport_sample);
-        let large_seek = expected_next_cycle.is_some_and(|next| {
-            let a = next as isize;
-            let b = self.transport_sample as isize;
-            (a - b).unsigned_abs() > self.preferred_process_block_size.max(1)
-        });
-        let loop_wrap = self.loop_enabled
-            && self.loop_range_samples.is_some_and(|(start, end)| {
-                end > start
-                    && expected_next_cycle
-                        .is_some_and(|next| next >= end && self.transport_sample <= end)
-            });
-        if discontinuity || large_seek || loop_wrap {
-            self.hybrid_prefetch_transport_sample = self.transport_sample;
-            self.hybrid_reset_buffers();
-            return false;
-        }
-
-        if self.hybrid_consume_active_to_outputs(cycle_frames) {
-            self.hybrid_last_cycle_transport_sample = Some(self.transport_sample);
-            true
-        } else {
-            false
-        }
+        let _ = self.process_render_block();
     }
 
     pub fn name(&self) -> String {
@@ -1294,7 +1137,6 @@ impl Track {
 
     pub fn arm(&mut self) {
         self.armed = !self.armed;
-        self.update_hybrid_process_block_size();
     }
 
     pub fn set_output_enabled(&mut self, enabled: bool) {
@@ -1352,7 +1194,6 @@ impl Track {
         if let Some(monitor) = self.input_monitor.get_mut(lane) {
             *monitor = !*monitor;
         }
-        self.update_hybrid_process_block_size();
     }
     pub fn toggle_disk_monitor(&mut self, lane: usize) {
         if let Some(monitor) = self.disk_monitor.get_mut(lane) {
@@ -1363,7 +1204,6 @@ impl Track {
         if let Some(monitor) = self.midi_input_monitor.get_mut(lane) {
             *monitor = !*monitor;
         }
-        self.update_hybrid_process_block_size();
     }
     pub fn toggle_midi_disk_monitor(&mut self, lane: usize) {
         if let Some(monitor) = self.midi_disk_monitor.get_mut(lane) {
@@ -3861,54 +3701,12 @@ impl Track {
             .unwrap_or(self.process_block_size)
     }
 
-    fn update_hybrid_process_block_size(&mut self) {
-        let next_block_size = if self.is_realtime_domain() {
-            self.hybrid_device_block_frames.max(1)
-        } else {
-            self.preferred_process_block_size.max(1)
-        };
-        if self.process_block_size != next_block_size {
-            self.process_block_size = next_block_size;
-            self.clip_plugin_tracks.clear();
-        }
-    }
-
-    pub fn configure_hybrid_timing(
-        &mut self,
-        device_block_frames: usize,
-        low_watermark_frames: usize,
-        playback_block_frames: usize,
-    ) {
-        self.hybrid_device_block_frames = device_block_frames.max(1);
-        self.hybrid_low_watermark_frames = low_watermark_frames.max(1);
-        self.preferred_process_block_size = playback_block_frames
-            .max(self.hybrid_device_block_frames)
-            .max(1);
-        self.hybrid_prefetch_transport_sample = self.transport_sample;
-        self.hybrid_refill_requested = true;
-        self.update_hybrid_process_block_size();
-    }
-
     pub fn set_force_realtime_domain(&mut self, forced: bool) {
-        if self.force_realtime_domain != forced {
-            self.force_realtime_domain = forced;
-            self.update_hybrid_process_block_size();
-            if forced {
-                self.hybrid_reset_buffers();
-            }
-        }
+        self.force_realtime_domain = forced;
     }
 
     pub fn set_shared_realtime_mixed(&mut self, mixed: bool) {
         self.shared_realtime_mixed = mixed;
-    }
-
-    pub fn set_hybrid_enabled(&mut self, enabled: bool) {
-        self.hybrid_enabled = enabled;
-    }
-
-    pub fn hybrid_enabled(&self) -> bool {
-        self.hybrid_enabled
     }
 
     pub fn is_realtime_domain(&self) -> bool {
@@ -3916,139 +3714,6 @@ impl Track {
             && (self.input_monitor.iter().any(|&m| m)
                 || self.midi_input_monitor.iter().any(|&m| m)))
             || self.force_realtime_domain
-    }
-
-    pub fn hybrid_needs_refill(&self) -> bool {
-        if self.is_realtime_domain() {
-            return false;
-        }
-        self.hybrid_refill_requested || self.hybrid_active_filled == 0
-    }
-
-    fn hybrid_reset_buffers(&mut self) {
-        self.hybrid_active_read_pos = 0;
-        self.hybrid_active_filled = 0;
-        self.hybrid_refill_filled = 0;
-        self.hybrid_last_cycle_transport_sample = None;
-        self.hybrid_refill_requested = true;
-        self.hybrid_last_refill_remaining = 0;
-    }
-
-    fn ensure_hybrid_output_buffers(&mut self, frames: usize) {
-        let channels = self.audio.outs.len();
-        let playback_capacity = self
-            .preferred_process_block_size
-            .max(self.hybrid_device_block_frames)
-            .max(1);
-        let capacity = if self.is_realtime_domain() {
-            self.hybrid_device_block_frames.max(frames).max(1)
-        } else {
-            playback_capacity.max(frames)
-        };
-        if self.hybrid_active_outs.len() != channels {
-            self.hybrid_active_outs = vec![vec![0.0; capacity]; channels];
-        }
-        if self.hybrid_refill_outs.len() != channels {
-            self.hybrid_refill_outs = vec![vec![0.0; capacity]; channels];
-        }
-        for ch in 0..channels {
-            if self.hybrid_active_outs[ch].len() != capacity {
-                self.hybrid_active_outs[ch].resize(capacity, 0.0);
-            }
-            if self.hybrid_refill_outs[ch].len() != capacity {
-                self.hybrid_refill_outs[ch].resize(capacity, 0.0);
-            }
-        }
-        self.hybrid_active_read_pos = self.hybrid_active_read_pos.min(self.hybrid_active_filled);
-        self.hybrid_active_filled = self.hybrid_active_filled.min(capacity);
-        self.hybrid_refill_filled = self.hybrid_refill_filled.min(capacity);
-    }
-
-    fn hybrid_active_remaining(&self) -> usize {
-        self.hybrid_active_filled
-            .saturating_sub(self.hybrid_active_read_pos)
-    }
-
-    fn hybrid_update_refill_request_edge(&mut self) {
-        let remaining = self.hybrid_active_remaining();
-        let threshold = self.hybrid_low_watermark_frames;
-        if remaining <= threshold && self.hybrid_last_refill_remaining > threshold {
-            self.hybrid_refill_requested = true;
-        }
-        if self.hybrid_active_filled == 0 {
-            self.hybrid_refill_requested = true;
-        }
-        self.hybrid_last_refill_remaining = remaining;
-    }
-
-    fn hybrid_append_current_outputs_to_refill(&mut self, frames: usize) {
-        if frames == 0 || self.audio.outs.is_empty() {
-            return;
-        }
-        self.ensure_hybrid_output_buffers(frames);
-        let capacity = self
-            .hybrid_refill_outs
-            .first()
-            .map(|b| b.len())
-            .unwrap_or(frames.max(1));
-        let append = frames.min(capacity.saturating_sub(self.hybrid_refill_filled));
-        if append == 0 {
-            return;
-        }
-        for ch in 0..self.audio.outs.len() {
-            let out = self.audio.outs[ch].buffer.lock();
-            self.hybrid_refill_outs[ch]
-                [self.hybrid_refill_filled..self.hybrid_refill_filled + append]
-                .copy_from_slice(&out[..append]);
-        }
-        self.hybrid_refill_filled += append;
-    }
-
-    fn hybrid_swap_refill_into_active_if_needed(&mut self) {
-        if self.hybrid_active_remaining() == 0 && self.hybrid_refill_filled > 0 {
-            std::mem::swap(&mut self.hybrid_active_outs, &mut self.hybrid_refill_outs);
-            self.hybrid_active_filled = self.hybrid_refill_filled;
-            self.hybrid_active_read_pos = 0;
-            self.hybrid_refill_filled = 0;
-            self.hybrid_refill_requested = false;
-            self.hybrid_last_refill_remaining = self.hybrid_active_remaining();
-        }
-    }
-
-    fn hybrid_consume_active_to_outputs(&mut self, frames: usize) -> bool {
-        if self.hybrid_active_remaining() < frames {
-            return false;
-        }
-        let start = self.hybrid_active_read_pos;
-        let end = start + frames;
-        for ch in 0..self.audio.outs.len() {
-            let out_io = self.audio.outs[ch].clone();
-            let out = out_io.buffer.lock();
-            out[..frames].copy_from_slice(&self.hybrid_active_outs[ch][start..end]);
-            *out_io.finished.lock() = true;
-        }
-        self.hybrid_active_read_pos = end;
-        if self.hybrid_active_read_pos >= self.hybrid_active_filled {
-            self.hybrid_active_read_pos = 0;
-            self.hybrid_active_filled = 0;
-        }
-        self.audio.finished = true;
-        self.audio.processing = false;
-        self.hybrid_update_refill_request_edge();
-        true
-    }
-
-    pub fn hybrid_take_refill_wakeup(&mut self) -> bool {
-        let requested = self.hybrid_refill_requested;
-        self.hybrid_refill_requested = false;
-        requested
-    }
-
-    pub fn take_hybrid_underflow_delta(&mut self) -> usize {
-        let total = self.hybrid_underflow_count;
-        let prev = self.hybrid_reported_underflow_count;
-        self.hybrid_reported_underflow_count = total;
-        total.saturating_sub(prev)
     }
 
     pub fn add_audio_input(&mut self) -> Result<(), String> {
@@ -5292,36 +4957,6 @@ mod tests {
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.5);
         assert_eq!(out[1], -0.25);
-    }
-
-    #[test]
-    fn hybrid_block_size_switches_when_track_is_armed_and_monitored() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 256, 48_000.0);
-        track.configure_hybrid_timing(64, 256, 256);
-        assert_eq!(track.process_block_size, 256);
-
-        track.arm();
-        assert_eq!(track.process_block_size, 256);
-
-        track.toggle_input_monitor(0);
-        assert_eq!(track.process_block_size, 64);
-
-        track.toggle_input_monitor(0);
-        assert_eq!(track.process_block_size, 256);
-    }
-
-    #[test]
-    fn hybrid_block_size_uses_large_playback_block_on_hw_sized_buffers() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        track.configure_hybrid_timing(64, 256, 64);
-        assert_eq!(track.process_block_size, 64);
-
-        track.arm();
-        track.toggle_input_monitor(0);
-        assert_eq!(track.process_block_size, 64);
-
-        track.toggle_input_monitor(0);
-        assert_eq!(track.process_block_size, 64);
     }
 
     #[test]

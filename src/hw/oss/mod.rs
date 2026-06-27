@@ -1,34 +1,37 @@
 use crate::audio::io::AudioIO;
 use crate::hw::convert_policy;
 use nix::libc;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::{
     fs::File,
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    sync::{Arc, Mutex},
+    os::{
+        fd::{AsRawFd, BorrowedFd},
+        unix::fs::OpenOptionsExt,
+    },
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 pub use super::midi_hub::MidiHub;
 
-mod audio_core;
 mod channel;
 mod consts;
 mod convert;
 mod driver;
-mod io_util;
 mod ioctl;
 mod sync;
 
 pub use self::channel::OSSChannel;
 pub use self::consts::*;
 pub use self::driver::HwDriver;
-pub use self::ioctl::{AudioInfo, BufferInfo, add_to_sync_group, start_sync_group};
+pub use self::ioctl::{AudioInfo, add_to_sync_group, start_sync_group};
 pub use crate::hw::options::HwOptions;
 
-use self::audio_core::DoubleBufferedChannel;
 use self::convert::*;
-use self::io_util::*;
 use self::ioctl::*;
-use self::sync::{DuplexSync, FrameClock, get_or_create_duplex_sync};
+use self::sync::FrameClock;
 
 #[cfg(target_endian = "little")]
 const AFMT_S16_FOREIGN: u32 = AFMT_S16_BE;
@@ -55,23 +58,11 @@ pub struct Audio {
     pub chsamples: usize,
     buffer: Vec<i32>,
     f32_buffer: Vec<f32>,
-    pub buffer_info: BufferInfo,
     frame_size_bytes: usize,
-    fragment_bytes: usize,
-    buffer_frames_cached: i64,
     caps: i32,
-    mapped: bool,
-    map: *mut libc::c_void,
-    map_progress_bytes: usize,
-    last_published_balance: i64,
     frame_clock: FrameClock,
     frame_stamp: i64,
-    duplex_sync: Arc<Mutex<DuplexSync>>,
-    channel: DoubleBufferedChannel,
-    last_underrun_count: i32,
-    last_overrun_count: i32,
-    xrun_count: u64,
-    playing: Arc<std::sync::atomic::AtomicBool>,
+    playing: Arc<AtomicBool>,
     was_playing_last_cycle: bool,
     stop_fade_remaining_frames: usize,
     stop_fade_total_frames: usize,
@@ -138,60 +129,6 @@ impl Audio {
             .unwrap_or_else(|| std::io::Error::other("OSS setfmt failed for all fallback formats")))
     }
 
-    fn min_fragment_bytes(frame_size: usize) -> Result<usize, std::io::Error> {
-        const MAX_FRAGMENT_BYTES: usize = 1 << 16;
-        if frame_size == 0 {
-            return Err(std::io::Error::other("OSS frame size is invalid"));
-        }
-        if frame_size > MAX_FRAGMENT_BYTES {
-            return Err(std::io::Error::other(format!(
-                "OSS frame size {frame_size} exceeds maximum fragment size {MAX_FRAGMENT_BYTES}"
-            )));
-        }
-        Ok(frame_size.next_power_of_two().min(MAX_FRAGMENT_BYTES))
-    }
-
-    fn request_fragment_layout(
-        fd: i32,
-        frame_size: usize,
-        period_frames: usize,
-    ) -> std::io::Result<usize> {
-        let fragment_bytes = Self::min_fragment_bytes(frame_size)?;
-        let period_bytes =
-            Self::period_bytes_for_fragment_grid(frame_size, period_frames, fragment_bytes)?;
-        let fragments = period_bytes.div_ceil(fragment_bytes).max(1);
-        let exponent = fragment_bytes.trailing_zeros();
-        let arg_bits = ((fragments.min(0xffff) as u32) << 16) | exponent;
-        let mut arg = arg_bits as i32;
-        unsafe { oss_set_fragment(fd, &mut arg) }?;
-        Ok(fragment_bytes)
-    }
-
-    fn period_bytes_for_fragment_grid(
-        frame_size: usize,
-        period_frames: usize,
-        min_bytes: usize,
-    ) -> std::io::Result<usize> {
-        let requested_bytes = period_frames
-            .max(1)
-            .checked_mul(frame_size)
-            .ok_or_else(|| std::io::Error::other("OSS period byte size overflow"))?;
-        let min_bytes = min_bytes.max(frame_size).max(1);
-        requested_bytes
-            .max(min_bytes)
-            .checked_next_power_of_two()
-            .ok_or_else(|| std::io::Error::other("OSS period byte size overflow"))
-    }
-
-    fn period_frames_for_fragment_grid(
-        frame_size: usize,
-        period_frames: usize,
-        min_bytes: usize,
-    ) -> std::io::Result<usize> {
-        let bytes = Self::period_bytes_for_fragment_grid(frame_size, period_frames, min_bytes)?;
-        Ok(bytes.div_ceil(frame_size).max(1))
-    }
-
     pub fn fd(&self) -> i32 {
         self.dsp.as_raw_fd()
     }
@@ -237,12 +174,12 @@ impl Audio {
 
     pub fn new(
         path: &str,
-        sync_key: &str,
+        _sync_key: &str,
         rate: i32,
         bits: i32,
         input: bool,
         options: HwOptions,
-        playing: Arc<std::sync::atomic::AtomicBool>,
+        playing: Arc<AtomicBool>,
     ) -> Result<Audio, std::io::Error> {
         let mut binding = File::options();
 
@@ -296,121 +233,24 @@ impl Audio {
             .ok_or_else(|| std::io::Error::other(format!("Unsupported format: {format:#x}")))?;
         let frame_size = (channels as usize) * bytes_per_sample;
 
-        let _requested_fragment_bytes =
-            Self::request_fragment_layout(dsp.as_raw_fd(), frame_size, options.period_frames)?;
-
-        let mut buffer_info = BufferInfo::new();
-        unsafe {
-            if input {
-                oss_input_buffer_info(dsp.as_raw_fd(), &mut buffer_info)
-                    .map_err(|_| std::io::Error::last_os_error())?;
-            } else {
-                oss_output_buffer_info(dsp.as_raw_fd(), &mut buffer_info)
-                    .map_err(|_| std::io::Error::last_os_error())?;
-            }
-        }
-
-        if buffer_info.fragments < 1 {
-            buffer_info.fragments = buffer_info.fragstotal;
-        }
-        if buffer_info.bytes < 1 {
-            buffer_info.bytes = buffer_info.fragstotal * buffer_info.fragsize;
-        }
-        if buffer_info.bytes < 1 {
-            return Err(std::io::Error::other("OSS buffer size is invalid"));
-        }
-
         let mut caps = 0_i32;
         unsafe {
             oss_get_caps(dsp.as_raw_fd(), &mut caps)
                 .map_err(|_| std::io::Error::last_os_error())?;
         }
-        let mut sys = OssSysInfo::default();
-        unsafe {
-            oss_get_sysinfo(dsp.as_raw_fd(), &mut sys)
-                .map_err(|_| std::io::Error::last_os_error())?;
-        }
-        if (caps & PCM_CAP_MMAP) != 0 {
-            let ver = cstr_fixed_prefix(&sys.version);
-            if ver.len() >= 7 && ver.as_bytes()[..7].cmp(b"1302000") == std::cmp::Ordering::Less {
-                caps &= !PCM_CAP_MMAP;
-            }
-        }
 
-        let _ring_total_frames = if frame_size > 0 && buffer_info.bytes > 0 {
-            (buffer_info.bytes as usize) / frame_size
-        } else {
-            0
-        };
-        let frag_frames = if frame_size > 0 && buffer_info.fragsize > 0 {
-            (buffer_info.fragsize as usize).div_ceil(frame_size)
-        } else {
-            0
-        };
-        let chsamples = Self::period_frames_for_fragment_grid(
-            frame_size,
-            options.period_frames,
-            buffer_info.fragsize.max(1) as usize,
-        )?;
-
-        if frag_frames > 0 {
-            let _direction = if input { "capture" } else { "playback" };
-            if chsamples % frag_frames != 0 {}
-        }
-
-        let buffer_bytes = chsamples * frame_size;
-        let channel = if input {
-            DoubleBufferedChannel::new_read(buffer_bytes, chsamples as i64)
-        } else {
-            DoubleBufferedChannel::new_write(buffer_bytes, chsamples as i64)
-        };
-
-        let mut map = std::ptr::null_mut();
-        let mut mapped = false;
-        if (caps & PCM_CAP_MMAP) != 0 {
-            let prot = if input {
-                libc::PROT_READ
-            } else {
-                libc::PROT_WRITE
-            };
-            let addr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    buffer_info.bytes as usize,
-                    prot,
-                    libc::MAP_SHARED,
-                    dsp.as_raw_fd(),
-                    0,
-                )
-            };
-            if addr != libc::MAP_FAILED {
-                map = addr;
-                mapped = true;
-            }
-        }
+        let chsamples = options.period_frames.max(1);
 
         let mut io_channels = Vec::with_capacity(channels as usize);
         for _ in 0..channels {
             io_channels.push(Arc::new(AudioIO::new(chsamples)));
         }
 
-        let duplex_sync = get_or_create_duplex_sync(sync_key, effective_rate, chsamples);
         let mut frame_clock = FrameClock::default();
         frame_clock.set_sample_rate(effective_rate as u32);
-        {
-            let mut sync = duplex_sync.lock().expect("duplex sync poisoned");
-            if let Some(zero) = sync.clock_zero {
-                frame_clock.zero = zero;
-            } else {
-                let _ = frame_clock.init_clock(effective_rate as u32);
-                sync.clock_zero = Some(frame_clock.zero);
-            }
-        }
+        let _ = frame_clock.init_clock(effective_rate as u32);
 
-        let buffer_frames_cached = (buffer_info.bytes as usize / frame_size) as i64;
-        let fragment_bytes = buffer_info.fragsize.max(1) as usize;
-
-        let mut initial_audio = Audio {
+        Ok(Audio {
             dsp,
             channels: io_channels,
             input,
@@ -421,32 +261,15 @@ impl Audio {
             chsamples,
             buffer: vec![0_i32; chsamples * (channels as usize)],
             f32_buffer: Vec::new(),
-            buffer_info,
             frame_size_bytes: frame_size,
-            fragment_bytes,
-            buffer_frames_cached,
             caps,
-            mapped,
-            map,
-            map_progress_bytes: 0,
-            last_published_balance: i64::MIN,
             frame_clock,
             frame_stamp: 0,
-            duplex_sync,
-            channel,
-            last_underrun_count: 0,
-            last_overrun_count: 0,
-            xrun_count: 0,
             playing,
             was_playing_last_cycle: false,
             stop_fade_remaining_frames: 0,
             stop_fade_total_frames: 0,
-        };
-
-        initial_audio.last_underrun_count = initial_audio.get_play_underruns();
-        initial_audio.last_overrun_count = initial_audio.get_rec_overruns();
-
-        Ok(initial_audio)
+        })
     }
 
     fn frame_size(&self) -> usize {
@@ -463,161 +286,103 @@ impl Audio {
             .unwrap_or(0)
     }
 
-    fn buffer_frames(&self) -> i64 {
-        self.buffer_frames_cached
-    }
-
-    fn io_chunk_bytes(&self) -> usize {
-        let aligned = self.fragment_bytes - (self.fragment_bytes % self.frame_size());
-        aligned.max(self.frame_size())
-    }
-
-    fn stepping(&self) -> i64 {
-        self.frame_clock.stepping()
-    }
-
-    fn map_pointer(&self) -> usize {
-        if self.buffer_info.bytes <= 0 {
-            return 0;
-        }
-        self.map_progress_bytes % (self.buffer_info.bytes as usize)
-    }
-
-    fn shared_cycle_end_add(&self, delta: i64) -> i64 {
-        let mut sync = self.duplex_sync.lock().expect("duplex sync poisoned");
-        sync.cycle_end += delta;
-        sync.cycle_end
-    }
-
-    fn shared_cycle_end_get(&self) -> i64 {
-        self.duplex_sync
-            .lock()
-            .expect("duplex sync poisoned")
-            .cycle_end
-    }
-
-    fn publish_balance(&mut self, balance: i64) {
-        if self.last_published_balance == balance {
-            return;
-        }
-        self.last_published_balance = balance;
-        let mut sync = self.duplex_sync.lock().expect("duplex sync poisoned");
-        if self.input {
-            sync.capture_balance = Some(balance);
+    /// Wait until the OSS fd is readable (`writable == false`) or writable
+    /// (`writable == true`), bailing out early if a stop is requested. A short
+    /// poll timeout is used so `request_stop()` is honored even when the device
+    /// never becomes ready.
+    fn wait_for_fd(&self, writable: bool, stop_requested: &AtomicBool) -> std::io::Result<()> {
+        let flags = if writable {
+            PollFlags::POLLOUT
         } else {
-            sync.playback_balance = Some(balance);
-        }
-    }
-
-    fn playback_correction(&self) -> i64 {
-        if self.input {
-            return 0;
-        }
-        let mut sync = self.duplex_sync.lock().expect("duplex sync poisoned");
-        match (sync.playback_balance, sync.capture_balance) {
-            (Some(play), Some(capture)) => sync.correction.correct(play, capture),
-            _ => 0,
-        }
-    }
-
-    fn update_map_progress_from_count(&mut self, info: &CountInfo) -> Option<usize> {
-        if self.buffer_info.bytes <= 0
-            || self.buffer_info.fragsize <= 0
-            || info.ptr < 0
-            || info.blocks < 0
-            || (info.ptr as usize) >= self.buffer_info.bytes as usize
-            || !(info.ptr as usize).is_multiple_of(self.frame_size())
-        {
-            return None;
-        }
-        let buf_bytes = self.buffer_info.bytes as usize;
-        let frag_bytes = self.buffer_info.fragsize as usize;
-        let ptr = info.ptr as usize;
-        let mut delta = (ptr + buf_bytes - self.map_pointer()) % buf_bytes;
-        let max_bytes = ((info.blocks as usize).saturating_add(1))
-            .saturating_mul(frag_bytes)
-            .saturating_sub(1);
-        if max_bytes >= delta {
-            let mut cycles = max_bytes - delta;
-            cycles -= cycles % buf_bytes;
-            delta += cycles;
-        }
-        self.map_progress_bytes = self.map_progress_bytes.saturating_add(delta);
-        Some(delta)
-    }
-
-    fn read_io(&self, dst: &mut [u8], len: usize, count: &mut usize) -> std::io::Result<()> {
-        read_nonblock(self.dsp.as_raw_fd(), dst, len, self.io_chunk_bytes(), count)
-    }
-
-    fn write_io(&self, src: &mut [u8], len: usize, count: &mut usize) -> std::io::Result<()> {
-        write_nonblock(self.dsp.as_raw_fd(), src, len, self.io_chunk_bytes(), count)
-    }
-
-    fn read_map(&self, dst: &mut [u8], offset: usize, length: usize) -> usize {
-        let total = self.buffer_info.bytes.max(0) as usize;
-        map_read(self.map, self.mapped, total, dst, offset, length)
-    }
-
-    fn write_map(&self, src: Option<&mut [u8]>, offset: usize, length: usize) -> usize {
-        let total = self.buffer_info.bytes.max(0) as usize;
-        map_write(self.map, self.mapped, total, src, offset, length)
-    }
-
-    fn queued_samples(&self) -> i32 {
-        let mut ptr = OssCount::default();
-        let req = if self.input {
-            unsafe { oss_current_iptr(self.dsp.as_raw_fd(), &mut ptr) }
-        } else {
-            unsafe { oss_current_optr(self.dsp.as_raw_fd(), &mut ptr) }
+            PollFlags::POLLIN
         };
-        if req.is_ok() { ptr.fifo_samples } else { 0 }
-    }
-
-    fn get_play_underruns(&self) -> i32 {
-        let mut err = AudioErrInfo::default();
-        let rc = unsafe { oss_get_error(self.dsp.as_raw_fd(), &mut err) };
-        if rc.is_ok() { err.play_underruns } else { 0 }
-    }
-
-    fn get_rec_overruns(&self) -> i32 {
-        let mut err = AudioErrInfo::default();
-        let rc = unsafe { oss_get_error(self.dsp.as_raw_fd(), &mut err) };
-        if rc.is_ok() { err.rec_overruns } else { 0 }
-    }
-
-    pub(super) fn detect_xrun_enhanced(&mut self) -> i64 {
-        let current_underruns = if self.input {
-            0
-        } else {
-            self.get_play_underruns()
-        };
-        let current_overruns = if self.input {
-            self.get_rec_overruns()
-        } else {
-            0
-        };
-
-        if (self.last_underrun_count >= 0 || self.last_overrun_count >= 0)
-            && (current_underruns > self.last_underrun_count
-                || current_overruns > self.last_overrun_count)
-        {
-            self.xrun_count += 1;
-            let _delta_underruns = current_underruns - self.last_underrun_count;
-            let _delta_overruns = current_overruns - self.last_overrun_count;
-            self.last_underrun_count = current_underruns;
-            self.last_overrun_count = current_overruns;
-
-            return self.chsamples as i64;
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd()) };
+        let mut pollfd = [PollFd::new(fd, flags)];
+        loop {
+            if stop_requested.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "OSS wait stopped",
+                ));
+            }
+            match poll(&mut pollfd, PollTimeout::from(100u16)) {
+                Ok(0) => continue,
+                Ok(_) => {
+                    let revents = pollfd[0].revents().unwrap_or(PollFlags::empty());
+                    if revents.contains(flags)
+                        || revents.contains(PollFlags::POLLERR)
+                        || revents.contains(PollFlags::POLLHUP)
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::EAGAIN) => continue,
+                Err(e) => return Err(std::io::Error::other(format!("poll failed: {e}"))),
+            }
         }
-
-        self.last_underrun_count = current_underruns;
-        self.last_overrun_count = current_overruns;
-
-        0
     }
 
-    pub fn process(&mut self) {
+    fn read_full_period(&self, buf: &mut [u8], stop_requested: &AtomicBool) -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            self.wait_for_fd(false, stop_requested)?;
+            let n = unsafe {
+                libc::read(
+                    self.fd(),
+                    buf[offset..].as_ptr() as *mut libc::c_void,
+                    buf.len() - offset,
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                return Err(e);
+            }
+            let n = n as usize;
+            if n == 0 {
+                continue;
+            }
+            offset += n;
+        }
+        Ok(())
+    }
+
+    fn write_full_period(&self, buf: &[u8], stop_requested: &AtomicBool) -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            self.wait_for_fd(true, stop_requested)?;
+            let n = unsafe {
+                libc::write(
+                    self.fd(),
+                    buf[offset..].as_ptr() as *const libc::c_void,
+                    buf.len() - offset,
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                return Err(e);
+            }
+            let n = n as usize;
+            if n == 0 {
+                continue;
+            }
+            offset += n;
+        }
+        Ok(())
+    }
+
+    pub fn process(&mut self, stop_requested: &AtomicBool) -> std::io::Result<()> {
         let num_channels = self.channels.len();
         let all_connected = self
             .channels
@@ -625,6 +390,17 @@ impl Audio {
             .all(crate::hw::ports::has_audio_connections);
 
         if self.input {
+            let period_bytes = self.chsamples * self.frame_size();
+            let mut raw = vec![0_u8; period_bytes];
+            self.read_full_period(&mut raw, stop_requested)?;
+            convert_in_to_i32_connected(
+                self.format,
+                self.chsamples,
+                &raw,
+                self.buffer.as_mut_slice(),
+                &self.channels,
+            );
+
             let norm_factor = convert_policy::F32_FROM_I32_MAX;
             let total_samples = self.chsamples * num_channels;
             self.f32_buffer.resize(total_samples, 0.0);
@@ -641,7 +417,7 @@ impl Audio {
                 num_channels,
             );
         } else {
-            let playing = self.playing.load(std::sync::atomic::Ordering::Relaxed);
+            let playing = self.playing.load(Ordering::Relaxed);
             if self.was_playing_last_cycle && !playing {
                 let fade_frames = self.chsamples.max(128);
                 self.stop_fade_remaining_frames = fade_frames;
@@ -683,7 +459,20 @@ impl Audio {
                         .saturating_sub(self.chsamples);
                 }
             }
+
+            let period_bytes = self.chsamples * self.frame_size();
+            let mut raw = vec![0_u8; period_bytes];
+            convert_out_from_i32_interleaved(
+                self.format,
+                num_channels,
+                self.chsamples,
+                self.buffer.as_mut_slice(),
+                raw.as_mut_slice(),
+            );
+            self.write_full_period(&raw, stop_requested)?;
         }
+
+        Ok(())
     }
 
     pub fn force_silence_now(&mut self) {
@@ -697,8 +486,6 @@ impl Audio {
         self.stop_fade_remaining_frames = 0;
         self.stop_fade_total_frames = 0;
         self.was_playing_last_cycle = false;
-        self.channel
-            .reset_buffers(self.frame_stamp, self.frame_size().max(1));
     }
 }
 
@@ -709,11 +496,5 @@ impl Drop for Audio {
         // which drains remaining audio data — sleeping up to CHN_TIMEOUT
         // (5 seconds by default) before actually closing the fd.
         let _ = self.halt();
-        if self.mapped && !self.map.is_null() && self.buffer_info.bytes > 0 {
-            unsafe {
-                let _ = libc::munmap(self.map, self.buffer_info.bytes as usize);
-            }
-            self.map = std::ptr::null_mut();
-        }
     }
 }

@@ -1,6 +1,5 @@
 use super::consts::*;
 use crate::audio::io::AudioIO;
-use nix::libc;
 use std::sync::Arc;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -21,12 +20,6 @@ pub(super) fn supported_sample_format(format: u32) -> bool {
         format,
         AFMT_S16_LE | AFMT_S16_BE | AFMT_S24_LE | AFMT_S24_BE | AFMT_S32_LE | AFMT_S32_BE | AFMT_S8
     )
-}
-
-pub(super) fn cstr_fixed_prefix<const N: usize>(buf: &[libc::c_char; N]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(N);
-    let bytes: Vec<u8> = buf[..len].iter().map(|&c| c as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub(super) fn convert_in_to_i32_interleaved(
