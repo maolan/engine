@@ -448,8 +448,22 @@ pub enum Action {
     TrackTogglePhase(String),
     TrackToggleSolo(String),
     TrackToggleMaster(String),
-    TrackToggleInputMonitor(String),
-    TrackToggleDiskMonitor(String),
+    TrackToggleInputMonitor {
+        track_name: String,
+        lane: usize,
+    },
+    TrackToggleDiskMonitor {
+        track_name: String,
+        lane: usize,
+    },
+    TrackToggleMidiInputMonitor {
+        track_name: String,
+        lane: usize,
+    },
+    TrackToggleMidiDiskMonitor {
+        track_name: String,
+        lane: usize,
+    },
     TrackSetColor {
         track_name: String,
         color: Option<TrackColor>,

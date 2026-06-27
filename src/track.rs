@@ -440,8 +440,10 @@ pub struct Track {
     pub phase_inverted: bool,
     pub soloed: bool,
     pub is_master: bool,
-    pub input_monitor: bool,
-    pub disk_monitor: bool,
+    pub input_monitor: Vec<bool>,
+    pub disk_monitor: Vec<bool>,
+    pub midi_input_monitor: Vec<bool>,
+    pub midi_disk_monitor: Vec<bool>,
     pub color: Option<crate::message::TrackColor>,
     pub midi_learn_volume: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_balance: Option<crate::message::MidiLearnBinding>,
@@ -545,8 +547,10 @@ impl Track {
             phase_inverted: false,
             soloed: false,
             is_master: false,
-            input_monitor: false,
-            disk_monitor: true,
+            input_monitor: vec![false; audio_ins],
+            disk_monitor: vec![true; audio_ins],
+            midi_input_monitor: vec![false; midi_ins],
+            midi_disk_monitor: vec![true; midi_ins],
             color: None,
             midi_learn_volume: None,
             midi_learn_balance: None,
@@ -880,7 +884,10 @@ impl Track {
             self.synthesize_metronome_into(&source, frames);
         }
         let t2 = std::time::Instant::now();
-        let clip_playback_active = self.disk_monitor && self.clip_playback_enabled;
+        let audio_disk_active = self.disk_monitor.iter().any(|&m| m);
+        let midi_disk_active = self.midi_disk_monitor.iter().any(|&m| m);
+        let clip_playback_active =
+            (audio_disk_active || midi_disk_active) && self.clip_playback_enabled;
         let record_tap_input_snapshots = if self.armed && self.record_tap_enabled {
             self.audio
                 .ins
@@ -896,8 +903,8 @@ impl Track {
         let t4 = std::time::Instant::now();
         if clip_playback_active {
             self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
-            if !self.input_monitor {
-                for audio_in in &self.audio.ins {
+            for (lane, audio_in) in self.audio.ins.iter().enumerate() {
+                if !self.input_monitor.get(lane).copied().unwrap_or(false) {
                     audio_in.buffer.lock().fill(0.0);
                 }
             }
@@ -1031,7 +1038,14 @@ impl Track {
             {
                 let mut seeded = false;
                 for source in sources {
-                    if !self.input_monitor
+                    let source_input_monitor = self
+                        .audio
+                        .ins
+                        .iter()
+                        .position(|input| Arc::ptr_eq(input, source))
+                        .and_then(|idx| self.input_monitor.get(idx).copied())
+                        .unwrap_or(false);
+                    if !source_input_monitor
                         && !clip_playback_active
                         && self.is_track_input_source(source)
                     {
@@ -1066,7 +1080,9 @@ impl Track {
                             .ins
                             .iter()
                             .position(|input| Arc::ptr_eq(input, &sources[0]));
-                        if let Some(idx) = first_idx.filter(|_| !self.input_monitor) {
+                        if let Some(idx) = first_idx
+                            .filter(|idx| !self.input_monitor.get(*idx).copied().unwrap_or(false))
+                        {
                             Self::copy_unity_with_zero_tail(tap, &record_tap_input_snapshots[idx]);
                         } else {
                             let first = sources[0].buffer.lock();
@@ -1078,7 +1094,9 @@ impl Track {
                                 .ins
                                 .iter()
                                 .position(|input| Arc::ptr_eq(input, source))
-                                .filter(|_| !self.input_monitor)
+                                .filter(|idx| {
+                                    !self.input_monitor.get(*idx).copied().unwrap_or(false)
+                                })
                             {
                                 Self::add_unity(tap, &record_tap_input_snapshots[idx]);
                             } else {
@@ -1330,12 +1348,27 @@ impl Track {
     pub fn set_master(&mut self, master: bool) {
         self.is_master = master;
     }
-    pub fn toggle_input_monitor(&mut self) {
-        self.input_monitor = !self.input_monitor;
+    pub fn toggle_input_monitor(&mut self, lane: usize) {
+        if let Some(monitor) = self.input_monitor.get_mut(lane) {
+            *monitor = !*monitor;
+        }
         self.update_hybrid_process_block_size();
     }
-    pub fn toggle_disk_monitor(&mut self) {
-        self.disk_monitor = !self.disk_monitor;
+    pub fn toggle_disk_monitor(&mut self, lane: usize) {
+        if let Some(monitor) = self.disk_monitor.get_mut(lane) {
+            *monitor = !*monitor;
+        }
+    }
+    pub fn toggle_midi_input_monitor(&mut self, lane: usize) {
+        if let Some(monitor) = self.midi_input_monitor.get_mut(lane) {
+            *monitor = !*monitor;
+        }
+        self.update_hybrid_process_block_size();
+    }
+    pub fn toggle_midi_disk_monitor(&mut self, lane: usize) {
+        if let Some(monitor) = self.midi_disk_monitor.get_mut(lane) {
+            *monitor = !*monitor;
+        }
     }
     pub fn set_vca_master(&mut self, master: Option<String>) {
         self.vca_master = master;
@@ -1379,8 +1412,10 @@ impl Track {
             .max(1);
 
         let saved_transport = self.transport_sample;
-        let saved_disk_monitor = self.disk_monitor;
-        let saved_input_monitor = self.input_monitor;
+        let saved_disk_monitor = self.disk_monitor.clone();
+        let saved_input_monitor = self.input_monitor.clone();
+        let saved_midi_disk_monitor = self.midi_disk_monitor.clone();
+        let saved_midi_input_monitor = self.midi_input_monitor.clone();
         let saved_clip_playback_enabled = self.clip_playback_enabled;
         let saved_record_tap_enabled = self.record_tap_enabled;
         let saved_armed = self.armed;
@@ -1389,8 +1424,12 @@ impl Track {
         let saved_loop_range = self.loop_range_samples;
         let saved_pending_hw = self.pending_hw_midi_out_events.clone();
 
-        self.disk_monitor = true;
-        self.input_monitor = false;
+        let audio_in_count = self.audio.ins.len();
+        let midi_in_count = self.midi.ins.len();
+        self.disk_monitor = vec![true; audio_in_count];
+        self.input_monitor = vec![false; audio_in_count];
+        self.midi_disk_monitor = vec![true; midi_in_count];
+        self.midi_input_monitor = vec![false; midi_in_count];
         self.clip_playback_enabled = true;
         self.record_tap_enabled = false;
         self.armed = false;
@@ -1463,6 +1502,8 @@ impl Track {
         self.transport_sample = saved_transport;
         self.disk_monitor = saved_disk_monitor;
         self.input_monitor = saved_input_monitor;
+        self.midi_disk_monitor = saved_midi_disk_monitor;
+        self.midi_input_monitor = saved_midi_input_monitor;
         self.clip_playback_enabled = saved_clip_playback_enabled;
         self.record_tap_enabled = saved_record_tap_enabled;
         self.armed = saved_armed;
@@ -2207,6 +2248,14 @@ impl Track {
             return;
         }
         let input_lane = clip.input_channel.min(input_events.len().saturating_sub(1));
+        if !self
+            .midi_disk_monitor
+            .get(input_lane)
+            .copied()
+            .unwrap_or(true)
+        {
+            return;
+        }
         let clip_end = clip_start.saturating_add(clip_len);
         let Some(events) = self.midi_clip_cache.get(&clip.name) else {
             return;
@@ -2651,6 +2700,9 @@ impl Track {
                     continue;
                 };
                 for in_channel in 0..self.audio.ins.len() {
+                    if !self.disk_monitor.get(in_channel).copied().unwrap_or(false) {
+                        continue;
+                    }
                     let in_samples = self.audio.ins[in_channel].buffer.lock();
                     let processed = processed_blocks
                         .get(in_channel)
@@ -3860,7 +3912,10 @@ impl Track {
     }
 
     pub fn is_realtime_domain(&self) -> bool {
-        (self.armed && self.input_monitor) || self.force_realtime_domain
+        (self.armed
+            && (self.input_monitor.iter().any(|&m| m)
+                || self.midi_input_monitor.iter().any(|&m| m)))
+            || self.force_realtime_domain
     }
 
     pub fn hybrid_needs_refill(&self) -> bool {
@@ -4765,14 +4820,20 @@ impl Track {
     fn collect_track_input_midi_events(&mut self) -> Vec<Vec<MidiEvent>> {
         let mut events: Vec<Vec<MidiEvent>> = Vec::with_capacity(self.midi.ins.len());
         self.record_tap_midi_in.clear();
-        let should_filter = self.input_monitor || self.record_tap_enabled;
+        let midi_disk_active = self.midi_disk_monitor.iter().any(|&m| m);
+        let clip_playback_active = midi_disk_active && self.clip_playback_enabled;
         for (lane, input) in self.midi.ins.iter().enumerate() {
             let input_lock = input.lock();
             let mut port_events = std::mem::take(&mut input_lock.buffer);
-            if should_filter && let Some(Some(channel)) = self.midi_lane_channels.get(lane) {
+            self.record_tap_midi_in.extend(port_events.iter().cloned());
+            let monitor = self.midi_input_monitor.get(lane).copied().unwrap_or(false);
+            if clip_playback_active && !monitor {
+                port_events.clear();
+            } else if (monitor || self.record_tap_enabled)
+                && let Some(Some(channel)) = self.midi_lane_channels.get(lane)
+            {
                 port_events.retain(|event| Self::event_matches_midi_channel(event, *channel));
             }
-            self.record_tap_midi_in.extend(port_events.iter().cloned());
             events.push(port_events);
         }
         self.record_tap_midi_in.sort_by_key(|e| e.frame);
@@ -4908,7 +4969,9 @@ impl Track {
                     &clap_input,
                     crate::plugins::types::ClapTransportInfo {
                         transport_sample: self.transport_sample,
-                        playing: self.disk_monitor && self.clip_playback_enabled,
+                        playing: (self.disk_monitor.iter().any(|&m| m)
+                            || self.midi_disk_monitor.iter().any(|&m| m))
+                            && self.clip_playback_enabled,
                         loop_enabled: self.loop_enabled,
                         loop_range_samples: self.loop_range_samples,
                         bpm: self.tempo_bpm,
@@ -5218,13 +5281,13 @@ mod tests {
         source.buffer.lock()[1] = -0.25;
         AudioIO::connect(&source, &track.audio.ins[0]);
 
-        track.input_monitor = false;
+        track.input_monitor = vec![false];
         track.process();
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.0);
         assert_eq!(out[1], 0.0);
 
-        track.input_monitor = true;
+        track.input_monitor = vec![true];
         track.process();
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.5);
@@ -5240,10 +5303,10 @@ mod tests {
         track.arm();
         assert_eq!(track.process_block_size, 256);
 
-        track.toggle_input_monitor();
+        track.toggle_input_monitor(0);
         assert_eq!(track.process_block_size, 64);
 
-        track.toggle_input_monitor();
+        track.toggle_input_monitor(0);
         assert_eq!(track.process_block_size, 256);
     }
 
@@ -5254,18 +5317,18 @@ mod tests {
         assert_eq!(track.process_block_size, 64);
 
         track.arm();
-        track.toggle_input_monitor();
+        track.toggle_input_monitor(0);
         assert_eq!(track.process_block_size, 64);
 
-        track.toggle_input_monitor();
+        track.toggle_input_monitor(0);
         assert_eq!(track.process_block_size, 64);
     }
 
     #[test]
     fn clip_playback_audible_with_input_monitor_off() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = false;
-        track.disk_monitor = true;
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
         let mut clip = AudioClip::new("clip".to_string(), 0, 4);
         clip.fade_enabled = false;
         track.audio.clips.push(clip);
@@ -5285,8 +5348,8 @@ mod tests {
     #[test]
     fn record_tap_captures_live_input_with_disk_monitor_on_and_input_monitor_off() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = false;
-        track.disk_monitor = true;
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
         track.armed = true;
         track.record_tap_enabled = true;
         let source = Arc::new(AudioIO::new(8));
@@ -5303,8 +5366,8 @@ mod tests {
     #[test]
     fn record_tap_falls_back_to_direct_input_when_no_internal_route_exists() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = false;
-        track.disk_monitor = true;
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
         track.armed = true;
         track.record_tap_enabled = true;
         track.clear_default_passthrough();
@@ -5322,8 +5385,8 @@ mod tests {
     #[test]
     fn clip_playback_respects_clip_playback_enabled_flag() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = false;
-        track.disk_monitor = true;
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
         track.clip_playback_enabled = false;
         let mut clip = AudioClip::new("clip".to_string(), 0, 4);
         clip.fade_enabled = false;
@@ -5355,8 +5418,8 @@ mod tests {
         right.buffer.lock()[0] = 0.75;
         AudioIO::connect(&left, &track.audio.ins[0]);
         AudioIO::connect(&right, &track.audio.ins[1]);
-        track.input_monitor = true;
-        track.disk_monitor = false;
+        track.input_monitor = vec![true; 2];
+        track.disk_monitor = vec![false; 2];
 
         track.process();
         let out_l = track.audio.outs[0].buffer.lock().to_vec();
@@ -5562,8 +5625,8 @@ mod tests {
     fn offline_bounce_restores_transport_and_monitor_state() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         track.transport_sample = 123;
-        track.disk_monitor = false;
-        track.input_monitor = true;
+        track.disk_monitor = vec![false];
+        track.input_monitor = vec![true];
         track.clip_playback_enabled = false;
         track.output_enabled = false;
         track.loop_enabled = true;
@@ -5579,8 +5642,8 @@ mod tests {
         assert_eq!(rendered.len(), 4);
 
         assert_eq!(track.transport_sample, 123);
-        assert!(!track.disk_monitor);
-        assert!(track.input_monitor);
+        assert!(!track.disk_monitor.first().copied().unwrap_or(false));
+        assert!(track.input_monitor.first().copied().unwrap_or(false));
         assert!(!track.clip_playback_enabled);
         assert!(!track.output_enabled);
         assert!(track.loop_enabled);
@@ -5592,7 +5655,7 @@ mod tests {
     #[test]
     fn midi_only_track_clip_playback_generates_hw_midi_events() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = true;
+        track.disk_monitor = vec![true];
         track.clip_playback_enabled = true;
         track.midi.clips.push(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
@@ -5621,7 +5684,7 @@ mod tests {
     #[test]
     fn midi_clip_emits_note_off_at_exact_clip_end() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = true;
+        track.disk_monitor = vec![true];
         track.clip_playback_enabled = true;
         track.midi.clips.push(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
@@ -5649,7 +5712,7 @@ mod tests {
     #[test]
     fn midi_clip_emits_note_off_at_exact_loop_end() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = true;
+        track.disk_monitor = vec![true];
         track.clip_playback_enabled = true;
         track.loop_enabled = true;
         track.loop_range_samples = Some((0, 8));
@@ -5679,7 +5742,7 @@ mod tests {
     #[test]
     fn midi_clip_orders_loop_boundary_note_off_before_next_note_on() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
-        track.disk_monitor = true;
+        track.disk_monitor = vec![true];
         track.clip_playback_enabled = true;
         track.transport_sample = 6;
         track.loop_enabled = true;
@@ -5710,7 +5773,7 @@ mod tests {
     #[test]
     fn midi_clip_sends_note_off_at_clip_end_when_source_note_ends_later() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = true;
+        track.disk_monitor = vec![true];
         track.clip_playback_enabled = true;
         track.midi.clips.push(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
@@ -5738,7 +5801,7 @@ mod tests {
     #[test]
     fn midi_clip_orders_synthetic_loop_note_off_before_next_note_on() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
-        track.disk_monitor = true;
+        track.disk_monitor = vec![true];
         track.clip_playback_enabled = true;
         track.transport_sample = 6;
         track.loop_enabled = true;
@@ -5769,7 +5832,7 @@ mod tests {
     #[test]
     fn midi_lane_channel_filters_monitored_input() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.input_monitor = true;
+        track.midi_input_monitor = vec![true];
         track.set_midi_lane_channel(0, Some(1));
         track.push_hw_midi_events_to_port(
             0,
@@ -5789,13 +5852,13 @@ mod tests {
             crate::midi::io::MidiEvent::new(1, vec![0x91, 61, 101])
         );
         assert_eq!(events[0][1], crate::midi::io::MidiEvent::new(2, vec![0xF8]));
-        assert_eq!(track.record_tap_midi_in, events[0]);
+        assert_eq!(track.record_tap_midi_in.len(), 3);
     }
 
     #[test]
     fn midi_lane_channel_omni_does_not_filter_input() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.input_monitor = true;
+        track.midi_input_monitor = vec![true];
         track.set_midi_lane_channel(0, None);
         track.push_hw_midi_events_to_port(
             0,
@@ -5814,8 +5877,8 @@ mod tests {
     #[test]
     fn grouped_audio_playback_sums_child_buffers() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = false;
-        track.disk_monitor = true;
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
 
         let mut active_child = AudioClip::new("active".to_string(), 0, 4);
         active_child.fade_enabled = false;

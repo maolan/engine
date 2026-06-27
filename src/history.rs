@@ -134,8 +134,10 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackToggleMute(_)
         | Action::TrackTogglePhase(_)
         | Action::TrackToggleSolo(_)
-        | Action::TrackToggleInputMonitor(_)
-        | Action::TrackToggleDiskMonitor(_)
+        | Action::TrackToggleInputMonitor { .. }
+        | Action::TrackToggleDiskMonitor { .. }
+        | Action::TrackToggleMidiInputMonitor { .. }
+        | Action::TrackToggleMidiDiskMonitor { .. }
         | Action::TrackSetColor { .. }
         | Action::TrackSetMidiLearnBinding { .. }
         | Action::SetGlobalMidiLearnBinding { .. }
@@ -224,10 +226,30 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         Action::TrackToggleMute(name) => Some(Action::TrackToggleMute(name.clone())),
         Action::TrackTogglePhase(name) => Some(Action::TrackTogglePhase(name.clone())),
         Action::TrackToggleSolo(name) => Some(Action::TrackToggleSolo(name.clone())),
-        Action::TrackToggleInputMonitor(name) => {
-            Some(Action::TrackToggleInputMonitor(name.clone()))
+        Action::TrackToggleInputMonitor { track_name, lane } => {
+            Some(Action::TrackToggleInputMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
         }
-        Action::TrackToggleDiskMonitor(name) => Some(Action::TrackToggleDiskMonitor(name.clone())),
+        Action::TrackToggleDiskMonitor { track_name, lane } => {
+            Some(Action::TrackToggleDiskMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
+        }
+        Action::TrackToggleMidiInputMonitor { track_name, lane } => {
+            Some(Action::TrackToggleMidiInputMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
+        }
+        Action::TrackToggleMidiDiskMonitor { track_name, lane } => {
+            Some(Action::TrackToggleMidiDiskMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
+        }
         Action::TrackSetColor {
             track_name,
             color: _,
@@ -1132,11 +1154,37 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             if track.soloed {
                 actions.push(Action::TrackToggleSolo(track.name.clone()));
             }
-            if track.input_monitor {
-                actions.push(Action::TrackToggleInputMonitor(track.name.clone()));
+            for (lane, &monitor) in track.input_monitor.iter().enumerate() {
+                if monitor {
+                    actions.push(Action::TrackToggleInputMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
             }
-            if !track.disk_monitor {
-                actions.push(Action::TrackToggleDiskMonitor(track.name.clone()));
+            for (lane, &monitor) in track.disk_monitor.iter().enumerate() {
+                if !monitor {
+                    actions.push(Action::TrackToggleDiskMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
+            }
+            for (lane, &monitor) in track.midi_input_monitor.iter().enumerate() {
+                if monitor {
+                    actions.push(Action::TrackToggleMidiInputMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
+            }
+            for (lane, &monitor) in track.midi_disk_monitor.iter().enumerate() {
+                if !monitor {
+                    actions.push(Action::TrackToggleMidiDiskMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
             }
             if let Some(color) = track.color {
                 actions.push(Action::TrackSetColor {
@@ -2414,8 +2462,8 @@ mod tests {
         track.armed = true;
         track.muted = true;
         track.soloed = true;
-        track.input_monitor = true;
-        track.disk_monitor = false;
+        track.input_monitor = vec![true];
+        track.disk_monitor = vec![false];
         track.midi_learn_volume = Some(binding(10));
         track.vca_master = Some("bus".to_string());
         track.audio.ins.push(Arc::new(AudioIO::new(64)));
@@ -2447,12 +2495,12 @@ mod tests {
         );
         assert!(
             inverses.iter().any(
-                |action| matches!(action, Action::TrackToggleInputMonitor(name) if name == "t")
+                |action| matches!(action, Action::TrackToggleInputMonitor { track_name, .. } if track_name == "t")
             )
         );
         assert!(
             inverses.iter().any(
-                |action| matches!(action, Action::TrackToggleDiskMonitor(name) if name == "t")
+                |action| matches!(action, Action::TrackToggleDiskMonitor { track_name, .. } if track_name == "t")
             )
         );
         assert!(inverses.iter().any(|action| {

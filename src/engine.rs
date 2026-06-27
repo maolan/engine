@@ -2409,8 +2409,11 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.input_monitor != wanted {
-                        mapped_actions.push(Action::TrackToggleInputMonitor(track_name.clone()));
+                    if t.input_monitor.first() != Some(&wanted) {
+                        mapped_actions.push(Action::TrackToggleInputMonitor {
+                            track_name: track_name.clone(),
+                            lane: 0,
+                        });
                     }
                 }
             }
@@ -2418,8 +2421,11 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.disk_monitor != wanted {
-                        mapped_actions.push(Action::TrackToggleDiskMonitor(track_name.clone()));
+                    if t.disk_monitor.first() != Some(&wanted) {
+                        mapped_actions.push(Action::TrackToggleDiskMonitor {
+                            track_name: track_name.clone(),
+                            lane: 0,
+                        });
                     }
                 }
             }
@@ -2519,20 +2525,56 @@ impl Engine {
                             .await;
                     }
                 }
-                Action::TrackToggleInputMonitor(ref track_name) => {
+                Action::TrackToggleInputMonitor {
+                    ref track_name,
+                    lane,
+                } => {
                     if let Some(track) = self.state.lock().tracks.get(track_name) {
-                        track.lock().toggle_input_monitor();
-                        self.notify_clients(Ok(Action::TrackToggleInputMonitor(
-                            track_name.clone(),
-                        )))
+                        track.lock().toggle_input_monitor(lane);
+                        self.notify_clients(Ok(Action::TrackToggleInputMonitor {
+                            track_name: track_name.clone(),
+                            lane,
+                        }))
                         .await;
                     }
                 }
-                Action::TrackToggleDiskMonitor(ref track_name) => {
+                Action::TrackToggleDiskMonitor {
+                    ref track_name,
+                    lane,
+                } => {
                     if let Some(track) = self.state.lock().tracks.get(track_name) {
-                        track.lock().toggle_disk_monitor();
-                        self.notify_clients(Ok(Action::TrackToggleDiskMonitor(track_name.clone())))
-                            .await;
+                        track.lock().toggle_disk_monitor(lane);
+                        self.notify_clients(Ok(Action::TrackToggleDiskMonitor {
+                            track_name: track_name.clone(),
+                            lane,
+                        }))
+                        .await;
+                    }
+                }
+                Action::TrackToggleMidiInputMonitor {
+                    ref track_name,
+                    lane,
+                } => {
+                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                        track.lock().toggle_midi_input_monitor(lane);
+                        self.notify_clients(Ok(Action::TrackToggleMidiInputMonitor {
+                            track_name: track_name.clone(),
+                            lane,
+                        }))
+                        .await;
+                    }
+                }
+                Action::TrackToggleMidiDiskMonitor {
+                    ref track_name,
+                    lane,
+                } => {
+                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                        track.lock().toggle_midi_disk_monitor(lane);
+                        self.notify_clients(Ok(Action::TrackToggleMidiDiskMonitor {
+                            track_name: track_name.clone(),
+                            lane,
+                        }))
+                        .await;
                     }
                 }
                 _ => {}
@@ -2651,7 +2693,7 @@ impl Engine {
             .iter()
             .filter_map(|(name, track)| {
                 let t = track.lock();
-                if t.armed && t.input_monitor {
+                if t.armed && t.input_monitor.iter().any(|&m| m) {
                     Some(name.clone())
                 } else {
                     None
@@ -5398,14 +5440,36 @@ impl Engine {
                     track.lock().toggle_master();
                 }
             }
-            Action::TrackToggleInputMonitor(ref name) => {
-                if let Some(track) = self.state.lock().tracks.get(name) {
-                    track.lock().toggle_input_monitor();
+            Action::TrackToggleInputMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track.lock().toggle_input_monitor(lane);
                 }
             }
-            Action::TrackToggleDiskMonitor(ref name) => {
-                if let Some(track) = self.state.lock().tracks.get(name) {
-                    track.lock().toggle_disk_monitor();
+            Action::TrackToggleDiskMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track.lock().toggle_disk_monitor(lane);
+                }
+            }
+            Action::TrackToggleMidiInputMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track.lock().toggle_midi_input_monitor(lane);
+                }
+            }
+            Action::TrackToggleMidiDiskMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track.lock().toggle_midi_disk_monitor(lane);
                 }
             }
             Action::TrackSetColor {
