@@ -141,7 +141,6 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackSetColor { .. }
         | Action::TrackSetMidiLearnBinding { .. }
         | Action::SetGlobalMidiLearnBinding { .. }
-        | Action::TrackSetVcaMaster { .. }
         | Action::TrackSetFrozen { .. }
         | Action::TrackAddAudioInput(_)
         | Action::TrackAddAudioOutput(_)
@@ -287,14 +286,6 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 track_name: track_name.clone(),
                 target: *target,
                 binding,
-            })
-        }
-        Action::TrackSetVcaMaster { track_name, .. } => {
-            let track = state.tracks.get(track_name)?;
-            let track_lock = track.lock();
-            Some(Action::TrackSetVcaMaster {
-                track_name: track_name.clone(),
-                master_track: track_lock.vca_master(),
             })
         }
         Action::TrackSetFrozen { track_name, .. } => {
@@ -1241,25 +1232,6 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     binding: track.midi_learn_disk_monitor.clone(),
                 });
             }
-            if track.vca_master.is_some() {
-                actions.push(Action::TrackSetVcaMaster {
-                    track_name: track.name.clone(),
-                    master_track: track.vca_master(),
-                });
-            }
-            for (other_name, other_track_handle) in &state.tracks {
-                if other_name == track_name {
-                    continue;
-                }
-                let other_track = other_track_handle.lock();
-                if other_track.vca_master.as_deref() == Some(track_name.as_str()) {
-                    actions.push(Action::TrackSetVcaMaster {
-                        track_name: other_name.clone(),
-                        master_track: Some(track_name.clone()),
-                    });
-                }
-            }
-
             for clip in &track.audio.clips {
                 let length = clip.end.saturating_sub(clip.start).max(1);
                 actions.push(Action::AddClip {
@@ -1882,26 +1854,6 @@ mod tests {
     }
 
     #[test]
-    fn create_inverse_action_for_track_set_vca_master_restores_none() {
-        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        let state = make_state_with_track(track);
-
-        let inverse = create_inverse_action(
-            &Action::TrackSetVcaMaster {
-                track_name: "t".to_string(),
-                master_track: Some("bus".to_string()),
-            },
-            &state,
-        )
-        .expect("inverse action");
-
-        assert!(matches!(
-            inverse,
-            Action::TrackSetVcaMaster { track_name, master_track: None } if track_name == "t"
-        ));
-    }
-
-    #[test]
     fn create_inverse_action_for_remove_audio_clip_restores_peaks_file() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
@@ -2465,7 +2417,6 @@ mod tests {
         track.input_monitor = vec![true];
         track.disk_monitor = vec![false];
         track.midi_learn_volume = Some(binding(10));
-        track.vca_master = Some("bus".to_string());
         track.audio.ins.push(Arc::new(AudioIO::new(64)));
         track.audio.outs.push(Arc::new(AudioIO::new(64)));
         let state = make_state_with_track(track);
@@ -2511,15 +2462,6 @@ mod tests {
                     binding: Some(MidiLearnBinding { cc: 10, .. }),
                     ..
                 }
-            )
-        }));
-        assert!(inverses.iter().any(|action| {
-            matches!(
-                action,
-                Action::TrackSetVcaMaster {
-                    track_name,
-                    master_track: Some(master),
-                } if track_name == "t" && master == "bus"
             )
         }));
     }

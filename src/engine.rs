@@ -2463,18 +2463,6 @@ impl Engine {
                 }
                 Action::TrackToggleMaster(ref track_name) => {
                     if let Some(track) = self.state.lock().tracks.get(track_name) {
-                        let blocked = {
-                            let t = track.lock();
-                            t.vca_master.is_some() || !self.vca_followers(track_name).is_empty()
-                        };
-                        if blocked {
-                            self.notify_clients(Err(format!(
-                                "Track '{}' cannot be promoted to Master while part of a VCA group",
-                                track_name
-                            )))
-                            .await;
-                            continue;
-                        }
                         track.lock().toggle_master();
                         self.notify_clients(Ok(Action::TrackToggleMaster(track_name.clone())))
                             .await;
@@ -2545,21 +2533,6 @@ impl Engine {
         for action in mapped_global_actions {
             self.handle_request_inner(action, false).await;
         }
-    }
-
-    fn vca_followers(&self, master_name: &str) -> Vec<String> {
-        self.state
-            .lock()
-            .tracks
-            .iter()
-            .filter_map(|(name, track)| {
-                if track.lock().vca_master.as_deref() == Some(master_name) {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 
     fn upstream_audio_track_names(
@@ -3414,7 +3387,7 @@ impl Engine {
     fn add_clip_to_track(&self, request: ClipAddRequest<'_>) {
         if let Some(track) = self.state.lock().tracks.get(request.track_name) {
             let track = track.lock();
-            if track.is_master {
+            if track.is_master || track.is_folder {
                 return;
             }
             match request.kind {
@@ -5048,9 +5021,6 @@ impl Engine {
                 self.state.lock().tracks.insert(new_name.clone(), track);
                 for other in self.state.lock().tracks.values() {
                     let other = other.lock();
-                    if other.vca_master.as_deref() == Some(old_name.as_str()) {
-                        other.set_vca_master(Some(new_name.clone()));
-                    }
                     if other.parent_track.as_deref() == Some(old_name.as_str()) {
                         other.parent_track = Some(new_name.clone());
                     }
@@ -5121,33 +5091,12 @@ impl Engine {
                 {
                     self.pending_midi_learn = None;
                 }
-                for track in self.state.lock().tracks.values() {
-                    let track = track.lock();
-                    if track.vca_master.as_deref() == Some(name.as_str()) {
-                        track.set_vca_master(None);
-                    }
-                }
             }
             Action::TrackLevel(ref name, level) => {
                 if name == "hw:out" {
                     self.hw_out_level_db = level;
                 } else if let Some(track) = self.state.lock().tracks.get(name) {
-                    let previous = track.lock().level();
                     track.lock().set_level(level);
-                    let delta = level - previous;
-                    if delta.abs() > f32::EPSILON {
-                        for follower_name in self.vca_followers(name) {
-                            if let Some(follower) = self.state.lock().tracks.get(&follower_name) {
-                                let next = (follower.lock().level() + delta).clamp(-90.0, 20.0);
-                                follower.lock().set_level(next);
-                                self.notify_clients(Ok(Action::TrackLevel(
-                                    follower_name.clone(),
-                                    next,
-                                )))
-                                .await;
-                            }
-                        }
-                    }
                 }
             }
             Action::TrackBalance(ref name, balance) => {
@@ -5162,22 +5111,7 @@ impl Engine {
                 if name == "hw:out" {
                     self.hw_out_level_db = level;
                 } else if let Some(track) = self.state.lock().tracks.get(name) {
-                    let previous = track.lock().level();
                     track.lock().set_level(level);
-                    let delta = level - previous;
-                    if delta.abs() > f32::EPSILON {
-                        for follower_name in self.vca_followers(name) {
-                            if let Some(follower) = self.state.lock().tracks.get(&follower_name) {
-                                let next = (follower.lock().level() + delta).clamp(-90.0, 20.0);
-                                follower.lock().set_level(next);
-                                self.notify_clients(Ok(Action::TrackAutomationLevel(
-                                    follower_name.clone(),
-                                    next,
-                                )))
-                                .await;
-                            }
-                        }
-                    }
                 }
             }
             Action::TrackAutomationBalance(ref name, balance) => {
@@ -5235,16 +5169,6 @@ impl Engine {
                     self.hw_out_muted = !self.hw_out_muted;
                 } else if let Some(track) = self.state.lock().tracks.get(name) {
                     track.lock().mute();
-                    let muted = track.lock().muted;
-                    for follower_name in self.vca_followers(name) {
-                        if let Some(follower) = self.state.lock().tracks.get(&follower_name)
-                            && follower.lock().muted != muted
-                        {
-                            follower.lock().set_muted(muted);
-                            self.notify_clients(Ok(Action::TrackToggleMute(follower_name.clone())))
-                                .await;
-                        }
-                    }
                 }
             }
             Action::TrackTogglePhase(ref name) => {
@@ -5258,32 +5182,10 @@ impl Engine {
                 }
                 if let Some(track) = self.state.lock().tracks.get(name) {
                     track.lock().solo();
-                    let soloed = track.lock().soloed;
-                    for follower_name in self.vca_followers(name) {
-                        if let Some(follower) = self.state.lock().tracks.get(&follower_name)
-                            && follower.lock().soloed != soloed
-                        {
-                            follower.lock().solo();
-                            self.notify_clients(Ok(Action::TrackToggleSolo(follower_name.clone())))
-                                .await;
-                        }
-                    }
                 }
             }
             Action::TrackToggleMaster(ref name) => {
                 if let Some(track) = self.state.lock().tracks.get(name) {
-                    let blocked = {
-                        let t = track.lock();
-                        t.vca_master.is_some() || !self.vca_followers(name).is_empty()
-                    };
-                    if blocked {
-                        self.notify_clients(Err(format!(
-                            "Track '{}' cannot be promoted to Master while part of a VCA group",
-                            name
-                        )))
-                        .await;
-                        return;
-                    }
                     track.lock().toggle_master();
                 }
             }
@@ -5420,45 +5322,6 @@ impl Engine {
                         self.global_midi_learn_record_toggle = binding.clone();
                     }
                 }
-            }
-            Action::TrackSetVcaMaster {
-                ref track_name,
-                ref master_track,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if track.lock().is_master {
-                    self.notify_clients(Err(format!(
-                        "Master track '{}' cannot be part of a VCA group",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Some(master_name) = master_track
-                    && master_name == track_name
-                {
-                    self.notify_clients(Err("Track cannot be its own VCA master".to_string()))
-                        .await;
-                    return;
-                }
-                if let Some(master_name) = master_track
-                    && let Some(master) = self.state.lock().tracks.get(master_name)
-                    && master.lock().is_master
-                {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' cannot be grouped to Master track '{}'",
-                        track_name, master_name
-                    )))
-                    .await;
-                    return;
-                }
-                track.lock().set_vca_master(master_track.clone());
             }
             Action::TrackSetFolder {
                 ref track_name,

@@ -452,7 +452,6 @@ pub struct Track {
     pub midi_learn_arm: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_input_monitor: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_disk_monitor: Option<crate::message::MidiLearnBinding>,
-    pub vca_master: Option<String>,
     pub is_folder: bool,
     pub folder_open: bool,
     pub parent_track: Option<String>,
@@ -544,7 +543,6 @@ impl Track {
             midi_learn_arm: None,
             midi_learn_input_monitor: None,
             midi_learn_disk_monitor: None,
-            vca_master: None,
             is_folder: false,
             folder_open: true,
             parent_track: None,
@@ -1209,12 +1207,6 @@ impl Track {
         if let Some(monitor) = self.midi_disk_monitor.get_mut(lane) {
             *monitor = !*monitor;
         }
-    }
-    pub fn set_vca_master(&mut self, master: Option<String>) {
-        self.vca_master = master;
-    }
-    pub fn vca_master(&self) -> Option<String> {
-        self.vca_master.clone()
     }
     pub fn set_session_base_dir(&mut self, base_dir: Option<PathBuf>) {
         if self.session_base_dir != base_dir {

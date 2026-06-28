@@ -484,10 +484,6 @@ pub enum Action {
         target: GlobalMidiLearnTarget,
         binding: Option<MidiLearnBinding>,
     },
-    TrackSetVcaMaster {
-        track_name: String,
-        master_track: Option<String>,
-    },
     TrackSetFolder {
         track_name: String,
         is_folder: bool,
