@@ -5,7 +5,7 @@ use crate::{
     midi::io::MIDIIO,
     state::State,
 };
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 fn audio_clip_to_data(clip: &crate::audio::clip::AudioClip) -> crate::message::AudioClipData {
@@ -201,6 +201,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 midi_ins: track_lock.midi.ins.len(),
                 audio_outs: track_lock.primary_audio_outs(),
                 midi_outs: track_lock.midi.outs.len(),
+                folder: track_lock.is_folder,
             })
         }
 
@@ -1122,7 +1123,14 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 midi_ins: track.midi.ins.len(),
                 audio_outs: track.primary_audio_outs(),
                 midi_outs: track.midi.outs.len(),
+                folder: track.is_folder,
             });
+            if let Some(parent_name) = track.parent_track.as_ref() {
+                actions.push(Action::TrackSetParent {
+                    track_name: track.name.clone(),
+                    parent_name: Some(parent_name.clone()),
+                });
+            }
             for _ in track.primary_audio_ins()..track.audio.ins.len() {
                 actions.push(Action::TrackAddAudioInput(track.name.clone()));
             }
@@ -1348,6 +1356,22 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let mut seen_audio = std::collections::HashSet::<(String, usize, String, usize)>::new();
         let mut seen_midi = std::collections::HashSet::<(String, usize, String, usize)>::new();
 
+        // Parent/child wiring is restored by TrackSetParent, so don't also capture it as a
+        // generic Connect action (that would create duplicate connections on undo).
+        let (parent_name, child_names) = {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let parent = track.parent_track.clone();
+            let children: HashSet<String> = track
+                .child_tracks
+                .iter()
+                .map(|c| c.lock().name.clone())
+                .collect();
+            (parent, children)
+        };
+        let is_family =
+            |other: &str| parent_name.as_deref() == Some(other) || child_names.contains(other);
+
         for (from_name, from_track_handle) in &state.tracks {
             let from_track = from_track_handle.lock();
             for (from_port, out) in from_track.audio.outs.iter().enumerate() {
@@ -1356,9 +1380,15 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     for (to_name, to_track_handle) in &state.tracks {
                         let to_track = to_track_handle.lock();
                         for (to_port, to_in) in to_track.audio.ins.iter().enumerate() {
+                            let other_name = if from_name == track_name {
+                                to_name
+                            } else {
+                                from_name
+                            };
                             if from_name != to_name
                                 && Arc::ptr_eq(&conn, to_in)
                                 && (from_name == track_name || to_name == track_name)
+                                && !is_family(other_name)
                                 && seen_audio.insert((
                                     from_name.clone(),
                                     from_port,
@@ -1386,9 +1416,15 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     for (to_name, to_track_handle) in &state.tracks {
                         let to_track = to_track_handle.lock();
                         for (to_port, to_in) in to_track.midi.ins.iter().enumerate() {
+                            let other_name = if from_name == track_name {
+                                to_name
+                            } else {
+                                from_name
+                            };
                             if from_name != to_name
                                 && Arc::ptr_eq(&conn, to_in)
                                 && (from_name == track_name || to_name == track_name)
+                                && !is_family(other_name)
                                 && seen_midi.insert((
                                     from_name.clone(),
                                     from_port,
@@ -1422,6 +1458,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                         let conns: Vec<Arc<AudioIO>> = out.connections.lock().to_vec();
                         if from_name != to_name
                             && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
+                            && !is_family(from_name)
                             && seen_audio.insert((
                                 from_name.clone(),
                                 from_port,
@@ -1448,6 +1485,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                             out.lock().connections.to_vec();
                         if from_name != to_name
                             && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
+                            && !is_family(from_name)
                             && seen_midi.insert((
                                 from_name.clone(),
                                 from_port,
@@ -2432,6 +2470,7 @@ mod tests {
                 audio_outs: 1,
                 midi_ins: 1,
                 midi_outs: 1,
+                folder: false,
             }) if name == "t"
         ));
         assert!(
@@ -2486,6 +2525,65 @@ mod tests {
                 } if from_track == to_track
             )),
             "internal passthrough should not be captured as a track-to-track Connect action"
+        );
+    }
+
+    #[test]
+    fn create_inverse_actions_for_remove_folder_track_restores_parent_and_omits_child_wiring() {
+        let mut state = State::default();
+        let folder = Track::new_folder("folder".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let child = Track::new("child".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        state.tracks.insert(
+            "folder".to_string(),
+            Arc::new(UnsafeMutex::new(Box::new(folder))),
+        );
+        state.tracks.insert(
+            "child".to_string(),
+            Arc::new(UnsafeMutex::new(Box::new(child))),
+        );
+        {
+            let folder_arc = state.tracks.get("folder").unwrap().clone();
+            let child_arc = state.tracks.get("child").unwrap().clone();
+            child_arc.lock().parent_track = Some("folder".to_string());
+            folder_arc.lock().child_tracks.push(child_arc.clone());
+
+            // Simulate the implicit wiring TrackSetParent creates.
+            let (folder_in, folder_out) = {
+                let folder = folder_arc.lock();
+                (folder.audio.ins[0].clone(), folder.audio.outs[0].clone())
+            };
+            let (child_in, child_out) = {
+                let child = child_arc.lock();
+                (child.audio.ins[0].clone(), child.audio.outs[0].clone())
+            };
+            AudioIO::connect(&folder_in, &child_in);
+            AudioIO::connect(&child_out, &folder_out);
+        }
+
+        let mut inverses =
+            create_inverse_actions(&Action::RemoveTrack("folder".to_string()), &state).unwrap();
+        inverses.extend(
+            create_inverse_actions(&Action::RemoveTrack("child".to_string()), &state).unwrap(),
+        );
+
+        assert!(
+            inverses.iter().any(|action| matches!(
+                action,
+                Action::TrackSetParent {
+                    track_name,
+                    parent_name: Some(parent_name),
+                } if track_name == "child" && parent_name == "folder"
+            )),
+            "inverse should restore the child-to-folder parent relationship"
+        );
+        assert!(
+            !inverses.iter().any(|action| matches!(
+                action,
+                Action::Connect { from_track, to_track, .. }
+                if (from_track == "folder" && to_track == "child")
+                    || (from_track == "child" && to_track == "folder")
+            )),
+            "implicit folder-to-child wiring should not be captured as a generic Connect action"
         );
     }
 }

@@ -227,6 +227,68 @@ pub struct PluginGraphConnection {
 
 pub type PluginGraphSnapshot = (Vec<PluginGraphPlugin>, Vec<PluginGraphConnection>);
 
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
+pub enum PluginKind {
+    Clap,
+    Vst3,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Lv2,
+}
+
+#[derive(Clone, Debug)]
+pub enum ProcessTask {
+    Track(Arc<UnsafeMutex<Box<Track>>>),
+    FolderInput(Arc<UnsafeMutex<Box<Track>>>),
+    FolderOutput(Arc<UnsafeMutex<Box<Track>>>),
+    Plugin {
+        track: Arc<UnsafeMutex<Box<Track>>>,
+        kind: PluginKind,
+        index: usize,
+    },
+}
+
+impl PartialEq for ProcessTask {
+    fn eq(&self, other: &Self) -> bool {
+        use ProcessTask::*;
+        match (self, other) {
+            (Track(a), Track(b))
+            | (FolderInput(a), FolderInput(b))
+            | (FolderOutput(a), FolderOutput(b)) => Arc::ptr_eq(a, b),
+            (
+                Plugin {
+                    track: a,
+                    kind: ka,
+                    index: ia,
+                },
+                Plugin {
+                    track: b,
+                    kind: kb,
+                    index: ib,
+                },
+            ) => Arc::ptr_eq(a, b) && ka == kb && ia == ib,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ProcessTask {}
+
+impl std::hash::Hash for ProcessTask {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use ProcessTask::*;
+        match self {
+            Track(t) | FolderInput(t) | FolderOutput(t) => {
+                Arc::as_ptr(t).hash(state);
+            }
+            Plugin { track, kind, index } => {
+                Arc::as_ptr(track).hash(state);
+                kind.hash(state);
+                index.hash(state);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Vst3GraphNode {
     TrackInput,
@@ -321,6 +383,7 @@ pub enum Action {
         midi_ins: usize,
         audio_outs: usize,
         midi_outs: usize,
+        folder: bool,
     },
     TrackAddAudioInput(String),
     TrackAddAudioOutput(String),
@@ -1039,14 +1102,14 @@ pub enum Message {
     Ready(usize),
     Finished {
         worker_id: usize,
-        track_name: String,
+        task: ProcessTask,
         output_linear: Vec<f32>,
         process_epoch: usize,
         parameter_updates: Vec<Action>,
     },
     TracksFinished,
 
-    ProcessTrack(Arc<UnsafeMutex<Box<Track>>>),
+    ProcessTask(ProcessTask),
     ProcessOfflineBounce(OfflineBounceWork),
     Channel(Sender<Self>),
 

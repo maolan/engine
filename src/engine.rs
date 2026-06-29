@@ -56,7 +56,9 @@ use crate::{
         traits::{HwDevice, HwWorkerDriver},
     },
     kind::Kind,
-    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
+    message::{
+        Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, PluginKind, ProcessTask,
+    },
     midi::clip::MIDIClip,
     midi::io::MidiEvent,
     mutex::UnsafeMutex,
@@ -243,7 +245,11 @@ pub struct Engine {
     hw_out_meter_publish_phase: bool,
     last_track_meter_publish: Option<Instant>,
     track_meter_linear_by_track: HashMap<String, Vec<f32>>,
-    track_processing_started_at: HashMap<String, Instant>,
+    task_processing_started_at: HashMap<String, Instant>,
+    cycle_tasks: Vec<ProcessTask>,
+    cycle_task_deps: HashMap<String, Vec<String>>,
+    cycle_tasks_running: Vec<ProcessTask>,
+    cycle_tasks_finished: Vec<ProcessTask>,
     latest_hw_out_meter_db: Arc<Vec<f32>>,
     latest_track_meter_snapshot: Arc<Vec<(String, Vec<f32>)>>,
     history: History,
@@ -985,7 +991,11 @@ impl Engine {
             hw_out_meter_publish_phase: false,
             last_track_meter_publish: None,
             track_meter_linear_by_track: HashMap::new(),
-            track_processing_started_at: HashMap::new(),
+            task_processing_started_at: HashMap::new(),
+            cycle_tasks: Vec::new(),
+            cycle_task_deps: HashMap::new(),
+            cycle_tasks_running: Vec::new(),
+            cycle_tasks_finished: Vec::new(),
             latest_hw_out_meter_db: Arc::new(Vec::new()),
             latest_track_meter_snapshot: Arc::new(Vec::new()),
             history: History::default(),
@@ -1326,6 +1336,7 @@ impl Engine {
             midi_ins: 0,
             audio_outs: 1,
             midi_outs: 0,
+            folder: false,
         }))
         .await;
         self.notify_clients(Ok(Action::TrackLevel(
@@ -1849,6 +1860,20 @@ impl Engine {
         Vec::new()
     }
 
+    fn all_hw_input_audio_ports(&self) -> Vec<Arc<AudioIO>> {
+        if let Some(driver) = &self.hw_driver {
+            let count = driver.lock().input_channels();
+            return (0..count)
+                .filter_map(|idx| self.hw_driver_input_audio_port(idx))
+                .collect();
+        }
+        #[cfg(unix)]
+        if let Some(jack) = &self.jack_runtime {
+            return jack.lock().audio_ins();
+        }
+        Vec::new()
+    }
+
     #[cfg(unix)]
     fn audio_ports_connected(source: &Arc<AudioIO>, target: &Arc<AudioIO>) -> bool {
         source
@@ -1865,23 +1890,53 @@ impl Engine {
         to_track: &str,
         to_port: usize,
     ) -> (Option<Arc<AudioIO>>, Option<Arc<AudioIO>>) {
+        let state = self.state.lock();
+        let from_is_child_of_to = state
+            .tracks
+            .get(from_track)
+            .and_then(|t| t.lock().parent_track.as_deref())
+            == Some(to_track);
+        let to_is_child_of_from = state
+            .tracks
+            .get(to_track)
+            .and_then(|t| t.lock().parent_track.as_deref())
+            == Some(from_track);
+
         let from_audio_io = if from_track == "hw:in" {
             self.hw_input_audio_port(from_port)
         } else {
-            let state = self.state.lock();
-            state
-                .tracks
-                .get(from_track)
-                .and_then(|t| t.lock().audio.outs.get(from_port).cloned())
+            state.tracks.get(from_track).and_then(|t| {
+                let t = t.lock();
+                if t.is_folder {
+                    if to_is_child_of_from {
+                        // Folder input -> child input.
+                        t.audio.ins.get(from_port).cloned()
+                    } else {
+                        // Folder output -> external target.
+                        t.audio.outs.get(from_port).cloned()
+                    }
+                } else {
+                    t.audio.outs.get(from_port).cloned()
+                }
+            })
         };
         let to_audio_io = if to_track == "hw:out" {
             self.hw_output_audio_port(to_port)
         } else {
-            let state = self.state.lock();
-            state
-                .tracks
-                .get(to_track)
-                .and_then(|t| t.lock().audio.ins.get(to_port).cloned())
+            state.tracks.get(to_track).and_then(|t| {
+                let t = t.lock();
+                if t.is_folder {
+                    if from_is_child_of_to {
+                        // Child output -> folder output.
+                        t.audio.outs.get(to_port).cloned()
+                    } else {
+                        // External source -> folder input.
+                        t.audio.ins.get(to_port).cloned()
+                    }
+                } else {
+                    t.audio.ins.get(to_port).cloned()
+                }
+            })
         };
         (from_audio_io, to_audio_io)
     }
@@ -3751,8 +3806,10 @@ impl Engine {
 
     async fn request_hw_cycle(&mut self) {
         if self.awaiting_hwfinished {
+            tracing::debug!("request_hw_cycle skipped (already awaiting)");
             return;
         }
+        tracing::debug!("request_hw_cycle sending TracksFinished");
         self.apply_hw_out_gain_and_meter().await;
         if let Some((after_frames, loop_start, cycle_end_sample)) =
             self.scheduled_loop_wrap_for_next_cycle()
@@ -3817,7 +3874,11 @@ impl Engine {
 
     fn invalidate_track_cycle_state(&mut self) {
         self.track_process_epoch = self.track_process_epoch.saturating_add(1);
-        self.track_processing_started_at.clear();
+        self.task_processing_started_at.clear();
+        self.cycle_tasks.clear();
+        self.cycle_task_deps.clear();
+        self.cycle_tasks_running.clear();
+        self.cycle_tasks_finished.clear();
         let state = self.state.lock();
         for track in state.tracks.values() {
             let t = track.lock();
@@ -3826,33 +3887,47 @@ impl Engine {
         }
     }
 
-    fn force_stalled_track_completions(&mut self) {
+    fn force_stalled_task_completions(&mut self) {
         let now = Instant::now();
-        let state = self.state.lock();
-        for (track_name, track) in state.tracks.iter() {
-            let started = self.track_processing_started_at.get(track_name).copied();
-            let Some(started) = started else {
+        let running: Vec<ProcessTask> = self.cycle_tasks_running.clone();
+        for task in running {
+            let key = Self::task_key(&task);
+            let Some(started) = self.task_processing_started_at.get(&key).copied() else {
                 continue;
             };
             if now.duration_since(started) < Self::TRACK_PROCESS_TIMEOUT {
                 continue;
             }
-            let t = track.lock();
-            if t.audio.finished || !t.audio.processing {
-                self.track_processing_started_at.remove(track_name);
+            if Self::task_running_finished_contains(&self.cycle_tasks_finished, &task) {
+                self.task_processing_started_at.remove(&key);
                 continue;
             }
-            for out in &t.audio.outs {
-                let out_buf = out.buffer.lock();
-                out_buf.fill(0.0);
-                *out.finished.lock() = true;
+            let track = match &task {
+                ProcessTask::Track(t)
+                | ProcessTask::FolderInput(t)
+                | ProcessTask::FolderOutput(t) => t.clone(),
+                ProcessTask::Plugin { track, .. } => track.clone(),
+            };
+            {
+                let t = track.lock();
+                if t.audio.finished || !t.audio.processing {
+                    self.task_processing_started_at.remove(&key);
+                    continue;
+                }
+                for out in &t.audio.outs {
+                    out.buffer.lock().fill(0.0);
+                    *out.finished.lock() = true;
+                }
+                t.audio.processing = false;
+                t.audio.finished = true;
             }
-            t.audio.processing = false;
-            t.audio.finished = true;
-            self.track_processing_started_at.remove(track_name);
+            self.cycle_tasks_running
+                .retain(|t| Self::task_key(t) != key);
+            self.cycle_tasks_finished.push(task.clone());
+            self.task_processing_started_at.remove(&key);
             tracing::warn!(
-                "Track '{}' exceeded process timeout ({} ms); forcing silent completion for cycle",
-                track_name,
+                "Task '{}' exceeded process timeout ({} ms); forcing silent completion for cycle",
+                Self::task_track_name(&task),
                 Self::TRACK_PROCESS_TIMEOUT.as_millis()
             );
         }
@@ -4039,72 +4114,280 @@ impl Engine {
         }
     }
 
-    async fn send_tracks(&mut self) -> bool {
+    fn build_task_graph(
+        &self,
+    ) -> (
+        Vec<ProcessTask>,
+        std::collections::HashMap<String, Vec<String>>,
+    ) {
+        let state = self.state.lock();
+        let ordered: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = state
+            .tracks
+            .iter()
+            .map(|(name, track)| (name.clone(), track.clone()))
+            .collect();
+        let mut tasks = Vec::new();
+        let mut deps = std::collections::HashMap::new();
+
+        for (_name, track) in &ordered {
+            let t = track.lock();
+            if t.parent_track.is_some() {
+                continue;
+            }
+            self.append_track_tasks(track.clone(), None, &mut tasks, &mut deps);
+        }
+
+        (tasks, deps)
+    }
+
+    fn append_track_tasks(
+        &self,
+        track: Arc<UnsafeMutex<Box<Track>>>,
+        predecessor: Option<String>,
+        tasks: &mut Vec<ProcessTask>,
+        deps: &mut std::collections::HashMap<String, Vec<String>>,
+    ) -> String {
+        let t = track.lock();
+        if t.is_folder {
+            let folder_input = ProcessTask::FolderInput(track.clone());
+            let folder_input_key = Self::task_key(&folder_input);
+            tasks.push(folder_input.clone());
+            deps.insert(
+                folder_input_key.clone(),
+                predecessor.into_iter().collect::<Vec<_>>(),
+            );
+            let mut prev = folder_input_key;
+
+            for idx in 0..t.clap_plugins.len() {
+                let plugin_task = ProcessTask::Plugin {
+                    track: track.clone(),
+                    kind: PluginKind::Clap,
+                    index: idx,
+                };
+                let plugin_key = Self::task_key(&plugin_task);
+                tasks.push(plugin_task);
+                deps.insert(plugin_key.clone(), vec![prev]);
+                prev = plugin_key;
+            }
+            for idx in 0..t.vst3_plugins.len() {
+                let plugin_task = ProcessTask::Plugin {
+                    track: track.clone(),
+                    kind: PluginKind::Vst3,
+                    index: idx,
+                };
+                let plugin_key = Self::task_key(&plugin_task);
+                tasks.push(plugin_task);
+                deps.insert(plugin_key.clone(), vec![prev]);
+                prev = plugin_key;
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            for idx in 0..t.lv2_plugins.len() {
+                let plugin_task = ProcessTask::Plugin {
+                    track: track.clone(),
+                    kind: PluginKind::Lv2,
+                    index: idx,
+                };
+                let plugin_key = Self::task_key(&plugin_task);
+                tasks.push(plugin_task);
+                deps.insert(plugin_key.clone(), vec![prev]);
+                prev = plugin_key;
+            }
+
+            for child_track in &t.child_tracks {
+                prev = self.append_track_tasks(child_track.clone(), Some(prev), tasks, deps);
+            }
+
+            let folder_output = ProcessTask::FolderOutput(track.clone());
+            let folder_output_key = Self::task_key(&folder_output);
+            tasks.push(folder_output.clone());
+            deps.insert(folder_output_key.clone(), vec![prev]);
+            folder_output_key
+        } else {
+            let task = ProcessTask::Track(track.clone());
+            let task_key = Self::task_key(&task);
+            tasks.push(task.clone());
+            deps.insert(
+                task_key.clone(),
+                predecessor.into_iter().collect::<Vec<_>>(),
+            );
+            task_key
+        }
+    }
+
+    fn task_track_name(task: &ProcessTask) -> String {
+        match task {
+            ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => {
+                t.lock().name.clone()
+            }
+            ProcessTask::Plugin { track, .. } => track.lock().name.clone(),
+        }
+    }
+
+    fn task_key(task: &ProcessTask) -> String {
+        match task {
+            ProcessTask::Track(t) => format!("Track:{:p}", std::sync::Arc::as_ptr(t)),
+            ProcessTask::FolderInput(t) => {
+                format!("FolderInput:{:p}", std::sync::Arc::as_ptr(t))
+            }
+            ProcessTask::FolderOutput(t) => {
+                format!("FolderOutput:{:p}", std::sync::Arc::as_ptr(t))
+            }
+            ProcessTask::Plugin { track, kind, index } => format!(
+                "Plugin:{:?}:{:p}:{}",
+                kind,
+                std::sync::Arc::as_ptr(track),
+                index
+            ),
+        }
+    }
+
+    fn task_running_finished_contains(haystack: &[ProcessTask], needle: &ProcessTask) -> bool {
+        let needle_key = Self::task_key(needle);
+        haystack.iter().any(|t| Self::task_key(t) == needle_key)
+    }
+
+    fn task_ready(&self, task: &ProcessTask) -> bool {
+        match task {
+            ProcessTask::Track(t) | ProcessTask::FolderInput(t) => {
+                let track = t.lock();
+                track.audio.ready()
+            }
+            ProcessTask::Plugin { .. } | ProcessTask::FolderOutput(_) => true,
+        }
+    }
+
+    fn task_dependencies_satisfied(&self, task: &ProcessTask) -> bool {
+        let key = Self::task_key(task);
+        let Some(deps) = self.cycle_task_deps.get(&key) else {
+            return true;
+        };
+        let finished_keys: std::collections::HashSet<String> = self
+            .cycle_tasks_finished
+            .iter()
+            .map(Self::task_key)
+            .collect();
+        deps.iter().all(|d| finished_keys.contains(d))
+    }
+
+    fn prepare_task_track(&self, task: &ProcessTask) {
+        let track = match task {
+            ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => t,
+            ProcessTask::Plugin { track, .. } => track,
+        };
+        let t = track.lock();
+        t.set_transport_sample(self.transport_sample);
+        t.set_loop_config(self.loop_enabled, self.loop_range_samples);
+        t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
+        t.process_epoch = self.track_process_epoch;
+        t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
+        t.set_record_tap_enabled(self.playing && self.record_enabled);
+        t.audio.processing = true;
+    }
+
+    async fn send_tasks(&mut self) -> bool {
         if !self.playing {
             return false;
         }
         self.refresh_realtime_infection();
-        self.force_stalled_track_completions();
+        self.force_stalled_task_completions();
+
+        if self.cycle_tasks.is_empty() {
+            let (tasks, deps) = self.build_task_graph();
+            let task_names: Vec<String> = tasks.iter().map(Self::task_track_name).collect();
+            tracing::debug!(
+                "send_tasks rebuilt graph: {} tasks ({:?})",
+                tasks.len(),
+                task_names
+            );
+            self.cycle_tasks = tasks;
+            self.cycle_task_deps = deps;
+            self.cycle_tasks_running.clear();
+            self.cycle_tasks_finished.clear();
+        }
+
         let mut finished = true;
         let mut dispatched = 0;
         loop {
-            let next_track = {
-                let state = self.state.lock();
+            let next_task = {
                 let mut next = None;
-                for track in state.tracks.values() {
-                    let t = track.lock();
-                    if t.audio.finished {
+                tracing::debug!(
+                    "selecting next: cycle={} running={} finished={}",
+                    self.cycle_tasks.len(),
+                    self.cycle_tasks_running.len(),
+                    self.cycle_tasks_finished.len()
+                );
+                for task in &self.cycle_tasks {
+                    let in_running =
+                        Self::task_running_finished_contains(&self.cycle_tasks_running, task);
+                    let in_finished =
+                        Self::task_running_finished_contains(&self.cycle_tasks_finished, task);
+                    tracing::debug!(
+                        "checking task {} in_running={} in_finished={}",
+                        Self::task_track_name(task),
+                        in_running,
+                        in_finished
+                    );
+                    if in_finished || in_running {
                         continue;
                     }
                     finished = false;
-                    if t.audio.processing || !t.audio.ready() {
+                    if !self.task_dependencies_satisfied(task) {
                         continue;
                     }
-                    if next.is_none() {
-                        next = Some(track.clone());
+                    if !self.task_ready(task) {
+                        continue;
                     }
+                    next = Some(task.clone());
+                    break;
                 }
                 next
             };
 
-            let Some(track) = next_track else {
-                if dispatched > 0 {
-                    tracing::info!("send_tracks dispatched {} tracks", dispatched);
-                }
+            let Some(task) = next_task else {
+                tracing::debug!(
+                    "send_tasks returning finished={} (dispatched {})",
+                    finished,
+                    dispatched
+                );
                 return finished;
             };
             let Some(worker_index) = self.take_ready_worker_index() else {
-                self.force_stalled_track_completions();
-                if dispatched > 0 {
-                    tracing::info!(
-                        "send_tracks dispatched {} tracks (no more workers)",
-                        dispatched
-                    );
-                }
+                self.force_stalled_task_completions();
+                tracing::debug!(
+                    "send_tasks returning false (no ready worker; dispatched {})",
+                    dispatched
+                );
                 return false;
             };
 
-            let t = track.lock();
-            if t.audio.finished || t.audio.processing || !t.audio.ready() {
+            if Self::task_running_finished_contains(&self.cycle_tasks_finished, &task)
+                || Self::task_running_finished_contains(&self.cycle_tasks_running, &task)
+            {
                 continue;
             }
             dispatched += 1;
-            t.set_transport_sample(self.transport_sample);
-            t.set_loop_config(self.loop_enabled, self.loop_range_samples);
-            t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
-            t.process_epoch = self.track_process_epoch;
-
-            t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
-
-            t.set_record_tap_enabled(self.playing && self.record_enabled);
-            t.audio.processing = true;
-            self.track_processing_started_at
-                .insert(t.name.clone(), Instant::now());
+            let task_key = Self::task_key(&task);
+            tracing::debug!(
+                "send_tasks dispatching {} (running={} finished={})",
+                Self::task_track_name(&task),
+                self.cycle_tasks_running.len(),
+                self.cycle_tasks_finished.len()
+            );
+            self.prepare_task_track(&task);
+            self.cycle_tasks_running.push(task.clone());
+            tracing::debug!(
+                "inserted task {} -> running_size={}",
+                Self::task_track_name(&task),
+                self.cycle_tasks_running.len()
+            );
+            self.task_processing_started_at
+                .insert(task_key.clone(), Instant::now());
             let worker = &self.workers[worker_index];
-            if let Err(e) = worker.tx.send(Message::ProcessTrack(track.clone())).await {
-                t.audio.processing = false;
-                self.track_processing_started_at.remove(&t.name);
-                self.notify_clients(Err(format!("Failed to send track to worker: {}", e)))
+            if let Err(e) = worker.tx.send(Message::ProcessTask(task.clone())).await {
+                self.cycle_tasks_running
+                    .retain(|t| Self::task_key(t) != task_key);
+                self.task_processing_started_at.remove(&task_key);
+                self.notify_clients(Err(format!("Failed to send task to worker: {}", e)))
                     .await;
             }
         }
@@ -4385,6 +4668,111 @@ impl Engine {
         }
     }
 
+    fn find_audio_io_owner(
+        &self,
+        state: &crate::state::State,
+        io: &std::sync::Arc<crate::audio::io::AudioIO>,
+    ) -> Option<(String, usize)> {
+        for (name, track) in &state.tracks {
+            let t = track.lock();
+            for (i, out) in t.audio.outs.iter().enumerate() {
+                if std::sync::Arc::ptr_eq(out, io) {
+                    return Some((name.clone(), i));
+                }
+            }
+            for (i, inp) in t.audio.ins.iter().enumerate() {
+                if std::sync::Arc::ptr_eq(inp, io) {
+                    return Some((name.clone(), i));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_midi_io_owner(
+        &self,
+        state: &crate::state::State,
+        io: &std::sync::Arc<crate::mutex::UnsafeMutex<Box<crate::midi::io::MIDIIO>>>,
+    ) -> Option<(String, usize, bool)> {
+        for (name, track) in &state.tracks {
+            let t = track.lock();
+            for (i, out) in t.midi.outs.iter().enumerate() {
+                if std::sync::Arc::ptr_eq(out, io) {
+                    return Some((name.clone(), i, false));
+                }
+            }
+            for (i, inp) in t.midi.ins.iter().enumerate() {
+                if std::sync::Arc::ptr_eq(inp, io) {
+                    return Some((name.clone(), i, true));
+                }
+            }
+        }
+        None
+    }
+
+    fn collect_descendant_track_names(&self, name: &str, out: &mut Vec<String>) {
+        // Clone the child arcs while briefly holding the parent lock, then release it before
+        // recursing so we never nest locks on the same thread.
+        let child_arcs: Vec<Arc<UnsafeMutex<Box<Track>>>> = {
+            let state = self.state.lock();
+            if let Some(track) = state.tracks.get(name) {
+                track.lock().child_tracks.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        for child in child_arcs {
+            let child_name = { child.lock().name.clone() };
+            self.collect_descendant_track_names(&child_name, out);
+            out.push(child_name);
+        }
+    }
+
+    async fn remove_single_track(&mut self, name: &str) {
+        let children: Vec<Arc<UnsafeMutex<Box<Track>>>> = {
+            let state = self.state.lock();
+            if let Some(removed) = state.tracks.get(name).cloned() {
+                removed.lock().child_tracks.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        let parent_name: Option<String> = {
+            let state = self.state.lock();
+            state
+                .tracks
+                .get(name)
+                .map(|t| t.lock().parent_track.clone())
+                .unwrap_or(None)
+        };
+        if let Some(parent_name) = parent_name {
+            let state = self.state.lock();
+            if let Some(parent) = state.tracks.get(&parent_name).cloned() {
+                let parent = parent.lock();
+                parent.child_tracks.retain(|c| c.lock().name != *name);
+            }
+        }
+        if let Some(removed_track) = self.state.lock().tracks.get(name).cloned() {
+            for child in children {
+                let removed = removed_track.lock();
+                child.lock().disconnect_from_parent(removed);
+                child.lock().parent_track = None;
+            }
+        }
+        self.state.lock().tracks.remove(name);
+        self.audio_recordings.remove(name);
+        self.midi_recordings.remove(name);
+        self.midi_hw_in_routes.retain(|r| r.to_track != *name);
+        self.midi_hw_out_routes.retain(|r| r.from_track != *name);
+        if self
+            .pending_midi_learn
+            .as_ref()
+            .is_some_and(|(track_name, _, _)| track_name == name)
+        {
+            self.pending_midi_learn = None;
+        }
+    }
+
     async fn handle_request_inner(&mut self, mut action_to_process: Action, record_history: bool) {
         let a = action_to_process.clone();
         let suppress_timing_history = self.playing
@@ -4524,7 +4912,7 @@ impl Engine {
 
         match action_to_process {
             Action::Play => {
-                tracing::info!(
+                tracing::debug!(
                     "Action::Play pressed, transport_sample={}",
                     self.transport_sample
                 );
@@ -4550,8 +4938,8 @@ impl Engine {
                         self.notify_clients(Ok(action)).await;
                     }
                 }
-                let send_result = self.send_tracks().await;
-                tracing::info!("send_tracks after Play returned finished={}", send_result);
+                let send_result = self.send_tasks().await;
+                tracing::debug!("send_tasks after Play returned finished={}", send_result);
                 if !self.awaiting_hwfinished
                     && !self.handling_hwfinished
                     && send_result
@@ -4583,7 +4971,7 @@ impl Engine {
                     self.preload_track_clips().await;
                     if !self.awaiting_hwfinished
                         && !self.handling_hwfinished
-                        && self.send_tracks().await
+                        && self.send_tasks().await
                         && self.hw_worker.is_some()
                     {
                         self.transport_restart_pending = false;
@@ -4675,7 +5063,7 @@ impl Engine {
                     if !self.awaiting_hwfinished && !self.handling_hwfinished {
                         if self.hw_worker.is_some() {
                             self.request_hw_cycle().await;
-                        } else if self.send_tracks().await {
+                        } else if self.send_tasks().await {
                             self.transport_restart_pending = false;
                             self.request_hw_cycle().await;
                         }
@@ -4888,6 +5276,7 @@ impl Engine {
                 midi_ins,
                 audio_outs,
                 midi_outs,
+                folder,
             } => {
                 let tracks = &mut self.state.lock().tracks;
                 if tracks.contains_key(name) {
@@ -4911,9 +5300,8 @@ impl Engine {
                 };
 
                 if let Some((chsamples, sample_rate)) = maybe_hw {
-                    tracks.insert(
-                        name.clone(),
-                        Arc::new(UnsafeMutex::new(Box::new(Track::new(
+                    let track = if folder {
+                        Track::new_folder(
                             name.clone(),
                             audio_ins,
                             audio_outs,
@@ -4921,12 +5309,21 @@ impl Engine {
                             midi_outs,
                             chsamples,
                             sample_rate,
-                        )))),
-                    );
+                        )
+                    } else {
+                        Track::new(
+                            name.clone(),
+                            audio_ins,
+                            audio_outs,
+                            midi_ins,
+                            midi_outs,
+                            chsamples,
+                            sample_rate,
+                        )
+                    };
+                    tracks.insert(name.clone(), Arc::new(UnsafeMutex::new(Box::new(track))));
                     if let Some(track) = tracks.get(name) {
                         let t = track.lock();
-                        t.ensure_default_audio_passthrough();
-                        t.ensure_default_midi_passthrough();
                         t.set_clip_playback_enabled(self.clip_playback_enabled);
                         t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
                         t.set_session_base_dir(self.session_dir.clone());
@@ -5056,41 +5453,86 @@ impl Engine {
                 .await;
             }
             Action::RemoveTrack(ref name) => {
-                let children: Vec<String> = {
+                let mut descendant_names = Vec::new();
+                self.collect_descendant_track_names(name, &mut descendant_names);
+                let names_to_remove: Vec<String> = descendant_names
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(name.clone()))
+                    .collect();
+
+                let combined_inverse = if record_history && !self.history_suspended {
                     let state = self.state.lock();
-                    state
-                        .tracks
-                        .iter()
-                        .filter_map(|(n, t)| {
-                            if t.lock().parent_track.as_deref() == Some(name.as_str()) {
-                                Some(n.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                };
-                if let Some(removed_track) = self.state.lock().tracks.get(name).cloned() {
-                    for child_name in children {
-                        if let Some(child) = self.state.lock().tracks.get(&child_name).cloned() {
-                            let removed = removed_track.lock();
-                            child.lock().disconnect_outputs_from_parent(removed);
-                            child.lock().parent_track = None;
+                    let mut inv = Vec::new();
+                    for n in &names_to_remove {
+                        if let Some(mut actions) =
+                            create_inverse_actions(&Action::RemoveTrack(n.clone()), state)
+                        {
+                            inv.append(&mut actions);
+                        }
+                        for route in self.midi_hw_in_routes.iter().filter(|r| &r.to_track == n) {
+                            inv.push(Action::Connect {
+                                from_track: format!("midi:hw:in:{}", route.device),
+                                from_port: 0,
+                                to_track: route.to_track.clone(),
+                                to_port: route.to_port,
+                                kind: Kind::MIDI,
+                            });
+                        }
+                        for route in self
+                            .midi_hw_out_routes
+                            .iter()
+                            .filter(|r| &r.from_track == n)
+                        {
+                            inv.push(Action::Connect {
+                                from_track: route.from_track.clone(),
+                                from_port: route.from_port,
+                                to_track: format!("midi:hw:out:{}", route.device),
+                                to_port: 0,
+                                kind: Kind::MIDI,
+                            });
                         }
                     }
+
+                    // Reorder so all AddTrack actions come first, then everything else, then
+                    // explicit Connect actions. This mirrors EndHistoryGroup and guarantees that
+                    // tracks are recreated before they are re-parented or reconnected.
+                    let mut add_tracks = Vec::new();
+                    let mut connections = Vec::new();
+                    let mut rest = Vec::new();
+                    for action in inv {
+                        match action {
+                            Action::AddTrack { .. } => add_tracks.push(action),
+                            Action::Connect { .. } => connections.push(action),
+                            _ => rest.push(action),
+                        }
+                    }
+                    let mut ordered = add_tracks;
+                    ordered.extend(rest);
+                    ordered.extend(connections);
+                    ordered
+                } else {
+                    Vec::new()
+                };
+
+                for n in &descendant_names {
+                    self.remove_single_track(n).await;
+                    self.notify_clients(Ok(Action::RemoveTrack(n.clone())))
+                        .await;
                 }
-                self.state.lock().tracks.remove(name);
-                self.audio_recordings.remove(name);
-                self.midi_recordings.remove(name);
-                self.midi_hw_in_routes.retain(|r| r.to_track != *name);
-                self.midi_hw_out_routes.retain(|r| r.from_track != *name);
-                if self
-                    .pending_midi_learn
-                    .as_ref()
-                    .is_some_and(|(track_name, _, _)| track_name == name)
-                {
-                    self.pending_midi_learn = None;
+                self.remove_single_track(name).await;
+
+                if record_history && !self.history_suspended && !combined_inverse.is_empty() {
+                    self.history.record(UndoEntry {
+                        forward_actions: vec![Action::RemoveTrack(name.clone())],
+                        inverse_actions: combined_inverse,
+                    });
                 }
+
+                // The outer code already computed a per-action inverse for the original
+                // RemoveTrack. We have recorded a combined inverse for the whole subtree, so
+                // suppress that default recording.
+                inverse_actions = None;
             }
             Action::TrackLevel(ref name, level) => {
                 if name == "hw:out" {
@@ -5334,7 +5776,12 @@ impl Engine {
                         return;
                     }
                 };
-                track.lock().is_folder = is_folder;
+                {
+                    let track = track.lock();
+                    track.is_folder = is_folder;
+                    track.ensure_default_audio_passthrough();
+                    track.ensure_default_midi_passthrough();
+                }
                 self.notify_clients(Ok(Action::TrackSetFolder {
                     track_name: track_name.clone(),
                     is_folder,
@@ -5358,25 +5805,290 @@ impl Engine {
                     return;
                 }
 
-                let old_parent = {
-                    let t = track.lock();
-                    t.parent_track.clone()
-                };
-                if let Some(ref old) = old_parent
-                    && let Some(old_track_arc) = self.state.lock().tracks.get(old).cloned()
-                {
-                    let old_track = old_track_arc.lock();
-                    track.lock().disconnect_outputs_from_parent(old_track);
+                // Validate the new parent is a folder (if any).
+                if let Some(parent_name) = parent_name {
+                    let state = self.state.lock();
+                    let parent = state.tracks.get(parent_name);
+                    if parent.is_none() {
+                        self.notify_clients(Err(format!(
+                            "Parent track '{}' does not exist",
+                            parent_name
+                        )))
+                        .await;
+                        return;
+                    }
+                    if !parent.unwrap().lock().is_folder {
+                        self.notify_clients(Err(format!(
+                            "Track '{}' is not a folder",
+                            parent_name
+                        )))
+                        .await;
+                        return;
+                    }
                 }
 
-                if let Some(new_parent) = parent_name
-                    && let Some(parent_track_arc) =
-                        self.state.lock().tracks.get(new_parent).cloned()
+                // Disconnect from the old parent and update its child list.
                 {
-                    let parent_track = parent_track_arc.lock();
-                    track.lock().connect_outputs_to_parent(parent_track);
+                    let old_parent_name = track.lock().parent_track.clone();
+                    if let Some(old_parent_name) = old_parent_name {
+                        let state = self.state.lock();
+                        if let (Some(parent_arc), Some(child_arc)) = (
+                            state.tracks.get(&old_parent_name).cloned(),
+                            state.tracks.get(track_name).cloned(),
+                        ) {
+                            {
+                                let parent = parent_arc.lock();
+                                parent.child_tracks.retain(|c| c.lock().name != *track_name);
+                            }
+                            {
+                                let child = child_arc.lock();
+                                let parent = parent_arc.lock();
+                                child.disconnect_from_parent(parent);
+                            }
+                        }
+                    }
                 }
-                track.lock().parent_track = parent_name.clone();
+
+                let mut disconnect_actions = Vec::new();
+
+                // Remove all existing audio and MIDI connections involving this track.
+                {
+                    let state = self.state.lock();
+                    let hw_inputs = self.all_hw_input_audio_ports();
+                    let hw_outputs = self.all_hw_output_audio_ports();
+                    if let Some(child_arc) = state.tracks.get(track_name).cloned() {
+                        let child = child_arc.lock();
+                        for (port_idx, inp) in child.audio.ins.iter().enumerate() {
+                            let sources = inp.connections.lock().clone();
+                            for src in sources {
+                                let _ = AudioIO::disconnect(&src, inp);
+                                if let Some((src_name, src_port)) =
+                                    self.find_audio_io_owner(state, &src)
+                                {
+                                    disconnect_actions.push(Action::Disconnect {
+                                        from_track: src_name,
+                                        from_port: src_port,
+                                        to_track: track_name.clone(),
+                                        to_port: port_idx,
+                                        kind: Kind::Audio,
+                                    });
+                                } else if let Some(src_port) = hw_inputs
+                                    .iter()
+                                    .position(|hw_in| std::sync::Arc::ptr_eq(hw_in, &src))
+                                {
+                                    disconnect_actions.push(Action::Disconnect {
+                                        from_track: "hw:in".to_string(),
+                                        from_port: src_port,
+                                        to_track: track_name.clone(),
+                                        to_port: port_idx,
+                                        kind: Kind::Audio,
+                                    });
+                                }
+                            }
+                        }
+                        for (port_idx, out) in child.audio.outs.iter().enumerate() {
+                            let targets = out.connections.lock().clone();
+                            for tgt in targets {
+                                let _ = AudioIO::disconnect(out, &tgt);
+                                if let Some((tgt_name, tgt_port)) =
+                                    self.find_audio_io_owner(state, &tgt)
+                                {
+                                    disconnect_actions.push(Action::Disconnect {
+                                        from_track: track_name.clone(),
+                                        from_port: port_idx,
+                                        to_track: tgt_name,
+                                        to_port: tgt_port,
+                                        kind: Kind::Audio,
+                                    });
+                                } else if let Some(tgt_port) = hw_outputs
+                                    .iter()
+                                    .position(|hw_out| std::sync::Arc::ptr_eq(hw_out, &tgt))
+                                {
+                                    disconnect_actions.push(Action::Disconnect {
+                                        from_track: track_name.clone(),
+                                        from_port: port_idx,
+                                        to_track: "hw:out".to_string(),
+                                        to_port: tgt_port,
+                                        kind: Kind::Audio,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Remove MIDI hardware routes.
+                        for route in self
+                            .midi_hw_in_routes
+                            .iter()
+                            .filter(|r| r.to_track == *track_name)
+                        {
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: format!("midi:hw:in:{}", route.device),
+                                from_port: 0,
+                                to_track: track_name.clone(),
+                                to_port: route.to_port,
+                                kind: Kind::MIDI,
+                            });
+                        }
+                        self.midi_hw_in_routes.retain(|r| r.to_track != *track_name);
+
+                        for route in self
+                            .midi_hw_out_routes
+                            .iter()
+                            .filter(|r| r.from_track == *track_name)
+                        {
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: track_name.clone(),
+                                from_port: route.from_port,
+                                to_track: format!("midi:hw:out:{}", route.device),
+                                to_port: 0,
+                                kind: Kind::MIDI,
+                            });
+                        }
+                        self.midi_hw_out_routes
+                            .retain(|r| r.from_track != *track_name);
+
+                        // Remove track-to-track MIDI connections where this track is the source.
+                        for (port_idx, out) in child.midi.outs.iter().enumerate() {
+                            let targets = out.lock().connections.clone();
+                            for tgt in targets {
+                                if let Some((tgt_name, tgt_port, _)) =
+                                    self.find_midi_io_owner(state, &tgt)
+                                {
+                                    let _ = out.lock().disconnect(&tgt);
+                                    disconnect_actions.push(Action::Disconnect {
+                                        from_track: track_name.clone(),
+                                        from_port: port_idx,
+                                        to_track: tgt_name,
+                                        to_port: tgt_port,
+                                        kind: Kind::MIDI,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Remove track-to-track MIDI connections where this track is the target.
+                    let child_input_arcs: Vec<_> =
+                        if let Some(child_arc) = state.tracks.get(track_name).cloned() {
+                            let child = child_arc.lock();
+                            child.midi.ins.clone()
+                        } else {
+                            Vec::new()
+                        };
+                    for (other_name, other_track) in &state.tracks {
+                        if other_name == track_name {
+                            continue;
+                        }
+                        let other = other_track.lock();
+                        for (out_port, out) in other.midi.outs.iter().enumerate() {
+                            let targets = out.lock().connections.clone();
+                            for tgt in targets {
+                                if let Some(to_port) = child_input_arcs
+                                    .iter()
+                                    .position(|inp| std::sync::Arc::ptr_eq(inp, &tgt))
+                                {
+                                    let _ = out.lock().disconnect(&tgt);
+                                    disconnect_actions.push(Action::Disconnect {
+                                        from_track: other_name.clone(),
+                                        from_port: out_port,
+                                        to_track: track_name.clone(),
+                                        to_port,
+                                        kind: Kind::MIDI,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply the parent change.
+                {
+                    track.lock().parent_track = parent_name.clone();
+                }
+
+                // Connect to the new parent and add to its child list.
+                if let Some(parent_name) = parent_name {
+                    let state = self.state.lock();
+                    if let (Some(parent_arc), Some(child_arc)) = (
+                        state.tracks.get(parent_name).cloned(),
+                        state.tracks.get(track_name).cloned(),
+                    ) {
+                        {
+                            let parent = parent_arc.lock();
+                            parent.child_tracks.push(child_arc.clone());
+                        }
+                        {
+                            let child = child_arc.lock();
+                            let parent = parent_arc.lock();
+                            // Folder input -> child input (one-to-one when counts match).
+                            if parent.audio.ins.len() == child.audio.ins.len() {
+                                for (parent_in, child_in) in
+                                    parent.audio.ins.iter().zip(child.audio.ins.iter())
+                                {
+                                    Track::connect_directed_audio(parent_in, child_in);
+                                }
+                            }
+                            // Child output -> folder output (one-to-one when counts match).
+                            if parent.audio.outs.len() == child.audio.outs.len() {
+                                for (child_out, parent_out) in
+                                    child.audio.outs.iter().zip(parent.audio.outs.iter())
+                                {
+                                    AudioIO::connect(child_out, parent_out);
+                                }
+                            }
+                            // Folder MIDI input -> child MIDI input (one-to-one when counts match).
+                            if parent.midi.ins.len() == child.midi.ins.len() {
+                                for (parent_in, child_in) in
+                                    parent.midi.ins.iter().zip(child.midi.ins.iter())
+                                {
+                                    let child_in_lock = child_in.lock();
+                                    if !child_in_lock
+                                        .connections
+                                        .iter()
+                                        .any(|c| Arc::ptr_eq(c, parent_in))
+                                    {
+                                        child_in_lock.connections.push(parent_in.clone());
+                                    }
+                                }
+                            }
+                            // Child MIDI output -> folder MIDI output (one-to-one when counts match).
+                            if parent.midi.outs.len() == child.midi.outs.len() {
+                                for (child_out, parent_out) in
+                                    child.midi.outs.iter().zip(parent.midi.outs.iter())
+                                {
+                                    let child_out_lock = child_out.lock();
+                                    if !child_out_lock
+                                        .connections
+                                        .iter()
+                                        .any(|c| Arc::ptr_eq(c, parent_out))
+                                    {
+                                        child_out_lock.connections.push(parent_out.clone());
+                                    }
+                                }
+                            }
+                            child.invalidate_audio_route_cache();
+                            parent.invalidate_audio_route_cache();
+                            child.invalidate_midi_route_cache();
+                            parent.invalidate_midi_route_cache();
+                        }
+                    }
+                }
+
+                // Restore default input->output passthrough so audio/MIDI can flow
+                // through the track whether it is a root track or a folder child.
+                {
+                    let state = self.state.lock();
+                    if let Some(child_arc) = state.tracks.get(track_name).cloned() {
+                        let child = child_arc.lock();
+                        child.ensure_default_audio_passthrough();
+                        child.ensure_default_midi_passthrough();
+                    }
+                }
+
+                for action in disconnect_actions {
+                    self.notify_clients(Ok(action)).await;
+                }
+
                 self.notify_clients(Ok(Action::TrackSetParent {
                     track_name: track_name.clone(),
                     parent_name: parent_name.clone(),
@@ -7857,28 +8569,51 @@ impl Engine {
                 Message::Ready(id) => self.push_ready_worker(id),
                 Message::Finished {
                     worker_id,
-                    track_name,
+                    task,
                     output_linear,
                     process_epoch,
                     parameter_updates,
                 } => {
+                    tracing::debug!(
+                        "engine received Finished from worker {} for task {:?} (epoch {} vs {})",
+                        worker_id,
+                        task,
+                        process_epoch,
+                        self.track_process_epoch
+                    );
                     self.push_ready_worker(worker_id);
-                    self.track_processing_started_at.remove(&track_name);
+                    let task_key = Self::task_key(&task);
+                    self.task_processing_started_at.remove(&task_key);
                     if process_epoch != self.track_process_epoch {
-                        if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+                        if let Some(track) = self
+                            .state
+                            .lock()
+                            .tracks
+                            .get(&Self::task_track_name(&task))
+                            .cloned()
+                        {
                             let t = track.lock();
                             t.audio.finished = false;
                             t.audio.processing = false;
                         }
                         continue;
                     }
+                    self.cycle_tasks_running
+                        .retain(|t| Self::task_key(t) != task_key);
+                    self.cycle_tasks_finished.push(task.clone());
+                    let track_name = Self::task_track_name(&task);
                     self.track_meter_linear_by_track
-                        .insert(track_name, output_linear);
+                        .insert(track_name.clone(), output_linear);
                     for action in parameter_updates {
                         self.notify_clients(Ok(action)).await;
                     }
-                    self.force_stalled_track_completions();
-                    let all_finished = self.send_tracks().await;
+                    self.force_stalled_task_completions();
+                    let all_finished = self.send_tasks().await;
+                    tracing::debug!(
+                        "engine after Finished for {}: all_finished={}",
+                        track_name,
+                        all_finished
+                    );
                     if all_finished {
                         self.on_all_tracks_finished().await;
                     }
@@ -7977,8 +8712,10 @@ impl Engine {
                 }
                 Message::HWFinished => {
                     if !self.awaiting_hwfinished {
+                        tracing::debug!("HWFinished ignored (not awaiting)");
                         continue;
                     }
+                    tracing::debug!("HWFinished handling; playing={}", self.playing);
                     self.handling_hwfinished = true;
                     self.awaiting_hwfinished = false;
                     #[cfg(unix)]
@@ -8078,7 +8815,14 @@ impl Engine {
                             self.notify_clients(Ok(action)).await;
                         }
                     }
-                    if self.send_tracks().await && self.hw_worker.is_some() {
+                    self.invalidate_track_cycle_state();
+                    let all_finished = self.send_tasks().await;
+                    tracing::debug!(
+                        "HWFinished send_tasks finished={} hw_worker={}",
+                        all_finished,
+                        self.hw_worker.is_some()
+                    );
+                    if all_finished && self.hw_worker.is_some() {
                         self.request_hw_cycle().await;
                     }
                     #[cfg(unix)]
@@ -8760,6 +9504,411 @@ mod tests {
             echoes.iter().any(
                 |a| matches!(a, Action::TrackAutomationBalance(name, _) if name == "pan-track")
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn track_set_parent_wires_folder_input_to_child_input_and_child_output_to_folder_output()
+    {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        let child = Track::new("child".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+        insert_track(&mut engine, child);
+
+        engine
+            .handle_request_inner(
+                Action::TrackSetParent {
+                    track_name: "child".to_string(),
+                    parent_name: Some("folder".to_string()),
+                },
+                false,
+            )
+            .await;
+
+        // Drain client messages so the channel does not block later drops.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await
+        {}
+
+        let state = engine.state.lock();
+        let folder = state.tracks.get("folder").unwrap().lock();
+        let child = state.tracks.get("child").unwrap().lock();
+
+        assert!(folder.child_tracks.iter().any(|c| c.lock().name == "child"));
+        assert_eq!(child.parent_track.as_deref(), Some("folder"));
+
+        // Folder input -> child input.
+        for (i, (parent_in, child_in)) in folder.audio.ins.iter().zip(&child.audio.ins).enumerate()
+        {
+            assert!(
+                child_in
+                    .connections
+                    .lock()
+                    .iter()
+                    .any(|c| Arc::ptr_eq(c, parent_in)),
+                "folder input {i} is not routed to child input {i}"
+            );
+            assert!(
+                !parent_in
+                    .connections
+                    .lock()
+                    .iter()
+                    .any(|c| Arc::ptr_eq(c, child_in)),
+                "folder input {i} should not read from child input {i}"
+            );
+        }
+
+        // Child output -> folder output.
+        for (i, (child_out, parent_out)) in
+            child.audio.outs.iter().zip(&folder.audio.outs).enumerate()
+        {
+            assert!(
+                parent_out
+                    .connections
+                    .lock()
+                    .iter()
+                    .any(|c| Arc::ptr_eq(c, child_out)),
+                "child output {i} is not routed to folder output {i}"
+            );
+        }
+
+        // Child passthrough is restored so audio can flow through.
+        for (i, child_out) in child.audio.outs.iter().enumerate() {
+            assert!(
+                child_out.connections.lock().iter().any(|c| {
+                    child
+                        .audio
+                        .ins
+                        .get(i)
+                        .is_some_and(|inp| Arc::ptr_eq(c, inp))
+                }),
+                "child output {i} is not connected to child input {i}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn track_set_parent_to_none_restores_root_passthrough() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        let child = Track::new("child".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+        insert_track(&mut engine, child);
+
+        engine
+            .handle_request_inner(
+                Action::TrackSetParent {
+                    track_name: "child".to_string(),
+                    parent_name: Some("folder".to_string()),
+                },
+                false,
+            )
+            .await;
+        engine
+            .handle_request_inner(
+                Action::TrackSetParent {
+                    track_name: "child".to_string(),
+                    parent_name: None,
+                },
+                false,
+            )
+            .await;
+
+        while let Ok(Some(_)) =
+            tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await
+        {}
+
+        let state = engine.state.lock();
+        let folder = state.tracks.get("folder").unwrap().lock();
+        let child = state.tracks.get("child").unwrap().lock();
+
+        assert!(folder.child_tracks.is_empty());
+        assert!(child.parent_track.is_none());
+
+        for (i, child_out) in child.audio.outs.iter().enumerate() {
+            assert!(
+                child_out.connections.lock().iter().any(|c| {
+                    child
+                        .audio
+                        .ins
+                        .get(i)
+                        .is_some_and(|inp| Arc::ptr_eq(c, inp))
+                }),
+                "child output {i} should be connected to child input {i} after moving to root"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn track_set_parent_wires_folder_midi_to_child_midi() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let child = Track::new("child".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+        insert_track(&mut engine, child);
+
+        engine
+            .handle_request_inner(
+                Action::TrackSetParent {
+                    track_name: "child".to_string(),
+                    parent_name: Some("folder".to_string()),
+                },
+                false,
+            )
+            .await;
+
+        while let Ok(Some(_)) =
+            tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await
+        {}
+
+        let state = engine.state.lock();
+        let folder = state.tracks.get("folder").unwrap().lock();
+        let child = state.tracks.get("child").unwrap().lock();
+
+        let folder_midi_in = &folder.midi.ins[0];
+        let child_midi_in = &child.midi.ins[0];
+        assert!(
+            child_midi_in
+                .lock()
+                .connections
+                .iter()
+                .any(|c| Arc::ptr_eq(c, folder_midi_in)),
+            "folder MIDI input should be routed to child MIDI input"
+        );
+
+        let child_midi_out = &child.midi.outs[0];
+        let folder_midi_out = &folder.midi.outs[0];
+        assert!(
+            child_midi_out
+                .lock()
+                .connections
+                .iter()
+                .any(|c| Arc::ptr_eq(c, folder_midi_out)),
+            "child MIDI output should be routed to folder MIDI output"
+        );
+    }
+
+    #[test]
+    fn nested_folder_expands_in_task_graph() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let outer = Track::new_folder("outer".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        let inner = Track::new_folder("inner".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        let leaf = Track::new("leaf".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, outer);
+        insert_track(&mut engine, inner);
+        insert_track(&mut engine, leaf);
+
+        {
+            let state = engine.state.lock();
+            let outer = state.tracks.get("outer").unwrap().clone();
+            let inner = state.tracks.get("inner").unwrap().clone();
+            let leaf = state.tracks.get("leaf").unwrap().clone();
+            outer.lock().child_tracks.push(inner.clone());
+            inner.lock().child_tracks.push(leaf.clone());
+            inner.lock().parent_track = Some("outer".to_string());
+            leaf.lock().parent_track = Some("inner".to_string());
+        }
+
+        let (tasks, deps) = engine.build_task_graph();
+        let names: Vec<String> = tasks
+            .iter()
+            .map(|t| match t {
+                ProcessTask::Track(t) => format!("track:{}", t.lock().name.clone()),
+                ProcessTask::FolderInput(t) => format!("in:{}", t.lock().name.clone()),
+                ProcessTask::FolderOutput(t) => format!("out:{}", t.lock().name.clone()),
+                ProcessTask::Plugin { track, .. } => {
+                    format!("plugin:{}", track.lock().name.clone())
+                }
+            })
+            .collect();
+
+        let expected = vec![
+            "in:outer",
+            "in:inner",
+            "track:leaf",
+            "out:inner",
+            "out:outer",
+        ];
+        assert_eq!(names, expected, "task graph should expand nested folders");
+
+        // Each task should depend on the previous one.
+        for window in tasks.windows(2) {
+            let prev = &window[0];
+            let next = &window[1];
+            let prev_key = Engine::task_key(prev);
+            let next_key = Engine::task_key(next);
+            assert!(
+                deps.get(&next_key).is_some_and(|d| d.contains(&prev_key)),
+                "{:?} should depend on {:?}",
+                next,
+                prev
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn track_set_parent_wires_child_io_to_folder_even_after_addtrack() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        let child = Track::new("child".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+        insert_track(&mut engine, child);
+
+        engine
+            .handle_request_inner(
+                Action::TrackSetParent {
+                    track_name: "child".to_string(),
+                    parent_name: Some("folder".to_string()),
+                },
+                false,
+            )
+            .await;
+
+        while let Ok(Some(_)) =
+            tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await
+        {}
+
+        let state = engine.state.lock();
+        let folder = state.tracks.get("folder").unwrap().lock();
+        let child = state.tracks.get("child").unwrap().lock();
+
+        // Folder input -> child input.
+        for (i, (parent_in, child_in)) in folder.audio.ins.iter().zip(&child.audio.ins).enumerate()
+        {
+            assert!(
+                child_in
+                    .connections
+                    .lock()
+                    .iter()
+                    .any(|c| Arc::ptr_eq(c, parent_in)),
+                "folder input {i} is not routed to child input {i}"
+            );
+        }
+
+        // Child output -> folder output.
+        for (i, (child_out, parent_out)) in
+            child.audio.outs.iter().zip(&folder.audio.outs).enumerate()
+        {
+            assert!(
+                parent_out
+                    .connections
+                    .lock()
+                    .iter()
+                    .any(|c| Arc::ptr_eq(c, child_out)),
+                "child output {i} is not routed to folder output {i}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_child_audio_passes_through() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let child = Track::new("child".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+        insert_track(&mut engine, child);
+
+        engine
+            .handle_request_inner(
+                Action::TrackSetParent {
+                    track_name: "child".to_string(),
+                    parent_name: Some("folder".to_string()),
+                },
+                false,
+            )
+            .await;
+        while let Ok(Some(_)) =
+            tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await
+        {}
+
+        {
+            let state = engine.state.lock();
+            let folder = state.tracks.get("folder").unwrap().clone();
+            let child = state.tracks.get("child").unwrap().clone();
+
+            folder.lock().input_monitor = vec![true];
+            child.lock().input_monitor = vec![true];
+
+            // Feed a signal into the folder input from an external source.
+            let source = Arc::new(crate::audio::io::AudioIO::new(64));
+            for sample in source.buffer.lock().iter_mut() {
+                *sample = 0.75;
+            }
+            crate::audio::io::AudioIO::connect(&source, &folder.lock().audio.ins[0]);
+
+            folder.lock().process_folder_input();
+            child.lock().process();
+            folder.lock().process_folder_output();
+
+            let output = folder.lock().audio.outs[0].buffer.lock();
+            assert!(
+                output.iter().any(|s| (*s - 0.75).abs() < 1e-5),
+                "folder output should contain the child-processed folder input signal, got {:?}",
+                output.iter().take(8).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_folder_track_deletes_descendants_recursively() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let child = Track::new_folder("child".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let grandchild = Track::new("grandchild".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+        insert_track(&mut engine, child);
+        insert_track(&mut engine, grandchild);
+
+        engine
+            .handle_request(Action::TrackSetParent {
+                track_name: "child".to_string(),
+                parent_name: Some("folder".to_string()),
+            })
+            .await;
+        engine
+            .handle_request(Action::TrackSetParent {
+                track_name: "grandchild".to_string(),
+                parent_name: Some("child".to_string()),
+            })
+            .await;
+
+        // Drain TrackSetParent notifications so we can inspect the removal notifications.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await
+        {}
+
+        engine
+            .handle_request(Action::RemoveTrack("folder".to_string()))
+            .await;
+
+        {
+            let state = engine.state.lock();
+            assert!(
+                !state.tracks.contains_key("folder"),
+                "folder should have been removed"
+            );
+            assert!(
+                !state.tracks.contains_key("child"),
+                "child should have been removed"
+            );
+            assert!(
+                !state.tracks.contains_key("grandchild"),
+                "grandchild should have been removed"
+            );
+        }
+
+        let mut removed_names = Vec::new();
+        for _ in 0..3 {
+            let msg = tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;
+            if let Ok(Some(Message::Response(Ok(Action::RemoveTrack(name))))) = msg {
+                removed_names.push(name);
+            }
+        }
+        assert_eq!(
+            removed_names,
+            vec!["grandchild", "child", "folder"],
+            "descendants should be removed before the folder and clients notified"
         );
     }
 }

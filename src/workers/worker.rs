@@ -1,7 +1,7 @@
 use crate::{
     message::{
         Action, Message, OfflineAutomationLane, OfflineAutomationPoint, OfflineAutomationTarget,
-        OfflineBounceWork,
+        OfflineBounceWork, ProcessTask,
     },
     midi::io::MidiEvent,
 };
@@ -403,31 +403,66 @@ impl Worker {
 
     pub async fn work(&mut self) {
         crate::enable_flush_denormals_to_zero();
-        let _ = Self::try_enable_realtime(self.realtime_priority);
+        if let Err(e) = Self::try_enable_realtime(self.realtime_priority) {
+            tracing::warn!(
+                "Worker {} realtime priority {} not enabled: {}",
+                self.id,
+                self.realtime_priority,
+                e
+            );
+        }
         while let Some(message) = self.rx.recv().await {
             match message {
                 Message::Request(Action::Quit) => {
                     return;
                 }
-                Message::ProcessTrack(t) => {
-                    let (track_name, output_linear, process_epoch, parameter_updates) = {
-                        let track = t.lock();
-                        let process_epoch = track.process_epoch;
-                        track.process();
-                        track.audio.processing = false;
-                        let updates = std::mem::take(track.echoed_parameter_updates.lock());
-                        (
-                            track.name.clone(),
-                            track.output_meter_linear(),
-                            process_epoch,
-                            updates,
-                        )
+                Message::ProcessTask(task) => {
+                    tracing::debug!("worker {} received task {:?}", self.id, task);
+                    let (output_linear, process_epoch, parameter_updates) = match &task {
+                        ProcessTask::Track(t) => {
+                            let track = t.lock();
+                            let process_epoch = track.process_epoch;
+                            track.process();
+                            track.audio.processing = false;
+                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
+                            (track.output_meter_linear(), process_epoch, updates)
+                        }
+                        ProcessTask::FolderInput(t) => {
+                            let track = t.lock();
+                            let process_epoch = track.process_epoch;
+                            track.process_folder_input();
+                            track.audio.processing = false;
+                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
+                            (track.output_meter_linear(), process_epoch, updates)
+                        }
+                        ProcessTask::FolderOutput(t) => {
+                            let track = t.lock();
+                            let process_epoch = track.process_epoch;
+                            track.process_folder_output();
+                            track.audio.processing = false;
+                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
+                            (track.output_meter_linear(), process_epoch, updates)
+                        }
+                        ProcessTask::Plugin { track, kind, index } => {
+                            let track = track.lock();
+                            let process_epoch = track.process_epoch;
+                            track.process_plugin(*kind, *index);
+                            track.audio.processing = false;
+                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
+                            (track.output_meter_linear(), process_epoch, updates)
+                        }
                     };
+                    tracing::debug!(
+                        "worker {} finished task {:?}, output_linear={:?}",
+                        self.id,
+                        task,
+                        output_linear
+                    );
                     let _ = self
                         .tx
                         .send(Message::Finished {
                             worker_id: self.id,
-                            track_name,
+                            task,
                             output_linear,
                             process_epoch,
                             parameter_updates,

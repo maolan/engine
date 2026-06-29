@@ -1,8 +1,7 @@
 use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
-use crate::message::PluginGraphNode;
-use crate::message::{PluginGraphConnection, PluginGraphPlugin};
+use crate::message::{PluginGraphConnection, PluginGraphNode, PluginGraphPlugin, PluginKind};
 use crate::mutex::UnsafeMutex;
 #[cfg(unix)]
 use crate::rubberband::LivePitchShifter;
@@ -21,6 +20,13 @@ use std::{
 };
 
 type MidiClipEvents = Arc<Vec<(usize, Vec<u8>)>>;
+
+struct TrackIoCounts {
+    audio_ins: usize,
+    audio_outs: usize,
+    midi_ins: usize,
+    midi_outs: usize,
+}
 
 pub struct ClapInstance {
     pub id: usize,
@@ -455,6 +461,7 @@ pub struct Track {
     pub is_folder: bool,
     pub folder_open: bool,
     pub parent_track: Option<String>,
+    pub child_tracks: Vec<Arc<UnsafeMutex<Box<Track>>>>,
     pub frozen: bool,
     pub midi_lane_channels: Vec<Option<u8>>,
     primary_audio_ins: usize,
@@ -508,19 +515,23 @@ pub struct Track {
     midi_input_to_out_routes_cache: Vec<Vec<usize>>,
     midi_out_external_targets_cache: Vec<Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>>,
     midi_route_cache_dirty: bool,
+
+    folder_input_midi_events: Vec<Vec<MidiEvent>>,
+    folder_plugin_midi_node_events: HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+    folder_processed_midi_plugins: HashSet<PluginGraphNode>,
+    folder_clip_playback_active: bool,
+    folder_record_tap_input_snapshots: Vec<Vec<f32>>,
 }
 
 impl Track {
     const METRONOME_DEFAULT_LEVEL_DB: f32 = -10.0;
 
-    pub fn new(
+    fn new_raw(
         name: String,
-        audio_ins: usize,
-        audio_outs: usize,
-        midi_ins: usize,
-        midi_outs: usize,
+        io: TrackIoCounts,
         buffer_size: usize,
         sample_rate: f64,
+        is_folder: bool,
     ) -> Self {
         Self {
             name,
@@ -531,10 +542,10 @@ impl Track {
             phase_inverted: false,
             soloed: false,
             is_master: false,
-            input_monitor: vec![false; audio_ins],
-            disk_monitor: vec![true; audio_ins],
-            midi_input_monitor: vec![false; midi_ins],
-            midi_disk_monitor: vec![true; midi_ins],
+            input_monitor: vec![false; io.audio_ins],
+            disk_monitor: vec![true; io.audio_ins],
+            midi_input_monitor: vec![false; io.midi_ins],
+            midi_disk_monitor: vec![true; io.midi_ins],
             color: None,
             midi_learn_volume: None,
             midi_learn_balance: None,
@@ -543,15 +554,16 @@ impl Track {
             midi_learn_arm: None,
             midi_learn_input_monitor: None,
             midi_learn_disk_monitor: None,
-            is_folder: false,
+            is_folder,
             folder_open: true,
             parent_track: None,
+            child_tracks: Vec::new(),
             frozen: false,
-            midi_lane_channels: vec![None; midi_ins],
-            primary_audio_ins: audio_ins,
-            primary_audio_outs: audio_outs,
-            audio: AudioTrack::new(audio_ins, audio_outs, buffer_size),
-            midi: MIDITrack::new(midi_ins, midi_outs),
+            midi_lane_channels: vec![None; io.midi_ins],
+            primary_audio_ins: io.audio_ins,
+            primary_audio_outs: io.audio_outs,
+            audio: AudioTrack::new(io.audio_ins, io.audio_outs, buffer_size),
+            midi: MIDITrack::new(io.midi_ins, io.midi_outs),
             clap_plugins: Vec::new(),
             vst3_plugins: Vec::new(),
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -581,9 +593,9 @@ impl Track {
             tsig_denom: 4,
             clip_playback_enabled: true,
             metronome_enabled: false,
-            output_meter_linear_cache: vec![0.0; audio_outs],
-            meter_peak_hold_linear: vec![0.0; audio_outs],
-            record_tap_outs: vec![vec![0.0; buffer_size]; audio_outs],
+            output_meter_linear_cache: vec![0.0; io.audio_outs],
+            meter_peak_hold_linear: vec![0.0; io.audio_outs],
+            record_tap_outs: vec![vec![0.0; buffer_size]; io.audio_outs],
             record_tap_midi_in: vec![],
             session_base_dir: None,
             record_tap_enabled: false,
@@ -598,7 +610,60 @@ impl Track {
             midi_input_to_out_routes_cache: Vec::new(),
             midi_out_external_targets_cache: Vec::new(),
             midi_route_cache_dirty: true,
+
+            folder_input_midi_events: Vec::new(),
+            folder_plugin_midi_node_events: HashMap::new(),
+            folder_processed_midi_plugins: HashSet::new(),
+            folder_clip_playback_active: false,
+            folder_record_tap_input_snapshots: Vec::new(),
         }
+    }
+
+    pub fn new(
+        name: String,
+        audio_ins: usize,
+        audio_outs: usize,
+        midi_ins: usize,
+        midi_outs: usize,
+        buffer_size: usize,
+        sample_rate: f64,
+    ) -> Self {
+        Self::new_raw(
+            name,
+            TrackIoCounts {
+                audio_ins,
+                audio_outs,
+                midi_ins,
+                midi_outs,
+            },
+            buffer_size,
+            sample_rate,
+            false,
+        )
+        .with_default_passthrough()
+    }
+
+    pub fn new_folder(
+        name: String,
+        audio_ins: usize,
+        audio_outs: usize,
+        midi_ins: usize,
+        midi_outs: usize,
+        buffer_size: usize,
+        sample_rate: f64,
+    ) -> Self {
+        Self::new_raw(
+            name,
+            TrackIoCounts {
+                audio_ins,
+                audio_outs,
+                midi_ins,
+                midi_outs,
+            },
+            buffer_size,
+            sample_rate,
+            true,
+        )
         .with_default_passthrough()
     }
 
@@ -630,7 +695,7 @@ impl Track {
         reconfigured
     }
 
-    fn connect_directed_audio(from: &Arc<AudioIO>, to: &Arc<AudioIO>) {
+    pub fn connect_directed_audio(from: &Arc<AudioIO>, to: &Arc<AudioIO>) {
         let new_len = {
             let conns = to.connections.lock();
             if !conns.iter().any(|conn| Arc::ptr_eq(conn, from)) {
@@ -832,64 +897,21 @@ impl Track {
     fn process_render_block(&mut self) -> usize {
         let live_mode = self.is_realtime_domain();
         let t0 = std::time::Instant::now();
-        for audio_in in &self.audio.ins {
-            audio_in.process();
-        }
-        let t1 = std::time::Instant::now();
-        let frames = self
-            .audio
-            .ins
-            .first()
-            .map(|audio_in| audio_in.buffer.lock().len())
-            .or_else(|| {
-                self.audio
-                    .outs
-                    .first()
-                    .map(|audio_out| audio_out.buffer.lock().len())
-            })
-            .unwrap_or(self.process_block_size);
-        if let Some(source) = self.ensure_metronome_source(frames) {
-            self.synthesize_metronome_into(&source, frames);
-        }
-        let t2 = std::time::Instant::now();
-        let audio_disk_active = self.disk_monitor.iter().any(|&m| m);
-        let midi_disk_active = self.midi_disk_monitor.iter().any(|&m| m);
-        let clip_playback_active =
-            (audio_disk_active || midi_disk_active) && self.clip_playback_enabled;
-        let record_tap_input_snapshots = if self.armed && self.record_tap_enabled {
-            self.audio
-                .ins
-                .iter()
-                .map(|audio_in| audio_in.buffer.lock().to_vec())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        let t3 = std::time::Instant::now();
-        let mut track_input_midi_events = self.collect_track_input_midi_events();
-        let t4 = std::time::Instant::now();
-        if clip_playback_active {
-            self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
-            for (lane, audio_in) in self.audio.ins.iter().enumerate() {
-                if !self.input_monitor.get(lane).copied().unwrap_or(false) {
-                    audio_in.buffer.lock().fill(0.0);
-                }
-            }
-            self.mix_clip_audio_into_inputs();
-        }
+        self.process_folder_input();
         let t5 = std::time::Instant::now();
+        let frames = self.compute_process_frames();
 
         {
             let track_name = self.name.clone();
+            let track_input_events = self.folder_input_midi_events.clone();
             let can_skip_plugins = !live_mode
                 && self.last_render_block_silent
-                && track_input_midi_events.is_empty()
+                && track_input_events.is_empty()
                 && self.audio.ins.iter().all(|audio_in| {
                     let buf = audio_in.buffer.lock();
                     buf.iter().all(|&s| s == 0.0)
                 });
-            let midi_node_events = if can_skip_plugins {
+            if can_skip_plugins {
                 for instance in &self.clap_plugins {
                     for output in instance.processor.lock().audio_outputs() {
                         output.buffer.lock().fill(0.0);
@@ -907,55 +929,303 @@ impl Track {
                     }
                 }
                 self.echoed_parameter_updates.lock().clear();
-                std::collections::HashMap::new()
+                self.folder_plugin_midi_node_events.clear();
+                self.folder_processed_midi_plugins.clear();
             } else {
-                self.process_track_plugins_in_graph_order(frames, &track_input_midi_events)
-            };
-            let t6 = std::time::Instant::now();
-            let t7 = t6;
-            let t8 = t6;
-            if !can_skip_plugins {
-                self.route_plugin_midi_to_track_outputs_graph(
-                    &track_input_midi_events,
-                    &midi_node_events,
-                );
+                self.process_track_plugins_in_graph_order(frames);
             }
+            let t6 = std::time::Instant::now();
             let t9 = std::time::Instant::now();
             let total = t9.duration_since(t0).as_secs_f64() * 1000.0;
             if total > 20.0 {
-                let clap_count = self.clap_plugins.len();
-                let vst3_count = self.vst3_plugins.len();
+                let _clap_count = self.clap_plugins.len();
+                let _vst3_count = self.vst3_plugins.len();
                 #[cfg(all(unix, not(target_os = "macos")))]
-                let lv2_count = self.lv2_plugins.len();
+                let _lv2_count = self.lv2_plugins.len();
                 #[cfg(not(all(unix, not(target_os = "macos"))))]
                 let lv2_count = 0;
                 tracing::warn!(
-                    "Track '{}' process breakdown: total={:.1}ms audio_in={:.1}ms metronome={:.1}ms preload={:.1}ms midi_collect={:.1}ms clip_mix={:.1}ms clap_plugins(n={})={:.1}ms vst3_plugins(n={})={:.1}ms lv2_plugins(n={})={:.1}ms midi_route={:.1}ms",
+                    "Track '{}' process breakdown: total={:.1}ms clip_mix={:.1}ms plugins={:.1}ms midi_route={:.1}ms",
                     track_name,
                     total,
-                    t1.duration_since(t0).as_secs_f64() * 1000.0,
-                    t2.duration_since(t1).as_secs_f64() * 1000.0,
-                    t3.duration_since(t2).as_secs_f64() * 1000.0,
-                    t4.duration_since(t3).as_secs_f64() * 1000.0,
-                    t5.duration_since(t4).as_secs_f64() * 1000.0,
-                    clap_count,
+                    t5.duration_since(t0).as_secs_f64() * 1000.0,
                     t6.duration_since(t5).as_secs_f64() * 1000.0,
-                    vst3_count,
-                    t7.duration_since(t6).as_secs_f64() * 1000.0,
-                    lv2_count,
-                    t8.duration_since(t7).as_secs_f64() * 1000.0,
-                    t9.duration_since(t8).as_secs_f64() * 1000.0,
+                    t9.duration_since(t6).as_secs_f64() * 1000.0,
                 );
             }
         }
 
+        self.process_folder_output();
+        frames
+    }
+
+    pub fn process(&mut self) {
+        let _ = self.process_render_block();
+    }
+
+    pub fn process_folder_input(&mut self) {
+        for audio_in in &self.audio.ins {
+            audio_in.process();
+        }
+        let frames = self
+            .audio
+            .ins
+            .first()
+            .map(|audio_in| audio_in.buffer.lock().len())
+            .or_else(|| {
+                self.audio
+                    .outs
+                    .first()
+                    .map(|audio_out| audio_out.buffer.lock().len())
+            })
+            .unwrap_or(self.process_block_size);
+        if let Some(source) = self.ensure_metronome_source(frames) {
+            self.synthesize_metronome_into(&source, frames);
+        }
+        let audio_disk_active = self.disk_monitor.iter().any(|&m| m);
+        let midi_disk_active = self.midi_disk_monitor.iter().any(|&m| m);
+        self.folder_clip_playback_active =
+            (audio_disk_active || midi_disk_active) && self.clip_playback_enabled;
+        tracing::debug!(
+            "process_folder_input for '{}' active={} disk={:?} clip_enabled={}",
+            self.name,
+            self.folder_clip_playback_active,
+            self.disk_monitor,
+            self.clip_playback_enabled
+        );
+        self.folder_record_tap_input_snapshots = if self.armed && self.record_tap_enabled {
+            self.audio
+                .ins
+                .iter()
+                .map(|audio_in| audio_in.buffer.lock().to_vec())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let mut track_input_midi_events = self.collect_track_input_midi_events();
+        if self.folder_clip_playback_active {
+            self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
+            for (lane, audio_in) in self.audio.ins.iter().enumerate() {
+                if !self.input_monitor.get(lane).copied().unwrap_or(false) {
+                    audio_in.buffer.lock().fill(0.0);
+                }
+            }
+            let mix_start = std::time::Instant::now();
+            self.mix_clip_audio_into_inputs();
+            let mix_elapsed = mix_start.elapsed().as_secs_f64() * 1000.0;
+            if mix_elapsed > 1.0 {
+                tracing::warn!(
+                    "mix_clip_audio_into_inputs for '{}' took {:.2}ms",
+                    self.name,
+                    mix_elapsed
+                );
+            }
+        }
+
+        self.folder_input_midi_events = track_input_midi_events.clone();
+
+        // Folder children receive the same input MIDI events as the folder.
+        if !self.child_tracks.is_empty() {
+            for child in &self.child_tracks {
+                let child = child.lock();
+                for (i, events) in track_input_midi_events.iter().enumerate() {
+                    if let Some(child_in) = child.midi.ins.get(i) {
+                        child_in.lock().buffer.extend_from_slice(events);
+                    }
+                }
+            }
+        }
+
+        self.folder_plugin_midi_node_events.clear();
+        self.folder_processed_midi_plugins.clear();
+    }
+
+    fn compute_process_frames(&self) -> usize {
+        self.audio
+            .ins
+            .first()
+            .map(|audio_in| audio_in.buffer.lock().len())
+            .or_else(|| {
+                self.audio
+                    .outs
+                    .first()
+                    .map(|audio_out| audio_out.buffer.lock().len())
+            })
+            .unwrap_or(self.process_block_size)
+    }
+
+    pub fn process_plugin(&mut self, kind: PluginKind, index: usize) {
+        let frames = self.compute_process_frames();
+        let track_input_events = self.folder_input_midi_events.clone();
+
+        match kind {
+            PluginKind::Clap => {
+                if index >= self.clap_plugins.len() {
+                    return;
+                }
+                let processor = self.clap_plugins[index].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[index].id);
+                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
+                    return;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    &track_input_events,
+                    &self.folder_plugin_midi_node_events,
+                );
+                let clap_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(
+                    frames,
+                    &clap_input,
+                    crate::plugins::types::ClapTransportInfo {
+                        transport_sample: self.transport_sample,
+                        playing: (self.disk_monitor.iter().any(|&m| m)
+                            || self.midi_disk_monitor.iter().any(|&m| m))
+                            && self.clip_playback_enabled,
+                        loop_enabled: self.loop_enabled,
+                        loop_range_samples: self.loop_range_samples,
+                        bpm: self.tempo_bpm,
+                        tsig_num: self.tsig_num,
+                        tsig_denom: self.tsig_denom,
+                    },
+                );
+                let track_name = self.name.clone();
+                for ev in processor.drain_echoed_parameters() {
+                    self.echoed_parameter_updates.lock().push(
+                        crate::message::Action::TrackSetClapParameter {
+                            track_name: track_name.clone(),
+                            instance_id: self.clap_plugins[index].id,
+                            param_id: ev.param_index,
+                            value: ev.value as f64,
+                        },
+                    );
+                }
+                for evt in outputs {
+                    self.folder_plugin_midi_node_events
+                        .entry((node.clone(), evt.port))
+                        .or_default()
+                        .push(evt.event);
+                }
+                self.folder_processed_midi_plugins.insert(node);
+            }
+            PluginKind::Vst3 => {
+                if index >= self.vst3_plugins.len() {
+                    return;
+                }
+                let processor = self.vst3_plugins[index].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[index].id);
+                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
+                    return;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    &track_input_events,
+                    &self.folder_plugin_midi_node_events,
+                );
+                let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(frames, &vst3_input);
+                let track_name = self.name.clone();
+                for ev in processor.drain_echoed_parameters() {
+                    self.echoed_parameter_updates.lock().push(
+                        crate::message::Action::TrackSetVst3Parameter {
+                            track_name: track_name.clone(),
+                            instance_id: self.vst3_plugins[index].id,
+                            param_id: ev.param_index,
+                            value: ev.value,
+                        },
+                    );
+                }
+                if !outputs.is_empty() {
+                    self.folder_plugin_midi_node_events
+                        .insert((node.clone(), 0), outputs);
+                }
+                self.folder_processed_midi_plugins.insert(node);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginKind::Lv2 => {
+                if index >= self.lv2_plugins.len() {
+                    return;
+                }
+                let processor = self.lv2_plugins[index].processor.lock();
+                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[index].id);
+                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
+                    return;
+                }
+                for input in processor.audio_inputs() {
+                    input.process();
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    &track_input_events,
+                    &self.folder_plugin_midi_node_events,
+                );
+                let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs = processor.process_with_midi(frames, &lv2_input);
+                let track_name = self.name.clone();
+                for ev in processor.drain_echoed_parameters() {
+                    self.echoed_parameter_updates.lock().push(
+                        crate::message::Action::TrackSetLv2ControlValue {
+                            track_name: track_name.clone(),
+                            instance_id: self.lv2_plugins[index].id,
+                            index: ev.param_index,
+                            value: ev.value,
+                        },
+                    );
+                }
+                if !outputs.is_empty() {
+                    self.folder_plugin_midi_node_events
+                        .insert((node.clone(), 0), outputs);
+                }
+                self.folder_processed_midi_plugins.insert(node);
+            }
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            PluginKind::Lv2 => {}
+        }
+    }
+
+    pub fn process_folder_output(&mut self) {
+        let track_input_events = self.folder_input_midi_events.clone();
+        let midi_node_events = self.folder_plugin_midi_node_events.clone();
+
         self.ensure_midi_route_cache();
-        self.route_track_inputs_to_track_outputs(&track_input_midi_events);
+        self.route_plugin_midi_to_track_outputs_graph(&track_input_events, &midi_node_events);
+        self.route_track_inputs_to_track_outputs(&track_input_events);
+
+        // Sum child-track MIDI outputs into the folder's MIDI outputs.
+        for child in &self.child_tracks {
+            let child = child.lock();
+            for (out_idx, child_out) in child.midi.outs.iter().enumerate() {
+                if let Some(folder_out) = self.midi.outs.get(out_idx) {
+                    let events = {
+                        let child_out_lock = child_out.lock();
+                        child_out_lock.buffer.clone()
+                    };
+                    if !events.is_empty() {
+                        folder_out.lock().buffer.extend_from_slice(&events);
+                    }
+                }
+            }
+        }
+
         self.route_modulator_midi_to_track_outputs();
         self.route_automation_midi_to_track_outputs();
         self.collect_hw_midi_output_events();
         self.dispatch_track_output_midi_to_connected_inputs();
         self.clear_local_midi_inputs();
+
         let linear_gain = 10.0_f32.powf(self.level / 20.0);
         let phase_multiplier = if self.phase_inverted { -1.0 } else { 1.0 };
         let (left_balance, right_balance) = if self.audio.outs.len() == 2 {
@@ -974,6 +1244,8 @@ impl Track {
             self.meter_peak_hold_linear
                 .resize(self.audio.outs.len(), 0.0);
         }
+        let clip_playback_active = self.folder_clip_playback_active;
+        let record_tap_input_snapshots = self.folder_record_tap_input_snapshots.clone();
         let mut all_outputs_zero = true;
         for out_idx in 0..self.audio.outs.len() {
             let audio_out = self.audio.outs[out_idx].clone();
@@ -1096,11 +1368,6 @@ impl Track {
         self.last_render_block_silent = all_outputs_zero;
         self.audio.finished = true;
         self.audio.processing = false;
-        frames
-    }
-
-    pub fn process(&mut self) {
-        let _ = self.process_render_block();
     }
 
     pub fn name(&self) -> String {
@@ -1208,8 +1475,15 @@ impl Track {
             *monitor = !*monitor;
         }
     }
+
     pub fn set_session_base_dir(&mut self, base_dir: Option<PathBuf>) {
         if self.session_base_dir != base_dir {
+            tracing::warn!(
+                "Clearing clip caches for track '{}' because session base dir changed from {:?} to {:?}",
+                self.name,
+                self.session_base_dir,
+                base_dir
+            );
             self.session_base_dir = base_dir;
 
             self.audio_clip_cache.clear();
@@ -1887,7 +2161,17 @@ impl Track {
         }
 
         let playback_name = Self::clip_playback_name(clip);
-        let buffer = self.audio_clip_cache.get(playback_name).cloned()?;
+        let buffer = match self.audio_clip_cache.get(playback_name).cloned() {
+            Some(buffer) => buffer,
+            None => {
+                tracing::warn!(
+                    "Audio clip cache miss for '{}' on track '{}'; loading from disk",
+                    playback_name,
+                    self.name
+                );
+                self.clip_buffer(playback_name)?
+            }
+        };
         let has_clip_plugins = clip.plugin_graph_json.is_some();
         if has_clip_plugins {
             active_clip_plugin_keys.insert(Self::clip_plugin_runtime_key(
@@ -2003,6 +2287,18 @@ impl Track {
 
         let channels = buffer.channels.max(1);
         let total_frames = buffer.samples.len() / channels;
+        tracing::debug!(
+            "render_audio_clip_segment buffer '{}' channels={} total_frames={} first_sample={} max_abs={}",
+            playback_name,
+            channels,
+            total_frames,
+            buffer.samples.first().copied().unwrap_or(0.0),
+            buffer
+                .samples
+                .iter()
+                .map(|s| s.abs())
+                .fold(0.0_f32, |a, b| a.max(b))
+        );
         if total_frames == 0 {
             return None;
         }
@@ -2493,6 +2789,12 @@ impl Track {
             .first()
             .map(|audio_in| audio_in.buffer.lock().len())
             .unwrap_or(0);
+        tracing::debug!(
+            "mix_clip_audio_into_inputs for '{}' frames={} clips={}",
+            self.name,
+            frames,
+            self.audio.clips.len()
+        );
         if frames == 0 || self.audio.ins.is_empty() {
             return;
         }
@@ -2501,12 +2803,26 @@ impl Track {
         let segments = self.cycle_segments(frames);
         for clip in self.audio.clips.clone() {
             if clip.muted {
+                tracing::debug!("mix_clip_audio_into_inputs clip '{}' muted", clip.name);
                 continue;
             }
             for (segment_start, segment_end, out_offset) in &segments {
                 let clip_start = clip.start;
                 let clip_end = clip_start.saturating_add(clip.end);
+                tracing::debug!(
+                    "mix_clip_audio_into_inputs clip '{}' range={}-{} segment={}-{} transport={}",
+                    clip.name,
+                    clip_start,
+                    clip_end,
+                    segment_start,
+                    segment_end,
+                    self.transport_sample
+                );
                 if clip_end <= *segment_start || clip_start >= *segment_end {
+                    tracing::debug!(
+                        "mix_clip_audio_into_inputs clip '{}' skipped (out of range)",
+                        clip.name
+                    );
                     continue;
                 }
                 let from = (*segment_start).max(clip_start);
@@ -2520,8 +2836,10 @@ impl Track {
                         .unwrap_or(0),
                 );
                 if copy_len == 0 {
+                    tracing::debug!("mix_clip_audio_into_inputs clip '{}' copy_len=0", clip.name);
                     continue;
                 }
+                let render_start = std::time::Instant::now();
                 let Some(processed_blocks) = self.render_audio_clip_segment(
                     &clip,
                     0,
@@ -2529,8 +2847,28 @@ impl Track {
                     copy_len,
                     &mut active_clip_plugin_keys,
                 ) else {
+                    tracing::debug!(
+                        "mix_clip_audio_into_inputs clip '{}' render returned None",
+                        clip.name
+                    );
                     continue;
                 };
+                let render_elapsed = render_start.elapsed().as_secs_f64() * 1000.0;
+                if render_elapsed > 1.0 {
+                    tracing::warn!(
+                        "render_audio_clip_segment for '{}' clip '{}' len={} took {:.2}ms",
+                        self.name,
+                        clip.name,
+                        copy_len,
+                        render_elapsed
+                    );
+                }
+                tracing::debug!(
+                    "mix_clip_audio_into_inputs clip '{}' rendered {} channels, first sample={:?}",
+                    clip.name,
+                    processed_blocks.len(),
+                    processed_blocks.first().and_then(|b| b.first())
+                );
                 for in_channel in 0..self.audio.ins.len() {
                     if !self.disk_monitor.get(in_channel).copied().unwrap_or(false) {
                         continue;
@@ -4063,7 +4401,11 @@ impl Track {
         self
     }
 
-    pub(crate) fn ensure_default_audio_passthrough(&mut self) {
+    pub fn ensure_default_audio_passthrough(&mut self) {
+        if self.is_folder {
+            self.disconnect_audio_inputs_from_outputs();
+            return;
+        }
         if self.audio.ins.is_empty() {
             self.invalidate_audio_route_cache();
             return;
@@ -4088,7 +4430,27 @@ impl Track {
         self.invalidate_audio_route_cache();
     }
 
-    pub(crate) fn ensure_default_midi_passthrough(&mut self) {
+    fn disconnect_audio_inputs_from_outputs(&mut self) {
+        for audio_in in &self.audio.ins {
+            audio_in
+                .connections
+                .lock()
+                .retain(|conn| !self.audio.outs.iter().any(|out| Arc::ptr_eq(out, conn)));
+        }
+        for audio_out in &self.audio.outs {
+            audio_out
+                .connections
+                .lock()
+                .retain(|conn| !self.audio.ins.iter().any(|input| Arc::ptr_eq(input, conn)));
+        }
+        self.invalidate_audio_route_cache();
+    }
+
+    pub fn ensure_default_midi_passthrough(&mut self) {
+        if self.is_folder {
+            self.disconnect_midi_inputs_from_outputs();
+            return;
+        }
         for (midi_in, midi_out) in self.midi.ins.iter().zip(self.midi.outs.iter()) {
             let out = midi_out.lock();
             let exists = out
@@ -4097,6 +4459,15 @@ impl Track {
                 .any(|conn| Arc::ptr_eq(conn, midi_in));
             if !exists {
                 out.connect(midi_in.clone());
+            }
+        }
+        self.invalidate_midi_route_cache();
+    }
+
+    fn disconnect_midi_inputs_from_outputs(&mut self) {
+        for midi_in in &self.midi.ins {
+            for midi_out in &self.midi.outs {
+                let _ = midi_out.lock().disconnect(midi_in);
             }
         }
         self.invalidate_midi_route_cache();
@@ -4118,17 +4489,42 @@ impl Track {
         self.invalidate_audio_route_cache();
     }
 
-    pub fn disconnect_outputs_from_parent(&mut self, parent: &Track) {
+    pub fn disconnect_from_parent(&mut self, parent: &Track) {
+        // Folder input -> child input
+        for (in_idx, child_in) in self.audio.ins.iter().enumerate() {
+            if let Some(parent_in) = parent.audio.ins.get(in_idx) {
+                let _ = AudioIO::disconnect(parent_in, child_in);
+            }
+        }
+        // Child output -> folder output
         for (out_idx, child_out) in self.audio.outs.iter().enumerate() {
-            if let Some(parent_in) = parent.audio.ins.get(out_idx) {
-                let _ = AudioIO::disconnect(child_out, parent_in);
+            if let Some(parent_out) = parent.audio.outs.get(out_idx) {
+                let _ = AudioIO::disconnect(child_out, parent_out);
+            }
+        }
+        // Folder MIDI input -> child MIDI input
+        for (in_idx, child_in) in self.midi.ins.iter().enumerate() {
+            if let Some(parent_in) = parent.midi.ins.get(in_idx) {
+                let _ = child_in.lock().disconnect(parent_in);
+            }
+        }
+        // Child MIDI output -> folder MIDI output
+        for (out_idx, child_out) in self.midi.outs.iter().enumerate() {
+            if let Some(parent_out) = parent.midi.outs.get(out_idx) {
+                let _ = child_out.lock().disconnect(parent_out);
             }
         }
         self.invalidate_audio_route_cache();
+        self.invalidate_midi_route_cache();
     }
 
     fn internal_audio_sources(&self) -> Vec<Arc<AudioIO>> {
-        let mut sources = self.audio.ins.clone();
+        // Folder tracks aggregate their children; their own inputs must not feed their outputs.
+        let mut sources = if self.is_folder {
+            Vec::new()
+        } else {
+            self.audio.ins.clone()
+        };
         if let Some(src) = &self.metronome_source {
             sources.push(src.clone());
         }
@@ -4141,6 +4537,10 @@ impl Track {
         }
         for instance in &self.clap_plugins {
             sources.extend(instance.processor.lock().audio_outputs().iter().cloned());
+        }
+        for child in &self.child_tracks {
+            let child = child.lock();
+            sources.extend(child.audio.outs.iter().cloned());
         }
         sources
     }
@@ -4511,7 +4911,7 @@ impl Track {
         for out in &self.midi.outs {
             out.lock().buffer.clear();
         }
-        if !self.output_enabled {
+        if !self.output_enabled || self.is_folder {
             return;
         }
         for (input_idx, events) in input_events.iter().enumerate() {
@@ -4579,11 +4979,8 @@ impl Track {
         }
     }
 
-    fn process_track_plugins_in_graph_order(
-        &self,
-        frames: usize,
-        track_input_events: &[Vec<MidiEvent>],
-    ) -> HashMap<(PluginGraphNode, usize), Vec<MidiEvent>> {
+    fn process_track_plugins_in_graph_order(&mut self, frames: usize) {
+        let track_input_events = self.folder_input_midi_events.clone();
         let mut clap_processed = vec![false; self.clap_plugins.len()];
         let mut vst3_processed = vec![false; self.vst3_plugins.len()];
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -4592,8 +4989,8 @@ impl Track {
         let mut remaining = clap_processed.len() + vst3_processed.len() + lv2_processed.len();
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         let mut remaining = clap_processed.len() + vst3_processed.len();
-        let mut processed_midi_plugins = HashSet::<PluginGraphNode>::new();
-        let mut midi_node_events = HashMap::<(PluginGraphNode, usize), Vec<MidiEvent>>::new();
+        self.folder_processed_midi_plugins.clear();
+        self.folder_plugin_midi_node_events.clear();
         let echoed = self.echoed_parameter_updates.lock();
         echoed.clear();
         let track_name = self.name.clone();
@@ -4608,7 +5005,7 @@ impl Track {
                 let processor = self.clap_plugins[idx].processor.lock();
                 let ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
                     continue;
                 }
                 for input in processor.audio_inputs() {
@@ -4617,8 +5014,8 @@ impl Track {
                 let midi_inputs = self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
-                    track_input_events,
-                    &midi_node_events,
+                    &track_input_events,
+                    &self.folder_plugin_midi_node_events,
                 );
                 let clap_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs = processor.process_with_midi(
@@ -4645,14 +5042,14 @@ impl Track {
                     });
                 }
                 for evt in outputs {
-                    midi_node_events
+                    self.folder_plugin_midi_node_events
                         .entry((node.clone(), evt.port))
                         .or_default()
                         .push(evt.event);
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
-                processed_midi_plugins.insert(node);
+                self.folder_processed_midi_plugins.insert(node);
                 progressed = true;
             }
 
@@ -4663,7 +5060,7 @@ impl Track {
                 let processor = self.vst3_plugins[idx].processor.lock();
                 let ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
                     continue;
                 }
                 for input in processor.audio_inputs() {
@@ -4672,8 +5069,8 @@ impl Track {
                 let midi_inputs = self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
-                    track_input_events,
-                    &midi_node_events,
+                    &track_input_events,
+                    &self.folder_plugin_midi_node_events,
                 );
                 let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs = processor.process_with_midi(frames, &vst3_input);
@@ -4686,11 +5083,12 @@ impl Track {
                     });
                 }
                 if !outputs.is_empty() {
-                    midi_node_events.insert((node.clone(), 0), outputs);
+                    self.folder_plugin_midi_node_events
+                        .insert((node.clone(), 0), outputs);
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
-                processed_midi_plugins.insert(node);
+                self.folder_processed_midi_plugins.insert(node);
                 progressed = true;
             }
 
@@ -4703,7 +5101,7 @@ impl Track {
                 let ready = processor.audio_inputs().iter().all(|input| input.ready());
                 #[cfg(all(unix, not(target_os = "macos")))]
                 let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
                     continue;
                 }
                 for input in processor.audio_inputs() {
@@ -4712,8 +5110,8 @@ impl Track {
                 let midi_inputs = self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
-                    track_input_events,
-                    &midi_node_events,
+                    &track_input_events,
+                    &self.folder_plugin_midi_node_events,
                 );
                 let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs = processor.process_with_midi(frames, &lv2_input);
@@ -4726,11 +5124,12 @@ impl Track {
                     });
                 }
                 if !outputs.is_empty() {
-                    midi_node_events.insert((node.clone(), 0), outputs);
+                    self.folder_plugin_midi_node_events
+                        .insert((node.clone(), 0), outputs);
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
-                processed_midi_plugins.insert(node);
+                self.folder_processed_midi_plugins.insert(node);
                 progressed = true;
             }
 
@@ -4738,8 +5137,6 @@ impl Track {
                 break;
             }
         }
-
-        midi_node_events
     }
 
     fn plugin_midi_ready(
