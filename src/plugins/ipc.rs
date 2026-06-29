@@ -253,13 +253,24 @@ pub unsafe fn copy_outputs_from_shm(outputs: &[Arc<AudioIO>], ptr: *mut u8, fram
 ///
 /// `ptr` must point to a valid, initialized shared-memory layout whose header
 /// can safely be written to.
-pub unsafe fn configure_shm_header(ptr: *mut u8, frames: usize, num_in: usize, num_out: usize) {
+pub unsafe fn configure_shm_header(
+    ptr: *mut u8,
+    frames: usize,
+    num_in: usize,
+    num_out: usize,
+    midi_in: usize,
+    midi_out: usize,
+) {
     unsafe {
         let h = header_mut(ptr);
         h.block_size.store(frames as u32, Ordering::Release);
         h.num_input_channels.store(num_in as u32, Ordering::Release);
         h.num_output_channels
             .store(num_out as u32, Ordering::Release);
+        h.midi_in_port_count
+            .store(midi_in as u32, Ordering::Release);
+        h.midi_out_port_count
+            .store(midi_out as u32, Ordering::Release);
     }
 }
 

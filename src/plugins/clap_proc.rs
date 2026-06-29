@@ -1,5 +1,5 @@
 use crate::audio::io::AudioIO;
-use crate::midi::io::MidiEvent;
+use crate::midi::io::{MidiEvent, MIDIIO};
 use crate::mutex::UnsafeMutex;
 use crate::plugins::ipc;
 use crate::plugins::types::{
@@ -49,8 +49,10 @@ pub struct ClapProcessor {
     audio_outputs: Vec<Arc<AudioIO>>,
     main_audio_inputs: usize,
     main_audio_outputs: usize,
-    midi_inputs: usize,
-    midi_outputs: usize,
+    midi_input_count: usize,
+    midi_output_count: usize,
+    midi_input_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
+    midi_output_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
     param_infos: Vec<ClapParameterInfo>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
@@ -116,6 +118,12 @@ impl ClapProcessor {
         let audio_outputs = (0..actual_audio_out as usize)
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
+        let midi_input_ports = (0..actual_midi_in as usize)
+            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .collect::<Vec<_>>();
+        let midi_output_ports = (0..actual_midi_out as usize)
+            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .collect::<Vec<_>>();
 
         let param_infos = Vec::new();
 
@@ -127,8 +135,10 @@ impl ClapProcessor {
             audio_outputs,
             main_audio_inputs: actual_audio_in as usize,
             main_audio_outputs: actual_audio_out as usize,
-            midi_inputs: actual_midi_in as usize,
-            midi_outputs: actual_midi_out as usize,
+            midi_input_count: actual_midi_in as usize,
+            midi_output_count: actual_midi_out as usize,
+            midi_input_ports,
+            midi_output_ports,
             param_infos,
             param_values: UnsafeMutex::new(HashMap::new()),
             bypassed: Arc::new(AtomicBool::new(false)),
@@ -151,6 +161,15 @@ impl ClapProcessor {
         }
     }
 
+    pub fn setup_midi_ports(&self) {
+        for port in &self.midi_input_ports {
+            port.lock().setup();
+        }
+        for port in &self.midi_output_ports {
+            port.lock().setup();
+        }
+    }
+
     pub fn audio_inputs(&self) -> &[Arc<AudioIO>] {
         &self.audio_inputs
     }
@@ -168,11 +187,19 @@ impl ClapProcessor {
     }
 
     pub fn midi_input_count(&self) -> usize {
-        self.midi_inputs
+        self.midi_input_count
     }
 
     pub fn midi_output_count(&self) -> usize {
-        self.midi_outputs
+        self.midi_output_count
+    }
+
+    pub fn midi_input_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+        &self.midi_input_ports
+    }
+
+    pub fn midi_output_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+        &self.midi_output_ports
     }
 
     pub fn set_bypassed(&self, bypassed: bool) {
@@ -439,6 +466,8 @@ impl ClapProcessor {
             return Vec::new();
         }
 
+        self.setup_midi_ports();
+
         {
             let child = self.child.lock();
             if let Some(ref mut c) = child.as_mut() {
@@ -468,6 +497,8 @@ impl ClapProcessor {
                 frames,
                 self.audio_inputs.len(),
                 self.audio_outputs.len(),
+                self.midi_input_ports.len(),
+                self.midi_output_ports.len(),
             );
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
 
@@ -478,23 +509,35 @@ impl ClapProcessor {
             t.denominator = transport.tsig_denom as u32;
             t.flags = if transport.playing { 1 } else { 0 };
 
-            let midi_buf = midi_ring_ptr(ptr);
-            let (midi_w, midi_r) = midi_indices(ptr);
-            let midi_ring = RingBuffer::new(midi_buf, midi_w, midi_r, RING_CAPACITY);
-            for ev in midi_in {
-                let midi_event = maolan_plugin_protocol::protocol::MidiEvent {
-                    sample_offset: ev.frame,
-                    data: [
-                        ev.data.first().copied().unwrap_or(0),
-                        ev.data.get(1).copied().unwrap_or(0),
-                        ev.data.get(2).copied().unwrap_or(0),
-                    ],
-                    channel: ev.data.first().map(|b| b & 0x0F).unwrap_or(0),
-                    flags: 0,
-                    _pad: 0,
-                };
-                if !midi_ring.push(midi_event) {
-                    break;
+            // Transitional: copy caller-supplied MIDI events into port 0 so
+            // existing engine scheduling keeps working until plugin MIDI
+            // connections are fully migrated to MIDIIO.
+            if let Some(port0) = self.midi_input_ports.first() {
+                let port0_lock = port0.lock();
+                port0_lock.buffer.extend_from_slice(midi_in);
+                port0_lock.mark_finished();
+            }
+
+            for (port_idx, port) in self.midi_input_ports.iter().enumerate() {
+                let port_lock = port.lock();
+                let midi_buf = midi_in_ring_ptr(ptr, port_idx);
+                let (midi_w, midi_r) = midi_in_indices(ptr, port_idx);
+                let midi_ring = RingBuffer::new(midi_buf, midi_w, midi_r, RING_CAPACITY);
+                for ev in &port_lock.buffer {
+                    let midi_event = maolan_plugin_protocol::protocol::MidiEvent {
+                        sample_offset: ev.frame,
+                        data: [
+                            ev.data.first().copied().unwrap_or(0),
+                            ev.data.get(1).copied().unwrap_or(0),
+                            ev.data.get(2).copied().unwrap_or(0),
+                        ],
+                        channel: ev.data.first().map(|b| b & 0x0F).unwrap_or(0),
+                        flags: 0,
+                        _pad: 0,
+                    };
+                    if !midi_ring.push(midi_event) {
+                        break;
+                    }
                 }
             }
         }
@@ -528,15 +571,22 @@ impl ClapProcessor {
 
         let mut midi_out = Vec::new();
         unsafe {
-            let midi_out_buf = midi_out_ring_ptr(ptr);
-            let (midi_out_w, midi_out_r) = midi_out_indices(ptr);
-            let midi_out_ring =
-                RingBuffer::new(midi_out_buf, midi_out_w, midi_out_r, RING_CAPACITY);
-            while let Some(ev) = midi_out_ring.pop() {
-                midi_out.push(ClapMidiOutputEvent {
-                    port: 0,
-                    event: crate::midi::io::MidiEvent::new(ev.sample_offset, ev.data.to_vec()),
-                });
+            for (port_idx, port) in self.midi_output_ports.iter().enumerate() {
+                let port_lock = port.lock();
+                port_lock.buffer.clear();
+                let midi_out_buf = midi_out_ring_ptr(ptr, port_idx);
+                let (midi_out_w, midi_out_r) = midi_out_indices(ptr, port_idx);
+                let midi_out_ring =
+                    RingBuffer::new(midi_out_buf, midi_out_w, midi_out_r, RING_CAPACITY);
+                while let Some(ev) = midi_out_ring.pop() {
+                    let event = crate::midi::io::MidiEvent::new(ev.sample_offset, ev.data.to_vec());
+                    port_lock.buffer.push(event.clone());
+                    midi_out.push(ClapMidiOutputEvent {
+                        port: port_idx,
+                        event,
+                    });
+                }
+                port_lock.mark_finished();
             }
         }
 
@@ -661,8 +711,8 @@ impl ClapProcessor {
         let mut result = Vec::new();
         if let Some(ref mapping) = self.mapping {
             let ring = unsafe {
-                let buf = midi_out_ring_ptr(mapping.as_ptr());
-                let (w, r) = midi_out_indices(mapping.as_ptr());
+                let buf = midi_out_ring_ptr(mapping.as_ptr(), 0);
+                let (w, r) = midi_out_indices(mapping.as_ptr(), 0);
                 RingBuffer::new(buf, w, r, RING_CAPACITY)
             };
             while let Some(ev) = ring.pop() {

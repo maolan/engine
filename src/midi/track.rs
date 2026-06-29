@@ -41,7 +41,7 @@ impl MIDITrack {
             ));
         }
         let myin = self.ins[index].clone();
-        myin.lock().connect(to);
+        MIDIIO::connect(&myin, &to);
         Ok(())
     }
 
@@ -58,7 +58,7 @@ impl MIDITrack {
             ));
         }
         let out = self.outs[index].clone();
-        out.lock().connect(to);
+        MIDIIO::connect(&out, &to);
         Ok(())
     }
 
@@ -75,7 +75,7 @@ impl MIDITrack {
             ));
         }
         let myin = self.ins[index].clone();
-        myin.lock().disconnect(to)
+        MIDIIO::disconnect(&myin, to)
     }
 
     pub fn disconnect_out(
@@ -91,7 +91,7 @@ impl MIDITrack {
             ));
         }
         let out = self.outs[index].clone();
-        out.lock().disconnect(to)
+        MIDIIO::disconnect(&out, to)
     }
 
     pub fn process(&self) {}

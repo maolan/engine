@@ -1,6 +1,7 @@
 mod audio;
 mod audio_codec;
 pub mod client;
+pub mod connectable;
 mod engine;
 pub use engine::Engine;
 pub mod history;

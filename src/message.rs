@@ -4,6 +4,7 @@ use crate::lv2::Lv2PluginInfo;
 use crate::midi::io::MidiEvent;
 use crate::vst3::Vst3PluginInfo;
 use crate::{kind::Kind, modulator::Modulator, mutex::UnsafeMutex, track::Track};
+pub use crate::connectable::{ConnectableConnection, ConnectableRef};
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc::Sender;
 
@@ -732,6 +733,7 @@ pub enum Action {
         track_name: String,
         plugins: Vec<PluginGraphPlugin>,
         connections: Vec<PluginGraphConnection>,
+        connectable_connections: Vec<ConnectableConnection>,
     },
     TrackConnectPluginAudio {
         track_name: String,
@@ -759,6 +761,34 @@ pub enum Action {
         from_node: PluginGraphNode,
         from_port: usize,
         to_node: PluginGraphNode,
+        to_port: usize,
+    },
+    TrackConnectAudio {
+        track_name: String,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
+        to_port: usize,
+    },
+    TrackDisconnectAudio {
+        track_name: String,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
+        to_port: usize,
+    },
+    TrackConnectMidi {
+        track_name: String,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
+        to_port: usize,
+    },
+    TrackDisconnectMidi {
+        track_name: String,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
         to_port: usize,
     },
     #[cfg(all(unix, not(target_os = "macos")))]

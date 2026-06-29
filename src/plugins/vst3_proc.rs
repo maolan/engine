@@ -1,5 +1,5 @@
 use crate::audio::io::AudioIO;
-use crate::midi::io::MidiEvent;
+use crate::midi::io::{MidiEvent, MIDIIO};
 use crate::mutex::UnsafeMutex;
 use crate::plugins::ipc;
 use crate::plugins::types::ParameterInfo;
@@ -22,6 +22,8 @@ pub struct Vst3Processor {
     audio_outputs: Vec<Arc<AudioIO>>,
     main_audio_inputs: usize,
     main_audio_outputs: usize,
+    midi_input_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
+    midi_output_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
     param_infos: Vec<ParameterInfo>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
@@ -89,6 +91,16 @@ impl Vst3Processor {
 
         let param_infos = Vec::new();
 
+        let header = unsafe { header_ref(mapping.as_ptr()) };
+        let midi_in_count = header.midi_in_port_count.load(Ordering::Acquire) as usize;
+        let midi_out_count = header.midi_out_port_count.load(Ordering::Acquire) as usize;
+        let midi_input_ports: Vec<_> = (0..midi_in_count)
+            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .collect();
+        let midi_output_ports: Vec<_> = (0..midi_out_count)
+            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .collect();
+
         Ok(Self {
             path: plugin_path.to_string(),
             name,
@@ -96,6 +108,8 @@ impl Vst3Processor {
             audio_outputs,
             main_audio_inputs: input_count.max(1),
             main_audio_outputs: output_count.max(1),
+            midi_input_ports,
+            midi_output_ports,
             param_infos,
             param_values: UnsafeMutex::new(HashMap::new()),
             bypassed: Arc::new(AtomicBool::new(false)),
@@ -118,6 +132,15 @@ impl Vst3Processor {
         }
     }
 
+    pub fn setup_midi_ports(&self) {
+        for port in &self.midi_input_ports {
+            port.lock().setup();
+        }
+        for port in &self.midi_output_ports {
+            port.lock().setup();
+        }
+    }
+
     pub fn audio_inputs(&self) -> &[Arc<AudioIO>] {
         &self.audio_inputs
     }
@@ -135,11 +158,19 @@ impl Vst3Processor {
     }
 
     pub fn midi_input_count(&self) -> usize {
-        0
+        self.midi_input_ports.len()
     }
 
     pub fn midi_output_count(&self) -> usize {
-        0
+        self.midi_output_ports.len()
+    }
+
+    pub fn midi_input_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+        &self.midi_input_ports
+    }
+
+    pub fn midi_output_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+        &self.midi_output_ports
     }
 
     pub fn set_bypassed(&self, bypassed: bool) {
@@ -295,8 +326,10 @@ impl Vst3Processor {
         let ptr = mapping.as_ptr();
         let num_in = self.audio_inputs.len();
         let num_out = self.audio_outputs.len();
+        let midi_in_count = self.midi_input_ports.len();
+        let midi_out_count = self.midi_output_ports.len();
         unsafe {
-            ipc::configure_shm_header(ptr, frames, num_in, num_out);
+            ipc::configure_shm_header(ptr, frames, num_in, num_out, midi_in_count, midi_out_count);
 
             let t = transport_mut(ptr);
             t.playhead_sample = 0;
@@ -306,6 +339,30 @@ impl Vst3Processor {
             t.flags = 1;
 
             ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
+
+            for (port_idx, port) in self.midi_input_ports.iter().enumerate() {
+                let buf = midi_in_ring_ptr(ptr, port_idx);
+                let (w, r) = midi_in_indices(ptr, port_idx);
+                let ring = RingBuffer::new(buf, w, r, RING_CAPACITY);
+                let lock = port.lock();
+                for ev in &lock.buffer {
+                    let data = {
+                        let mut d = [0u8; 3];
+                        for (i, b) in ev.data.iter().enumerate().take(3) {
+                            d[i] = *b;
+                        }
+                        d
+                    };
+                    let _ = ring.push(maolan_plugin_protocol::MidiEvent {
+                        sample_offset: ev.frame,
+                        data,
+                        channel: ev.data.first().copied().unwrap_or(0) & 0x0F,
+                        flags: 0,
+                        _pad: 0,
+                    });
+                }
+                lock.mark_finished();
+            }
         }
 
         if events.signal_host().is_err() {
@@ -324,10 +381,27 @@ impl Vst3Processor {
 
         unsafe {
             ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
-        }
 
-        *self.last_process_time.lock() = Instant::now();
-        Vec::new()
+            let mut output_events = Vec::new();
+            for (port_idx, port) in self.midi_output_ports.iter().enumerate() {
+                let buf = midi_out_ring_ptr(ptr, port_idx);
+                let (w, r) = midi_out_indices(ptr, port_idx);
+                let ring = RingBuffer::new(buf, w, r, RING_CAPACITY);
+                let lock = port.lock();
+                lock.buffer.clear();
+                while let Some(ev) = ring.pop() {
+                    let event = MidiEvent {
+                        frame: ev.sample_offset,
+                        data: ev.data.to_vec(),
+                    };
+                    lock.buffer.push(event.clone());
+                    output_events.push(event);
+                }
+                lock.mark_finished();
+            }
+            *self.last_process_time.lock() = Instant::now();
+            return output_events;
+        }
     }
 
     pub fn path(&self) -> &str {

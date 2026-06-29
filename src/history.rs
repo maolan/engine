@@ -179,7 +179,11 @@ pub fn should_record(action: &Action) -> bool {
         Action::TrackConnectPluginAudio { .. }
         | Action::TrackDisconnectPluginAudio { .. }
         | Action::TrackConnectPluginMidi { .. }
-        | Action::TrackDisconnectPluginMidi { .. } => true,
+        | Action::TrackDisconnectPluginMidi { .. }
+        | Action::TrackConnectAudio { .. }
+        | Action::TrackDisconnectAudio { .. }
+        | Action::TrackConnectMidi { .. }
+        | Action::TrackDisconnectMidi { .. } => true,
         #[cfg(all(unix, not(target_os = "macos")))]
         Action::TrackLoadLv2Plugin { .. }
         | Action::TrackUnloadLv2PluginInstance { .. }
@@ -740,6 +744,58 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             from_node: from_node.clone(),
             from_port: *from_port,
             to_node: to_node.clone(),
+            to_port: *to_port,
+        }),
+        Action::TrackConnectAudio {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackDisconnectAudio {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
+            to_port: *to_port,
+        }),
+        Action::TrackDisconnectAudio {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackConnectAudio {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
+            to_port: *to_port,
+        }),
+        Action::TrackConnectMidi {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackDisconnectMidi {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
+            to_port: *to_port,
+        }),
+        Action::TrackDisconnectMidi {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackConnectMidi {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
             to_port: *to_port,
         }),
 

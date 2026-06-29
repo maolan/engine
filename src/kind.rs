@@ -1,4 +1,7 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Audio,
     MIDI,

@@ -60,7 +60,7 @@ use crate::{
         Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, PluginKind, ProcessTask,
     },
     midi::clip::MIDIClip,
-    midi::io::MidiEvent,
+    midi::io::{MidiEvent, MIDIIO},
     mutex::UnsafeMutex,
     osc::OscServer,
     routing,
@@ -4146,18 +4146,24 @@ impl Engine {
         predecessor: Option<String>,
         tasks: &mut Vec<ProcessTask>,
         deps: &mut std::collections::HashMap<String, Vec<String>>,
-    ) -> String {
+    ) -> (String, String) {
+        use crate::message::ConnectableRef;
         let t = track.lock();
         if t.is_folder {
             let folder_input = ProcessTask::FolderInput(track.clone());
             let folder_input_key = Self::task_key(&folder_input);
             tasks.push(folder_input.clone());
-            deps.insert(
-                folder_input_key.clone(),
-                predecessor.into_iter().collect::<Vec<_>>(),
-            );
-            let mut prev = folder_input_key;
+            let folder_input_deps: Vec<_> = predecessor.into_iter().collect();
+            deps.insert(folder_input_key.clone(), folder_input_deps);
 
+            let mut source_keys: std::collections::HashMap<ConnectableRef, String> =
+                std::collections::HashMap::new();
+            let mut target_keys: std::collections::HashMap<ConnectableRef, String> =
+                std::collections::HashMap::new();
+            source_keys.insert(ConnectableRef::TrackInput, folder_input_key.clone());
+            target_keys.insert(ConnectableRef::TrackInput, folder_input_key.clone());
+
+            let mut plugin_keys: Vec<String> = Vec::new();
             for idx in 0..t.clap_plugins.len() {
                 let plugin_task = ProcessTask::Plugin {
                     track: track.clone(),
@@ -4165,9 +4171,12 @@ impl Engine {
                     index: idx,
                 };
                 let plugin_key = Self::task_key(&plugin_task);
+                let id = t.clap_plugins[idx].id;
+                source_keys.insert(ConnectableRef::ClapPlugin(id), plugin_key.clone());
+                target_keys.insert(ConnectableRef::ClapPlugin(id), plugin_key.clone());
                 tasks.push(plugin_task);
-                deps.insert(plugin_key.clone(), vec![prev]);
-                prev = plugin_key;
+                deps.insert(plugin_key.clone(), vec![folder_input_key.clone()]);
+                plugin_keys.push(plugin_key);
             }
             for idx in 0..t.vst3_plugins.len() {
                 let plugin_task = ProcessTask::Plugin {
@@ -4176,9 +4185,12 @@ impl Engine {
                     index: idx,
                 };
                 let plugin_key = Self::task_key(&plugin_task);
+                let id = t.vst3_plugins[idx].id;
+                source_keys.insert(ConnectableRef::Vst3Plugin(id), plugin_key.clone());
+                target_keys.insert(ConnectableRef::Vst3Plugin(id), plugin_key.clone());
                 tasks.push(plugin_task);
-                deps.insert(plugin_key.clone(), vec![prev]);
-                prev = plugin_key;
+                deps.insert(plugin_key.clone(), vec![folder_input_key.clone()]);
+                plugin_keys.push(plugin_key);
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             for idx in 0..t.lv2_plugins.len() {
@@ -4188,20 +4200,60 @@ impl Engine {
                     index: idx,
                 };
                 let plugin_key = Self::task_key(&plugin_task);
+                let id = t.lv2_plugins[idx].id;
+                source_keys.insert(ConnectableRef::Lv2Plugin(id), plugin_key.clone());
+                target_keys.insert(ConnectableRef::Lv2Plugin(id), plugin_key.clone());
                 tasks.push(plugin_task);
-                deps.insert(plugin_key.clone(), vec![prev]);
-                prev = plugin_key;
+                deps.insert(plugin_key.clone(), vec![folder_input_key.clone()]);
+                plugin_keys.push(plugin_key);
             }
 
+            let mut child_keys = Vec::new();
             for child_track in &t.child_tracks {
-                prev = self.append_track_tasks(child_track.clone(), Some(prev), tasks, deps);
+                let (child_first, child_last) = self.append_track_tasks(
+                    child_track.clone(),
+                    Some(folder_input_key.clone()),
+                    tasks,
+                    deps,
+                );
+                let child_name = child_track.lock().name.clone();
+                source_keys.insert(
+                    ConnectableRef::ChildTrack(child_name.clone()),
+                    child_last.clone(),
+                );
+                target_keys.insert(ConnectableRef::ChildTrack(child_name), child_first.clone());
+                child_keys.push((child_first, child_last.clone()));
             }
 
             let folder_output = ProcessTask::FolderOutput(track.clone());
             let folder_output_key = Self::task_key(&folder_output);
+            source_keys.insert(ConnectableRef::TrackOutput, folder_output_key.clone());
+            target_keys.insert(ConnectableRef::TrackOutput, folder_output_key.clone());
             tasks.push(folder_output.clone());
-            deps.insert(folder_output_key.clone(), vec![prev]);
-            folder_output_key
+            let mut folder_output_deps = vec![folder_input_key.clone()];
+            folder_output_deps.extend(plugin_keys);
+            folder_output_deps.extend(child_keys.iter().map(|(_, last)| last.clone()));
+            deps.insert(folder_output_key.clone(), folder_output_deps);
+
+            // Add cross-connectable dependencies based on the track's routing graph.
+            // This includes child->plugin, plugin->folder output, plugin->plugin, etc.
+            for conn in t.connectable_connections() {
+                let Some(source_key) = source_keys.get(&conn.from) else {
+                    continue;
+                };
+                let Some(target_key) = target_keys.get(&conn.to) else {
+                    continue;
+                };
+                if source_key == target_key {
+                    continue;
+                }
+                let entry = deps.entry(target_key.clone()).or_default();
+                if !entry.contains(source_key) {
+                    entry.push(source_key.clone());
+                }
+            }
+
+            (folder_input_key, folder_output_key)
         } else {
             let task = ProcessTask::Track(track.clone());
             let task_key = Self::task_key(&task);
@@ -4210,7 +4262,7 @@ impl Engine {
                 task_key.clone(),
                 predecessor.into_iter().collect::<Vec<_>>(),
             );
-            task_key
+            (task_key.clone(), task_key)
         }
     }
 
@@ -5954,7 +6006,7 @@ impl Engine {
                                 if let Some((tgt_name, tgt_port, _)) =
                                     self.find_midi_io_owner(state, &tgt)
                                 {
-                                    let _ = out.lock().disconnect(&tgt);
+                                    let _ = MIDIIO::disconnect(out, &tgt);
                                     disconnect_actions.push(Action::Disconnect {
                                         from_track: track_name.clone(),
                                         from_port: port_idx,
@@ -5987,7 +6039,7 @@ impl Engine {
                                     .iter()
                                     .position(|inp| std::sync::Arc::ptr_eq(inp, &tgt))
                                 {
-                                    let _ = out.lock().disconnect(&tgt);
+                                    let _ = MIDIIO::disconnect(out, &tgt);
                                     disconnect_actions.push(Action::Disconnect {
                                         from_track: other_name.clone(),
                                         from_port: out_port,
@@ -6315,17 +6367,19 @@ impl Engine {
                         return;
                     }
                 };
-                let (plugins, connections) = {
+                let (plugins, connections, connectable_connections) = {
                     let track = track.lock();
                     (
                         track.plugin_graph_plugins(),
                         track.plugin_graph_connections(),
+                        track.connectable_connections(),
                     )
                 };
                 self.notify_clients(Ok(Action::TrackPluginGraph {
                     track_name: track_name.clone(),
                     plugins,
                     connections,
+                    connectable_connections,
                 }))
                 .await;
                 return;
@@ -6447,6 +6501,122 @@ impl Engine {
                     to_node.clone(),
                     to_port,
                 ) {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackConnectAudio {
+                ref track_name,
+                ref from,
+                from_port,
+                ref to,
+                to_port,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "routing changes")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    track
+                        .lock()
+                        .connect_audio_connectable(from.clone(), from_port, to.clone(), to_port)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackDisconnectAudio {
+                ref track_name,
+                ref from,
+                from_port,
+                ref to,
+                to_port,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "routing changes")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    track
+                        .lock()
+                        .disconnect_audio_connectable(from.clone(), from_port, to.clone(), to_port)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackConnectMidi {
+                ref track_name,
+                ref from,
+                from_port,
+                ref to,
+                to_port,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "routing changes")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    track
+                        .lock()
+                        .connect_midi_connectable(from.clone(), from_port, to.clone(), to_port)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return;
+                }
+            }
+            Action::TrackDisconnectMidi {
+                ref track_name,
+                ref from,
+                from_port,
+                ref to,
+                to_port,
+            } => {
+                if self
+                    .reject_if_track_frozen(track_name, "routing changes")
+                    .await
+                {
+                    return;
+                }
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    track
+                        .lock()
+                        .disconnect_midi_connectable(from.clone(), from_port, to.clone(), to_port)
+                {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -8768,17 +8938,19 @@ impl Engine {
                     for track_name in reconfigured_tracks {
                         let track = self.state.lock().tracks.get(&track_name).cloned();
                         if let Some(track) = track {
-                            let (plugins, connections) = {
+                            let (plugins, connections, connectable_connections) = {
                                 let track_lock = track.lock();
                                 (
                                     track_lock.plugin_graph_plugins(),
                                     track_lock.plugin_graph_connections(),
+                                    track_lock.connectable_connections(),
                                 )
                             };
                             self.notify_clients(Ok(Action::TrackPluginGraph {
                                 track_name: track_name.clone(),
                                 plugins,
                                 connections,
+                                connectable_connections,
                             }))
                             .await;
                         }
@@ -9745,6 +9917,172 @@ mod tests {
                 prev
             );
         }
+    }
+
+    #[test]
+    fn child_to_plugin_to_folder_output_task_graph_has_no_cycle() {
+        use crate::message::ConnectableRef;
+
+        let plugin_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("daw")
+            .join("plugin-host")
+            .join("tests")
+            .join("test_passthrough.clap");
+        if !plugin_path.exists() {
+            return;
+        }
+        if crate::plugins::ipc::find_plugin_host_binary().is_none() {
+            return;
+        }
+
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let mut folder = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        let child = Track::new("child".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+
+        folder
+            .load_clap_plugin(
+                &format!("{}::com.maolan.test.passthrough", plugin_path.display()),
+                None,
+            )
+            .expect("should load CLAP plugin on folder");
+        folder.clap_plugins[0]
+            .processor
+            .lock()
+            .setup_audio_ports();
+        let plugin_id = folder.clap_plugins[0].id;
+
+        insert_track(&mut engine, folder);
+        insert_track(&mut engine, child);
+
+        {
+            let state = engine.state.lock();
+            let folder = state.tracks.get("folder").unwrap().clone();
+            let child = state.tracks.get("child").unwrap().clone();
+            folder.lock().child_tracks.push(child.clone());
+            child.lock().parent_track = Some("folder".to_string());
+
+            folder
+                .lock()
+                .connect_audio_connectable(
+                    ConnectableRef::ChildTrack("child".to_string()),
+                    0,
+                    ConnectableRef::ClapPlugin(plugin_id),
+                    0,
+                )
+                .expect("connect child L to plugin L");
+            folder
+                .lock()
+                .connect_audio_connectable(
+                    ConnectableRef::ChildTrack("child".to_string()),
+                    1,
+                    ConnectableRef::ClapPlugin(plugin_id),
+                    1,
+                )
+                .expect("connect child R to plugin R");
+            folder
+                .lock()
+                .connect_audio_connectable(
+                    ConnectableRef::ClapPlugin(plugin_id),
+                    0,
+                    ConnectableRef::TrackOutput,
+                    0,
+                )
+                .expect("connect plugin L to folder output L");
+            folder
+                .lock()
+                .connect_audio_connectable(
+                    ConnectableRef::ClapPlugin(plugin_id),
+                    1,
+                    ConnectableRef::TrackOutput,
+                    1,
+                )
+                .expect("connect plugin R to folder output R");
+        }
+
+        let (tasks, deps) = engine.build_task_graph();
+
+        let folder_in_key = tasks
+            .iter()
+            .find(|t| matches!(t, ProcessTask::FolderInput(t) if t.lock().name == "folder"))
+            .map(Engine::task_key)
+            .expect("folder input task");
+        let child_key = tasks
+            .iter()
+            .find(|t| matches!(t, ProcessTask::Track(t) if t.lock().name == "child"))
+            .map(Engine::task_key)
+            .expect("child task");
+        let plugin_key = tasks
+            .iter()
+            .find(|t| matches!(
+                t,
+                ProcessTask::Plugin {
+                    track,
+                    kind: PluginKind::Clap,
+                    index: 0,
+                } if track.lock().name == "folder"
+            ))
+            .map(Engine::task_key)
+            .expect("plugin task");
+        let folder_out_key = tasks
+            .iter()
+            .find(|t| matches!(t, ProcessTask::FolderOutput(t) if t.lock().name == "folder"))
+            .map(Engine::task_key)
+            .expect("folder output task");
+
+        assert!(
+            deps.get(&child_key)
+                .is_some_and(|d| d.contains(&folder_in_key)),
+            "child task should depend on folder input"
+        );
+        assert!(
+            deps.get(&plugin_key)
+                .is_some_and(|d| d.contains(&folder_in_key) && d.contains(&child_key)),
+            "plugin task should depend on folder input and child"
+        );
+        assert!(
+            deps.get(&folder_out_key).is_some_and(|d| {
+                d.contains(&folder_in_key)
+                    && d.contains(&plugin_key)
+                    && d.contains(&child_key)
+            }),
+            "folder output should depend on folder input, plugin, and child"
+        );
+
+        fn has_cycle(deps: &HashMap<String, Vec<String>>) -> bool {
+            let mut state: HashMap<String, u8> = HashMap::new();
+            fn visit(
+                node: &str,
+                deps: &HashMap<String, Vec<String>>,
+                state: &mut HashMap<String, u8>,
+            ) -> bool {
+                match state.get(node).copied() {
+                    Some(1) => return true,
+                    Some(2) => return false,
+                    _ => {}
+                }
+                state.insert(node.to_string(), 1);
+                for next in deps.get(node).into_iter().flatten() {
+                    if visit(next, deps, state) {
+                        return true;
+                    }
+                }
+                state.insert(node.to_string(), 2);
+                false
+            }
+            for node in deps.keys() {
+                if visit(node, deps, &mut state) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        assert!(
+            !has_cycle(&deps),
+            "task graph should not contain a cycle when a plugin reads from a child track"
+        );
     }
 
     #[tokio::test]

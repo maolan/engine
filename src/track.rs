@@ -1,6 +1,7 @@
 use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
+use crate::connectable::{ConnectableConnection, ConnectableRef};
 use crate::message::{PluginGraphConnection, PluginGraphNode, PluginGraphPlugin, PluginKind};
 use crate::mutex::UnsafeMutex;
 #[cfg(unix)]
@@ -14,7 +15,7 @@ use crate::{kind::Kind, routing};
 use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
@@ -262,7 +263,7 @@ impl ClipPluginRuntime {
     fn process_plugins_in_graph_order(
         &self,
         frames: usize,
-        track_input_events: &[Vec<MidiEvent>],
+        _track_input_events: &[Vec<MidiEvent>],
         midi_node_events: &mut HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
     ) {
         let mut clap_processed = vec![false; self.clap_plugins.len()];
@@ -273,7 +274,6 @@ impl ClipPluginRuntime {
         let mut remaining = clap_processed.len() + vst3_processed.len() + lv2_processed.len();
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         let mut remaining = clap_processed.len() + vst3_processed.len();
-        let mut processed_midi_plugins = HashSet::<PluginGraphNode>::new();
 
         while remaining > 0 {
             let mut progressed = false;
@@ -283,24 +283,19 @@ impl ClipPluginRuntime {
                     continue;
                 }
                 let processor = self.clap_plugins[idx].processor.lock();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                if !audio_ready || !midi_ready {
                     continue;
                 }
                 for input in processor.audio_inputs() {
                     input.process();
                 }
-                let midi_inputs = self.plugin_midi_input_events(
-                    &node,
-                    processor.midi_input_count(),
-                    track_input_events,
-                    midi_node_events,
-                );
-                let clap_input = midi_inputs.first().cloned().unwrap_or_default();
+                let _midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
                 let outputs = processor.process_with_midi(
                     frames,
-                    &clap_input,
+                    &[],
                     crate::plugins::types::ClapTransportInfo::default(),
                 );
                 for evt in outputs {
@@ -311,7 +306,6 @@ impl ClipPluginRuntime {
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
-                processed_midi_plugins.insert(node);
                 progressed = true;
             }
 
@@ -320,20 +314,16 @@ impl ClipPluginRuntime {
                     continue;
                 }
                 let processor = self.vst3_plugins[idx].processor.lock();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                if !audio_ready || !midi_ready {
                     continue;
                 }
                 for input in processor.audio_inputs() {
                     input.process();
                 }
-                let midi_inputs = self.plugin_midi_input_events(
-                    &node,
-                    processor.midi_input_count(),
-                    track_input_events,
-                    midi_node_events,
-                );
+                let midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
                 let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs = processor.process_with_midi(frames, &vst3_input);
                 if !outputs.is_empty() {
@@ -341,7 +331,6 @@ impl ClipPluginRuntime {
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
-                processed_midi_plugins.insert(node);
                 progressed = true;
             }
 
@@ -351,21 +340,16 @@ impl ClipPluginRuntime {
                     continue;
                 }
                 let processor = self.lv2_plugins[idx].processor.lock();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
-                #[cfg(all(unix, not(target_os = "macos")))]
+                let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
+                let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &processed_midi_plugins) {
+                if !audio_ready || !midi_ready {
                     continue;
                 }
                 for input in processor.audio_inputs() {
                     input.process();
                 }
-                let midi_inputs = self.plugin_midi_input_events(
-                    &node,
-                    processor.midi_input_count(),
-                    track_input_events,
-                    midi_node_events,
-                );
+                let midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
                 let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs = processor.process_with_midi(frames, &lv2_input);
                 if !outputs.is_empty() {
@@ -373,7 +357,6 @@ impl ClipPluginRuntime {
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
-                processed_midi_plugins.insert(node);
                 progressed = true;
             }
 
@@ -383,50 +366,23 @@ impl ClipPluginRuntime {
         }
     }
 
-    fn plugin_midi_ready(
-        &self,
-        node: &PluginGraphNode,
-        processed: &HashSet<PluginGraphNode>,
+    fn plugin_midi_inputs_ready(
+        ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>],
     ) -> bool {
-        self.plugin_midi_connections
-            .iter()
-            .filter(|conn| {
-                if conn.kind != Kind::MIDI || &conn.to_node != node {
-                    return false;
-                }
-                let is_plugin = matches!(
-                    conn.from_node,
-                    PluginGraphNode::ClapPluginInstance(_) | PluginGraphNode::Vst3PluginInstance(_)
-                );
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let is_plugin =
-                    is_plugin || matches!(conn.from_node, PluginGraphNode::Lv2PluginInstance(_));
-                is_plugin
-            })
-            .all(|conn| processed.contains(&conn.from_node))
+        ports.iter().all(|port| port.lock().ready())
     }
 
-    fn plugin_midi_input_events(
-        &self,
-        node: &PluginGraphNode,
-        midi_inputs: usize,
-        track_input_events: &[Vec<MidiEvent>],
-        node_events: &HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+    fn prepare_plugin_midi_inputs(
+        ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>],
     ) -> Vec<Vec<MidiEvent>> {
-        let mut per_port = vec![Vec::new(); midi_inputs];
-        for conn in self.plugin_midi_connections.iter().filter(|conn| {
-            conn.kind == Kind::MIDI && &conn.to_node == node && conn.to_port < midi_inputs
-        }) {
-            let events_opt = if conn.from_node == PluginGraphNode::TrackInput {
-                track_input_events.get(conn.from_port)
-            } else {
-                node_events.get(&(conn.from_node.clone(), conn.from_port))
-            };
-            if let Some(events) = events_opt {
-                per_port[conn.to_port].extend_from_slice(events);
-            }
-        }
-        per_port
+        ports
+            .iter()
+            .map(|port| {
+                let lock = port.lock();
+                lock.process();
+                lock.buffer.clone()
+            })
+            .collect()
     }
 }
 
@@ -761,17 +717,18 @@ impl Track {
 
         for (out_idx, out) in self.midi.outs.iter().enumerate() {
             let out_lock = out.lock();
-            for target in &out_lock.connections {
+            for source in &out_lock.sources {
                 if let Some(input_idx) = self
                     .midi
                     .ins
                     .iter()
-                    .position(|input| Arc::ptr_eq(input, target))
+                    .position(|input| Arc::ptr_eq(input, source))
                 {
                     input_to_out[input_idx].push(out_idx);
-                } else {
-                    out_external_targets[out_idx].push(target.clone());
                 }
+            }
+            for target in &out_lock.connections {
+                out_external_targets[out_idx].push(target.clone());
             }
         }
 
@@ -1006,6 +963,15 @@ impl Track {
         let mut track_input_midi_events = self.collect_track_input_midi_events();
         if self.folder_clip_playback_active {
             self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
+            for (lane, input) in self.midi.ins.iter().enumerate() {
+                let lock = input.lock();
+                lock.buffer.clear();
+                if let Some(events) = track_input_midi_events.get(lane) {
+                    lock.buffer.extend_from_slice(events);
+                }
+                lock.buffer.sort_by_key(|event| event.frame);
+                lock.mark_finished();
+            }
             for (lane, audio_in) in self.audio.ins.iter().enumerate() {
                 if !self.input_monitor.get(lane).copied().unwrap_or(false) {
                     audio_in.buffer.lock().fill(0.0);
@@ -1073,16 +1039,15 @@ impl Track {
                 for input in processor.audio_inputs() {
                     input.process();
                 }
-                let midi_inputs = self.plugin_midi_input_events(
+                self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
                     &track_input_events,
                     &self.folder_plugin_midi_node_events,
                 );
-                let clap_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs = processor.process_with_midi(
                     frames,
-                    &clap_input,
+                    &[],
                     crate::plugins::types::ClapTransportInfo {
                         transport_sample: self.transport_sample,
                         playing: (self.disk_monitor.iter().any(|&m| m)
@@ -1201,8 +1166,8 @@ impl Track {
         let midi_node_events = self.folder_plugin_midi_node_events.clone();
 
         self.ensure_midi_route_cache();
-        self.route_plugin_midi_to_track_outputs_graph(&track_input_events, &midi_node_events);
         self.route_track_inputs_to_track_outputs(&track_input_events);
+        self.route_plugin_midi_to_track_outputs_graph(&track_input_events, &midi_node_events);
 
         // Sum child-track MIDI outputs into the folder's MIDI outputs.
         for child in &self.child_tracks {
@@ -1223,7 +1188,6 @@ impl Track {
         self.route_modulator_midi_to_track_outputs();
         self.route_automation_midi_to_track_outputs();
         self.collect_hw_midi_output_events();
-        self.dispatch_track_output_midi_to_connected_inputs();
         self.clear_local_midi_inputs();
 
         let linear_gain = 10.0_f32.powf(self.level / 20.0);
@@ -4016,7 +3980,7 @@ impl Track {
             let _ = AudioIO::disconnect(audio_out, audio_in);
         }
         for (midi_in, midi_out) in self.midi.ins.iter().zip(self.midi.outs.iter()) {
-            let _ = midi_out.lock().disconnect(midi_in);
+            let _ = MIDIIO::disconnect(midi_out, midi_in);
         }
         self.invalidate_audio_route_cache();
         self.invalidate_midi_route_cache();
@@ -4249,14 +4213,14 @@ impl Track {
                 }
             }
         }
-        for (to_port, to_io) in self.midi.outs.iter().enumerate() {
-            for conn in to_io.lock().connections.iter() {
-                if let Some((from_port, _)) = self
+        for (from_port, from_io) in self.midi.ins.iter().enumerate() {
+            for conn in from_io.lock().connections.iter() {
+                if let Some((to_port, _)) = self
                     .midi
-                    .ins
+                    .outs
                     .iter()
                     .enumerate()
-                    .find(|(_, in_io)| Arc::ptr_eq(in_io, conn))
+                    .find(|(_, out_io)| Arc::ptr_eq(out_io, conn))
                 {
                     connections.push(PluginGraphConnection {
                         from_node: PluginGraphNode::TrackInput,
@@ -4270,6 +4234,257 @@ impl Track {
         }
         connections.extend(self.plugin_midi_connections.iter().cloned());
         connections
+    }
+
+    pub fn connectable_connections(&self) -> Vec<ConnectableConnection> {
+        use crate::connectable::{AudioPorts, MidiPorts};
+        let mut connections = Vec::new();
+
+        // --- Audio ---
+        let mut audio_sources: Vec<(Arc<AudioIO>, ConnectableRef, usize)> = Vec::new();
+        for (port, io) in self.audio.ins.iter().enumerate() {
+            audio_sources.push((io.clone(), ConnectableRef::TrackInput, port));
+        }
+        for (port, io) in self.audio.outs.iter().enumerate() {
+            audio_sources.push((io.clone(), ConnectableRef::TrackOutput, port));
+        }
+        for child in &self.child_tracks {
+            let child = child.lock();
+            let name = child.name.clone();
+            for (port, io) in child.audio_outputs().iter().enumerate() {
+                audio_sources.push((io.clone(), ConnectableRef::ChildTrack(name.clone()), port));
+            }
+        }
+        for instance in &self.clap_plugins {
+            for (port, io) in instance.audio_outputs().iter().enumerate() {
+                audio_sources.push((io.clone(), ConnectableRef::ClapPlugin(instance.id), port));
+            }
+        }
+        for instance in &self.vst3_plugins {
+            for (port, io) in instance.audio_outputs().iter().enumerate() {
+                audio_sources.push((io.clone(), ConnectableRef::Vst3Plugin(instance.id), port));
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for instance in &self.lv2_plugins {
+            for (port, io) in instance.audio_outputs().iter().enumerate() {
+                audio_sources.push((io.clone(), ConnectableRef::Lv2Plugin(instance.id), port));
+            }
+        }
+
+        let find_audio_source = |io: &Arc<AudioIO>| {
+            audio_sources
+                .iter()
+                .find(|(candidate, _, _)| Arc::ptr_eq(candidate, io))
+                .map(|(_, r, p)| (r.clone(), *p))
+        };
+
+        let mut report_audio_targets =
+            |targets: Vec<Arc<AudioIO>>, target_ref: ConnectableRef| {
+                for (port, target) in targets.iter().enumerate() {
+                    let source_list = target.connections.lock().clone();
+                    for source in source_list {
+                        if let Some((from_ref, from_port)) = find_audio_source(&source) {
+                            connections.push(ConnectableConnection {
+                                from: from_ref,
+                                from_port,
+                                to: target_ref.clone(),
+                                to_port: port,
+                                kind: Kind::Audio,
+                            });
+                        }
+                    }
+                }
+            };
+
+        report_audio_targets(self.audio_outputs(), ConnectableRef::TrackOutput);
+        for child in &self.child_tracks {
+            let child = child.lock();
+            let name = child.name.clone();
+            report_audio_targets(child.audio_inputs(), ConnectableRef::ChildTrack(name));
+        }
+        for instance in &self.clap_plugins {
+            report_audio_targets(
+                instance.audio_inputs(),
+                ConnectableRef::ClapPlugin(instance.id),
+            );
+        }
+        for instance in &self.vst3_plugins {
+            report_audio_targets(
+                instance.audio_inputs(),
+                ConnectableRef::Vst3Plugin(instance.id),
+            );
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for instance in &self.lv2_plugins {
+            report_audio_targets(
+                instance.audio_inputs(),
+                ConnectableRef::Lv2Plugin(instance.id),
+            );
+        }
+
+        // --- MIDI ---
+        let mut midi_sources: Vec<(Arc<UnsafeMutex<Box<MIDIIO>>>, ConnectableRef, usize)> =
+            Vec::new();
+        for (port, io) in self.midi.ins.iter().enumerate() {
+            midi_sources.push((io.clone(), ConnectableRef::TrackInput, port));
+        }
+        for (port, io) in self.midi.outs.iter().enumerate() {
+            midi_sources.push((io.clone(), ConnectableRef::TrackOutput, port));
+        }
+        for child in &self.child_tracks {
+            let child = child.lock();
+            let name = child.name.clone();
+            for (port, io) in child.midi_outputs().iter().enumerate() {
+                midi_sources.push((io.clone(), ConnectableRef::ChildTrack(name.clone()), port));
+            }
+        }
+        for instance in &self.clap_plugins {
+            for (port, io) in instance.midi_outputs().iter().enumerate() {
+                midi_sources.push((io.clone(), ConnectableRef::ClapPlugin(instance.id), port));
+            }
+        }
+        for instance in &self.vst3_plugins {
+            for (port, io) in instance.midi_outputs().iter().enumerate() {
+                midi_sources.push((io.clone(), ConnectableRef::Vst3Plugin(instance.id), port));
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for instance in &self.lv2_plugins {
+            for (port, io) in instance.midi_outputs().iter().enumerate() {
+                midi_sources.push((io.clone(), ConnectableRef::Lv2Plugin(instance.id), port));
+            }
+        }
+
+        let find_midi_source = |io: &Arc<UnsafeMutex<Box<MIDIIO>>>| {
+            midi_sources
+                .iter()
+                .find(|(candidate, _, _)| Arc::ptr_eq(candidate, io))
+                .map(|(_, r, p)| (r.clone(), *p))
+        };
+
+        let mut report_midi_targets =
+            |targets: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>, target_ref: ConnectableRef| {
+                for (port, target) in targets.iter().enumerate() {
+                    let source_list = target.lock().sources.clone();
+                    for source in source_list {
+                        if let Some((from_ref, from_port)) = find_midi_source(&source) {
+                            connections.push(ConnectableConnection {
+                                from: from_ref,
+                                from_port,
+                                to: target_ref.clone(),
+                                to_port: port,
+                                kind: Kind::MIDI,
+                            });
+                        }
+                    }
+                }
+            };
+
+        report_midi_targets(self.midi_outputs(), ConnectableRef::TrackOutput);
+        for child in &self.child_tracks {
+            let child = child.lock();
+            let name = child.name.clone();
+            report_midi_targets(child.midi_inputs(), ConnectableRef::ChildTrack(name));
+        }
+        for instance in &self.clap_plugins {
+            report_midi_targets(
+                instance.midi_inputs(),
+                ConnectableRef::ClapPlugin(instance.id),
+            );
+        }
+        for instance in &self.vst3_plugins {
+            report_midi_targets(
+                instance.midi_inputs(),
+                ConnectableRef::Vst3Plugin(instance.id),
+            );
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for instance in &self.lv2_plugins {
+            report_midi_targets(
+                instance.midi_inputs(),
+                ConnectableRef::Lv2Plugin(instance.id),
+            );
+        }
+
+        connections
+    }
+
+    fn plugin_process_order(&self) -> Vec<(PluginKind, usize)> {
+        let mut entries: Vec<(PluginGraphNode, PluginKind, usize)> = Vec::new();
+        for (idx, instance) in self.clap_plugins.iter().enumerate() {
+            entries.push((
+                PluginGraphNode::ClapPluginInstance(instance.id),
+                PluginKind::Clap,
+                idx,
+            ));
+        }
+        for (idx, instance) in self.vst3_plugins.iter().enumerate() {
+            entries.push((
+                PluginGraphNode::Vst3PluginInstance(instance.id),
+                PluginKind::Vst3,
+                idx,
+            ));
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for (idx, instance) in self.lv2_plugins.iter().enumerate() {
+            entries.push((
+                PluginGraphNode::Lv2PluginInstance(instance.id),
+                PluginKind::Lv2,
+                idx,
+            ));
+        }
+
+        let node_to_index: HashMap<PluginGraphNode, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, (node, _, _))| (node.clone(), idx))
+            .collect();
+        let count = entries.len();
+        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); count];
+        let mut in_degree = vec![0usize; count];
+        for conn in self.plugin_graph_connections() {
+            if let Some(&from_idx) = node_to_index.get(&conn.from_node) {
+                if let Some(&to_idx) = node_to_index.get(&conn.to_node) {
+                    adjacency[from_idx].push(to_idx);
+                    in_degree[to_idx] += 1;
+                }
+            }
+        }
+
+        let mut queue: VecDeque<usize> = in_degree
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| **d == 0)
+            .map(|(idx, _)| idx)
+            .collect();
+        let mut order = Vec::with_capacity(count);
+        while let Some(idx) = queue.pop_front() {
+            order.push((entries[idx].1, entries[idx].2));
+            for &next in &adjacency[idx] {
+                in_degree[next] = in_degree[next].saturating_sub(1);
+                if in_degree[next] == 0 {
+                    queue.push_back(next);
+                }
+            }
+        }
+
+        if order.len() < count {
+            // Cycle or disconnected graph: fall back to type ordering so every
+            // plugin still gets a chance to run.
+            order.clear();
+            for (idx, _) in self.clap_plugins.iter().enumerate() {
+                order.push((PluginKind::Clap, idx));
+            }
+            for (idx, _) in self.vst3_plugins.iter().enumerate() {
+                order.push((PluginKind::Vst3, idx));
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            for (idx, _) in self.lv2_plugins.iter().enumerate() {
+                order.push((PluginKind::Lv2, idx));
+            }
+        }
+        order
     }
 
     pub fn connect_plugin_audio(
@@ -4321,42 +4536,32 @@ impl Track {
         if from_node == to_node && from_port == to_port {
             return Err("Cannot connect a MIDI port to itself".to_string());
         }
-        if matches!(from_node, PluginGraphNode::TrackInput)
-            && matches!(to_node, PluginGraphNode::TrackOutput)
-        {
-            let Some(midi_in) = self.midi.ins.get(from_port).cloned() else {
-                return Err(format!("Track MIDI input port {from_port} not found"));
-            };
-            let Some(midi_out) = self.midi.outs.get(to_port).cloned() else {
-                return Err(format!("Track MIDI output port {to_port} not found"));
-            };
-            let out = midi_out.lock();
-            let exists = out
-                .connections
-                .iter()
-                .any(|conn| Arc::ptr_eq(conn, &midi_in));
-            if !exists {
-                out.connect(midi_in);
-            }
-            self.invalidate_midi_route_cache();
-            return Ok(());
-        }
         if routing::would_create_cycle(&from_node, &to_node, |node| {
             self.plugin_connected_neighbors(Kind::MIDI, node)
         }) {
             return Err("Circular routing is not allowed!".to_string());
         }
-        let new_conn = PluginGraphConnection {
-            from_node,
-            from_port,
-            to_node,
-            to_port,
-            kind: Kind::MIDI,
-        };
-        if self.plugin_midi_connections.iter().any(|c| c == &new_conn) {
-            return Ok(());
+
+        let source = self.plugin_midi_source_io(&from_node, from_port)?;
+        let target = self.plugin_midi_target_io(&to_node, to_port)?;
+        MIDIIO::connect(&source, &target);
+
+        if !(matches!(from_node, PluginGraphNode::TrackInput)
+            && matches!(to_node, PluginGraphNode::TrackOutput))
+        {
+            let new_conn = PluginGraphConnection {
+                from_node,
+                from_port,
+                to_node,
+                to_port,
+                kind: Kind::MIDI,
+            };
+            if !self.plugin_midi_connections.iter().any(|c| c == &new_conn) {
+                self.plugin_midi_connections.push(new_conn);
+            }
         }
-        self.plugin_midi_connections.push(new_conn);
+
+        self.invalidate_midi_route_cache();
         Ok(())
     }
 
@@ -4367,32 +4572,266 @@ impl Track {
         to_node: PluginGraphNode,
         to_port: usize,
     ) -> Result<(), String> {
-        if matches!(from_node, PluginGraphNode::TrackInput)
-            && matches!(to_node, PluginGraphNode::TrackOutput)
+        let source = self.plugin_midi_source_io(&from_node, from_port)?;
+        let target = self.plugin_midi_target_io(&to_node, to_port)?;
+        MIDIIO::disconnect(&source, &target)?;
+
+        if !(matches!(from_node, PluginGraphNode::TrackInput)
+            && matches!(to_node, PluginGraphNode::TrackOutput))
         {
-            let Some(midi_in) = self.midi.ins.get(from_port).cloned() else {
-                return Err(format!("Track MIDI input port {from_port} not found"));
-            };
-            let Some(midi_out) = self.midi.outs.get(to_port).cloned() else {
-                return Err(format!("Track MIDI output port {to_port} not found"));
-            };
-            midi_out.lock().disconnect(&midi_in)?;
-            self.invalidate_midi_route_cache();
-            return Ok(());
+            let before = self.plugin_midi_connections.len();
+            self.plugin_midi_connections.retain(|c| {
+                !(c.kind == Kind::MIDI
+                    && c.from_node == from_node
+                    && c.from_port == from_port
+                    && c.to_node == to_node
+                    && c.to_port == to_port)
+            });
+            if self.plugin_midi_connections.len() == before {
+                return Err("MIDI plugin graph connection not found".to_string());
+            }
         }
-        let before = self.plugin_midi_connections.len();
-        self.plugin_midi_connections.retain(|c| {
-            !(c.kind == Kind::MIDI
-                && c.from_node == from_node
-                && c.from_port == from_port
-                && c.to_node == to_node
-                && c.to_port == to_port)
-        });
-        if self.plugin_midi_connections.len() == before {
-            Err("MIDI plugin graph connection not found".to_string())
-        } else {
-            Ok(())
+
+        self.invalidate_midi_route_cache();
+        Ok(())
+    }
+
+    fn connectable_audio_output(
+        &self,
+        connectable: &ConnectableRef,
+        port: usize,
+    ) -> Result<Arc<AudioIO>, String> {
+        use crate::connectable::AudioPorts;
+        match connectable {
+            ConnectableRef::TrackInput => {
+                Err("Track input cannot be used as an audio source".to_string())
+            }
+            ConnectableRef::TrackOutput => self
+                .audio_outputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track output audio port {port} not found")),
+            ConnectableRef::ChildTrack(name) => self
+                .child_tracks
+                .iter()
+                .find(|child| child.lock().name == *name)
+                .and_then(|child| child.lock().audio_outputs().get(port).cloned())
+                .ok_or_else(|| format!("Child track '{name}' audio output port {port} not found")),
+            ConnectableRef::ClapPlugin(instance_id) => self
+                .clap_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.audio_outputs().get(port).cloned())
+                .ok_or_else(|| format!("CLAP plugin audio output port {port} not found")),
+            ConnectableRef::Vst3Plugin(instance_id) => self
+                .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.audio_outputs().get(port).cloned())
+                .ok_or_else(|| format!("VST3 plugin audio output port {port} not found")),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            ConnectableRef::Lv2Plugin(instance_id) => self
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.audio_outputs().get(port).cloned())
+                .ok_or_else(|| format!("LV2 plugin audio output port {port} not found")),
         }
+    }
+
+    fn connectable_audio_input(
+        &self,
+        connectable: &ConnectableRef,
+        port: usize,
+    ) -> Result<Arc<AudioIO>, String> {
+        use crate::connectable::AudioPorts;
+        match connectable {
+            ConnectableRef::TrackOutput => self
+                .audio_outputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track output audio port {port} not found")),
+            ConnectableRef::TrackInput => self
+                .audio_inputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track input audio port {port} not found")),
+            ConnectableRef::ChildTrack(name) => self
+                .child_tracks
+                .iter()
+                .find(|child| child.lock().name == *name)
+                .and_then(|child| child.lock().audio_inputs().get(port).cloned())
+                .ok_or_else(|| format!("Child track '{name}' audio input port {port} not found")),
+            ConnectableRef::ClapPlugin(instance_id) => self
+                .clap_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.audio_inputs().get(port).cloned())
+                .ok_or_else(|| format!("CLAP plugin audio input port {port} not found")),
+            ConnectableRef::Vst3Plugin(instance_id) => self
+                .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.audio_inputs().get(port).cloned())
+                .ok_or_else(|| format!("VST3 plugin audio input port {port} not found")),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            ConnectableRef::Lv2Plugin(instance_id) => self
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.audio_inputs().get(port).cloned())
+                .ok_or_else(|| format!("LV2 plugin audio input port {port} not found")),
+        }
+    }
+
+    fn connectable_midi_output(
+        &self,
+        connectable: &ConnectableRef,
+        port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        use crate::connectable::MidiPorts;
+        match connectable {
+            ConnectableRef::TrackInput => {
+                Err("Track input cannot be used as a MIDI source".to_string())
+            }
+            ConnectableRef::TrackOutput => self
+                .midi_outputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track output MIDI port {port} not found")),
+            ConnectableRef::ChildTrack(name) => self
+                .child_tracks
+                .iter()
+                .find(|child| child.lock().name == *name)
+                .and_then(|child| child.lock().midi_outputs().get(port).cloned())
+                .ok_or_else(|| format!("Child track '{name}' MIDI output port {port} not found")),
+            ConnectableRef::ClapPlugin(instance_id) => self
+                .clap_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.midi_outputs().get(port).cloned())
+                .ok_or_else(|| format!("CLAP plugin MIDI output port {port} not found")),
+            ConnectableRef::Vst3Plugin(instance_id) => self
+                .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.midi_outputs().get(port).cloned())
+                .ok_or_else(|| format!("VST3 plugin MIDI output port {port} not found")),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            ConnectableRef::Lv2Plugin(instance_id) => self
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.midi_outputs().get(port).cloned())
+                .ok_or_else(|| format!("LV2 plugin MIDI output port {port} not found")),
+        }
+    }
+
+    fn connectable_midi_input(
+        &self,
+        connectable: &ConnectableRef,
+        port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        use crate::connectable::MidiPorts;
+        match connectable {
+            ConnectableRef::TrackOutput => self
+                .midi_outputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track output MIDI port {port} not found")),
+            ConnectableRef::TrackInput => self
+                .midi_inputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track input MIDI port {port} not found")),
+            ConnectableRef::ChildTrack(name) => self
+                .child_tracks
+                .iter()
+                .find(|child| child.lock().name == *name)
+                .and_then(|child| child.lock().midi_inputs().get(port).cloned())
+                .ok_or_else(|| format!("Child track '{name}' MIDI input port {port} not found")),
+            ConnectableRef::ClapPlugin(instance_id) => self
+                .clap_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.midi_inputs().get(port).cloned())
+                .ok_or_else(|| format!("CLAP plugin MIDI input port {port} not found")),
+            ConnectableRef::Vst3Plugin(instance_id) => self
+                .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.midi_inputs().get(port).cloned())
+                .ok_or_else(|| format!("VST3 plugin MIDI input port {port} not found")),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            ConnectableRef::Lv2Plugin(instance_id) => self
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .and_then(|instance| instance.midi_inputs().get(port).cloned())
+                .ok_or_else(|| format!("LV2 plugin MIDI input port {port} not found")),
+        }
+    }
+
+    pub fn connect_audio_connectable(
+        &mut self,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
+        to_port: usize,
+    ) -> Result<(), String> {
+        let source = self.connectable_audio_output(&from, from_port)?;
+        let target = self.connectable_audio_input(&to, to_port)?;
+        if from == to && from_port == to_port {
+            return Err("Cannot connect an audio port to itself".to_string());
+        }
+        AudioIO::connect(&source, &target);
+        self.invalidate_audio_route_cache();
+        Ok(())
+    }
+
+    pub fn disconnect_audio_connectable(
+        &mut self,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
+        to_port: usize,
+    ) -> Result<(), String> {
+        let source = self.connectable_audio_output(&from, from_port)?;
+        let target = self.connectable_audio_input(&to, to_port)?;
+        AudioIO::disconnect(&source, &target)?;
+        self.invalidate_audio_route_cache();
+        Ok(())
+    }
+
+    pub fn connect_midi_connectable(
+        &mut self,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
+        to_port: usize,
+    ) -> Result<(), String> {
+        let source = self.connectable_midi_output(&from, from_port)?;
+        let target = self.connectable_midi_input(&to, to_port)?;
+        if from == to && from_port == to_port {
+            return Err("Cannot connect a MIDI port to itself".to_string());
+        }
+        MIDIIO::connect(&source, &target);
+        self.invalidate_midi_route_cache();
+        Ok(())
+    }
+
+    pub fn disconnect_midi_connectable(
+        &mut self,
+        from: ConnectableRef,
+        from_port: usize,
+        to: ConnectableRef,
+        to_port: usize,
+    ) -> Result<(), String> {
+        let source = self.connectable_midi_output(&from, from_port)?;
+        let target = self.connectable_midi_input(&to, to_port)?;
+        MIDIIO::disconnect(&source, &target)?;
+        self.invalidate_midi_route_cache();
+        Ok(())
     }
 
     fn with_default_passthrough(mut self) -> Self {
@@ -4451,26 +4890,27 @@ impl Track {
             self.disconnect_midi_inputs_from_outputs();
             return;
         }
-        for (midi_in, midi_out) in self.midi.ins.iter().zip(self.midi.outs.iter()) {
-            let out = midi_out.lock();
-            let exists = out
-                .connections
-                .iter()
-                .any(|conn| Arc::ptr_eq(conn, midi_in));
-            if !exists {
-                out.connect(midi_in.clone());
-            }
+        let count = self.midi.ins.len().min(self.midi.outs.len());
+        for port in 0..count {
+            let _ = self.connect_plugin_midi(
+                PluginGraphNode::TrackInput,
+                port,
+                PluginGraphNode::TrackOutput,
+                port,
+            );
         }
-        self.invalidate_midi_route_cache();
     }
 
     fn disconnect_midi_inputs_from_outputs(&mut self) {
-        for midi_in in &self.midi.ins {
-            for midi_out in &self.midi.outs {
-                let _ = midi_out.lock().disconnect(midi_in);
-            }
+        let count = self.midi.ins.len().min(self.midi.outs.len());
+        for port in 0..count {
+            let _ = self.disconnect_plugin_midi(
+                PluginGraphNode::TrackInput,
+                port,
+                PluginGraphNode::TrackOutput,
+                port,
+            );
         }
-        self.invalidate_midi_route_cache();
     }
 
     pub fn connect_outputs_to_parent(&mut self, parent: &Track) {
@@ -4505,13 +4945,13 @@ impl Track {
         // Folder MIDI input -> child MIDI input
         for (in_idx, child_in) in self.midi.ins.iter().enumerate() {
             if let Some(parent_in) = parent.midi.ins.get(in_idx) {
-                let _ = child_in.lock().disconnect(parent_in);
+                let _ = MIDIIO::disconnect(parent_in, child_in);
             }
         }
         // Child MIDI output -> folder MIDI output
         for (out_idx, child_out) in self.midi.outs.iter().enumerate() {
             if let Some(parent_out) = parent.midi.outs.get(out_idx) {
-                let _ = child_out.lock().disconnect(parent_out);
+                let _ = MIDIIO::disconnect(child_out, parent_out);
             }
         }
         self.invalidate_audio_route_cache();
@@ -4722,6 +5162,96 @@ impl Track {
             .ok_or_else(|| format!("CLAP instance {instance_id} MIDI input port {port} missing"))
     }
 
+    fn clap_midi_output_io(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        self.clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| {
+                instance
+                    .processor
+                    .lock()
+                    .midi_output_ports()
+                    .get(port)
+                    .cloned()
+            })
+            .ok_or_else(|| format!("CLAP instance {instance_id} MIDI output port {port} missing"))
+    }
+
+    fn clap_midi_input_io(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        self.clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| {
+                instance
+                    .processor
+                    .lock()
+                    .midi_input_ports()
+                    .get(port)
+                    .cloned()
+            })
+            .ok_or_else(|| format!("CLAP instance {instance_id} MIDI input port {port} missing"))
+    }
+
+    fn vst3_midi_output_io(
+        &self,
+        _instance_id: usize,
+        _port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        Err("VST3 MIDI output ports not yet implemented".to_string())
+    }
+
+    fn vst3_midi_input_io(
+        &self,
+        _instance_id: usize,
+        _port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        Err("VST3 MIDI input ports not yet implemented".to_string())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn lv2_midi_output_io(
+        &self,
+        _instance_id: usize,
+        _port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        Err("LV2 MIDI output ports not yet implemented".to_string())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn lv2_midi_input_io(
+        &self,
+        _instance_id: usize,
+        _port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        Err("LV2 MIDI input ports not yet implemented".to_string())
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn lv2_midi_output_io(
+        &self,
+        _instance_id: usize,
+        _port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        Err("LV2 is not supported on this platform".to_string())
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn lv2_midi_input_io(
+        &self,
+        _instance_id: usize,
+        _port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        Err("LV2 is not supported on this platform".to_string())
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     fn lv2_instance_id_exists(&self, id: usize) -> bool {
         self.lv2_plugins.iter().any(|i| i.id == id)
@@ -4780,6 +5310,62 @@ impl Track {
             #[cfg(all(unix, not(target_os = "macos")))]
             PluginGraphNode::Lv2PluginInstance(instance_id) => {
                 self.lv2_audio_input_io(*instance_id, port)
+            }
+        }
+    }
+
+    pub fn plugin_midi_source_io(
+        &self,
+        node: &PluginGraphNode,
+        port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        match node {
+            PluginGraphNode::TrackInput => self
+                .midi
+                .ins
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track MIDI input port {port} not found")),
+            PluginGraphNode::TrackOutput => {
+                Err("Track output node cannot be MIDI source".to_string())
+            }
+            PluginGraphNode::ClapPluginInstance(instance_id) => {
+                self.clap_midi_output_io(*instance_id, port)
+            }
+            PluginGraphNode::Vst3PluginInstance(instance_id) => {
+                self.vst3_midi_output_io(*instance_id, port)
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginGraphNode::Lv2PluginInstance(instance_id) => {
+                self.lv2_midi_output_io(*instance_id, port)
+            }
+        }
+    }
+
+    pub fn plugin_midi_target_io(
+        &self,
+        node: &PluginGraphNode,
+        port: usize,
+    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+        match node {
+            PluginGraphNode::TrackInput => {
+                Err("Track input node cannot be MIDI target".to_string())
+            }
+            PluginGraphNode::TrackOutput => self
+                .midi
+                .outs
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track MIDI output port {port} not found")),
+            PluginGraphNode::ClapPluginInstance(instance_id) => {
+                self.clap_midi_input_io(*instance_id, port)
+            }
+            PluginGraphNode::Vst3PluginInstance(instance_id) => {
+                self.vst3_midi_input_io(*instance_id, port)
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginGraphNode::Lv2PluginInstance(instance_id) => {
+                self.lv2_midi_input_io(*instance_id, port)
             }
         }
     }
@@ -4881,17 +5467,20 @@ impl Track {
         let clip_playback_active = midi_disk_active && self.clip_playback_enabled;
         for (lane, input) in self.midi.ins.iter().enumerate() {
             let input_lock = input.lock();
-            let mut port_events = std::mem::take(&mut input_lock.buffer);
-            self.record_tap_midi_in.extend(port_events.iter().cloned());
+            self.record_tap_midi_in.extend(input_lock.buffer.iter().cloned());
             let monitor = self.midi_input_monitor.get(lane).copied().unwrap_or(false);
             if clip_playback_active && !monitor {
-                port_events.clear();
+                input_lock.buffer.clear();
             } else if (monitor || self.record_tap_enabled)
                 && let Some(Some(channel)) = self.midi_lane_channels.get(lane)
             {
-                port_events.retain(|event| Self::event_matches_midi_channel(event, *channel));
+                input_lock
+                    .buffer
+                    .retain(|event| Self::event_matches_midi_channel(event, *channel));
             }
-            events.push(port_events);
+            input_lock.buffer.sort_by_key(|event| event.frame);
+            input_lock.mark_finished();
+            events.push(input_lock.buffer.clone());
         }
         self.record_tap_midi_in.sort_by_key(|e| e.frame);
         events
@@ -4907,25 +5496,15 @@ impl Track {
         (status & 0x0F) == channel.min(15)
     }
 
-    fn route_track_inputs_to_track_outputs(&mut self, input_events: &[Vec<MidiEvent>]) {
+    fn route_track_inputs_to_track_outputs(&mut self, _input_events: &[Vec<MidiEvent>]) {
         for out in &self.midi.outs {
             out.lock().buffer.clear();
         }
         if !self.output_enabled || self.is_folder {
             return;
         }
-        for (input_idx, events) in input_events.iter().enumerate() {
-            if events.is_empty() {
-                continue;
-            }
-            let Some(out_indices) = self.midi_input_to_out_routes_cache.get(input_idx) else {
-                continue;
-            };
-            for out_idx in out_indices {
-                if let Some(out) = self.midi.outs.get(*out_idx) {
-                    out.lock().buffer.extend_from_slice(events);
-                }
-            }
+        for out in &self.midi.outs {
+            out.lock().process();
         }
     }
 
@@ -4981,158 +5560,136 @@ impl Track {
 
     fn process_track_plugins_in_graph_order(&mut self, frames: usize) {
         let track_input_events = self.folder_input_midi_events.clone();
-        let mut clap_processed = vec![false; self.clap_plugins.len()];
-        let mut vst3_processed = vec![false; self.vst3_plugins.len()];
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let mut lv2_processed = vec![false; self.lv2_plugins.len()];
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let mut remaining = clap_processed.len() + vst3_processed.len() + lv2_processed.len();
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
-        let mut remaining = clap_processed.len() + vst3_processed.len();
+        let order = self.plugin_process_order();
+        let mut processed = HashSet::<(PluginKind, usize)>::new();
         self.folder_processed_midi_plugins.clear();
         self.folder_plugin_midi_node_events.clear();
         let echoed = self.echoed_parameter_updates.lock();
         echoed.clear();
         let track_name = self.name.clone();
 
-        while remaining > 0 {
+        while processed.len() < order.len() {
             let mut progressed = false;
-
-            for (idx, done) in clap_processed.iter_mut().enumerate() {
-                if *done {
+            for &(kind, idx) in &order {
+                if processed.contains(&(kind, idx)) {
                     continue;
                 }
-                let processor = self.clap_plugins[idx].processor.lock();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
-                let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
-                    continue;
+                match kind {
+                    PluginKind::Clap => {
+                        let processor = self.clap_plugins[idx].processor.lock();
+                        if !processor.audio_inputs().iter().all(|input| input.ready()) {
+                            continue;
+                        }
+                        let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
+                        for input in processor.audio_inputs() {
+                            input.process();
+                        }
+                        self.plugin_midi_input_events(
+                            &node,
+                            processor.midi_input_count(),
+                            &track_input_events,
+                            &self.folder_plugin_midi_node_events,
+                        );
+                        let outputs = processor.process_with_midi(
+                            frames,
+                            &[],
+                            crate::plugins::types::ClapTransportInfo {
+                                transport_sample: self.transport_sample,
+                                playing: (self.disk_monitor.iter().any(|&m| m)
+                                    || self.midi_disk_monitor.iter().any(|&m| m))
+                                    && self.clip_playback_enabled,
+                                loop_enabled: self.loop_enabled,
+                                loop_range_samples: self.loop_range_samples,
+                                bpm: self.tempo_bpm,
+                                tsig_num: self.tsig_num,
+                                tsig_denom: self.tsig_denom,
+                            },
+                        );
+                        for ev in processor.drain_echoed_parameters() {
+                            echoed.push(crate::message::Action::TrackSetClapParameter {
+                                track_name: track_name.clone(),
+                                instance_id: self.clap_plugins[idx].id,
+                                param_id: ev.param_index,
+                                value: ev.value as f64,
+                            });
+                        }
+                        for evt in outputs {
+                            self.folder_plugin_midi_node_events
+                                .entry((node.clone(), evt.port))
+                                .or_default()
+                                .push(evt.event);
+                        }
+                        self.folder_processed_midi_plugins.insert(node);
+                    }
+                    PluginKind::Vst3 => {
+                        let processor = self.vst3_plugins[idx].processor.lock();
+                        if !processor.audio_inputs().iter().all(|input| input.ready()) {
+                            continue;
+                        }
+                        let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
+                        for input in processor.audio_inputs() {
+                            input.process();
+                        }
+                        let midi_inputs = self.plugin_midi_input_events(
+                            &node,
+                            processor.midi_input_count(),
+                            &track_input_events,
+                            &self.folder_plugin_midi_node_events,
+                        );
+                        let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
+                        let outputs = processor.process_with_midi(frames, &vst3_input);
+                        for ev in processor.drain_echoed_parameters() {
+                            echoed.push(crate::message::Action::TrackSetVst3Parameter {
+                                track_name: track_name.clone(),
+                                instance_id: self.vst3_plugins[idx].id,
+                                param_id: ev.param_index,
+                                value: ev.value,
+                            });
+                        }
+                        if !outputs.is_empty() {
+                            self.folder_plugin_midi_node_events
+                                .insert((node.clone(), 0), outputs);
+                        }
+                        self.folder_processed_midi_plugins.insert(node);
+                    }
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    PluginKind::Lv2 => {
+                        let processor = self.lv2_plugins[idx].processor.lock();
+                        if !processor.audio_inputs().iter().all(|input| input.ready()) {
+                            continue;
+                        }
+                        let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
+                        for input in processor.audio_inputs() {
+                            input.process();
+                        }
+                        let midi_inputs = self.plugin_midi_input_events(
+                            &node,
+                            processor.midi_input_count(),
+                            &track_input_events,
+                            &self.folder_plugin_midi_node_events,
+                        );
+                        let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
+                        let outputs = processor.process_with_midi(frames, &lv2_input);
+                        for ev in processor.drain_echoed_parameters() {
+                            echoed.push(crate::message::Action::TrackSetLv2ControlValue {
+                                track_name: track_name.clone(),
+                                instance_id: self.lv2_plugins[idx].id,
+                                index: ev.param_index,
+                                value: ev.value,
+                            });
+                        }
+                        if !outputs.is_empty() {
+                            self.folder_plugin_midi_node_events
+                                .insert((node.clone(), 0), outputs);
+                        }
+                        self.folder_processed_midi_plugins.insert(node);
+                    }
+                    #[cfg(not(all(unix, not(target_os = "macos"))))]
+                    PluginKind::Lv2 => {}
                 }
-                for input in processor.audio_inputs() {
-                    input.process();
-                }
-                let midi_inputs = self.plugin_midi_input_events(
-                    &node,
-                    processor.midi_input_count(),
-                    &track_input_events,
-                    &self.folder_plugin_midi_node_events,
-                );
-                let clap_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs = processor.process_with_midi(
-                    frames,
-                    &clap_input,
-                    crate::plugins::types::ClapTransportInfo {
-                        transport_sample: self.transport_sample,
-                        playing: (self.disk_monitor.iter().any(|&m| m)
-                            || self.midi_disk_monitor.iter().any(|&m| m))
-                            && self.clip_playback_enabled,
-                        loop_enabled: self.loop_enabled,
-                        loop_range_samples: self.loop_range_samples,
-                        bpm: self.tempo_bpm,
-                        tsig_num: self.tsig_num,
-                        tsig_denom: self.tsig_denom,
-                    },
-                );
-                for ev in processor.drain_echoed_parameters() {
-                    echoed.push(crate::message::Action::TrackSetClapParameter {
-                        track_name: track_name.clone(),
-                        instance_id: self.clap_plugins[idx].id,
-                        param_id: ev.param_index,
-                        value: ev.value as f64,
-                    });
-                }
-                for evt in outputs {
-                    self.folder_plugin_midi_node_events
-                        .entry((node.clone(), evt.port))
-                        .or_default()
-                        .push(evt.event);
-                }
-                *done = true;
-                remaining = remaining.saturating_sub(1);
-                self.folder_processed_midi_plugins.insert(node);
+                processed.insert((kind, idx));
                 progressed = true;
             }
-
-            for (idx, done) in vst3_processed.iter_mut().enumerate() {
-                if *done {
-                    continue;
-                }
-                let processor = self.vst3_plugins[idx].processor.lock();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
-                let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
-                    continue;
-                }
-                for input in processor.audio_inputs() {
-                    input.process();
-                }
-                let midi_inputs = self.plugin_midi_input_events(
-                    &node,
-                    processor.midi_input_count(),
-                    &track_input_events,
-                    &self.folder_plugin_midi_node_events,
-                );
-                let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs = processor.process_with_midi(frames, &vst3_input);
-                for ev in processor.drain_echoed_parameters() {
-                    echoed.push(crate::message::Action::TrackSetVst3Parameter {
-                        track_name: track_name.clone(),
-                        instance_id: self.vst3_plugins[idx].id,
-                        param_id: ev.param_index,
-                        value: ev.value,
-                    });
-                }
-                if !outputs.is_empty() {
-                    self.folder_plugin_midi_node_events
-                        .insert((node.clone(), 0), outputs);
-                }
-                *done = true;
-                remaining = remaining.saturating_sub(1);
-                self.folder_processed_midi_plugins.insert(node);
-                progressed = true;
-            }
-
-            #[cfg(all(unix, not(target_os = "macos")))]
-            for (idx, done) in lv2_processed.iter_mut().enumerate() {
-                if *done {
-                    continue;
-                }
-                let processor = self.lv2_plugins[idx].processor.lock();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
-                if !ready || !self.plugin_midi_ready(&node, &self.folder_processed_midi_plugins) {
-                    continue;
-                }
-                for input in processor.audio_inputs() {
-                    input.process();
-                }
-                let midi_inputs = self.plugin_midi_input_events(
-                    &node,
-                    processor.midi_input_count(),
-                    &track_input_events,
-                    &self.folder_plugin_midi_node_events,
-                );
-                let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs = processor.process_with_midi(frames, &lv2_input);
-                for ev in processor.drain_echoed_parameters() {
-                    echoed.push(crate::message::Action::TrackSetLv2ControlValue {
-                        track_name: track_name.clone(),
-                        instance_id: self.lv2_plugins[idx].id,
-                        index: ev.param_index,
-                        value: ev.value,
-                    });
-                }
-                if !outputs.is_empty() {
-                    self.folder_plugin_midi_node_events
-                        .insert((node.clone(), 0), outputs);
-                }
-                *done = true;
-                remaining = remaining.saturating_sub(1);
-                self.folder_processed_midi_plugins.insert(node);
-                progressed = true;
-            }
-
             if !progressed {
                 break;
             }
@@ -5166,28 +5723,55 @@ impl Track {
         &self,
         node: &PluginGraphNode,
         midi_inputs: usize,
-        track_input_events: &[Vec<MidiEvent>],
-        node_events: &HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+        _track_input_events: &[Vec<MidiEvent>],
+        _node_events: &HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
     ) -> Vec<Vec<MidiEvent>> {
-        let mut per_port = vec![Vec::new(); midi_inputs];
-        for conn in self.plugin_midi_connections.iter().filter(|conn| {
-            conn.kind == Kind::MIDI && &conn.to_node == node && conn.to_port < midi_inputs
-        }) {
-            let events_opt = if conn.from_node == PluginGraphNode::TrackInput {
-                track_input_events.get(conn.from_port)
-            } else {
-                node_events.get(&(conn.from_node.clone(), conn.from_port))
-            };
-            if let Some(events) = events_opt {
-                per_port[conn.to_port].extend_from_slice(events);
-            }
+        let ports = self.plugin_midi_input_ports_for_node(node);
+        let mut per_port: Vec<Vec<MidiEvent>> = ports
+            .iter()
+            .map(|port| {
+                let lock = port.lock();
+                lock.process();
+                lock.buffer.clone()
+            })
+            .collect();
+        if per_port.len() < midi_inputs {
+            per_port.resize_with(midi_inputs, Vec::new);
         }
         per_port
     }
 
+    fn plugin_midi_input_ports_for_node(
+        &self,
+        node: &PluginGraphNode,
+    ) -> Vec<Arc<UnsafeMutex<Box<MIDIIO>>>> {
+        match node {
+            PluginGraphNode::ClapPluginInstance(instance_id) => self
+                .clap_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.lock().midi_input_ports().to_vec())
+                .unwrap_or_default(),
+            PluginGraphNode::Vst3PluginInstance(instance_id) => self
+                .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.lock().midi_input_ports().to_vec())
+                .unwrap_or_default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginGraphNode::Lv2PluginInstance(instance_id) => self
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.lock().midi_input_ports().to_vec())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     fn route_plugin_midi_to_track_outputs_graph(
         &self,
-        track_input_events: &[Vec<MidiEvent>],
+        _track_input_events: &[Vec<MidiEvent>],
         node_events: &HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
     ) {
         if !self.output_enabled {
@@ -5198,34 +5782,18 @@ impl Track {
             .iter()
             .filter(|conn| conn.kind == Kind::MIDI && conn.to_node == PluginGraphNode::TrackOutput)
         {
+            // Track input -> output is handled by MIDIIO::process on the output.
+            // CLAP plugin outputs already feed track outputs through their MIDIIO ports.
+            if conn.from_node == PluginGraphNode::TrackInput
+                || matches!(conn.from_node, PluginGraphNode::ClapPluginInstance(_))
+            {
+                continue;
+            }
             let Some(out) = self.midi.outs.get(conn.to_port) else {
                 continue;
             };
-            let events_opt = if conn.from_node == PluginGraphNode::TrackInput {
-                track_input_events.get(conn.from_port)
-            } else {
-                node_events.get(&(conn.from_node.clone(), conn.from_port))
-            };
-            if let Some(events) = events_opt {
+            if let Some(events) = node_events.get(&(conn.from_node.clone(), conn.from_port)) {
                 out.lock().buffer.extend_from_slice(events);
-            }
-        }
-    }
-
-    fn dispatch_track_output_midi_to_connected_inputs(&mut self) {
-        for (out_idx, out) in self.midi.outs.iter().enumerate() {
-            let events = {
-                let out_lock = out.lock();
-                std::mem::take(&mut out_lock.buffer)
-            };
-            if events.is_empty() {
-                continue;
-            }
-            let Some(targets) = self.midi_out_external_targets_cache.get(out_idx) else {
-                continue;
-            };
-            for target in targets.iter() {
-                target.lock().buffer.extend_from_slice(&events);
             }
         }
     }
@@ -5254,11 +5822,94 @@ impl Track {
     }
 }
 
+impl crate::connectable::AudioPorts for Track {
+    fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.audio.ins.clone()
+    }
+
+    fn audio_outputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.audio.outs.clone()
+    }
+}
+
+impl crate::connectable::MidiPorts for Track {
+    fn midi_inputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.midi.ins.clone()
+    }
+
+    fn midi_outputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.midi.outs.clone()
+    }
+}
+
+impl crate::connectable::AudioPorts for ClapInstance {
+    fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.processor.lock().audio_inputs().to_vec()
+    }
+
+    fn audio_outputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.processor.lock().audio_outputs().to_vec()
+    }
+}
+
+impl crate::connectable::MidiPorts for ClapInstance {
+    fn midi_inputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.processor.lock().midi_input_ports().to_vec()
+    }
+
+    fn midi_outputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.processor.lock().midi_output_ports().to_vec()
+    }
+}
+
+impl crate::connectable::AudioPorts for Vst3Instance {
+    fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.processor.lock().audio_inputs().to_vec()
+    }
+
+    fn audio_outputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.processor.lock().audio_outputs().to_vec()
+    }
+}
+
+impl crate::connectable::MidiPorts for Vst3Instance {
+    fn midi_inputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.processor.lock().midi_input_ports().to_vec()
+    }
+
+    fn midi_outputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.processor.lock().midi_output_ports().to_vec()
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl crate::connectable::AudioPorts for Lv2Instance {
+    fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.processor.lock().audio_inputs().to_vec()
+    }
+
+    fn audio_outputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
+        self.processor.lock().audio_outputs().to_vec()
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl crate::connectable::MidiPorts for Lv2Instance {
+    fn midi_inputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.processor.lock().midi_input_ports().to_vec()
+    }
+
+    fn midi_outputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+        self.processor.lock().midi_output_ports().to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AudioClipBuffer, HwMidiOutEvent, Track};
     use crate::audio::clip::AudioClip;
     use crate::audio::io::AudioIO;
+    use crate::mutex::UnsafeMutex;
     use crate::{kind::Kind, message::PluginGraphNode};
     use std::sync::Arc;
 
@@ -5291,18 +5942,18 @@ mod tests {
         assert_eq!(track.midi.ins.len(), 1);
         assert_eq!(track.midi.outs.len(), 2);
         assert!(
-            track.midi.outs[0]
+            track.midi.ins[0]
                 .lock()
                 .connections
                 .iter()
-                .any(|conn| Arc::ptr_eq(conn, &track.midi.ins[0]))
+                .any(|conn| Arc::ptr_eq(conn, &track.midi.outs[0]))
         );
         assert!(
-            track.midi.outs[1]
+            track.midi.ins[0]
                 .lock()
                 .connections
                 .iter()
-                .all(|conn| !Arc::ptr_eq(conn, &track.midi.ins[0]))
+                .all(|conn| !Arc::ptr_eq(conn, &track.midi.outs[1]))
         );
     }
 
@@ -5952,4 +6603,125 @@ mod tests {
         let outputs = Track::process_direct_clip_graph(&graph, &[vec![0.5, -0.25]], 2);
         assert_eq!(outputs, vec![vec![0.0, 0.0]]);
     }
+
+    #[test]
+    fn connectable_connections_reports_default_audio_passthrough() {
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let connections = track.connectable_connections();
+
+        assert!(connections.iter().any(|c| {
+            c.kind == Kind::Audio
+                && c.from == crate::connectable::ConnectableRef::TrackInput
+                && c.from_port == 0
+                && c.to == crate::connectable::ConnectableRef::TrackOutput
+                && c.to_port == 0
+        }));
+    }
+
+    #[test]
+    fn connectable_connections_reports_child_to_folder_output() {
+        let mut folder = Track::new_folder("Folder".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let child = Arc::new(UnsafeMutex::new(Box::new(Track::new(
+            "Child".to_string(),
+            1,
+            1,
+            0,
+            0,
+            8,
+            48_000.0,
+        ))));
+        {
+            let child_lock = child.lock();
+            AudioIO::connect(&child_lock.audio.outs[0], &folder.audio.outs[0]);
+        }
+        folder.child_tracks.push(child);
+
+        let connections = folder.connectable_connections();
+        assert!(connections.iter().any(|c| {
+            c.kind == Kind::Audio
+                && c.from == crate::connectable::ConnectableRef::ChildTrack("Child".to_string())
+                && c.from_port == 0
+                && c.to == crate::connectable::ConnectableRef::TrackOutput
+                && c.to_port == 0
+        }));
+    }
+
+    #[test]
+    fn connect_audio_connectable_links_child_output_to_track_input() {
+        let mut track = Track::new("Parent".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.clear_default_passthrough();
+        let child = Arc::new(UnsafeMutex::new(Box::new(Track::new(
+            "Child".to_string(),
+            1,
+            1,
+            0,
+            0,
+            8,
+            48_000.0,
+        ))));
+        track.child_tracks.push(child);
+
+        track
+            .connect_audio_connectable(
+                crate::connectable::ConnectableRef::ChildTrack("Child".to_string()),
+                0,
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+            )
+            .unwrap();
+
+        let child_out = track.child_tracks[0].lock().audio.outs[0].clone();
+        assert!(track.audio.ins[0]
+            .connections
+            .lock()
+            .iter()
+            .any(|c| Arc::ptr_eq(c, &child_out)));
+    }
+
+    #[test]
+    fn connect_midi_connectable_links_child_output_to_track_input() {
+        let mut track = Track::new("Parent".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.clear_default_passthrough();
+        let child = Arc::new(UnsafeMutex::new(Box::new(Track::new(
+            "Child".to_string(),
+            0,
+            0,
+            1,
+            1,
+            8,
+            48_000.0,
+        ))));
+        track.child_tracks.push(child);
+
+        track
+            .connect_midi_connectable(
+                crate::connectable::ConnectableRef::ChildTrack("Child".to_string()),
+                0,
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+            )
+            .unwrap();
+
+        let child_out = track.child_tracks[0].lock().midi.outs[0].clone();
+        assert!(track.midi.ins[0]
+            .lock()
+            .sources
+            .iter()
+            .any(|s| Arc::ptr_eq(s, &child_out)));
+    }
+
+    #[test]
+    fn connect_audio_connectable_rejects_track_input_as_source() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let err = track
+            .connect_audio_connectable(
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+                crate::connectable::ConnectableRef::TrackOutput,
+                0,
+            )
+            .unwrap_err();
+        assert!(err.contains("cannot be used as an audio source"));
+    }
 }
+
