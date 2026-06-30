@@ -6632,13 +6632,17 @@ impl Engine {
                         self.notify_clients(Ok(Action::Lv2Plugins(plugins))).await;
                     }
                     Err(e) => {
-                        self.notify_clients(Err(e)).await;
+                        tracing::error!("LV2 plugin scan failed: {e}");
+                        self.notify_clients(Ok(Action::Lv2PluginsUnavailable { error: e }))
+                            .await;
                     }
                 }
                 return;
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::Lv2Plugins(_) => {}
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::Lv2PluginsUnavailable { .. } => {}
             Action::ListVst3Plugins => {
                 match crate::plugins::scan_plugins::<crate::plugins::types::Vst3PluginInfo>("vst3")
                 {
@@ -6646,12 +6650,15 @@ impl Engine {
                         self.notify_clients(Ok(Action::Vst3Plugins(plugins))).await;
                     }
                     Err(e) => {
-                        self.notify_clients(Err(e)).await;
+                        tracing::error!("VST3 plugin scan failed: {e}");
+                        self.notify_clients(Ok(Action::Vst3PluginsUnavailable { error: e }))
+                            .await;
                     }
                 }
                 return;
             }
             Action::Vst3Plugins(_) => {}
+            Action::Vst3PluginsUnavailable { .. } => {}
             Action::ListClapPlugins => {
                 match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap")
                 {
@@ -6659,7 +6666,9 @@ impl Engine {
                         self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
                     }
                     Err(e) => {
-                        self.notify_clients(Err(e)).await;
+                        tracing::error!("CLAP plugin scan failed: {e}");
+                        self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
+                            .await;
                     }
                 }
                 return;
@@ -6671,12 +6680,15 @@ impl Engine {
                         self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
                     }
                     Err(e) => {
-                        self.notify_clients(Err(e)).await;
+                        tracing::error!("CLAP plugin scan failed: {e}");
+                        self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
+                            .await;
                     }
                 }
                 return;
             }
             Action::ClapPlugins(_) => {}
+            Action::ClapPluginsUnavailable { .. } => {}
             Action::TrackLoadClapPlugin {
                 ref track_name,
                 ref plugin_path,

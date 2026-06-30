@@ -795,11 +795,21 @@ pub enum Action {
     ListLv2Plugins,
     #[cfg(all(unix, not(target_os = "macos")))]
     Lv2Plugins(Vec<Lv2PluginInfo>),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Lv2PluginsUnavailable {
+        error: String,
+    },
     ListVst3Plugins,
     Vst3Plugins(Vec<Vst3PluginInfo>),
+    Vst3PluginsUnavailable {
+        error: String,
+    },
     ListClapPlugins,
     ListClapPluginsWithCapabilities,
     ClapPlugins(Vec<ClapPluginInfo>),
+    ClapPluginsUnavailable {
+        error: String,
+    },
     TrackSetClapParameter {
         track_name: String,
         instance_id: usize,
