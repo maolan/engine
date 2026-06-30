@@ -1,10 +1,10 @@
 use crate::clap::{ClapParameterInfo, ClapPluginInfo};
+pub use crate::connectable::{ConnectableConnection, ConnectableRef};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::lv2::Lv2PluginInfo;
 use crate::midi::io::MidiEvent;
 use crate::vst3::Vst3PluginInfo;
 use crate::{kind::Kind, modulator::Modulator, mutex::UnsafeMutex, track::Track};
-pub use crate::connectable::{ConnectableConnection, ConnectableRef};
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc::Sender;
 

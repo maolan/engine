@@ -366,15 +366,11 @@ impl ClipPluginRuntime {
         }
     }
 
-    fn plugin_midi_inputs_ready(
-        ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>],
-    ) -> bool {
+    fn plugin_midi_inputs_ready(ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>]) -> bool {
         ports.iter().all(|port| port.lock().ready())
     }
 
-    fn prepare_plugin_midi_inputs(
-        ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>],
-    ) -> Vec<Vec<MidiEvent>> {
+    fn prepare_plugin_midi_inputs(ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>]) -> Vec<Vec<MidiEvent>> {
         ports
             .iter()
             .map(|port| {
@@ -4279,23 +4275,22 @@ impl Track {
                 .map(|(_, r, p)| (r.clone(), *p))
         };
 
-        let mut report_audio_targets =
-            |targets: Vec<Arc<AudioIO>>, target_ref: ConnectableRef| {
-                for (port, target) in targets.iter().enumerate() {
-                    let source_list = target.connections.lock().clone();
-                    for source in source_list {
-                        if let Some((from_ref, from_port)) = find_audio_source(&source) {
-                            connections.push(ConnectableConnection {
-                                from: from_ref,
-                                from_port,
-                                to: target_ref.clone(),
-                                to_port: port,
-                                kind: Kind::Audio,
-                            });
-                        }
+        let mut report_audio_targets = |targets: Vec<Arc<AudioIO>>, target_ref: ConnectableRef| {
+            for (port, target) in targets.iter().enumerate() {
+                let source_list = target.connections.lock().clone();
+                for source in source_list {
+                    if let Some((from_ref, from_port)) = find_audio_source(&source) {
+                        connections.push(ConnectableConnection {
+                            from: from_ref,
+                            from_port,
+                            to: target_ref.clone(),
+                            to_port: port,
+                            kind: Kind::Audio,
+                        });
                     }
                 }
-            };
+            }
+        };
 
         report_audio_targets(self.audio_outputs(), ConnectableRef::TrackOutput);
         for child in &self.child_tracks {
@@ -4324,8 +4319,8 @@ impl Track {
         }
 
         // --- MIDI ---
-        let mut midi_sources: Vec<(Arc<UnsafeMutex<Box<MIDIIO>>>, ConnectableRef, usize)> =
-            Vec::new();
+        type MidiSource = (Arc<UnsafeMutex<Box<MIDIIO>>>, ConnectableRef, usize);
+        let mut midi_sources: Vec<MidiSource> = Vec::new();
         for (port, io) in self.midi.ins.iter().enumerate() {
             midi_sources.push((io.clone(), ConnectableRef::TrackInput, port));
         }
@@ -4444,11 +4439,11 @@ impl Track {
         let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); count];
         let mut in_degree = vec![0usize; count];
         for conn in self.plugin_graph_connections() {
-            if let Some(&from_idx) = node_to_index.get(&conn.from_node) {
-                if let Some(&to_idx) = node_to_index.get(&conn.to_node) {
-                    adjacency[from_idx].push(to_idx);
-                    in_degree[to_idx] += 1;
-                }
+            if let Some(&from_idx) = node_to_index.get(&conn.from_node)
+                && let Some(&to_idx) = node_to_index.get(&conn.to_node)
+            {
+                adjacency[from_idx].push(to_idx);
+                in_degree[to_idx] += 1;
             }
         }
 
@@ -5467,7 +5462,8 @@ impl Track {
         let clip_playback_active = midi_disk_active && self.clip_playback_enabled;
         for (lane, input) in self.midi.ins.iter().enumerate() {
             let input_lock = input.lock();
-            self.record_tap_midi_in.extend(input_lock.buffer.iter().cloned());
+            self.record_tap_midi_in
+                .extend(input_lock.buffer.iter().cloned());
             let monitor = self.midi_input_monitor.get(lane).copied().unwrap_or(false);
             if clip_playback_active && !monitor {
                 input_lock.buffer.clear();
@@ -6671,11 +6667,13 @@ mod tests {
             .unwrap();
 
         let child_out = track.child_tracks[0].lock().audio.outs[0].clone();
-        assert!(track.audio.ins[0]
-            .connections
-            .lock()
-            .iter()
-            .any(|c| Arc::ptr_eq(c, &child_out)));
+        assert!(
+            track.audio.ins[0]
+                .connections
+                .lock()
+                .iter()
+                .any(|c| Arc::ptr_eq(c, &child_out))
+        );
     }
 
     #[test]
@@ -6703,11 +6701,13 @@ mod tests {
             .unwrap();
 
         let child_out = track.child_tracks[0].lock().midi.outs[0].clone();
-        assert!(track.midi.ins[0]
-            .lock()
-            .sources
-            .iter()
-            .any(|s| Arc::ptr_eq(s, &child_out)));
+        assert!(
+            track.midi.ins[0]
+                .lock()
+                .sources
+                .iter()
+                .any(|s| Arc::ptr_eq(s, &child_out))
+        );
     }
 
     #[test]
@@ -6724,4 +6724,3 @@ mod tests {
         assert!(err.contains("cannot be used as an audio source"));
     }
 }
-

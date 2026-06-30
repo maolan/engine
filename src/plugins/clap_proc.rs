@@ -1,5 +1,5 @@
 use crate::audio::io::AudioIO;
-use crate::midi::io::{MidiEvent, MIDIIO};
+use crate::midi::io::{MIDIIO, MidiEvent};
 use crate::mutex::UnsafeMutex;
 use crate::plugins::ipc;
 use crate::plugins::types::{

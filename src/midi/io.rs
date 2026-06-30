@@ -162,8 +162,14 @@ mod tests {
         let source_b = Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new())));
         let consumer = Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new())));
 
-        source_a.lock().buffer.push(MidiEvent::new(10, vec![0x90, 60, 100]));
-        source_b.lock().buffer.push(MidiEvent::new(5, vec![0x80, 60, 100]));
+        source_a
+            .lock()
+            .buffer
+            .push(MidiEvent::new(10, vec![0x90, 60, 100]));
+        source_b
+            .lock()
+            .buffer
+            .push(MidiEvent::new(5, vec![0x80, 60, 100]));
 
         MIDIIO::connect(&source_a, &consumer);
         MIDIIO::connect(&source_b, &consumer);

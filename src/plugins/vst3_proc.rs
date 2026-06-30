@@ -1,5 +1,5 @@
 use crate::audio::io::AudioIO;
-use crate::midi::io::{MidiEvent, MIDIIO};
+use crate::midi::io::{MIDIIO, MidiEvent};
 use crate::mutex::UnsafeMutex;
 use crate::plugins::ipc;
 use crate::plugins::types::ParameterInfo;
@@ -400,7 +400,7 @@ impl Vst3Processor {
                 lock.mark_finished();
             }
             *self.last_process_time.lock() = Instant::now();
-            return output_events;
+            output_events
         }
     }
 

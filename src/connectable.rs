@@ -132,10 +132,12 @@ pub fn disconnect_midi(
     MIDIIO::disconnect(&from, &to)
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::{AudioPorts, ConnectableRef, ConnectableConnection, MidiPorts, connect_audio, connect_midi, disconnect_audio, disconnect_midi};
+    use super::{
+        AudioPorts, ConnectableConnection, ConnectableRef, MidiPorts, connect_audio, connect_midi,
+        disconnect_audio, disconnect_midi,
+    };
     use crate::audio::io::AudioIO;
     use crate::midi::io::MIDIIO;
     use crate::mutex::UnsafeMutex;
@@ -198,11 +200,13 @@ mod tests {
 
         connect_audio(&source, 0, &target, 0).unwrap();
 
-        assert!(target.audio_ins[0]
-            .connections
-            .lock()
-            .iter()
-            .any(|c| Arc::ptr_eq(c, &source.audio_outs[0])));
+        assert!(
+            target.audio_ins[0]
+                .connections
+                .lock()
+                .iter()
+                .any(|c| Arc::ptr_eq(c, &source.audio_outs[0]))
+        );
     }
 
     #[test]
@@ -233,11 +237,13 @@ mod tests {
 
         connect_midi(&source, 0, &target, 0).unwrap();
 
-        assert!(target.midi_ins[0]
-            .lock()
-            .sources
-            .iter()
-            .any(|s| Arc::ptr_eq(s, &source.midi_outs[0])));
+        assert!(
+            target.midi_ins[0]
+                .lock()
+                .sources
+                .iter()
+                .any(|s| Arc::ptr_eq(s, &source.midi_outs[0]))
+        );
     }
 
     #[test]

@@ -9,6 +9,21 @@ pub use types::*;
 
 use serde::de::DeserializeOwned;
 
+#[derive(serde::Deserialize)]
+struct ScanDiagnostic {
+    message: String,
+    plugin_uri: Option<String>,
+    plugin_name: Option<String>,
+    bundle_uri: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ScanOutput<T> {
+    data: T,
+    errors: Vec<ScanDiagnostic>,
+    warnings: Vec<ScanDiagnostic>,
+}
+
 pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String> {
     let host_bin = ipc::find_plugin_host_binary().ok_or("maolan-plugin-host binary not found")?;
 
@@ -33,5 +48,68 @@ pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String>
     }
 
     let json = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&json).map_err(|e| format!("failed to parse scan JSON: {e}"))
+    let parsed: ScanOutput<Vec<T>> =
+        serde_json::from_str(&json).map_err(|e| format!("failed to parse scan JSON: {e}"))?;
+
+    for error in &parsed.errors {
+        tracing::error!(
+            message = %error.message,
+            plugin_uri = ?error.plugin_uri,
+            plugin_name = ?error.plugin_name,
+            bundle_uri = ?error.bundle_uri,
+            "plugin scan error"
+        );
+    }
+    for warning in &parsed.warnings {
+        tracing::warn!(
+            message = %warning.message,
+            plugin_uri = ?warning.plugin_uri,
+            plugin_name = ?warning.plugin_name,
+            bundle_uri = ?warning.bundle_uri,
+            "plugin scan warning"
+        );
+    }
+
+    Ok(parsed.data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScanOutput;
+
+    #[test]
+    fn scan_output_parses_wrapper() {
+        let json = r#"{
+            "errors": [
+                {
+                    "message": "error: failed to open manifest.ttl",
+                    "bundle_uri": "file:///tmp/broken.lv2/"
+                }
+            ],
+            "warnings": [
+                {
+                    "message": "warning: duplicate version",
+                    "plugin_uri": "http://example.com/plugin"
+                }
+            ],
+            "data": [{"name": "Test", "path": "/tmp/test.clap", "capabilities": null}]
+        }"#;
+        let output: ScanOutput<Vec<serde_json::Value>> = serde_json::from_str(json).unwrap();
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(
+            output.errors[0].message,
+            "error: failed to open manifest.ttl"
+        );
+        assert_eq!(
+            output.errors[0].bundle_uri,
+            Some("file:///tmp/broken.lv2/".to_string())
+        );
+        assert_eq!(output.warnings.len(), 1);
+        assert_eq!(
+            output.warnings[0].plugin_uri,
+            Some("http://example.com/plugin".to_string())
+        );
+        assert_eq!(output.data.len(), 1);
+        assert_eq!(output.data[0]["name"], "Test");
+    }
 }

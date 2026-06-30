@@ -60,7 +60,7 @@ use crate::{
         Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, PluginKind, ProcessTask,
     },
     midi::clip::MIDIClip,
-    midi::io::{MidiEvent, MIDIIO},
+    midi::io::{MIDIIO, MidiEvent},
     mutex::UnsafeMutex,
     osc::OscServer,
     routing,
@@ -6525,11 +6525,12 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) =
-                    track
-                        .lock()
-                        .connect_audio_connectable(from.clone(), from_port, to.clone(), to_port)
-                {
+                if let Err(e) = track.lock().connect_audio_connectable(
+                    from.clone(),
+                    from_port,
+                    to.clone(),
+                    to_port,
+                ) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -6554,11 +6555,12 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) =
-                    track
-                        .lock()
-                        .disconnect_audio_connectable(from.clone(), from_port, to.clone(), to_port)
-                {
+                if let Err(e) = track.lock().disconnect_audio_connectable(
+                    from.clone(),
+                    from_port,
+                    to.clone(),
+                    to_port,
+                ) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -6583,11 +6585,12 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) =
-                    track
-                        .lock()
-                        .connect_midi_connectable(from.clone(), from_port, to.clone(), to_port)
-                {
+                if let Err(e) = track.lock().connect_midi_connectable(
+                    from.clone(),
+                    from_port,
+                    to.clone(),
+                    to_port,
+                ) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -6612,11 +6615,12 @@ impl Engine {
                         return;
                     }
                 };
-                if let Err(e) =
-                    track
-                        .lock()
-                        .disconnect_midi_connectable(from.clone(), from_port, to.clone(), to_port)
-                {
+                if let Err(e) = track.lock().disconnect_midi_connectable(
+                    from.clone(),
+                    from_port,
+                    to.clone(),
+                    to_port,
+                ) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
@@ -9947,10 +9951,7 @@ mod tests {
                 None,
             )
             .expect("should load CLAP plugin on folder");
-        folder.clap_plugins[0]
-            .processor
-            .lock()
-            .setup_audio_ports();
+        folder.clap_plugins[0].processor.lock().setup_audio_ports();
         let plugin_id = folder.clap_plugins[0].id;
 
         insert_track(&mut engine, folder);
@@ -10015,14 +10016,16 @@ mod tests {
             .expect("child task");
         let plugin_key = tasks
             .iter()
-            .find(|t| matches!(
-                t,
-                ProcessTask::Plugin {
-                    track,
-                    kind: PluginKind::Clap,
-                    index: 0,
-                } if track.lock().name == "folder"
-            ))
+            .find(|t| {
+                matches!(
+                    t,
+                    ProcessTask::Plugin {
+                        track,
+                        kind: PluginKind::Clap,
+                        index: 0,
+                    } if track.lock().name == "folder"
+                )
+            })
             .map(Engine::task_key)
             .expect("plugin task");
         let folder_out_key = tasks
@@ -10043,9 +10046,7 @@ mod tests {
         );
         assert!(
             deps.get(&folder_out_key).is_some_and(|d| {
-                d.contains(&folder_in_key)
-                    && d.contains(&plugin_key)
-                    && d.contains(&child_key)
+                d.contains(&folder_in_key) && d.contains(&plugin_key) && d.contains(&child_key)
             }),
             "folder output should depend on folder input, plugin, and child"
         );
