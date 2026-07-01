@@ -2518,9 +2518,15 @@ impl Engine {
                 }
                 Action::TrackToggleMaster(ref track_name) => {
                     if let Some(track) = self.state.lock().tracks.get(track_name) {
-                        track.lock().toggle_master();
-                        self.notify_clients(Ok(Action::TrackToggleMaster(track_name.clone())))
-                            .await;
+                        let can_toggle = {
+                            let t = track.lock();
+                            t.is_master || !t.is_folder
+                        };
+                        if can_toggle {
+                            track.lock().toggle_master();
+                            self.notify_clients(Ok(Action::TrackToggleMaster(track_name.clone())))
+                                .await;
+                        }
                     }
                 }
                 Action::TrackToggleArm(ref track_name) => {
@@ -5828,6 +5834,17 @@ impl Engine {
                         return;
                     }
                 };
+                if is_folder {
+                    let is_master = track.lock().is_master;
+                    if is_master {
+                        self.notify_clients(Err(format!(
+                            "Track '{}' is the master track and cannot be made a folder",
+                            track_name
+                        )))
+                        .await;
+                        return;
+                    }
+                }
                 {
                     let track = track.lock();
                     track.is_folder = is_folder;
@@ -10260,6 +10277,61 @@ mod tests {
             removed_names,
             vec!["grandchild", "child", "folder"],
             "descendants should be removed before the folder and clients notified"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_set_folder_rejects_master_track() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let mut track = Track::new("master".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.is_master = true;
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_request_inner(
+                Action::TrackSetFolder {
+                    track_name: "master".to_string(),
+                    is_folder: true,
+                },
+                false,
+            )
+            .await;
+
+        {
+            let state = engine.state.lock();
+            assert!(!state.tracks.get("master").unwrap().lock().is_folder);
+        }
+
+        let msg = tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;
+        assert!(
+            matches!(msg, Ok(Some(Message::Response(Err(_))))),
+            "master track folder conversion should report an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_toggle_master_ignored_for_folder_track() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+
+        engine
+            .handle_request_inner(Action::TrackToggleMaster("folder".to_string()), false)
+            .await;
+
+        {
+            let state = engine.state.lock();
+            assert!(!state.tracks.get("folder").unwrap().lock().is_master);
+        }
+
+        let msg = tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;
+        assert!(
+            matches!(
+                msg,
+                Ok(Some(Message::Response(Ok(Action::TrackToggleMaster(ref name)))))
+                    if name == "folder"
+            ),
+            "folder track master toggle should still be echoed to clients: {msg:?}"
         );
     }
 }

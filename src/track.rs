@@ -1410,9 +1410,17 @@ impl Track {
         self.soloed = !self.soloed;
     }
     pub fn toggle_master(&mut self) {
+        // A folder track can never become master; an already-master folder
+        // is allowed to toggle off to recover from invalid legacy states.
+        if !self.is_master && self.is_folder {
+            return;
+        }
         self.is_master = !self.is_master;
     }
     pub fn set_master(&mut self, master: bool) {
+        if master && self.is_folder {
+            return;
+        }
         self.is_master = master;
     }
     pub fn toggle_input_monitor(&mut self, lane: usize) {
@@ -6722,5 +6730,41 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("cannot be used as an audio source"));
+    }
+
+    #[test]
+    fn folder_track_cannot_become_master() {
+        let mut track = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        assert!(!track.is_master);
+
+        track.toggle_master();
+        assert!(!track.is_master);
+
+        track.set_master(true);
+        assert!(!track.is_master);
+    }
+
+    #[test]
+    fn master_track_can_be_unmastered_even_when_folder() {
+        let mut track = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.is_master = true;
+
+        track.toggle_master();
+        assert!(!track.is_master);
+
+        track.set_master(true);
+        assert!(!track.is_master);
+    }
+
+    #[test]
+    fn normal_track_can_be_toggled_master() {
+        let mut track = Track::new("t".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        assert!(!track.is_master);
+
+        track.toggle_master();
+        assert!(track.is_master);
+
+        track.toggle_master();
+        assert!(!track.is_master);
     }
 }
