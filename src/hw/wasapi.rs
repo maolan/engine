@@ -126,7 +126,7 @@ impl HwDriver {
                             frames_since_tick -= period_frames;
                         }
                     },
-                    move |e| (),
+                    move |_e| (),
                     None,
                 )
                 .map_err(|e| format!("Failed to build {backend_label} output stream: {e}"))?
@@ -152,7 +152,7 @@ impl HwDriver {
                                     let _ = input_tx.try_send(chunk);
                                 }
                             },
-                            move |e| (),
+                            move |_e| (),
                             None,
                         )
                         .map_err(|e| format!("Failed to build {backend_label} input stream: {e}"))?
@@ -195,6 +195,13 @@ impl HwDriver {
 
     pub fn sample_rate(&self) -> i32 {
         self.sample_rate as i32
+    }
+
+    pub fn close_fds(&mut self) {
+        let _ = self.output_stream.pause();
+        if let Some(stream) = &self.input_stream {
+            let _ = stream.pause();
+        }
     }
 
     pub fn cycle_samples(&self) -> usize {
@@ -560,6 +567,15 @@ impl MidiHub {
 
     pub fn write_events_blocking(&mut self, events: &[HwMidiEvent], _timeout: Duration) {
         self.write_events(events);
+    }
+
+    pub fn close_all(&mut self) {
+        while let Some(input) = self.inputs.pop() {
+            let _ = input.connection.close();
+        }
+        while let Some(output) = self.outputs.pop() {
+            let _ = output.connection.close();
+        }
     }
 
     pub fn output_devices(&self) -> Vec<String> {

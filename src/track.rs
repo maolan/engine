@@ -896,7 +896,7 @@ impl Track {
                 #[cfg(all(unix, not(target_os = "macos")))]
                 let _lv2_count = self.lv2_plugins.len();
                 #[cfg(not(all(unix, not(target_os = "macos"))))]
-                let lv2_count = 0;
+                let _lv2_count = 0;
                 tracing::warn!(
                     "Track '{}' process breakdown: total={:.1}ms clip_mix={:.1}ms plugins={:.1}ms midi_route={:.1}ms",
                     track_name,
@@ -1152,8 +1152,6 @@ impl Track {
                 }
                 self.folder_processed_midi_plugins.insert(node);
             }
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
-            PluginKind::Lv2 => {}
         }
     }
 
@@ -5237,24 +5235,6 @@ impl Track {
         Err("LV2 MIDI input ports not yet implemented".to_string())
     }
 
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn lv2_midi_output_io(
-        &self,
-        _instance_id: usize,
-        _port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
-        Err("LV2 is not supported on this platform".to_string())
-    }
-
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    fn lv2_midi_input_io(
-        &self,
-        _instance_id: usize,
-        _port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
-        Err("LV2 is not supported on this platform".to_string())
-    }
-
     #[cfg(all(unix, not(target_os = "macos")))]
     fn lv2_instance_id_exists(&self, id: usize) -> bool {
         self.lv2_plugins.iter().any(|i| i.id == id)
@@ -5688,8 +5668,6 @@ impl Track {
                         }
                         self.folder_processed_midi_plugins.insert(node);
                     }
-                    #[cfg(not(all(unix, not(target_os = "macos"))))]
-                    PluginKind::Lv2 => {}
                 }
                 processed.insert((kind, idx));
                 progressed = true;

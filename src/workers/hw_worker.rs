@@ -330,6 +330,26 @@ impl<B: Backend> HwWorker<B> {
                                 let driver = self.driver.clone();
                                 let tx = cycle_tx.clone();
                                 tokio::task::spawn_blocking(move || {
+                                    // The tokio blocking thread that executes the audio cycle
+                                    // does not inherit the async worker thread's realtime
+                                    // priority. Configure it here so OSS/ALSA cycles run with
+                                    // the same SCHED_FIFO priority as the legacy assist thread.
+                                    if let Err(e) = Self::configure_rt_thread(
+                                        B::WORKER_THREAD_NAME,
+                                        RT_PRIORITY_WORKER,
+                                    ) {
+                                        static WARNED: std::sync::atomic::AtomicBool =
+                                            std::sync::atomic::AtomicBool::new(false);
+                                        if !WARNED
+                                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            tracing::warn!(
+                                                "{} cycle thread realtime priority not enabled: {}",
+                                                B::LABEL,
+                                                e
+                                            );
+                                        }
+                                    }
                                     let result = driver.lock().run_cycle_for_worker();
                                     let _ = tx.blocking_send(result);
                                 });
@@ -456,6 +476,7 @@ impl<B: Backend> HwWorker<B> {
         }
     }
 
+    #[cfg(unix)]
     fn shutdown_quit(&mut self, midi_handle: JoinHandle<()>) {
         self.driver.lock().request_stop();
         self.flush_pending_midi_out();
@@ -463,6 +484,7 @@ impl<B: Backend> HwWorker<B> {
         self.driver.lock().request_stop();
     }
 
+    #[cfg(unix)]
     fn shutdown_channel_closed(&mut self, midi_handle: JoinHandle<()>) {
         self.driver.lock().request_stop();
         self.shutdown_midi(midi_handle);
