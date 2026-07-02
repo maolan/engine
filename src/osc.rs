@@ -1,6 +1,6 @@
 use crate::message::{Action, Message};
 use std::{
-    net::{ToSocketAddrs, UdpSocket},
+    net::{SocketAddr, ToSocketAddrs, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,14 +10,11 @@ use std::{
 };
 use tokio::sync::mpsc::Sender;
 
-#[cfg(test)]
-use std::net::SocketAddr;
-
 const OSC_LISTEN_ADDR: &str = "0.0.0.0:9000";
+const WAKEUP_PACKET: &[u8] = b"\0";
 
 pub struct OscServer {
     stop: Arc<AtomicBool>,
-    #[cfg(test)]
     listen_addr: SocketAddr,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -38,12 +35,7 @@ impl OscServer {
         socket
             .set_read_timeout(Some(Duration::from_millis(250)))
             .map_err(|e| format!("Failed to configure OSC socket timeout: {e}"))?;
-        #[cfg(test)]
         let listen_addr = socket
-            .local_addr()
-            .map_err(|e| format!("Failed to read OSC socket address: {e}"))?;
-        #[cfg(not(test))]
-        socket
             .local_addr()
             .map_err(|e| format!("Failed to read OSC socket address: {e}"))?;
 
@@ -54,9 +46,10 @@ impl OscServer {
             while !stop_thread.load(Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok((len, _)) => {
-                        if let Some(action) = parse_osc_action(&buf[..len])
-                            && tx.blocking_send(Message::Request(action)).is_err()
-                        {
+                        let Some(action) = parse_osc_action(&buf[..len]) else {
+                            continue;
+                        };
+                        if tx.blocking_send(Message::Request(action)).is_err() {
                             break;
                         }
                     }
@@ -72,7 +65,6 @@ impl OscServer {
 
         Ok(Self {
             stop,
-            #[cfg(test)]
             listen_addr,
             handle: Some(handle),
         })
@@ -85,6 +77,12 @@ impl OscServer {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Send a dummy packet to wake up the receiver thread so it notices the
+        // stop flag and exits promptly, instead of blocking in recv_from until
+        // the read timeout expires.
+        if let Ok(wake) = UdpSocket::bind("127.0.0.1:0") {
+            let _ = wake.send_to(WAKEUP_PACKET, self.listen_addr);
+        }
         if let Some(handle) = self.handle.take() {
             drop(handle.join());
         }
