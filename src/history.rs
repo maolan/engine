@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 fn audio_clip_to_data(clip: &crate::audio::clip::AudioClip) -> crate::message::AudioClipData {
     crate::message::AudioClipData {
+        id: clip.id.clone(),
         name: clip.name.clone(),
         start: clip.start,
         length: clip.end.saturating_sub(clip.start).max(1),
@@ -35,6 +36,7 @@ fn audio_clip_to_data(clip: &crate::audio::clip::AudioClip) -> crate::message::A
 
 fn midi_clip_to_data(clip: &crate::midi::clip::MIDIClip) -> crate::message::MidiClipData {
     crate::message::MidiClipData {
+        id: clip.id.clone(),
         name: clip.name.clone(),
         start: clip.start,
         length: clip.end.saturating_sub(clip.start).max(1),
@@ -141,7 +143,9 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackSetColor { .. }
         | Action::TrackSetMidiLearnBinding { .. }
         | Action::SetGlobalMidiLearnBinding { .. }
+        | Action::SetSessionMidiLearnBinding { .. }
         | Action::TrackSetFrozen { .. }
+        | Action::TrackSetSessionSlot { .. }
         | Action::TrackAddAudioInput(_)
         | Action::TrackAddAudioOutput(_)
         | Action::TrackRemoveAudioInput(_)
@@ -301,6 +305,19 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 frozen: track_lock.frozen(),
             })
         }
+        Action::TrackSetSessionSlot {
+            track_name,
+            scene_index,
+            clip_id: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetSessionSlot {
+                track_name: track_name.clone(),
+                scene_index: *scene_index,
+                clip_id: track_lock.session_slots.get(scene_index).cloned(),
+            })
+        }
         Action::TrackAddAudioInput(name) => Some(Action::TrackRemoveAudioInput(name.clone())),
         Action::TrackAddAudioOutput(name) => Some(Action::TrackRemoveAudioOutput(name.clone())),
         Action::TrackRemoveAudioInput(name) => Some(Action::TrackAddAudioInput(name.clone())),
@@ -357,6 +374,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                     if clip.grouped_clips.is_empty() {
                         let length = clip.end.saturating_sub(clip.start);
                         Some(Action::AddClip {
+                            clip_id: clip.id.clone(),
                             name: clip.name.clone(),
                             track_name: track_name.clone(),
                             start: clip.start,
@@ -394,6 +412,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                     if clip.grouped_clips.is_empty() {
                         let length = clip.end.saturating_sub(clip.start);
                         Some(Action::AddClip {
+                            clip_id: clip.id.clone(),
                             name: clip.name.clone(),
                             track_name: track_name.clone(),
                             start: clip.start,
@@ -1299,6 +1318,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             for clip in &track.audio.clips {
                 let length = clip.end.saturating_sub(clip.start).max(1);
                 actions.push(Action::AddClip {
+                    clip_id: clip.id.clone(),
                     name: clip.name.clone(),
                     track_name: track.name.clone(),
                     start: clip.start,
@@ -1326,6 +1346,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             for clip in &track.midi.clips {
                 let length = clip.end.saturating_sub(clip.start).max(1);
                 actions.push(Action::AddClip {
+                    clip_id: clip.id.clone(),
                     name: clip.name.clone(),
                     track_name: track.name.clone(),
                     start: clip.start,
@@ -1742,6 +1763,7 @@ mod tests {
 
         let inverse = create_inverse_action(
             &Action::AddClip {
+                clip_id: String::new(),
                 name: "new".to_string(),
                 track_name: "t".to_string(),
                 start: 32,
@@ -2641,5 +2663,65 @@ mod tests {
             )),
             "implicit folder-to-child wiring should not be captured as a generic Connect action"
         );
+    }
+
+    #[test]
+    fn create_inverse_action_for_track_set_session_slot_restores_previous_clip() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track.session_slots.insert(0, "old-clip".to_string());
+        let state = make_state_with_track(track);
+
+        let inverse = create_inverse_action(
+            &Action::TrackSetSessionSlot {
+                track_name: "t".to_string(),
+                scene_index: 0,
+                clip_id: Some("new-clip".to_string()),
+            },
+            &state,
+        )
+        .unwrap();
+
+        match inverse {
+            Action::TrackSetSessionSlot {
+                track_name,
+                scene_index,
+                clip_id,
+            } => {
+                assert_eq!(track_name, "t");
+                assert_eq!(scene_index, 0);
+                assert_eq!(clip_id, Some("old-clip".to_string()));
+            }
+            other => panic!("unexpected inverse action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_inverse_action_for_track_set_session_slot_clear_restores_none() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track.session_slots.insert(0, "old-clip".to_string());
+        let state = make_state_with_track(track);
+
+        let inverse = create_inverse_action(
+            &Action::TrackSetSessionSlot {
+                track_name: "t".to_string(),
+                scene_index: 0,
+                clip_id: None,
+            },
+            &state,
+        )
+        .unwrap();
+
+        match inverse {
+            Action::TrackSetSessionSlot {
+                track_name,
+                scene_index,
+                clip_id,
+            } => {
+                assert_eq!(track_name, "t");
+                assert_eq!(scene_index, 0);
+                assert_eq!(clip_id, Some("old-clip".to_string()));
+            }
+            other => panic!("unexpected inverse action: {other:?}"),
+        }
     }
 }

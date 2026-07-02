@@ -57,7 +57,8 @@ use crate::{
     },
     kind::Kind,
     message::{
-        Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, PluginKind, ProcessTask,
+        Action, HwMidiEvent, LaunchQuantization, Message, MidiControllerData, MidiNoteData,
+        PluginKind, ProcessTask, SessionAction, SessionSlotState,
     },
     midi::clip::MIDIClip,
     midi::io::{MIDIIO, MidiEvent},
@@ -147,6 +148,7 @@ struct AudioOpenRequest<'a> {
 }
 
 struct ClipAddRequest<'a> {
+    clip_id: &'a str,
     name: &'a str,
     track_name: &'a str,
     start: usize,
@@ -181,6 +183,7 @@ struct JackTransportSyncDecision {
 enum MidiLearnSlot {
     Track(String, crate::message::TrackMidiLearnTarget),
     Global(crate::message::GlobalMidiLearnTarget),
+    Session(crate::message::SessionMidiLearnTarget),
 }
 
 pub struct Engine {
@@ -244,6 +247,8 @@ pub struct Engine {
     #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
     hw_out_meter_publish_phase: bool,
     last_track_meter_publish: Option<Instant>,
+    last_session_report_publish: Option<Instant>,
+    session_report_state: HashMap<(String, usize), SessionSlotState>,
     track_meter_linear_by_track: HashMap<String, Vec<f32>>,
     task_processing_started_at: HashMap<String, Instant>,
     cycle_tasks: Vec<ProcessTask>,
@@ -258,9 +263,14 @@ pub struct Engine {
     offline_bounce_jobs: HashMap<String, OfflineBounceJob>,
     pending_midi_learn: Option<(String, crate::message::TrackMidiLearnTarget, Option<String>)>,
     pending_global_midi_learn: Option<crate::message::GlobalMidiLearnTarget>,
+    pending_session_midi_learn: Option<crate::message::SessionMidiLearnTarget>,
     global_midi_learn_play_pause: Option<crate::message::MidiLearnBinding>,
     global_midi_learn_stop: Option<crate::message::MidiLearnBinding>,
     global_midi_learn_record_toggle: Option<crate::message::MidiLearnBinding>,
+    session_midi_learn_slots: HashMap<(String, usize), crate::message::MidiLearnBinding>,
+    session_midi_learn_scenes: HashMap<usize, crate::message::MidiLearnBinding>,
+    session_midi_learn_stop_track: HashMap<String, crate::message::MidiLearnBinding>,
+    session_midi_learn_stop_all: Option<crate::message::MidiLearnBinding>,
     midi_cc_gate: HashMap<(String, u8, u8), bool>,
     modulators: Vec<crate::modulator::Modulator>,
     modulator_values: Option<Arc<std::collections::HashMap<usize, f32>>>,
@@ -844,6 +854,7 @@ impl Engine {
     }
 
     const METER_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
+    const SESSION_RUNTIME_REPORT_INTERVAL: Duration = Duration::from_millis(50);
     const TRACK_PROCESS_TIMEOUT: Duration = Duration::from_millis(250);
     #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
     const HW_OUT_METER_LINEAR_EPSILON: f32 = 0.0025;
@@ -990,6 +1001,8 @@ impl Engine {
             #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
             hw_out_meter_publish_phase: false,
             last_track_meter_publish: None,
+            last_session_report_publish: None,
+            session_report_state: HashMap::new(),
             track_meter_linear_by_track: HashMap::new(),
             task_processing_started_at: HashMap::new(),
             cycle_tasks: Vec::new(),
@@ -1004,9 +1017,14 @@ impl Engine {
             offline_bounce_jobs: HashMap::new(),
             pending_midi_learn: None,
             pending_global_midi_learn: None,
+            pending_session_midi_learn: None,
             global_midi_learn_play_pause: None,
             global_midi_learn_stop: None,
             global_midi_learn_record_toggle: None,
+            session_midi_learn_slots: HashMap::new(),
+            session_midi_learn_scenes: HashMap::new(),
+            session_midi_learn_stop_track: HashMap::new(),
+            session_midi_learn_stop_all: None,
             midi_cc_gate: HashMap::new(),
             modulators: Vec::new(),
             modulator_values: None,
@@ -2277,6 +2295,45 @@ impl Engine {
                 "DiskMonitor",
             );
         }
+        for (key, existing) in &self.session_midi_learn_slots {
+            if Self::midi_binding_matches(binding, existing) {
+                push_conflict(
+                    MidiLearnSlot::Session(crate::message::SessionMidiLearnTarget::Slot {
+                        track_name: key.0.clone(),
+                        scene_index: key.1,
+                    }),
+                    format!("{} Slot {}", key.0, key.1 + 1),
+                );
+            }
+        }
+        for (scene_index, existing) in &self.session_midi_learn_scenes {
+            if Self::midi_binding_matches(binding, existing) {
+                push_conflict(
+                    MidiLearnSlot::Session(crate::message::SessionMidiLearnTarget::Scene(
+                        *scene_index,
+                    )),
+                    format!("Scene {}", scene_index + 1),
+                );
+            }
+        }
+        for (track_name, existing) in &self.session_midi_learn_stop_track {
+            if Self::midi_binding_matches(binding, existing) {
+                push_conflict(
+                    MidiLearnSlot::Session(crate::message::SessionMidiLearnTarget::StopTrack(
+                        track_name.clone(),
+                    )),
+                    format!("{track_name} Stop"),
+                );
+            }
+        }
+        if let Some(existing) = self.session_midi_learn_stop_all.as_ref()
+            && Self::midi_binding_matches(binding, existing)
+        {
+            push_conflict(
+                MidiLearnSlot::Session(crate::message::SessionMidiLearnTarget::StopAll),
+                "Stop All Clips".to_string(),
+            );
+        }
         conflicts
     }
 
@@ -2372,6 +2429,49 @@ impl Engine {
                 }
             }
             self.notify_clients(Ok(Action::SetGlobalMidiLearnBinding {
+                target,
+                binding: Some(binding),
+            }))
+            .await;
+        }
+        if let Some(target) = self.pending_session_midi_learn.take() {
+            let binding = crate::message::MidiLearnBinding {
+                device: Some(device.to_string()),
+                channel,
+                cc,
+            };
+            let conflicts = self
+                .midi_learn_slot_conflicts(&binding, Some(MidiLearnSlot::Session(target.clone())));
+            if !conflicts.is_empty() {
+                self.notify_clients(Err(format!(
+                    "Session MIDI learn conflict for {:?}: {}",
+                    target,
+                    conflicts.join(", ")
+                )))
+                .await;
+                return;
+            }
+            match target {
+                crate::message::SessionMidiLearnTarget::Slot {
+                    ref track_name,
+                    scene_index,
+                } => {
+                    self.session_midi_learn_slots
+                        .insert((track_name.clone(), scene_index), binding.clone());
+                }
+                crate::message::SessionMidiLearnTarget::Scene(scene_index) => {
+                    self.session_midi_learn_scenes
+                        .insert(scene_index, binding.clone());
+                }
+                crate::message::SessionMidiLearnTarget::StopTrack(ref track_name) => {
+                    self.session_midi_learn_stop_track
+                        .insert(track_name.clone(), binding.clone());
+                }
+                crate::message::SessionMidiLearnTarget::StopAll => {
+                    self.session_midi_learn_stop_all = Some(binding.clone());
+                }
+            }
+            self.notify_clients(Ok(Action::SetSessionMidiLearnBinding {
                 target,
                 binding: Some(binding),
             }))
@@ -2478,6 +2578,45 @@ impl Engine {
             && rising
         {
             mapped_global_actions.push(Action::SetRecordEnabled(!self.record_enabled));
+        }
+        if rising {
+            for (key, binding) in &self.session_midi_learn_slots {
+                let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
+                if device_matches && binding.channel == channel && binding.cc == cc {
+                    mapped_global_actions.push(Action::SessionMidiLearnTriggered {
+                        target: crate::message::SessionMidiLearnTarget::Slot {
+                            track_name: key.0.clone(),
+                            scene_index: key.1,
+                        },
+                    });
+                }
+            }
+            for (scene_index, binding) in &self.session_midi_learn_scenes {
+                let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
+                if device_matches && binding.channel == channel && binding.cc == cc {
+                    mapped_global_actions.push(Action::SessionMidiLearnTriggered {
+                        target: crate::message::SessionMidiLearnTarget::Scene(*scene_index),
+                    });
+                }
+            }
+            for (track_name, binding) in &self.session_midi_learn_stop_track {
+                let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
+                if device_matches && binding.channel == channel && binding.cc == cc {
+                    mapped_global_actions.push(Action::SessionMidiLearnTriggered {
+                        target: crate::message::SessionMidiLearnTarget::StopTrack(
+                            track_name.clone(),
+                        ),
+                    });
+                }
+            }
+            if let Some(binding) = self.session_midi_learn_stop_all.as_ref() {
+                let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
+                if device_matches && binding.channel == channel && binding.cc == cc {
+                    mapped_global_actions.push(Action::SessionMidiLearnTriggered {
+                        target: crate::message::SessionMidiLearnTarget::StopAll,
+                    });
+                }
+            }
         }
         for action in mapped_actions {
             match action {
@@ -3142,7 +3281,7 @@ impl Engine {
         let length = samples.len() / rec.channels;
         let start_sample = rec.start_sample.saturating_add(trim_frames);
         let clip_rel_name = format!("audio/{}", rec.file_name);
-        let clip = AudioClip::new(
+        let mut clip = AudioClip::new(
             clip_rel_name.clone(),
             start_sample,
             start_sample.saturating_add(length.max(1)),
@@ -3161,7 +3300,10 @@ impl Engine {
             );
             (0, 0)
         };
+        let clip_id = crate::message::generate_clip_id();
+        clip.id.clone_from(&clip_id);
         self.notify_clients(Ok(Action::AddClip {
+            clip_id,
             name: clip_rel_name,
             track_name: track_name.clone(),
             start: start_sample,
@@ -3300,10 +3442,13 @@ impl Engine {
             rec.start_sample.saturating_add(clip_len_samples.max(1)),
         );
         clip.offset = 0;
+        let clip_id = crate::message::generate_clip_id();
+        clip.id.clone_from(&clip_id);
         if let Some(track) = self.state.lock().tracks.get(&track_name) {
             track.lock().midi.clips.push(clip);
         }
         self.notify_clients(Ok(Action::AddClip {
+            clip_id,
             name: clip_rel_name,
             track_name: track_name.clone(),
             start: rec.start_sample,
@@ -3458,6 +3603,7 @@ impl Engine {
                         request.start,
                         request.start.saturating_add(request.length.max(1)),
                     );
+                    clip.id = request.clip_id.to_string();
                     clip.offset = request.offset;
                     let max_lane = track.audio.ins.len().saturating_sub(1);
                     clip.input_channel = request.input_channel.min(max_lane);
@@ -3486,6 +3632,7 @@ impl Engine {
                         request.start,
                         request.start.saturating_add(request.length.max(1)),
                     );
+                    clip.id = request.clip_id.to_string();
                     clip.offset = request.offset;
                     let max_lane = track.midi.ins.len().saturating_sub(1);
                     clip.input_channel = request.input_channel.min(max_lane);
@@ -3502,6 +3649,7 @@ impl Engine {
             data.start,
             data.start.saturating_add(data.length.max(1)),
         );
+        clip.id = data.id.clone();
         clip.offset = data.offset;
         clip.input_channel = data.input_channel;
         clip.muted = data.muted;
@@ -3537,6 +3685,7 @@ impl Engine {
             data.start,
             data.start.saturating_add(data.length.max(1)),
         );
+        clip.id = data.id.clone();
         clip.offset = data.offset;
         clip.input_channel = data.input_channel;
         clip.muted = data.muted;
@@ -4540,6 +4689,64 @@ impl Engine {
         }
     }
 
+    async fn publish_session_runtime_reports(&mut self) {
+        if self
+            .last_session_report_publish
+            .is_some_and(|t| t.elapsed() < Self::SESSION_RUNTIME_REPORT_INTERVAL)
+        {
+            return;
+        }
+
+        let mut current = HashMap::<(String, usize), (SessionSlotState, usize)>::new();
+        {
+            let state = self.state.lock();
+            for (track_name, track) in &state.tracks {
+                let track = track.lock();
+                for launch in &track.pending_session_launches {
+                    current.insert(
+                        (track_name.clone(), launch.scene_index),
+                        (SessionSlotState::Queued, 0),
+                    );
+                }
+                for clip in &track.playing_session_clips {
+                    current.insert(
+                        (track_name.clone(), clip.scene_index),
+                        (SessionSlotState::Playing, clip.play_position_samples),
+                    );
+                }
+            }
+        }
+
+        let previous_keys: Vec<(String, usize)> =
+            self.session_report_state.keys().cloned().collect();
+        for key in previous_keys {
+            if current.contains_key(&key) {
+                continue;
+            }
+            let (track_name, scene_index) = key;
+            self.notify_clients(Ok(Action::SessionRuntimeReport {
+                track_name,
+                scene_index,
+                state: SessionSlotState::Stopped,
+                play_position_samples: 0,
+            }))
+            .await;
+        }
+
+        for ((track_name, scene_index), (state, play_position_samples)) in &current {
+            self.notify_clients(Ok(Action::SessionRuntimeReport {
+                track_name: track_name.clone(),
+                scene_index: *scene_index,
+                state: *state,
+                play_position_samples: *play_position_samples,
+            }))
+            .await;
+        }
+
+        self.session_report_state = current.into_iter().map(|(k, (s, _))| (k, s)).collect();
+        self.last_session_report_publish = Some(Instant::now());
+    }
+
     async fn publish_clap_state_dirty(&mut self) {
         let tracks: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = self
             .state
@@ -4720,8 +4927,143 @@ impl Engine {
                 self.handle_request_inner(Action::EndHistoryGroup, true)
                     .await;
             }
+            Action::Session(_) => {
+                self.handle_request_inner(a, false).await;
+            }
             other => {
                 self.handle_request_inner(other, true).await;
+            }
+        }
+    }
+
+    async fn handle_session_action(&mut self, action: SessionAction) {
+        let sample_rate = self.sample_rate();
+        let bpm = self.tempo_bpm;
+        let tsig_num = self.tsig_num;
+        let tsig_denom = self.tsig_denom;
+        let quantize = |sample: usize, quantization: LaunchQuantization| -> usize {
+            Track::quantize_sample_to_boundary(
+                sample,
+                quantization,
+                bpm,
+                tsig_num,
+                tsig_denom,
+                sample_rate,
+            )
+        };
+
+        match action {
+            SessionAction::LaunchClip {
+                track_name,
+                scene_index,
+                clip_id,
+                launch_quantization,
+                loop_enabled,
+                loop_start_samples,
+                loop_end_samples,
+            } => {
+                let Some(track) = self.track_handle_by_name(&track_name) else {
+                    tracing::warn!("Session launch for unknown track '{}'", track_name);
+                    return;
+                };
+                let track = track.lock();
+                let clip_id = if clip_id.is_empty() {
+                    track
+                        .session_slots
+                        .get(&scene_index)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    clip_id
+                };
+                let kind = if track.audio.clips.iter().any(|c| c.id == clip_id) {
+                    Kind::Audio
+                } else if track.midi.clips.iter().any(|c| c.id == clip_id) {
+                    Kind::MIDI
+                } else {
+                    tracing::warn!(
+                        "Session launch for unknown clip '{}' on track '{}'",
+                        clip_id,
+                        track_name
+                    );
+                    return;
+                };
+                let launch_at_sample = quantize(self.transport_sample, launch_quantization);
+                track.schedule_session_launch(crate::track::PendingSessionLaunch {
+                    scene_index,
+                    clip_id,
+                    kind,
+                    launch_at_sample,
+                    loop_enabled,
+                    loop_start_samples,
+                    loop_end_samples,
+                });
+            }
+            SessionAction::StopClip {
+                track_name,
+                scene_index,
+                launch_quantization,
+            } => {
+                let Some(track) = self.track_handle_by_name(&track_name) else {
+                    return;
+                };
+                let stop_at_sample = quantize(self.transport_sample, launch_quantization);
+                track
+                    .lock()
+                    .schedule_session_stop(scene_index, stop_at_sample);
+            }
+            SessionAction::LaunchScene {
+                scene_index,
+                launch_quantization,
+            } => {
+                let launch_at_sample = quantize(self.transport_sample, launch_quantization);
+                let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+                for track in tracks {
+                    let track_lock = track.lock();
+                    let Some(clip_id) = track_lock.session_slots.get(&scene_index).cloned() else {
+                        continue;
+                    };
+                    let kind = if track_lock.audio.clips.iter().any(|c| c.id == clip_id) {
+                        Kind::Audio
+                    } else if track_lock.midi.clips.iter().any(|c| c.id == clip_id) {
+                        Kind::MIDI
+                    } else {
+                        continue;
+                    };
+                    track_lock.schedule_session_launch(crate::track::PendingSessionLaunch {
+                        scene_index,
+                        clip_id,
+                        kind,
+                        launch_at_sample,
+                        loop_enabled: true,
+                        loop_start_samples: 0,
+                        loop_end_samples: 0,
+                    });
+                }
+            }
+            SessionAction::StopScene {
+                scene_index,
+                launch_quantization,
+            } => {
+                let stop_at_sample = quantize(self.transport_sample, launch_quantization);
+                let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+                for track in tracks {
+                    track
+                        .lock()
+                        .schedule_session_stop(scene_index, stop_at_sample);
+                }
+            }
+            SessionAction::StopAllClips => {
+                let stop_at_sample = quantize(self.transport_sample, LaunchQuantization::Bar);
+                let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+                for track in tracks {
+                    let track = track.lock();
+                    for clip in &mut track.playing_session_clips {
+                        if clip.stop_at_sample.is_none() {
+                            clip.stop_at_sample = Some(stop_at_sample);
+                        }
+                    }
+                }
             }
         }
     }
@@ -4892,6 +5234,33 @@ impl Engine {
                     binding: Some(binding),
                 });
             }
+            for (key, binding) in self.session_midi_learn_slots.clone() {
+                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
+                    target: crate::message::SessionMidiLearnTarget::Slot {
+                        track_name: key.0,
+                        scene_index: key.1,
+                    },
+                    binding: Some(binding),
+                });
+            }
+            for (scene_index, binding) in self.session_midi_learn_scenes.clone() {
+                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
+                    target: crate::message::SessionMidiLearnTarget::Scene(scene_index),
+                    binding: Some(binding),
+                });
+            }
+            for (track_name, binding) in self.session_midi_learn_stop_track.clone() {
+                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
+                    target: crate::message::SessionMidiLearnTarget::StopTrack(track_name),
+                    binding: Some(binding),
+                });
+            }
+            if let Some(binding) = self.session_midi_learn_stop_all.clone() {
+                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
+                    target: crate::message::SessionMidiLearnTarget::StopAll,
+                    binding: Some(binding),
+                });
+            }
         }
         let mut inverse_actions = if record_history
             && !suppress_timing_history
@@ -4961,6 +5330,30 @@ impl Engine {
                     };
                     inverse_actions = Some(vec![Action::SetGlobalMidiLearnBinding {
                         target: *target,
+                        binding,
+                    }]);
+                }
+                Action::SetSessionMidiLearnBinding { target, .. } => {
+                    let binding = match target {
+                        crate::message::SessionMidiLearnTarget::Slot {
+                            track_name,
+                            scene_index,
+                        } => self
+                            .session_midi_learn_slots
+                            .get(&(track_name.clone(), *scene_index))
+                            .cloned(),
+                        crate::message::SessionMidiLearnTarget::Scene(scene_index) => {
+                            self.session_midi_learn_scenes.get(scene_index).cloned()
+                        }
+                        crate::message::SessionMidiLearnTarget::StopTrack(track_name) => {
+                            self.session_midi_learn_stop_track.get(track_name).cloned()
+                        }
+                        crate::message::SessionMidiLearnTarget::StopAll => {
+                            self.session_midi_learn_stop_all.clone()
+                        }
+                    };
+                    inverse_actions = Some(vec![Action::SetSessionMidiLearnBinding {
+                        target: target.clone(),
                         binding,
                     }]);
                 }
@@ -5092,6 +5485,11 @@ impl Engine {
                         .extend(panic_events);
                 }
             }
+            Action::Session(ref session_action) => {
+                self.handle_session_action(session_action.clone()).await;
+            }
+            Action::SessionRuntimeReport { .. } => {}
+            Action::SessionMidiLearnTriggered { .. } => {}
             Action::SetClipPlaybackEnabled(enabled) => {
                 self.clip_playback_enabled = enabled;
                 for track in self.state.lock().tracks.values() {
@@ -5742,6 +6140,9 @@ impl Engine {
             Action::GlobalArmMidiLearn { target } => {
                 self.pending_global_midi_learn = Some(target);
             }
+            Action::SessionArmMidiLearn { ref target } => {
+                self.pending_session_midi_learn = Some(target.clone());
+            }
             Action::TrackSetMidiLearnBinding {
                 ref track_name,
                 target,
@@ -5820,6 +6221,61 @@ impl Engine {
                     }
                     crate::message::GlobalMidiLearnTarget::RecordToggle => {
                         self.global_midi_learn_record_toggle = binding.clone();
+                    }
+                }
+            }
+            Action::SetSessionMidiLearnBinding {
+                ref target,
+                ref binding,
+            } => {
+                if let Some(binding) = binding.as_ref() {
+                    let conflicts = self.midi_learn_slot_conflicts(
+                        binding,
+                        Some(MidiLearnSlot::Session(target.clone())),
+                    );
+                    if !conflicts.is_empty() {
+                        self.notify_clients(Err(format!(
+                            "Session MIDI learn conflict for {:?}: {}",
+                            target,
+                            conflicts.join(", ")
+                        )))
+                        .await;
+                        return;
+                    }
+                }
+                match target {
+                    crate::message::SessionMidiLearnTarget::Slot {
+                        track_name,
+                        scene_index,
+                    } => {
+                        if binding.is_some() {
+                            self.session_midi_learn_slots.insert(
+                                (track_name.clone(), *scene_index),
+                                binding.clone().unwrap(),
+                            );
+                        } else {
+                            self.session_midi_learn_slots
+                                .remove(&(track_name.clone(), *scene_index));
+                        }
+                    }
+                    crate::message::SessionMidiLearnTarget::Scene(scene_index) => {
+                        if binding.is_some() {
+                            self.session_midi_learn_scenes
+                                .insert(*scene_index, binding.clone().unwrap());
+                        } else {
+                            self.session_midi_learn_scenes.remove(scene_index);
+                        }
+                    }
+                    crate::message::SessionMidiLearnTarget::StopTrack(track_name) => {
+                        if binding.is_some() {
+                            self.session_midi_learn_stop_track
+                                .insert(track_name.clone(), binding.clone().unwrap());
+                        } else {
+                            self.session_midi_learn_stop_track.remove(track_name);
+                        }
+                    }
+                    crate::message::SessionMidiLearnTarget::StopAll => {
+                        self.session_midi_learn_stop_all = binding.clone();
                     }
                 }
             }
@@ -6213,6 +6669,28 @@ impl Engine {
                     }
                 };
                 track.lock().set_frozen(frozen);
+            }
+            Action::TrackSetSessionSlot {
+                ref track_name,
+                scene_index,
+                ref clip_id,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                match clip_id {
+                    Some(id) => {
+                        track.session_slots.insert(scene_index, id.clone());
+                    }
+                    None => {
+                        track.session_slots.remove(&scene_index);
+                    }
+                }
             }
             Action::TrackOfflineBounce {
                 track_name,
@@ -7848,6 +8326,7 @@ impl Engine {
                 }
             }
             Action::AddClip {
+                ref clip_id,
                 ref name,
                 ref track_name,
                 start,
@@ -7871,6 +8350,7 @@ impl Engine {
                 ref plugin_graph_json,
             } => {
                 self.add_clip_to_track(ClipAddRequest {
+                    clip_id,
                     name,
                     track_name,
                     start,
@@ -8710,6 +9190,27 @@ impl Engine {
                         lines.push(format!("{} DiskMonitor: {}", track_name, fmt_binding(b)));
                     }
                 }
+                for ((track_name, scene_index), binding) in &self.session_midi_learn_slots {
+                    lines.push(format!(
+                        "{} Slot {}: {}",
+                        track_name,
+                        scene_index + 1,
+                        fmt_binding(binding)
+                    ));
+                }
+                for (scene_index, binding) in &self.session_midi_learn_scenes {
+                    lines.push(format!(
+                        "Scene {}: {}",
+                        scene_index + 1,
+                        fmt_binding(binding)
+                    ));
+                }
+                for (track_name, binding) in &self.session_midi_learn_stop_track {
+                    lines.push(format!("{} Stop: {}", track_name, fmt_binding(binding)));
+                }
+                if let Some(binding) = self.session_midi_learn_stop_all.as_ref() {
+                    lines.push(format!("Stop All Clips: {}", fmt_binding(binding)));
+                }
                 if lines.is_empty() {
                     lines.push("No MIDI learn mappings configured".to_string());
                 }
@@ -8719,9 +9220,14 @@ impl Engine {
             Action::ClearAllMidiLearnBindings => {
                 self.pending_midi_learn = None;
                 self.pending_global_midi_learn = None;
+                self.pending_session_midi_learn = None;
                 self.global_midi_learn_play_pause = None;
                 self.global_midi_learn_stop = None;
                 self.global_midi_learn_record_toggle = None;
+                self.session_midi_learn_slots.clear();
+                self.session_midi_learn_scenes.clear();
+                self.session_midi_learn_stop_track.clear();
+                self.session_midi_learn_stop_all = None;
                 self.midi_cc_gate.clear();
                 for track in self.state.lock().tracks.values() {
                     let t = track.lock();
@@ -8873,7 +9379,8 @@ impl Engine {
                         | Action::InsertMidiControllers { .. }
                         | Action::DeleteMidiNotes { .. }
                         | Action::InsertMidiNotes { .. }
-                        | Action::SetMidiSysExEvents { .. } => {
+                        | Action::SetMidiSysExEvents { .. }
+                        | Action::Session(_) => {
                             self.handle_request(a).await;
                         }
                         #[cfg(all(unix, not(target_os = "macos")))]
@@ -8967,6 +9474,7 @@ impl Engine {
                         }
                     }
                     self.publish_track_meters().await;
+                    self.publish_session_runtime_reports().await;
                     self.publish_clap_state_dirty().await;
                     for track_name in reconfigured_tracks {
                         let track = self.state.lock().tracks.get(&track_name).cloned();

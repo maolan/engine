@@ -388,6 +388,30 @@ pub struct HwMidiOutEvent {
     pub event: MidiEvent,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingSessionLaunch {
+    pub scene_index: usize,
+    pub clip_id: String,
+    pub kind: Kind,
+    pub launch_at_sample: usize,
+    pub loop_enabled: bool,
+    pub loop_start_samples: usize,
+    pub loop_end_samples: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayingSessionClip {
+    pub scene_index: usize,
+    pub clip_id: String,
+    pub kind: Kind,
+    pub play_position_samples: usize,
+    pub loop_enabled: bool,
+    pub loop_start_samples: usize,
+    pub loop_end_samples: usize,
+    pub stop_at_sample: Option<usize>,
+    pub active_midi_notes: HashSet<(u8, u8)>,
+}
+
 #[derive(Debug)]
 pub struct Track {
     pub name: String,
@@ -467,6 +491,11 @@ pub struct Track {
     midi_input_to_out_routes_cache: Vec<Vec<usize>>,
     midi_out_external_targets_cache: Vec<Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>>,
     midi_route_cache_dirty: bool,
+
+    pub pending_session_launches: Vec<PendingSessionLaunch>,
+    pub playing_session_clips: Vec<PlayingSessionClip>,
+    pending_session_midi_note_offs: Vec<MidiEvent>,
+    pub session_slots: HashMap<usize, String>,
 
     folder_input_midi_events: Vec<Vec<MidiEvent>>,
     folder_plugin_midi_node_events: HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
@@ -562,6 +591,11 @@ impl Track {
             midi_input_to_out_routes_cache: Vec::new(),
             midi_out_external_targets_cache: Vec::new(),
             midi_route_cache_dirty: true,
+
+            pending_session_launches: Vec::new(),
+            playing_session_clips: Vec::new(),
+            pending_session_midi_note_offs: Vec::new(),
+            session_slots: HashMap::new(),
 
             folder_input_midi_events: Vec::new(),
             folder_plugin_midi_node_events: HashMap::new(),
@@ -957,8 +991,18 @@ impl Track {
         };
 
         let mut track_input_midi_events = self.collect_track_input_midi_events();
-        if self.folder_clip_playback_active {
-            self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
+        let cycle_start = self.transport_sample;
+        let cycle_end = cycle_start.saturating_add(frames);
+        let session_active =
+            !self.playing_session_clips.is_empty() || !self.pending_session_launches.is_empty();
+        if self.clip_playback_enabled && (self.folder_clip_playback_active || session_active) {
+            self.process_session_clips(cycle_start, cycle_end, frames);
+            if self.folder_clip_playback_active {
+                self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
+            }
+            if session_active {
+                self.mix_session_midi_into_inputs(&mut track_input_midi_events, frames);
+            }
             for (lane, input) in self.midi.ins.iter().enumerate() {
                 let lock = input.lock();
                 lock.buffer.clear();
@@ -974,11 +1018,16 @@ impl Track {
                 }
             }
             let mix_start = std::time::Instant::now();
-            self.mix_clip_audio_into_inputs();
+            if self.folder_clip_playback_active {
+                self.mix_clip_audio_into_inputs();
+            }
+            if session_active {
+                self.mix_session_audio_into_inputs();
+            }
             let mix_elapsed = mix_start.elapsed().as_secs_f64() * 1000.0;
             if mix_elapsed > 1.0 {
                 tracing::warn!(
-                    "mix_clip_audio_into_inputs for '{}' took {:.2}ms",
+                    "mix session/clip audio into inputs for '{}' took {:.2}ms",
                     self.name,
                     mix_elapsed
                 );
@@ -1385,6 +1434,51 @@ impl Track {
     }
     pub fn set_record_tap_enabled(&mut self, enabled: bool) {
         self.record_tap_enabled = enabled;
+    }
+
+    pub fn quantize_sample_to_boundary(
+        sample: usize,
+        quantization: crate::message::LaunchQuantization,
+        bpm: f64,
+        tsig_num: u16,
+        tsig_denom: u16,
+        sample_rate: f64,
+    ) -> usize {
+        use crate::message::LaunchQuantization;
+        match quantization {
+            LaunchQuantization::None => sample,
+            _ => {
+                let denom = tsig_denom.max(1) as f64;
+                let beats_per_bar = tsig_num.max(1) as f64;
+                let samples_per_beat = ((sample_rate * 60.0) / bpm.max(1.0)) * (4.0 / denom);
+                if !samples_per_beat.is_finite() || samples_per_beat <= 0.0 {
+                    return sample;
+                }
+                let interval = match quantization {
+                    LaunchQuantization::Beat => samples_per_beat,
+                    LaunchQuantization::Bar => samples_per_beat * beats_per_bar,
+                    LaunchQuantization::TwoBars => samples_per_beat * beats_per_bar * 2.0,
+                    LaunchQuantization::FourBars => samples_per_beat * beats_per_bar * 4.0,
+                    LaunchQuantization::EightBars => samples_per_beat * beats_per_bar * 8.0,
+                    LaunchQuantization::None => return sample,
+                };
+                ((sample as f64 / interval).ceil() * interval).max(0.0) as usize
+            }
+        }
+    }
+
+    pub fn schedule_session_launch(&mut self, launch: PendingSessionLaunch) {
+        self.pending_session_launches.push(launch);
+    }
+
+    pub fn schedule_session_stop(&mut self, scene_index: usize, stop_at_sample: usize) {
+        if let Some(clip) = self
+            .playing_session_clips
+            .iter_mut()
+            .find(|c| c.scene_index == scene_index && c.stop_at_sample.is_none())
+        {
+            clip.stop_at_sample = Some(stop_at_sample);
+        }
     }
 
     pub fn set_midi_lane_channel(&mut self, lane: usize, channel: Option<u8>) {
@@ -2866,6 +2960,319 @@ impl Track {
         let segments = self.cycle_segments(frames);
         for clip in &self.midi.clips {
             self.collect_midi_clip_events_recursive(clip, 0, input_events, frames, &segments);
+        }
+        for events in input_events.iter_mut() {
+            events.sort_by_key(|event| event.frame);
+        }
+    }
+
+    pub fn process_session_clips(&mut self, cycle_start: usize, cycle_end: usize, _frames: usize) {
+        let _ = cycle_end;
+        let mut activated = Vec::new();
+        self.pending_session_launches.retain(|launch| {
+            if launch.launch_at_sample <= cycle_start {
+                activated.push(launch.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for launch in activated {
+            let exists = match launch.kind {
+                Kind::Audio => self.audio.clips.iter().any(|c| c.id == launch.clip_id),
+                Kind::MIDI => self.midi.clips.iter().any(|c| c.id == launch.clip_id),
+            };
+            if !exists {
+                tracing::warn!(
+                    "Session launch references missing clip {} on track {}",
+                    launch.clip_id,
+                    self.name
+                );
+                continue;
+            }
+            self.playing_session_clips
+                .retain(|c| c.scene_index != launch.scene_index);
+            self.playing_session_clips.push(PlayingSessionClip {
+                scene_index: launch.scene_index,
+                clip_id: launch.clip_id,
+                kind: launch.kind,
+                play_position_samples: 0,
+                loop_enabled: launch.loop_enabled,
+                loop_start_samples: launch.loop_start_samples,
+                loop_end_samples: launch.loop_end_samples,
+                stop_at_sample: None,
+                active_midi_notes: HashSet::new(),
+            });
+        }
+
+        let mut note_offs = Vec::new();
+        let mut remove_indices = Vec::new();
+        for (i, clip) in self.playing_session_clips.iter().enumerate() {
+            let should_stop = if let Some(stop_at) = clip.stop_at_sample {
+                stop_at <= cycle_start
+            } else {
+                false
+            };
+            if should_stop {
+                if clip.kind == Kind::MIDI {
+                    for (channel, note) in &clip.active_midi_notes {
+                        note_offs.push(MidiEvent::new(
+                            0,
+                            vec![0x80 | (*channel).min(15), (*note).min(127), 64],
+                        ));
+                    }
+                }
+                remove_indices.push(i);
+            }
+        }
+        for i in remove_indices.into_iter().rev() {
+            self.playing_session_clips.remove(i);
+        }
+        self.pending_session_midi_note_offs.extend(note_offs);
+    }
+
+    fn mix_session_audio_into_inputs(&mut self) {
+        let frames = self
+            .audio
+            .ins
+            .first()
+            .map(|audio_in| audio_in.buffer.lock().len())
+            .unwrap_or(0);
+        if frames == 0 || self.audio.ins.is_empty() {
+            return;
+        }
+        let mut active_clip_plugin_keys = HashSet::new();
+        let channel_count = self.audio.ins.len();
+        let clip_count = self.playing_session_clips.len();
+        let mut position_updates = Vec::new();
+        let mut remove_indices = Vec::new();
+
+        for i in 0..clip_count {
+            if self.playing_session_clips[i].kind != Kind::Audio {
+                continue;
+            }
+            let clip_id = self.playing_session_clips[i].clip_id.clone();
+            let arrangement_clip = match self.audio.clips.iter().find(|c| c.id == clip_id).cloned()
+            {
+                Some(c) => c,
+                None => {
+                    remove_indices.push(i);
+                    continue;
+                }
+            };
+            let clip_length = arrangement_clip.end.saturating_sub(arrangement_clip.start);
+            if clip_length == 0 {
+                remove_indices.push(i);
+                continue;
+            }
+            let loop_enabled = self.playing_session_clips[i].loop_enabled;
+            let loop_start = self.playing_session_clips[i].loop_start_samples;
+            let loop_end = self.playing_session_clips[i]
+                .loop_end_samples
+                .max(loop_start.saturating_add(1))
+                .min(clip_length);
+            let mut play_position = self.playing_session_clips[i].play_position_samples;
+            let mut out_offset = 0usize;
+            let mut rendered_any = false;
+
+            while out_offset < frames {
+                if play_position >= clip_length {
+                    if loop_enabled && loop_end > loop_start {
+                        play_position =
+                            loop_start + ((play_position - loop_start) % (loop_end - loop_start));
+                    } else {
+                        break;
+                    }
+                }
+                let segment_end = if loop_enabled { loop_end } else { clip_length };
+                let remaining_segment = segment_end.saturating_sub(play_position);
+                if remaining_segment == 0 {
+                    break;
+                }
+                let segment_len = (frames - out_offset).min(remaining_segment);
+                let mut session_clip = arrangement_clip.clone();
+                session_clip.start = 0;
+                session_clip.end = clip_length;
+
+                let processed = match self.render_audio_clip_segment(
+                    &session_clip,
+                    0,
+                    play_position,
+                    segment_len,
+                    &mut active_clip_plugin_keys,
+                ) {
+                    Some(p) => p,
+                    None => break,
+                };
+                for ch in 0..channel_count {
+                    let in_samples = self.audio.ins[ch].buffer.lock();
+                    let src = processed.get(ch).or_else(|| processed.first());
+                    if let Some(src) = src {
+                        let len = src
+                            .len()
+                            .min(segment_len)
+                            .min(in_samples.len().saturating_sub(out_offset));
+                        crate::simd::add_inplace(
+                            &mut in_samples[out_offset..out_offset + len],
+                            &src[..len],
+                        );
+                    }
+                }
+                rendered_any = true;
+                play_position += segment_len;
+                out_offset += segment_len;
+            }
+
+            if rendered_any {
+                position_updates.push((i, play_position));
+            } else if play_position >= clip_length && !loop_enabled {
+                remove_indices.push(i);
+            } else {
+                position_updates.push((i, play_position));
+            }
+        }
+
+        for (idx, pos) in position_updates {
+            self.playing_session_clips[idx].play_position_samples = pos;
+        }
+        for idx in remove_indices.into_iter().rev() {
+            self.playing_session_clips.remove(idx);
+        }
+        self.clip_plugin_tracks
+            .retain(|key, _| active_clip_plugin_keys.contains(key));
+    }
+
+    fn mix_session_midi_into_inputs(&mut self, input_events: &mut [Vec<MidiEvent>], frames: usize) {
+        if frames == 0 || input_events.is_empty() {
+            return;
+        }
+        for event in self.pending_session_midi_note_offs.drain(..) {
+            for lane in input_events.iter_mut() {
+                lane.push(event.clone());
+            }
+        }
+
+        let clip_count = self.playing_session_clips.len();
+        let mut position_updates = Vec::new();
+        let mut remove_indices = Vec::new();
+
+        for i in 0..clip_count {
+            if self.playing_session_clips[i].kind != Kind::MIDI {
+                continue;
+            }
+            let clip_id = self.playing_session_clips[i].clip_id.clone();
+            let arrangement_clip = match self.midi.clips.iter().find(|c| c.id == clip_id).cloned() {
+                Some(c) => c,
+                None => {
+                    remove_indices.push(i);
+                    continue;
+                }
+            };
+            let clip_length = arrangement_clip.end.saturating_sub(arrangement_clip.start);
+            if clip_length == 0 {
+                remove_indices.push(i);
+                continue;
+            }
+            let loop_enabled = self.playing_session_clips[i].loop_enabled;
+            let loop_start = self.playing_session_clips[i].loop_start_samples;
+            let loop_end = self.playing_session_clips[i]
+                .loop_end_samples
+                .max(loop_start.saturating_add(1))
+                .min(clip_length);
+            let mut play_position = self.playing_session_clips[i].play_position_samples;
+            let input_lane = arrangement_clip
+                .input_channel
+                .min(input_events.len().saturating_sub(1));
+            let events = match self.midi_clip_cache.get(&arrangement_clip.name).cloned() {
+                Some(e) => e,
+                None => {
+                    remove_indices.push(i);
+                    continue;
+                }
+            };
+
+            let mut out_offset = 0usize;
+            let mut emitted_any = false;
+
+            while out_offset < frames {
+                if play_position >= clip_length {
+                    if loop_enabled && loop_end > loop_start {
+                        for (channel, note) in &self.playing_session_clips[i].active_midi_notes {
+                            input_events[input_lane].push(MidiEvent::new(
+                                out_offset as u32,
+                                vec![0x80 | (*channel).min(15), (*note).min(127), 64],
+                            ));
+                        }
+                        self.playing_session_clips[i].active_midi_notes.clear();
+                        play_position =
+                            loop_start + ((play_position - loop_start) % (loop_end - loop_start));
+                    } else {
+                        break;
+                    }
+                }
+                let segment_end = if loop_enabled { loop_end } else { clip_length };
+                let remaining_segment = segment_end.saturating_sub(play_position);
+                if remaining_segment == 0 {
+                    break;
+                }
+                let segment_len = (frames - out_offset).min(remaining_segment);
+                let content_start = arrangement_clip.offset.saturating_add(play_position);
+                let content_end = content_start.saturating_add(segment_len);
+
+                for (source_sample, data) in events.iter() {
+                    if *source_sample < content_start {
+                        continue;
+                    }
+                    if *source_sample >= content_end {
+                        break;
+                    }
+                    let frame = out_offset + (source_sample - content_start);
+                    if frame < frames {
+                        input_events[input_lane].push(MidiEvent::new(frame as u32, data.clone()));
+                        if let Some(&status) = data.first() {
+                            let channel = status & 0x0F;
+                            if let Some(&note) = data.get(1) {
+                                if status & 0xF0 == 0x90 && data.get(2).copied().unwrap_or(0) > 0 {
+                                    self.playing_session_clips[i]
+                                        .active_midi_notes
+                                        .insert((channel, note));
+                                } else if status & 0xF0 == 0x80
+                                    || (status & 0xF0 == 0x90
+                                        && data.get(2).copied().unwrap_or(0) == 0)
+                                {
+                                    self.playing_session_clips[i]
+                                        .active_midi_notes
+                                        .remove(&(channel, note));
+                                }
+                            }
+                        }
+                    }
+                }
+                emitted_any = true;
+                play_position += segment_len;
+                out_offset += segment_len;
+            }
+
+            if emitted_any {
+                position_updates.push((i, play_position));
+            } else if play_position >= clip_length && !loop_enabled {
+                for (channel, note) in &self.playing_session_clips[i].active_midi_notes {
+                    input_events[input_lane].push(MidiEvent::new(
+                        frames.saturating_sub(1) as u32,
+                        vec![0x80 | (*channel).min(15), (*note).min(127), 64],
+                    ));
+                }
+                remove_indices.push(i);
+            } else {
+                position_updates.push((i, play_position));
+            }
+        }
+
+        for (idx, pos) in position_updates {
+            self.playing_session_clips[idx].play_position_samples = pos;
+        }
+        for idx in remove_indices.into_iter().rev() {
+            self.playing_session_clips.remove(idx);
         }
         for events in input_events.iter_mut() {
             events.sort_by_key(|event| event.frame);
@@ -6746,5 +7153,438 @@ mod tests {
 
         track.toggle_master();
         assert!(!track.is_master);
+    }
+
+    #[test]
+    fn quantize_sample_to_boundary_beat() {
+        let sample_rate = 48_000.0;
+        let bpm = 120.0;
+        // One quarter note at 120 BPM, 48 kHz = 24000 samples.
+        assert_eq!(
+            Track::quantize_sample_to_boundary(
+                100,
+                crate::message::LaunchQuantization::Beat,
+                bpm,
+                4,
+                4,
+                sample_rate
+            ),
+            24_000
+        );
+    }
+
+    #[test]
+    fn quantize_sample_to_boundary_bar() {
+        let sample_rate = 48_000.0;
+        let bpm = 120.0;
+        // One bar (4 beats) = 96000 samples.
+        assert_eq!(
+            Track::quantize_sample_to_boundary(
+                100,
+                crate::message::LaunchQuantization::Bar,
+                bpm,
+                4,
+                4,
+                sample_rate
+            ),
+            96_000
+        );
+    }
+
+    #[test]
+    fn quantize_sample_to_boundary_two_bars() {
+        let sample_rate = 48_000.0;
+        let bpm = 120.0;
+        // Two bars = 192000 samples.
+        assert_eq!(
+            Track::quantize_sample_to_boundary(
+                100,
+                crate::message::LaunchQuantization::TwoBars,
+                bpm,
+                4,
+                4,
+                sample_rate
+            ),
+            192_000
+        );
+    }
+
+    #[test]
+    fn quantize_sample_to_boundary_none_returns_input() {
+        let sample_rate = 48_000.0;
+        let bpm = 120.0;
+        assert_eq!(
+            Track::quantize_sample_to_boundary(
+                12345,
+                crate::message::LaunchQuantization::None,
+                bpm,
+                4,
+                4,
+                sample_rate
+            ),
+            12345
+        );
+    }
+
+    #[test]
+    fn quantize_sample_to_boundary_uses_min_bpm_when_zero() {
+        // Zero BPM is clamped to 1.0 inside the function, so one beat at 48 kHz
+        // becomes 2_880_000 samples and sample 100 rounds up to that boundary.
+        assert_eq!(
+            Track::quantize_sample_to_boundary(
+                100,
+                crate::message::LaunchQuantization::Beat,
+                0.0,
+                4,
+                4,
+                48_000.0
+            ),
+            2_880_000
+        );
+    }
+
+    #[test]
+    fn session_audio_launch_plays_referenced_clip() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        // Place the arrangement clip far after the current transport so only the
+        // session playback path contributes audio.
+        let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
+        clip.id = "clip-1".to_string();
+        clip.fade_enabled = false;
+        track.audio.clips.push(clip);
+
+        track.audio_clip_cache.insert(
+            "session_clip".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.8, 0.0, 0.0, 0.0],
+            }),
+        );
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "clip-1".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+
+        let out = track.audio.outs[0].buffer.lock().to_vec();
+        assert_eq!(out[0], 0.8);
+    }
+
+    #[test]
+    fn session_audio_stop_at_boundary_halts_playback() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1016);
+        clip.id = "clip-1".to_string();
+        clip.fade_enabled = false;
+        track.audio.clips.push(clip);
+
+        track.audio_clip_cache.insert(
+            "session_clip".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.5; 16],
+            }),
+        );
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "clip-1".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+        assert_eq!(track.playing_session_clips.len(), 1);
+        assert_eq!(track.playing_session_clips[0].play_position_samples, 8);
+
+        track.transport_sample = 8;
+        track.schedule_session_stop(0, 8);
+        track.process();
+
+        assert!(track.playing_session_clips.is_empty());
+    }
+
+    #[test]
+    fn session_audio_loop_repeats_clip_content() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
+        clip.id = "clip-1".to_string();
+        clip.fade_enabled = false;
+        track.audio.clips.push(clip);
+
+        track.audio_clip_cache.insert(
+            "session_clip".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.1, 0.2, 0.3, 0.4],
+            }),
+        );
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "clip-1".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: true,
+            loop_start_samples: 0,
+            loop_end_samples: 4,
+        });
+
+        track.process();
+
+        let out = track.audio.outs[0].buffer.lock().to_vec();
+        assert_eq!(out[0], 0.1);
+        assert_eq!(out[1], 0.2);
+        assert_eq!(out[2], 0.3);
+        assert_eq!(out[3], 0.4);
+        assert_eq!(out[4], 0.1);
+        assert_eq!(out[5], 0.2);
+        assert_eq!(out[6], 0.3);
+        assert_eq!(out[7], 0.4);
+    }
+
+    #[test]
+    fn session_multiple_clips_mix_together() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        let mut clip1 = AudioClip::new("clip1".to_string(), 1000, 1004);
+        clip1.id = "id1".to_string();
+        clip1.fade_enabled = false;
+        track.audio.clips.push(clip1);
+
+        let mut clip2 = AudioClip::new("clip2".to_string(), 1000, 1004);
+        clip2.id = "id2".to_string();
+        clip2.fade_enabled = false;
+        track.audio.clips.push(clip2);
+
+        track.audio_clip_cache.insert(
+            "clip1".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.5, 0.0, 0.0, 0.0],
+            }),
+        );
+        track.audio_clip_cache.insert(
+            "clip2".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.3, 0.0, 0.0, 0.0],
+            }),
+        );
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "id1".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 1,
+            clip_id: "id2".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+
+        let out = track.audio.outs[0].buffer.lock().to_vec();
+        assert_eq!(out[0], 0.8);
+    }
+
+    #[test]
+    fn session_midi_launch_plays_referenced_clip() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        let mut clip = crate::midi::clip::MIDIClip::new("session_clip".to_string(), 0, 8);
+        clip.id = "clip-1".to_string();
+        track.midi.clips.push(clip);
+
+        track.midi_clip_cache.insert(
+            "session_clip".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100])]),
+        );
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "clip-1".to_string(),
+            kind: Kind::MIDI,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+
+        assert!(
+            track
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|e| e.event.data == vec![0x90, 60, 100])
+        );
+    }
+
+    #[test]
+    fn session_midi_stop_emits_note_off_for_active_notes() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        let mut clip = crate::midi::clip::MIDIClip::new("session_clip".to_string(), 0, 16);
+        clip.id = "clip-1".to_string();
+        track.midi.clips.push(clip);
+
+        track.midi_clip_cache.insert(
+            "session_clip".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100])]),
+        );
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "clip-1".to_string(),
+            kind: Kind::MIDI,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+        assert!(
+            track
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|e| e.event.data == vec![0x90, 60, 100])
+        );
+
+        track.transport_sample = 8;
+        track.schedule_session_stop(0, 8);
+        track.process();
+
+        assert!(
+            track
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|e| e.event.data == vec![0x80, 60, 64])
+        );
+    }
+
+    #[test]
+    fn session_launch_with_missing_clip_is_ignored() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "missing-id".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+
+        assert!(track.playing_session_clips.is_empty());
+        let out = track.audio.outs[0].buffer.lock().to_vec();
+        assert_eq!(out[0], 0.0);
+    }
+
+    #[test]
+    fn session_launch_same_scene_replaces_playing_clip() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        let mut clip1 = AudioClip::new("clip1".to_string(), 1000, 1008);
+        clip1.id = "id1".to_string();
+        clip1.fade_enabled = false;
+        track.audio.clips.push(clip1);
+
+        let mut clip2 = AudioClip::new("clip2".to_string(), 1000, 1008);
+        clip2.id = "id2".to_string();
+        clip2.fade_enabled = false;
+        track.audio.clips.push(clip2);
+
+        track.audio_clip_cache.insert(
+            "clip1".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.1; 8],
+            }),
+        );
+        track.audio_clip_cache.insert(
+            "clip2".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.7; 8],
+            }),
+        );
+
+        track.playing_session_clips.push(super::PlayingSessionClip {
+            scene_index: 0,
+            clip_id: "id1".to_string(),
+            kind: Kind::Audio,
+            play_position_samples: 4,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+            stop_at_sample: None,
+            active_midi_notes: std::collections::HashSet::new(),
+        });
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "id2".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+
+        assert_eq!(track.playing_session_clips.len(), 1);
+        assert_eq!(track.playing_session_clips[0].clip_id, "id2");
+        let out = track.audio.outs[0].buffer.lock().to_vec();
+        assert_eq!(out[0], 0.7);
     }
 }

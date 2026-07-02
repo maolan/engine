@@ -1,5 +1,6 @@
 #[derive(Default, Clone, Debug)]
 pub struct MIDIClip {
+    pub id: String,
     pub name: String,
     pub start: usize,
     pub end: usize,
@@ -12,6 +13,7 @@ pub struct MIDIClip {
 impl MIDIClip {
     pub fn new(name: String, start: usize, end: usize) -> Self {
         Self {
+            id: String::new(),
             name,
             start,
             end,

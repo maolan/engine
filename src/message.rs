@@ -110,6 +110,8 @@ pub struct PitchCorrectionPointData {
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AudioClipData {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub start: usize,
     pub length: usize,
@@ -134,6 +136,8 @@ pub struct AudioClipData {
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MidiClipData {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub start: usize,
     pub length: usize,
@@ -141,6 +145,11 @@ pub struct MidiClipData {
     pub input_channel: usize,
     pub muted: bool,
     pub grouped_clips: Vec<MidiClipData>,
+}
+
+/// Generates a new unique clip identifier.
+pub fn generate_clip_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +350,62 @@ pub enum GlobalMidiLearnTarget {
     RecordToggle,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SessionMidiLearnTarget {
+    Slot {
+        track_name: String,
+        scene_index: usize,
+    },
+    Scene(usize),
+    StopTrack(String),
+    StopAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionSlotState {
+    Stopped,
+    Queued,
+    Playing,
+    Stopping,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchQuantization {
+    None,
+    Beat,
+    Bar,
+    TwoBars,
+    FourBars,
+    EightBars,
+}
+
+#[derive(Clone, Debug)]
+pub enum SessionAction {
+    LaunchClip {
+        track_name: String,
+        scene_index: usize,
+        clip_id: String,
+        launch_quantization: LaunchQuantization,
+        loop_enabled: bool,
+        loop_start_samples: usize,
+        loop_end_samples: usize,
+    },
+    StopClip {
+        track_name: String,
+        scene_index: usize,
+        launch_quantization: LaunchQuantization,
+    },
+    LaunchScene {
+        scene_index: usize,
+        launch_quantization: LaunchQuantization,
+    },
+    StopScene {
+        scene_index: usize,
+        launch_quantization: LaunchQuantization,
+    },
+    StopAllClips,
+}
+
 #[derive(Clone, Debug)]
 pub enum Action {
     Quit,
@@ -391,6 +456,7 @@ pub enum Action {
     TrackRemoveAudioInput(String),
     TrackRemoveAudioOutput(String),
     AddClip {
+        clip_id: String,
         name: String,
         track_name: String,
         start: usize,
@@ -539,6 +605,9 @@ pub enum Action {
     GlobalArmMidiLearn {
         target: GlobalMidiLearnTarget,
     },
+    SessionArmMidiLearn {
+        target: SessionMidiLearnTarget,
+    },
     TrackSetMidiLearnBinding {
         track_name: String,
         target: TrackMidiLearnTarget,
@@ -547,6 +616,13 @@ pub enum Action {
     SetGlobalMidiLearnBinding {
         target: GlobalMidiLearnTarget,
         binding: Option<MidiLearnBinding>,
+    },
+    SetSessionMidiLearnBinding {
+        target: SessionMidiLearnTarget,
+        binding: Option<MidiLearnBinding>,
+    },
+    SessionMidiLearnTriggered {
+        target: SessionMidiLearnTarget,
     },
     TrackSetFolder {
         track_name: String,
@@ -567,6 +643,11 @@ pub enum Action {
     TrackSetFrozen {
         track_name: String,
         frozen: bool,
+    },
+    TrackSetSessionSlot {
+        track_name: String,
+        scene_index: usize,
+        clip_id: Option<String>,
     },
     TrackOfflineBounce {
         track_name: String,
@@ -1134,6 +1215,13 @@ pub enum Action {
     },
     Undo,
     Redo,
+    Session(SessionAction),
+    SessionRuntimeReport {
+        track_name: String,
+        scene_index: usize,
+        state: SessionSlotState,
+        play_position_samples: usize,
+    },
     Panic,
 }
 
@@ -1172,6 +1260,7 @@ mod tests {
     #[test]
     fn audio_clip_data_serde_round_trips_nested_groups() {
         let clip = AudioClipData {
+            id: String::new(),
             name: "group.wav".to_string(),
             start: 12,
             length: 96,
@@ -1220,6 +1309,7 @@ mod tests {
     #[test]
     fn midi_clip_data_serde_round_trips_nested_groups() {
         let clip = MidiClipData {
+            id: String::new(),
             name: "group.mid".to_string(),
             start: 5,
             length: 64,

@@ -3,6 +3,7 @@ use serde_json::Value;
 
 #[derive(Default, Clone, Debug)]
 pub struct AudioClip {
+    pub id: String,
     pub name: String,
     pub start: usize,
     pub end: usize,
@@ -28,6 +29,7 @@ pub struct AudioClip {
 impl AudioClip {
     pub fn new(name: String, start: usize, end: usize) -> Self {
         Self {
+            id: String::new(),
             name,
             start,
             end,
