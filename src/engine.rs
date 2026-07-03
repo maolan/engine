@@ -4457,7 +4457,34 @@ impl Engine {
         match task {
             ProcessTask::Track(t) | ProcessTask::FolderInput(t) => {
                 let track = t.lock();
-                track.audio.ready()
+                let ready = track.audio.ready();
+                if !ready {
+                    let task_kind = match task {
+                        ProcessTask::Track(_) => "Track",
+                        ProcessTask::FolderInput(_) => "FolderInput",
+                        _ => "?",
+                    };
+                    let mut input_status = Vec::new();
+                    for (idx, input) in track.audio.ins.iter().enumerate() {
+                        let finished = *input.finished.lock();
+                        let conn_count = input.connection_count.load(Ordering::Relaxed);
+                        let mut pending = Vec::new();
+                        for conn in input.connections.lock().iter() {
+                            pending.push(*conn.finished.lock());
+                        }
+                        input_status.push(format!(
+                            "in{}: finished={} conns={} pending_finished={:?}",
+                            idx, finished, conn_count, pending
+                        ));
+                    }
+                    tracing::info!(
+                        "task not ready for '{}' ({}): {}",
+                        track.name,
+                        task_kind,
+                        input_status.join(", ")
+                    );
+                }
+                ready
             }
             ProcessTask::Plugin { .. } | ProcessTask::FolderOutput(_) => true,
         }
@@ -4551,11 +4578,19 @@ impl Engine {
             };
 
             let Some(task) = next_task else {
-                tracing::debug!(
-                    "send_tasks returning finished={} (dispatched {})",
-                    finished,
-                    dispatched
-                );
+                if !finished && dispatched == 0 {
+                    tracing::info!(
+                        "send_tasks returning finished={} (dispatched {})",
+                        finished,
+                        dispatched
+                    );
+                } else {
+                    tracing::debug!(
+                        "send_tasks returning finished={} (dispatched {})",
+                        finished,
+                        dispatched
+                    );
+                }
                 return finished;
             };
             let Some(worker_index) = self.take_ready_worker_index() else {
@@ -4574,7 +4609,7 @@ impl Engine {
             }
             dispatched += 1;
             let task_key = Self::task_key(&task);
-            tracing::debug!(
+            tracing::info!(
                 "send_tasks dispatching {} (running={} finished={})",
                 Self::task_track_name(&task),
                 self.cycle_tasks_running.len(),
@@ -8513,24 +8548,8 @@ impl Engine {
             } => {
                 match kind {
                     Kind::Audio => {
-                        let from_audio_io = if from_track == "hw:in" {
-                            self.hw_input_audio_port(from_port)
-                        } else {
-                            self.state
-                                .lock()
-                                .tracks
-                                .get(from_track)
-                                .and_then(|t| t.lock().audio.outs.get(from_port).cloned())
-                        };
-                        let to_audio_io = if to_track == "hw:out" {
-                            self.hw_output_audio_port(to_port)
-                        } else {
-                            self.state
-                                .lock()
-                                .tracks
-                                .get(to_track)
-                                .and_then(|t| t.lock().audio.ins.get(to_port).cloned())
-                        };
+                        let (from_audio_io, to_audio_io) = self
+                            .resolve_audio_route_ports(from_track, from_port, to_track, to_port);
                         match (from_audio_io, to_audio_io) {
                             (Some(source), Some(target)) => {
                                 if from_track != "hw:in"
@@ -9311,6 +9330,13 @@ impl Engine {
                         .retain(|t| Self::task_key(t) != task_key);
                     self.cycle_tasks_finished.push(task.clone());
                     let track_name = Self::task_track_name(&task);
+                    let peak = output_linear.iter().copied().fold(0.0_f32, |a, b| a.max(b));
+                    tracing::info!(
+                        "Finished task for '{}' epoch={} output_peak={}",
+                        track_name,
+                        process_epoch,
+                        peak
+                    );
                     self.track_meter_linear_by_track
                         .insert(track_name.clone(), output_linear);
                     for action in parameter_updates {

@@ -24,14 +24,18 @@ impl AudioIO {
     pub fn connect(from: &Arc<Self>, to: &Arc<Self>) {
         let to_len = {
             let conns = to.connections.lock();
-            conns.push(from.clone());
+            if !conns.iter().any(|conn| Arc::ptr_eq(conn, from)) {
+                conns.push(from.clone());
+            }
             conns.len()
         };
         to.connection_count.store(to_len, Ordering::Relaxed);
 
         let from_len = {
             let conns = from.connections.lock();
-            conns.push(to.clone());
+            if !conns.iter().any(|conn| Arc::ptr_eq(conn, to)) {
+                conns.push(to.clone());
+            }
             conns.len()
         };
         from.connection_count.store(from_len, Ordering::Relaxed);

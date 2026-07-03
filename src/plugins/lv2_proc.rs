@@ -471,6 +471,19 @@ impl Lv2Processor {
         Err("No active host to set parent window".to_string())
     }
 
+    pub fn gui_set_floating_mode(&self, floating: bool) -> Result<(), String> {
+        if let Some(ref mapping) = self.mapping {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.set_gui_mode(if floating {
+                GuiMode::Floating
+            } else {
+                GuiMode::Embedded
+            });
+            return Ok(());
+        }
+        Err("No active host to set GUI mode".to_string())
+    }
+
     pub fn gui_show(&self) -> Result<(), String> {
         if let Some(ref mapping) = self.mapping
             && let Some(ref events) = self.events

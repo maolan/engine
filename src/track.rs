@@ -3589,6 +3589,7 @@ impl Track {
         if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
             let processor = instance.processor.lock();
             processor.gui_set_parent_x11(0)?;
+            processor.gui_set_floating_mode(true)?;
             return processor.gui_show();
         }
         Err(format!(
@@ -3599,7 +3600,9 @@ impl Track {
 
     pub fn show_vst3_gui(&self, instance_id: usize) -> Result<(), String> {
         if let Some(instance) = self.vst3_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.lock().gui_show();
+            let processor = instance.processor.lock();
+            processor.gui_set_floating_mode(true)?;
+            return processor.gui_show();
         }
         Err(format!(
             "Track '{}' does not have VST3 instance id: {}",
@@ -3610,7 +3613,9 @@ impl Track {
     #[cfg(all(unix, not(target_os = "macos")))]
     pub fn show_lv2_gui(&self, instance_id: usize) -> Result<(), String> {
         if let Some(instance) = self.lv2_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.lock().gui_show();
+            let processor = instance.processor.lock();
+            processor.gui_set_floating_mode(true)?;
+            return processor.gui_show();
         }
         Err(format!(
             "Track '{}' does not have LV2 instance id: {}",

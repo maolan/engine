@@ -461,6 +461,19 @@ impl Vst3Processor {
         Err("GUI not yet supported for VST3 plugins".to_string())
     }
 
+    pub fn gui_set_floating_mode(&self, floating: bool) -> Result<(), String> {
+        if let Some(ref mapping) = self.mapping {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.set_gui_mode(if floating {
+                GuiMode::Floating
+            } else {
+                GuiMode::Embedded
+            });
+            return Ok(());
+        }
+        Err("No active host to set GUI mode".to_string())
+    }
+
     pub fn gui_on_size(&self, _width: i32, _height: i32) -> Result<(), String> {
         Err("GUI not yet supported for VST3 plugins".to_string())
     }
@@ -642,6 +655,10 @@ impl UnsafeMutex<Vst3Processor> {
 
     pub fn gui_set_parent(&self, window: usize, platform_type: &str) -> Result<(), String> {
         self.lock().gui_set_parent(window, platform_type)
+    }
+
+    pub fn gui_set_floating_mode(&self, floating: bool) -> Result<(), String> {
+        self.lock().gui_set_floating_mode(floating)
     }
 
     pub fn gui_on_size(&self, width: i32, height: i32) -> Result<(), String> {

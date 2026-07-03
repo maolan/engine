@@ -627,9 +627,9 @@ dependencies = [
 
 [[package]]
 name = "maolan-plugin-protocol"
-version = "0.0.9"
+version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f0dd0c7564bcdc89d08e88e8fef811672fecb6742e33cb0cc5d7b662d79122"
+checksum = "870ea862e4365dbf08833f4141285e0dbfb98895b127c1543e749505a77e7e66"
 dependencies = [
  "libc",
  "tracing",
