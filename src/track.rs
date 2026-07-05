@@ -496,6 +496,7 @@ pub struct Track {
     pub playing_session_clips: Vec<PlayingSessionClip>,
     pending_session_midi_note_offs: Vec<MidiEvent>,
     pub session_slots: HashMap<usize, String>,
+    session_clip_playback_enabled: bool,
 
     folder_input_midi_events: Vec<Vec<MidiEvent>>,
     folder_plugin_midi_node_events: HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
@@ -596,6 +597,7 @@ impl Track {
             playing_session_clips: Vec::new(),
             pending_session_midi_note_offs: Vec::new(),
             session_slots: HashMap::new(),
+            session_clip_playback_enabled: false,
 
             folder_input_midi_events: Vec::new(),
             folder_plugin_midi_node_events: HashMap::new(),
@@ -993,11 +995,13 @@ impl Track {
         let mut track_input_midi_events = self.collect_track_input_midi_events();
         let cycle_start = self.transport_sample;
         let cycle_end = cycle_start.saturating_add(frames);
-        let session_active =
-            !self.playing_session_clips.is_empty() || !self.pending_session_launches.is_empty();
-        if self.clip_playback_enabled && (self.folder_clip_playback_active || session_active) {
+        let arrangement_active = self.clip_playback_enabled && self.folder_clip_playback_active;
+        let session_active = (self.clip_playback_enabled || self.session_clip_playback_enabled)
+            && (!self.playing_session_clips.is_empty()
+                || !self.pending_session_launches.is_empty());
+        if arrangement_active || session_active {
             self.process_session_clips(cycle_start, cycle_end, frames);
-            if self.folder_clip_playback_active {
+            if arrangement_active {
                 self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);
             }
             if session_active {
@@ -1018,7 +1022,7 @@ impl Track {
                 }
             }
             let mix_start = std::time::Instant::now();
-            if self.folder_clip_playback_active {
+            if arrangement_active {
                 self.mix_clip_audio_into_inputs();
             }
             if session_active {
@@ -1252,6 +1256,16 @@ impl Track {
                 .resize(self.audio.outs.len(), 0.0);
         }
         let clip_playback_active = self.folder_clip_playback_active;
+        let session_active = self.session_clip_playback_enabled
+            && (!self.playing_session_clips.is_empty()
+                || !self.pending_session_launches.is_empty());
+        let child_session_active = self.is_folder
+            && self.child_tracks.iter().any(|child| {
+                let c = child.lock();
+                c.session_clip_playback_enabled
+                    && (!c.playing_session_clips.is_empty()
+                        || !c.pending_session_launches.is_empty())
+            });
         let record_tap_input_snapshots = self.folder_record_tap_input_snapshots.clone();
         let mut all_outputs_zero = true;
         for out_idx in 0..self.audio.outs.len() {
@@ -1294,6 +1308,8 @@ impl Track {
                         .unwrap_or(false);
                     if !source_input_monitor
                         && !clip_playback_active
+                        && !session_active
+                        && !child_session_active
                         && self.is_track_input_source(source)
                     {
                         continue;
@@ -1428,6 +1444,9 @@ impl Track {
     }
     pub fn set_clip_playback_enabled(&mut self, enabled: bool) {
         self.clip_playback_enabled = enabled;
+    }
+    pub fn set_session_clip_playback_enabled(&mut self, enabled: bool) {
+        self.session_clip_playback_enabled = enabled;
     }
     pub fn set_metronome_enabled(&mut self, enabled: bool) {
         self.metronome_enabled = enabled;
@@ -2977,6 +2996,14 @@ impl Track {
                 true
             }
         });
+        if !activated.is_empty() {
+            tracing::info!(
+                "process_session_clips track={} cycle_start={} activated={}",
+                self.name,
+                cycle_start,
+                activated.len()
+            );
+        }
         for launch in activated {
             let exists = match launch.kind {
                 Kind::Audio => self.audio.clips.iter().any(|c| c.id == launch.clip_id),
@@ -3067,10 +3094,14 @@ impl Track {
             }
             let loop_enabled = self.playing_session_clips[i].loop_enabled;
             let loop_start = self.playing_session_clips[i].loop_start_samples;
-            let loop_end = self.playing_session_clips[i]
-                .loop_end_samples
-                .max(loop_start.saturating_add(1))
-                .min(clip_length);
+            let loop_end = if self.playing_session_clips[i].loop_end_samples == 0 && loop_enabled {
+                clip_length
+            } else {
+                self.playing_session_clips[i]
+                    .loop_end_samples
+                    .max(loop_start.saturating_add(1))
+                    .min(clip_length)
+            };
             let mut play_position = self.playing_session_clips[i].play_position_samples;
             let mut out_offset = 0usize;
             let mut rendered_any = false;
@@ -3140,6 +3171,24 @@ impl Track {
         }
         self.clip_plugin_tracks
             .retain(|key, _| active_clip_plugin_keys.contains(key));
+        let peak = self
+            .audio
+            .ins
+            .iter()
+            .map(|in_| {
+                in_.buffer
+                    .lock()
+                    .iter()
+                    .map(|&s| s.abs())
+                    .fold(0.0_f32, f32::max)
+            })
+            .fold(0.0_f32, f32::max);
+        tracing::debug!(
+            "mix_session_audio_into_inputs track={} playing_clips={} input_peak={}",
+            self.name,
+            self.playing_session_clips.len(),
+            peak
+        );
     }
 
     fn mix_session_midi_into_inputs(&mut self, input_events: &mut [Vec<MidiEvent>], frames: usize) {
@@ -3175,10 +3224,14 @@ impl Track {
             }
             let loop_enabled = self.playing_session_clips[i].loop_enabled;
             let loop_start = self.playing_session_clips[i].loop_start_samples;
-            let loop_end = self.playing_session_clips[i]
-                .loop_end_samples
-                .max(loop_start.saturating_add(1))
-                .min(clip_length);
+            let loop_end = if self.playing_session_clips[i].loop_end_samples == 0 && loop_enabled {
+                clip_length
+            } else {
+                self.playing_session_clips[i]
+                    .loop_end_samples
+                    .max(loop_start.saturating_add(1))
+                    .min(clip_length)
+            };
             let mut play_position = self.playing_session_clips[i].play_position_samples;
             let input_lane = arrangement_clip
                 .input_channel
@@ -7371,6 +7424,49 @@ mod tests {
     }
 
     #[test]
+    fn session_audio_loop_with_zero_end_loops_full_clip() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.input_monitor = vec![false];
+        track.disk_monitor = vec![true];
+        track.clip_playback_enabled = true;
+
+        let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
+        clip.id = "clip-1".to_string();
+        clip.fade_enabled = false;
+        track.audio.clips.push(clip);
+
+        track.audio_clip_cache.insert(
+            "session_clip".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.1, 0.2, 0.3, 0.4],
+            }),
+        );
+
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "clip-1".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: true,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.process();
+
+        let out = track.audio.outs[0].buffer.lock().to_vec();
+        assert_eq!(out[0], 0.1);
+        assert_eq!(out[1], 0.2);
+        assert_eq!(out[2], 0.3);
+        assert_eq!(out[3], 0.4);
+        assert_eq!(out[4], 0.1);
+        assert_eq!(out[5], 0.2);
+        assert_eq!(out[6], 0.3);
+        assert_eq!(out[7], 0.4);
+    }
+
+    #[test]
     fn session_multiple_clips_mix_together() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         track.input_monitor = vec![false];
@@ -7591,5 +7687,56 @@ mod tests {
         assert_eq!(track.playing_session_clips[0].clip_id, "id2");
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.7);
+    }
+
+    #[test]
+    fn folder_output_passes_child_session_clip_audio() {
+        let mut child = Track::new("child".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        child.input_monitor = vec![false];
+        child.disk_monitor = vec![true];
+        child.clip_playback_enabled = false;
+        child.session_clip_playback_enabled = true;
+
+        let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
+        clip.id = "clip-1".to_string();
+        clip.fade_enabled = false;
+        child.audio.clips.push(clip);
+        child.audio_clip_cache.insert(
+            "session_clip".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.1, 0.2, 0.3, 0.4],
+            }),
+        );
+        child.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 0,
+            clip_id: "clip-1".to_string(),
+            kind: Kind::Audio,
+            launch_at_sample: 0,
+            loop_enabled: true,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        child.process();
+        assert_eq!(child.audio.outs[0].buffer.lock()[0], 0.1);
+
+        let mut folder = Track::new_folder("folder".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        folder.clip_playback_enabled = false;
+        folder.session_clip_playback_enabled = true;
+        let child_arc = Arc::new(UnsafeMutex::new(Box::new(child)));
+        {
+            let child_lock = child_arc.lock();
+            AudioIO::connect(&child_lock.audio.outs[0], &folder.audio.outs[0]);
+        }
+        folder.child_tracks.push(child_arc);
+        folder.process();
+
+        let folder_out = folder.audio.outs[0].buffer.lock().to_vec();
+        assert!(
+            folder_out.iter().any(|&s| s > 0.0),
+            "folder output should carry child session clip audio, got {:?}",
+            folder_out
+        );
     }
 }

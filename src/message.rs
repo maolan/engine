@@ -416,6 +416,7 @@ pub enum Action {
     Play,
     Pause,
     Stop,
+    SessionPlay,
     TransportPosition(usize),
     TransportPositionAt {
         sample: usize,
@@ -434,6 +435,7 @@ pub enum Action {
     },
     SetOscEnabled(bool),
     SetClipPlaybackEnabled(bool),
+    SetSessionClipPlaybackEnabled(bool),
     SetRecordEnabled(bool),
     SetModulators(Vec<Modulator>),
     SetSessionPath(String),
@@ -1196,6 +1198,7 @@ pub enum Action {
         workers_ready: usize,
         pending_hw_midi_events: usize,
         playing: bool,
+        transport_running: bool,
         transport_sample: usize,
         tempo_bpm: f64,
         sample_rate_hz: usize,

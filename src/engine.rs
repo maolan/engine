@@ -233,7 +233,9 @@ pub struct Engine {
     completed_audio_recordings: Vec<(String, RecordingSession)>,
     completed_midi_recordings: Vec<(String, MidiRecordingSession)>,
     playing: bool,
+    transport_running: bool,
     clip_playback_enabled: bool,
+    session_clip_playback_enabled: bool,
     record_enabled: bool,
     step_recording_enabled: bool,
     session_dir: Option<PathBuf>,
@@ -987,7 +989,9 @@ impl Engine {
             completed_audio_recordings: Vec::new(),
             completed_midi_recordings: Vec::new(),
             playing: false,
+            transport_running: false,
             clip_playback_enabled: true,
+            session_clip_playback_enabled: false,
             record_enabled: false,
             step_recording_enabled: false,
             session_dir: None,
@@ -1626,6 +1630,7 @@ impl Engine {
 
         if let Some(play_sync) = decision.play_sync {
             self.playing = matches!(play_sync, JackTransportPlaySync::Start);
+            self.transport_running = self.playing;
             if matches!(play_sync, JackTransportPlaySync::Start) {
                 self.transport_restart_pending = false;
                 self.transport_panic_flush_pending = false;
@@ -4514,6 +4519,7 @@ impl Engine {
         t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
         t.process_epoch = self.track_process_epoch;
         t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
+        t.set_session_clip_playback_enabled(self.session_clip_playback_enabled && self.playing);
         t.set_record_tap_enabled(self.playing && self.record_enabled);
         t.audio.processing = true;
     }
@@ -4977,6 +4983,9 @@ impl Engine {
         let tsig_num = self.tsig_num;
         let tsig_denom = self.tsig_denom;
         let quantize = |sample: usize, quantization: LaunchQuantization| -> usize {
+            if !self.transport_running {
+                return sample;
+            }
             Track::quantize_sample_to_boundary(
                 sample,
                 quantization,
@@ -5024,6 +5033,15 @@ impl Engine {
                     return;
                 };
                 let launch_at_sample = quantize(self.transport_sample, launch_quantization);
+                tracing::info!(
+                    "Session launch track={} scene={} clip_id={} kind={:?} launch_at={} transport_running={}",
+                    track_name,
+                    scene_index,
+                    clip_id,
+                    kind,
+                    launch_at_sample,
+                    self.transport_running
+                );
                 track.schedule_session_launch(crate::track::PendingSessionLaunch {
                     scene_index,
                     clip_id,
@@ -5403,6 +5421,7 @@ impl Engine {
                     self.transport_sample
                 );
                 self.playing = true;
+                self.transport_running = true;
                 self.transport_restart_pending = true;
                 self.notified_loop_wrap_sample = None;
                 self.invalidate_track_cycle_state();
@@ -5437,9 +5456,13 @@ impl Engine {
             }
             Action::Pause => {
                 self.clip_playback_enabled = false;
+                self.session_clip_playback_enabled = false;
                 for track in self.state.lock().tracks.values() {
-                    track.lock().set_clip_playback_enabled(false);
+                    let t = track.lock();
+                    t.set_clip_playback_enabled(false);
+                    t.set_session_clip_playback_enabled(false);
                 }
+                self.transport_running = false;
                 if !self.playing {
                     self.playing = true;
                     self.transport_restart_pending = true;
@@ -5470,9 +5493,17 @@ impl Engine {
             }
             Action::Stop => {
                 self.playing = false;
+                self.transport_running = false;
                 self.transport_panic_flush_pending = false;
                 self.transport_restart_pending = false;
                 self.notified_loop_wrap_sample = None;
+                self.clip_playback_enabled = true;
+                self.session_clip_playback_enabled = false;
+                for track in self.state.lock().tracks.values() {
+                    let t = track.lock();
+                    t.set_clip_playback_enabled(true);
+                    t.set_session_clip_playback_enabled(false);
+                }
                 self.invalidate_track_cycle_state();
                 if let Some(driver) = self.hw_driver.as_mut() {
                     driver.lock().set_playing(false);
@@ -5498,6 +5529,57 @@ impl Engine {
                 self.flush_recordings().await;
                 self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                     .await;
+            }
+            Action::SessionPlay => {
+                tracing::info!(
+                    "Action::SessionPlay pressed, transport_sample={} playing={} transport_running={} clip_enabled={} session_enabled={}",
+                    self.transport_sample,
+                    self.playing,
+                    self.transport_running,
+                    self.clip_playback_enabled,
+                    self.session_clip_playback_enabled
+                );
+                self.playing = true;
+                self.transport_running = false;
+                self.transport_restart_pending = true;
+                self.notified_loop_wrap_sample = None;
+                self.invalidate_track_cycle_state();
+                self.clip_playback_enabled = false;
+                self.session_clip_playback_enabled = true;
+                if let Some(driver) = self.hw_driver.as_mut() {
+                    driver.lock().set_playing(true);
+                }
+                #[cfg(unix)]
+                if let Some(jack) = &self.jack_runtime
+                    && let Err(e) = jack.lock().transport_start()
+                {
+                    self.notify_clients(Err(e)).await;
+                }
+                self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+                    .await;
+                self.preload_track_clips().await;
+                {
+                    let echoes = self.apply_modulators(self.transport_sample);
+                    for action in echoes {
+                        self.notify_clients(Ok(action)).await;
+                    }
+                }
+                let send_result = self.send_tasks().await;
+                tracing::info!(
+                    "Action::SessionPlay send_result={} awaiting_hwfinished={} handling_hwfinished={} hw_worker={}",
+                    send_result,
+                    self.awaiting_hwfinished,
+                    self.handling_hwfinished,
+                    self.hw_worker.is_some()
+                );
+                if !self.awaiting_hwfinished
+                    && !self.handling_hwfinished
+                    && send_result
+                    && self.hw_worker.is_some()
+                {
+                    self.transport_restart_pending = false;
+                    self.request_hw_cycle().await;
+                }
             }
             Action::JumpToEnd => {
                 self.transport_sample = self.normalize_transport_sample(self.session_end_sample());
@@ -5529,6 +5611,12 @@ impl Engine {
                 self.clip_playback_enabled = enabled;
                 for track in self.state.lock().tracks.values() {
                     track.lock().set_clip_playback_enabled(enabled);
+                }
+            }
+            Action::SetSessionClipPlaybackEnabled(enabled) => {
+                self.session_clip_playback_enabled = enabled;
+                for track in self.state.lock().tracks.values() {
+                    track.lock().set_session_clip_playback_enabled(enabled);
                 }
             }
             Action::TransportPosition(sample) => {
@@ -9163,6 +9251,7 @@ impl Engine {
                     workers_ready: self.ready_workers.len(),
                     pending_hw_midi_events,
                     playing: self.playing,
+                    transport_running: self.transport_running,
                     transport_sample: self.transport_sample,
                     tempo_bpm: self.tempo_bpm,
                     sample_rate_hz,
@@ -9331,7 +9420,7 @@ impl Engine {
                     self.cycle_tasks_finished.push(task.clone());
                     let track_name = Self::task_track_name(&task);
                     let peak = output_linear.iter().copied().fold(0.0_f32, |a, b| a.max(b));
-                    tracing::info!(
+                    tracing::debug!(
                         "Finished task for '{}' epoch={} output_peak={}",
                         track_name,
                         process_epoch,
@@ -9524,7 +9613,7 @@ impl Engine {
                     }
                     self.pending_hw_midi_events.clear();
                     self.pending_hw_midi_events_by_device.clear();
-                    if self.playing {
+                    if self.transport_running {
                         if self.transport_panic_flush_pending {
                             self.transport_panic_flush_pending = false;
                         } else if self.transport_restart_pending {
