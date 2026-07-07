@@ -146,6 +146,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::SetSessionMidiLearnBinding { .. }
         | Action::TrackSetFrozen { .. }
         | Action::TrackSetSessionSlot { .. }
+        | Action::TrackSetSessionSlotPlayEnabled { .. }
         | Action::TrackAddAudioInput(_)
         | Action::TrackAddAudioOutput(_)
         | Action::TrackRemoveAudioInput(_)
@@ -315,7 +316,28 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             Some(Action::TrackSetSessionSlot {
                 track_name: track_name.clone(),
                 scene_index: *scene_index,
-                clip_id: track_lock.session_slots.get(scene_index).cloned(),
+                clip_id: track_lock
+                    .session_slots
+                    .get(scene_index)
+                    .map(|slot| slot.clip_id.clone()),
+            })
+        }
+        Action::TrackSetSessionSlotPlayEnabled {
+            track_name,
+            scene_index,
+            enabled: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let enabled = track_lock
+                .session_slots
+                .get(scene_index)
+                .map(|slot| slot.play_enabled)
+                .unwrap_or(true);
+            Some(Action::TrackSetSessionSlotPlayEnabled {
+                track_name: track_name.clone(),
+                scene_index: *scene_index,
+                enabled,
             })
         }
         Action::TrackAddAudioInput(name) => Some(Action::TrackRemoveAudioInput(name.clone())),
@@ -2668,7 +2690,9 @@ mod tests {
     #[test]
     fn create_inverse_action_for_track_set_session_slot_restores_previous_clip() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        track.session_slots.insert(0, "old-clip".to_string());
+        track
+            .session_slots
+            .insert(0, crate::track::SessionSlot::new("old-clip".to_string()));
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2698,7 +2722,9 @@ mod tests {
     #[test]
     fn create_inverse_action_for_track_set_session_slot_clear_restores_none() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        track.session_slots.insert(0, "old-clip".to_string());
+        track
+            .session_slots
+            .insert(0, crate::track::SessionSlot::new("old-clip".to_string()));
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2720,6 +2746,39 @@ mod tests {
                 assert_eq!(track_name, "t");
                 assert_eq!(scene_index, 0);
                 assert_eq!(clip_id, Some("old-clip".to_string()));
+            }
+            other => panic!("unexpected inverse action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_inverse_action_for_track_set_session_slot_play_enabled_restores_previous_flag() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track
+            .session_slots
+            .insert(0, crate::track::SessionSlot::new("clip".to_string()));
+        track.session_slots.get_mut(&0).unwrap().play_enabled = false;
+        let state = make_state_with_track(track);
+
+        let inverse = create_inverse_action(
+            &Action::TrackSetSessionSlotPlayEnabled {
+                track_name: "t".to_string(),
+                scene_index: 0,
+                enabled: true,
+            },
+            &state,
+        )
+        .unwrap();
+
+        match inverse {
+            Action::TrackSetSessionSlotPlayEnabled {
+                track_name,
+                scene_index,
+                enabled,
+            } => {
+                assert_eq!(track_name, "t");
+                assert_eq!(scene_index, 0);
+                assert!(!enabled);
             }
             other => panic!("unexpected inverse action: {other:?}"),
         }

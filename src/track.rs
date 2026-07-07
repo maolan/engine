@@ -22,6 +22,24 @@ use std::{
 
 type MidiClipEvents = Arc<Vec<(usize, Vec<u8>)>>;
 
+/// A single slot in the live/session grid.
+#[derive(Debug, Clone)]
+pub struct SessionSlot {
+    /// Identifier of the clip assigned to this slot.
+    pub clip_id: String,
+    /// Whether this slot takes part in scene launches.
+    pub play_enabled: bool,
+}
+
+impl SessionSlot {
+    pub fn new(clip_id: String) -> Self {
+        Self {
+            clip_id,
+            play_enabled: true,
+        }
+    }
+}
+
 struct TrackIoCounts {
     audio_ins: usize,
     audio_outs: usize,
@@ -495,7 +513,7 @@ pub struct Track {
     pub pending_session_launches: Vec<PendingSessionLaunch>,
     pub playing_session_clips: Vec<PlayingSessionClip>,
     pending_session_midi_note_offs: Vec<MidiEvent>,
-    pub session_slots: HashMap<usize, String>,
+    pub session_slots: HashMap<usize, SessionSlot>,
     session_clip_playback_enabled: bool,
 
     folder_input_midi_events: Vec<Vec<MidiEvent>>,
@@ -1479,6 +1497,10 @@ impl Track {
                     LaunchQuantization::TwoBars => samples_per_beat * beats_per_bar * 2.0,
                     LaunchQuantization::FourBars => samples_per_beat * beats_per_bar * 4.0,
                     LaunchQuantization::EightBars => samples_per_beat * beats_per_bar * 8.0,
+                    LaunchQuantization::Eighth => samples_per_beat / 2.0,
+                    LaunchQuantization::Sixteenth => samples_per_beat / 4.0,
+                    LaunchQuantization::ThirtySecond => samples_per_beat / 8.0,
+                    LaunchQuantization::SixtyFourth => samples_per_beat / 16.0,
                     LaunchQuantization::None => return sample,
                 };
                 ((sample as f64 / interval).ceil() * interval).max(0.0) as usize

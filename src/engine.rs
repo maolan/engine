@@ -66,7 +66,7 @@ use crate::{
     osc::OscServer,
     routing,
     state::State,
-    track::Track,
+    track::{SessionSlot, Track},
     workers::worker::Worker,
 };
 
@@ -236,6 +236,7 @@ pub struct Engine {
     transport_running: bool,
     clip_playback_enabled: bool,
     session_clip_playback_enabled: bool,
+    session_transport_sample: usize,
     record_enabled: bool,
     step_recording_enabled: bool,
     session_dir: Option<PathBuf>,
@@ -992,6 +993,7 @@ impl Engine {
             transport_running: false,
             clip_playback_enabled: true,
             session_clip_playback_enabled: false,
+            session_transport_sample: 0,
             record_enabled: false,
             step_recording_enabled: false,
             session_dir: None,
@@ -4514,7 +4516,12 @@ impl Engine {
             ProcessTask::Plugin { track, .. } => track,
         };
         let t = track.lock();
-        t.set_transport_sample(self.transport_sample);
+        let transport_sample = if self.session_clip_playback_enabled && self.playing {
+            self.session_transport_sample
+        } else {
+            self.transport_sample
+        };
+        t.set_transport_sample(transport_sample);
         t.set_loop_config(self.loop_enabled, self.loop_range_samples);
         t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
         t.process_epoch = self.track_process_epoch;
@@ -4982,8 +4989,14 @@ impl Engine {
         let bpm = self.tempo_bpm;
         let tsig_num = self.tsig_num;
         let tsig_denom = self.tsig_denom;
+        let session_active = self.session_clip_playback_enabled && self.playing;
+        let quantize_reference_sample = if session_active {
+            self.session_transport_sample
+        } else {
+            self.transport_sample
+        };
         let quantize = |sample: usize, quantization: LaunchQuantization| -> usize {
-            if !self.transport_running {
+            if !self.transport_running && !session_active {
                 return sample;
             }
             Track::quantize_sample_to_boundary(
@@ -5015,7 +5028,7 @@ impl Engine {
                     track
                         .session_slots
                         .get(&scene_index)
-                        .cloned()
+                        .map(|slot| slot.clip_id.clone())
                         .unwrap_or_default()
                 } else {
                     clip_id
@@ -5032,7 +5045,7 @@ impl Engine {
                     );
                     return;
                 };
-                let launch_at_sample = quantize(self.transport_sample, launch_quantization);
+                let launch_at_sample = quantize(quantize_reference_sample, launch_quantization);
                 tracing::info!(
                     "Session launch track={} scene={} clip_id={} kind={:?} launch_at={} transport_running={}",
                     track_name,
@@ -5060,7 +5073,7 @@ impl Engine {
                 let Some(track) = self.track_handle_by_name(&track_name) else {
                     return;
                 };
-                let stop_at_sample = quantize(self.transport_sample, launch_quantization);
+                let stop_at_sample = quantize(quantize_reference_sample, launch_quantization);
                 track
                     .lock()
                     .schedule_session_stop(scene_index, stop_at_sample);
@@ -5069,13 +5082,17 @@ impl Engine {
                 scene_index,
                 launch_quantization,
             } => {
-                let launch_at_sample = quantize(self.transport_sample, launch_quantization);
+                let launch_at_sample = quantize(quantize_reference_sample, launch_quantization);
                 let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
                 for track in tracks {
                     let track_lock = track.lock();
-                    let Some(clip_id) = track_lock.session_slots.get(&scene_index).cloned() else {
+                    let Some(slot) = track_lock.session_slots.get(&scene_index) else {
                         continue;
                     };
+                    if !slot.play_enabled {
+                        continue;
+                    }
+                    let clip_id = slot.clip_id.clone();
                     let kind = if track_lock.audio.clips.iter().any(|c| c.id == clip_id) {
                         Kind::Audio
                     } else if track_lock.midi.clips.iter().any(|c| c.id == clip_id) {
@@ -5098,7 +5115,7 @@ impl Engine {
                 scene_index,
                 launch_quantization,
             } => {
-                let stop_at_sample = quantize(self.transport_sample, launch_quantization);
+                let stop_at_sample = quantize(quantize_reference_sample, launch_quantization);
                 let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
                 for track in tracks {
                     track
@@ -5107,7 +5124,7 @@ impl Engine {
                 }
             }
             SessionAction::StopAllClips => {
-                let stop_at_sample = quantize(self.transport_sample, LaunchQuantization::Bar);
+                let stop_at_sample = quantize(quantize_reference_sample, LaunchQuantization::Bar);
                 let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
                 for track in tracks {
                     let track = track.lock();
@@ -5499,6 +5516,7 @@ impl Engine {
                 self.notified_loop_wrap_sample = None;
                 self.clip_playback_enabled = true;
                 self.session_clip_playback_enabled = false;
+                self.session_transport_sample = 0;
                 for track in self.state.lock().tracks.values() {
                     let t = track.lock();
                     t.set_clip_playback_enabled(true);
@@ -5546,6 +5564,7 @@ impl Engine {
                 self.invalidate_track_cycle_state();
                 self.clip_playback_enabled = false;
                 self.session_clip_playback_enabled = true;
+                self.session_transport_sample = 0;
                 if let Some(driver) = self.hw_driver.as_mut() {
                     driver.lock().set_playing(true);
                 }
@@ -6808,11 +6827,39 @@ impl Engine {
                 let track = track.lock();
                 match clip_id {
                     Some(id) => {
-                        track.session_slots.insert(scene_index, id.clone());
+                        let play_enabled = track
+                            .session_slots
+                            .get(&scene_index)
+                            .map(|slot| slot.play_enabled)
+                            .unwrap_or(true);
+                        track.session_slots.insert(
+                            scene_index,
+                            SessionSlot {
+                                clip_id: id.clone(),
+                                play_enabled,
+                            },
+                        );
                     }
                     None => {
                         track.session_slots.remove(&scene_index);
                     }
+                }
+            }
+            Action::TrackSetSessionSlotPlayEnabled {
+                ref track_name,
+                scene_index,
+                enabled,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                if let Some(slot) = track.session_slots.get_mut(&scene_index) {
+                    slot.play_enabled = enabled;
                 }
             }
             Action::TrackOfflineBounce {
@@ -9636,6 +9683,11 @@ impl Engine {
                                 }
                             }
                         }
+                    }
+                    if self.session_clip_playback_enabled && self.playing {
+                        self.session_transport_sample = self
+                            .session_transport_sample
+                            .saturating_add(self.current_cycle_samples());
                     }
                     {
                         let echoes = self.apply_modulators(self.transport_sample);

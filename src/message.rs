@@ -377,6 +377,10 @@ pub enum LaunchQuantization {
     TwoBars,
     FourBars,
     EightBars,
+    Eighth,
+    Sixteenth,
+    ThirtySecond,
+    SixtyFourth,
 }
 
 #[derive(Clone, Debug)]
@@ -650,6 +654,11 @@ pub enum Action {
         track_name: String,
         scene_index: usize,
         clip_id: Option<String>,
+    },
+    TrackSetSessionSlotPlayEnabled {
+        track_name: String,
+        scene_index: usize,
+        enabled: bool,
     },
     TrackOfflineBounce {
         track_name: String,
