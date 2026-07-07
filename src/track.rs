@@ -423,6 +423,7 @@ pub struct PlayingSessionClip {
     pub clip_id: String,
     pub kind: Kind,
     pub play_position_samples: usize,
+    pub elapsed_samples: usize,
     pub loop_enabled: bool,
     pub loop_start_samples: usize,
     pub loop_end_samples: usize,
@@ -3046,6 +3047,7 @@ impl Track {
                 clip_id: launch.clip_id,
                 kind: launch.kind,
                 play_position_samples: 0,
+                elapsed_samples: 0,
                 loop_enabled: launch.loop_enabled,
                 loop_start_samples: launch.loop_start_samples,
                 loop_end_samples: launch.loop_end_samples,
@@ -3125,6 +3127,7 @@ impl Track {
                     .min(clip_length)
             };
             let mut play_position = self.playing_session_clips[i].play_position_samples;
+            let mut elapsed_samples = self.playing_session_clips[i].elapsed_samples;
             let mut out_offset = 0usize;
             let mut rendered_any = false;
 
@@ -3173,20 +3176,22 @@ impl Track {
                 }
                 rendered_any = true;
                 play_position += segment_len;
+                elapsed_samples += segment_len;
                 out_offset += segment_len;
             }
 
             if rendered_any {
-                position_updates.push((i, play_position));
+                position_updates.push((i, play_position, elapsed_samples));
             } else if play_position >= clip_length && !loop_enabled {
                 remove_indices.push(i);
             } else {
-                position_updates.push((i, play_position));
+                position_updates.push((i, play_position, elapsed_samples));
             }
         }
 
-        for (idx, pos) in position_updates {
+        for (idx, pos, elapsed) in position_updates {
             self.playing_session_clips[idx].play_position_samples = pos;
+            self.playing_session_clips[idx].elapsed_samples = elapsed;
         }
         for idx in remove_indices.into_iter().rev() {
             self.playing_session_clips.remove(idx);
@@ -3255,6 +3260,7 @@ impl Track {
                     .min(clip_length)
             };
             let mut play_position = self.playing_session_clips[i].play_position_samples;
+            let mut elapsed_samples = self.playing_session_clips[i].elapsed_samples;
             let input_lane = arrangement_clip
                 .input_channel
                 .min(input_events.len().saturating_sub(1));
@@ -3325,11 +3331,12 @@ impl Track {
                 }
                 emitted_any = true;
                 play_position += segment_len;
+                elapsed_samples += segment_len;
                 out_offset += segment_len;
             }
 
             if emitted_any {
-                position_updates.push((i, play_position));
+                position_updates.push((i, play_position, elapsed_samples));
             } else if play_position >= clip_length && !loop_enabled {
                 for (channel, note) in &self.playing_session_clips[i].active_midi_notes {
                     input_events[input_lane].push(MidiEvent::new(
@@ -3339,12 +3346,13 @@ impl Track {
                 }
                 remove_indices.push(i);
             } else {
-                position_updates.push((i, play_position));
+                position_updates.push((i, play_position, elapsed_samples));
             }
         }
 
-        for (idx, pos) in position_updates {
+        for (idx, pos, elapsed) in position_updates {
             self.playing_session_clips[idx].play_position_samples = pos;
+            self.playing_session_clips[idx].elapsed_samples = elapsed;
         }
         for idx in remove_indices.into_iter().rev() {
             self.playing_session_clips.remove(idx);
@@ -7686,6 +7694,7 @@ mod tests {
             clip_id: "id1".to_string(),
             kind: Kind::Audio,
             play_position_samples: 4,
+            elapsed_samples: 4,
             loop_enabled: false,
             loop_start_samples: 0,
             loop_end_samples: 0,

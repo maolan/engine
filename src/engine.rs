@@ -4745,7 +4745,7 @@ impl Engine {
             return;
         }
 
-        let mut current = HashMap::<(String, usize), (SessionSlotState, usize)>::new();
+        let mut current = HashMap::<(String, usize), (SessionSlotState, usize, usize)>::new();
         {
             let state = self.state.lock();
             for (track_name, track) in &state.tracks {
@@ -4753,13 +4753,17 @@ impl Engine {
                 for launch in &track.pending_session_launches {
                     current.insert(
                         (track_name.clone(), launch.scene_index),
-                        (SessionSlotState::Queued, 0),
+                        (SessionSlotState::Queued, 0, 0),
                     );
                 }
                 for clip in &track.playing_session_clips {
                     current.insert(
                         (track_name.clone(), clip.scene_index),
-                        (SessionSlotState::Playing, clip.play_position_samples),
+                        (
+                            SessionSlotState::Playing,
+                            clip.play_position_samples,
+                            clip.elapsed_samples,
+                        ),
                     );
                 }
             }
@@ -4777,21 +4781,24 @@ impl Engine {
                 scene_index,
                 state: SessionSlotState::Stopped,
                 play_position_samples: 0,
+                elapsed_samples: 0,
             }))
             .await;
         }
 
-        for ((track_name, scene_index), (state, play_position_samples)) in &current {
+        for ((track_name, scene_index), (state, play_position_samples, elapsed_samples)) in &current
+        {
             self.notify_clients(Ok(Action::SessionRuntimeReport {
                 track_name: track_name.clone(),
                 scene_index: *scene_index,
                 state: *state,
                 play_position_samples: *play_position_samples,
+                elapsed_samples: *elapsed_samples,
             }))
             .await;
         }
 
-        self.session_report_state = current.into_iter().map(|(k, (s, _))| (k, s)).collect();
+        self.session_report_state = current.into_iter().map(|(k, (s, _, _))| (k, s)).collect();
         self.last_session_report_publish = Some(Instant::now());
     }
 

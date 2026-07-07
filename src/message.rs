@@ -1233,6 +1233,7 @@ pub enum Action {
         scene_index: usize,
         state: SessionSlotState,
         play_position_samples: usize,
+        elapsed_samples: usize,
     },
     Panic,
 }
