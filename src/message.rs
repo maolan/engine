@@ -108,6 +108,19 @@ pub struct PitchCorrectionPointData {
     pub clarity: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TempoPoint {
+    pub sample: usize,
+    pub bpm: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeSignaturePoint {
+    pub sample: usize,
+    pub numerator: u16,
+    pub denominator: u16,
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AudioClipData {
     #[serde(default)]
@@ -436,6 +449,10 @@ pub enum Action {
     SetTimeSignature {
         numerator: u16,
         denominator: u16,
+    },
+    SetTempoMap {
+        tempo_points: Vec<TempoPoint>,
+        time_signature_points: Vec<TimeSignaturePoint>,
     },
     SetOscEnabled(bool),
     SetClipPlaybackEnabled(bool),

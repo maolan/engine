@@ -127,6 +127,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::SetPunchRange(_)
         | Action::SetMetronomeEnabled(_)
         | Action::SetTimeSignature { .. }
+        | Action::SetTempoMap { .. }
         | Action::AddTrack { .. }
         | Action::RemoveTrack(_)
         | Action::RenameTrack { .. }

@@ -226,6 +226,8 @@ pub struct Engine {
     tempo_bpm: f64,
     tsig_num: u16,
     tsig_denom: u16,
+    tempo_points: Vec<crate::message::TempoPoint>,
+    time_signature_points: Vec<crate::message::TimeSignaturePoint>,
     punch_enabled: bool,
     punch_range_samples: Option<(usize, usize)>,
     audio_recordings: std::collections::HashMap<String, RecordingSession>,
@@ -288,6 +290,32 @@ type MidiEditParseResult = (
 impl Engine {
     pub fn state(&self) -> Arc<UnsafeMutex<State>> {
         self.state.clone()
+    }
+
+    fn timing_at_sample(&self, sample: usize) -> (f64, u16, u16) {
+        let bpm = self
+            .tempo_points
+            .iter()
+            .filter(|p| p.sample <= sample)
+            .max_by_key(|p| p.sample)
+            .map(|p| p.bpm)
+            .unwrap_or(self.tempo_bpm)
+            .max(1.0);
+        let (num, den) = self
+            .time_signature_points
+            .iter()
+            .filter(|p| p.sample <= sample)
+            .max_by_key(|p| p.sample)
+            .map(|p| (p.numerator.max(1), p.denominator.max(1)))
+            .unwrap_or((self.tsig_num.max(1), self.tsig_denom.max(1)));
+        (bpm, num, den)
+    }
+
+    fn update_global_tempo_from_map(&mut self) {
+        let (bpm, num, den) = self.timing_at_sample(0);
+        self.tempo_bpm = bpm;
+        self.tsig_num = num;
+        self.tsig_denom = den;
     }
 
     const METRONOME_TRACK: &'static str = "metronome";
@@ -983,6 +1011,15 @@ impl Engine {
             tempo_bpm: 120.0,
             tsig_num: 4,
             tsig_denom: 4,
+            tempo_points: vec![crate::message::TempoPoint {
+                sample: 0,
+                bpm: 120.0,
+            }],
+            time_signature_points: vec![crate::message::TimeSignaturePoint {
+                sample: 0,
+                numerator: 4,
+                denominator: 4,
+            }],
             punch_enabled: false,
             punch_range_samples: None,
             audio_recordings: std::collections::HashMap::new(),
@@ -1088,6 +1125,7 @@ impl Engine {
         sample: usize,
     ) -> Arc<std::collections::HashMap<usize, f32>> {
         let sample_rate = self.sample_rate();
+        let (bpm, tsig_num, tsig_denom) = self.timing_at_sample(sample);
         let values: std::collections::HashMap<usize, f32> = self
             .modulators
             .iter()
@@ -1095,13 +1133,7 @@ impl Engine {
             .map(|m| {
                 (
                     m.id,
-                    m.value_at(
-                        sample,
-                        sample_rate,
-                        self.tempo_bpm,
-                        self.tsig_num,
-                        self.tsig_denom,
-                    ),
+                    m.value_at(sample, sample_rate, bpm, tsig_num, tsig_denom),
                 )
             })
             .collect();
@@ -5274,7 +5306,7 @@ impl Engine {
         let suppress_timing_history = self.playing
             && matches!(
                 &action_to_process,
-                Action::SetTempo(_) | Action::SetTimeSignature { .. }
+                Action::SetTempo(_) | Action::SetTimeSignature { .. } | Action::SetTempoMap { .. }
             );
         let mut extra_inverse_actions: Vec<Action> = Vec::new();
         if record_history
@@ -5402,6 +5434,12 @@ impl Engine {
                     inverse_actions = Some(vec![Action::SetTimeSignature {
                         numerator: self.tsig_num,
                         denominator: self.tsig_denom,
+                    }]);
+                }
+                Action::SetTempoMap { .. } => {
+                    inverse_actions = Some(vec![Action::SetTempoMap {
+                        tempo_points: self.tempo_points.clone(),
+                        time_signature_points: self.time_signature_points.clone(),
                     }]);
                 }
                 Action::SetClipPlaybackEnabled(_) => {
@@ -5748,6 +5786,14 @@ impl Engine {
             } => {
                 self.tsig_num = numerator.max(1);
                 self.tsig_denom = denominator.max(1);
+            }
+            Action::SetTempoMap {
+                ref tempo_points,
+                ref time_signature_points,
+            } => {
+                self.tempo_points = tempo_points.clone();
+                self.time_signature_points = time_signature_points.clone();
+                self.update_global_tempo_from_map();
             }
             Action::SetOscEnabled(enabled) => {
                 if let Err(err) = self.set_osc_enabled_with(enabled, OscServer::start) {
@@ -9603,6 +9649,7 @@ impl Engine {
                         | Action::SetMetronomeEnabled(_)
                         | Action::SetTempo(_)
                         | Action::SetTimeSignature { .. }
+                        | Action::SetTempoMap { .. }
                         | Action::SetOscEnabled(_)
                         | Action::SetClipPlaybackEnabled(_)
                         | Action::SetRecordEnabled(_)
@@ -9998,6 +10045,45 @@ mod tests {
             .set_osc_enabled_with(false, OscServer::start)
             .expect("stop osc server");
         assert!(engine.osc_server.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_tempo_map_is_recorded_and_undone() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let original_tempo_points = engine.tempo_points.clone();
+        let original_time_signature_points = engine.time_signature_points.clone();
+
+        let new_tempo_points = vec![crate::message::TempoPoint {
+            sample: 0,
+            bpm: 140.0,
+        }];
+        let new_time_signature_points = vec![crate::message::TimeSignaturePoint {
+            sample: 0,
+            numerator: 3,
+            denominator: 4,
+        }];
+
+        engine
+            .handle_request(Action::SetTempoMap {
+                tempo_points: new_tempo_points.clone(),
+                time_signature_points: new_time_signature_points.clone(),
+            })
+            .await;
+
+        assert_eq!(engine.tempo_points, new_tempo_points);
+        assert_eq!(engine.time_signature_points, new_time_signature_points);
+        assert_eq!(engine.tempo_bpm, 140.0);
+        assert_eq!(engine.tsig_num, 3);
+        assert_eq!(engine.tsig_denom, 4);
+        assert!(engine.history.is_dirty());
+
+        engine.handle_request(Action::Undo).await;
+
+        assert_eq!(engine.tempo_points, original_tempo_points);
+        assert_eq!(engine.time_signature_points, original_time_signature_points);
+        assert_eq!(engine.tempo_bpm, 120.0);
+        assert_eq!(engine.tsig_num, 4);
+        assert_eq!(engine.tsig_denom, 4);
     }
 
     #[tokio::test]
