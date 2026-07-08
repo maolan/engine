@@ -128,6 +128,8 @@ pub fn should_record(action: &Action) -> bool {
         | Action::SetMetronomeEnabled(_)
         | Action::SetTimeSignature { .. }
         | Action::SetTempoMap { .. }
+        | Action::SetModulators(_)
+        | Action::SetTrackAutomationLanes { .. }
         | Action::AddTrack { .. }
         | Action::RemoveTrack(_)
         | Action::RenameTrack { .. }
@@ -148,6 +150,10 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackSetFrozen { .. }
         | Action::TrackSetSessionSlot { .. }
         | Action::TrackSetSessionSlotPlayEnabled { .. }
+        | Action::TrackSetFolder { .. }
+        | Action::TrackSetParent { .. }
+        | Action::TrackToggleFolder { .. }
+        | Action::TrackToggleMaster(_)
         | Action::TrackAddAudioInput(_)
         | Action::TrackAddAudioOutput(_)
         | Action::TrackRemoveAudioInput(_)
@@ -161,6 +167,8 @@ pub fn should_record(action: &Action) -> bool {
         | Action::SetClipBounds { .. }
         | Action::SetClipMuted { .. }
         | Action::SetClipSourceName { .. }
+        | Action::SetClipPluginGraphJson { .. }
+        | Action::SetClipPitchCorrection { .. }
         | Action::ClearAllMidiLearnBindings
         | Action::Connect { .. }
         | Action::Disconnect { .. }
@@ -340,6 +348,34 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 scene_index: *scene_index,
                 enabled,
             })
+        }
+        Action::TrackSetFolder {
+            track_name,
+            is_folder: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetFolder {
+                track_name: track_name.clone(),
+                is_folder: track_lock.is_folder,
+            })
+        }
+        Action::TrackSetParent {
+            track_name,
+            parent_name: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetParent {
+                track_name: track_name.clone(),
+                parent_name: track_lock.parent_track.clone(),
+            })
+        }
+        Action::TrackToggleFolder { track_name } => Some(Action::TrackToggleFolder {
+            track_name: track_name.clone(),
+        }),
+        Action::TrackToggleMaster(track_name) => {
+            Some(Action::TrackToggleMaster(track_name.clone()))
         }
         Action::TrackAddAudioInput(name) => Some(Action::TrackRemoveAudioInput(name.clone())),
         Action::TrackAddAudioOutput(name) => Some(Action::TrackRemoveAudioOutput(name.clone())),
@@ -681,6 +717,38 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 pitch_correction_frame_likeness: clip.pitch_correction_frame_likeness,
                 pitch_correction_inertia_ms: clip.pitch_correction_inertia_ms,
                 pitch_correction_formant_compensation: clip.pitch_correction_formant_compensation,
+            })
+        }
+        Action::SetClipPluginGraphJson {
+            track_name,
+            clip_index,
+            plugin_graph_json: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let plugin_graph_json = track_lock
+                .audio
+                .clips
+                .get(*clip_index)
+                .map(|clip| clip.plugin_graph_json.clone())
+                .unwrap_or_default();
+            Some(Action::SetClipPluginGraphJson {
+                track_name: track_name.clone(),
+                clip_index: *clip_index,
+                plugin_graph_json,
+            })
+        }
+        Action::SetTrackAutomationLanes {
+            track_name,
+            lanes: _,
+            mode: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::SetTrackAutomationLanes {
+                track_name: track_name.clone(),
+                lanes: track_lock.automation_lanes.clone(),
+                mode: track_lock.automation_mode,
             })
         }
         Action::Connect {

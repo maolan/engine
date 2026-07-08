@@ -396,6 +396,15 @@ pub enum LaunchQuantization {
     SixtyFourth,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TrackAutomationMode {
+    #[default]
+    Read,
+    Touch,
+    Latch,
+    Write,
+}
+
 #[derive(Clone, Debug)]
 pub enum SessionAction {
     LaunchClip {
@@ -459,6 +468,11 @@ pub enum Action {
     SetSessionClipPlaybackEnabled(bool),
     SetRecordEnabled(bool),
     SetModulators(Vec<Modulator>),
+    SetTrackAutomationLanes {
+        track_name: String,
+        lanes: serde_json::Value,
+        mode: TrackAutomationMode,
+    },
     SetSessionPath(String),
     BeginHistoryGroup,
     EndHistoryGroup,

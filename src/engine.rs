@@ -5467,6 +5467,9 @@ impl Engine {
                         binding,
                     }]);
                 }
+                Action::SetModulators(_) => {
+                    inverse_actions = Some(vec![Action::SetModulators(self.modulators.clone())]);
+                }
                 Action::SetSessionMidiLearnBinding { target, .. } => {
                     let binding = match target {
                         crate::message::SessionMidiLearnTarget::Slot {
@@ -5819,6 +5822,17 @@ impl Engine {
                 let echoes = self.apply_modulators(self.active_transport_sample());
                 for action in echoes {
                     self.notify_clients(Ok(action)).await;
+                }
+            }
+            Action::SetTrackAutomationLanes {
+                ref track_name,
+                ref lanes,
+                mode,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    let track = track.lock();
+                    track.automation_lanes = lanes.clone();
+                    track.automation_mode = mode;
                 }
             }
             Action::SetStepRecording(enabled) => {
