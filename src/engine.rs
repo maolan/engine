@@ -7031,7 +7031,11 @@ impl Engine {
                 }))
                 .await;
             }
-            Action::TrackGetPluginGraph { ref track_name } => {
+            Action::TrackGetPluginGraph {
+                ref track_name,
+                include_state,
+            } => {
+                let start = std::time::Instant::now();
                 let track = match self.track_handle_or_err(track_name) {
                     Ok(track) => track,
                     Err(e) => {
@@ -7041,12 +7045,34 @@ impl Engine {
                 };
                 let (plugins, connections, connectable_connections) = {
                     let track = track.lock();
-                    (
-                        track.plugin_graph_plugins(),
-                        track.plugin_graph_connections(),
-                        track.connectable_connections(),
-                    )
+                    let plugins_start = std::time::Instant::now();
+                    let plugins = track.plugin_graph_plugins(include_state);
+                    let plugins_ms = plugins_start.elapsed().as_millis();
+                    let conns_start = std::time::Instant::now();
+                    let connections = track.plugin_graph_connections();
+                    let conns_ms = conns_start.elapsed().as_millis();
+                    let cc_start = std::time::Instant::now();
+                    let connectable_connections = track.connectable_connections();
+                    let cc_ms = cc_start.elapsed().as_millis();
+                    tracing::info!(
+                        %track_name,
+                        include_state,
+                        plugins_ms,
+                        conns_ms,
+                        cc_ms,
+                        "TrackGetPluginGraph collected graph data"
+                    );
+                    (plugins, connections, connectable_connections)
                 };
+                let total_ms = start.elapsed().as_millis();
+                tracing::info!(
+                    %track_name,
+                    total_ms,
+                    plugins = plugins.len(),
+                    connections = connections.len(),
+                    connectable = connectable_connections.len(),
+                    "TrackGetPluginGraph responding"
+                );
                 self.notify_clients(Ok(Action::TrackPluginGraph {
                     track_name: track_name.clone(),
                     plugins,
@@ -9651,7 +9677,7 @@ impl Engine {
                             let (plugins, connections, connectable_connections) = {
                                 let track_lock = track.lock();
                                 (
-                                    track_lock.plugin_graph_plugins(),
+                                    track_lock.plugin_graph_plugins(false),
                                     track_lock.plugin_graph_connections(),
                                     track_lock.connectable_connections(),
                                 )

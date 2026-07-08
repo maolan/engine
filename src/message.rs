@@ -820,6 +820,7 @@ pub enum Action {
     },
     TrackGetPluginGraph {
         track_name: String,
+        include_state: bool,
     },
     TrackPluginGraph {
         track_name: String,

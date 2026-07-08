@@ -3455,7 +3455,7 @@ impl Track {
         plugins.push(plugin);
     }
 
-    pub fn plugin_graph_plugins(&self) -> Vec<PluginGraphPlugin> {
+    pub fn plugin_graph_plugins(&self, include_state: bool) -> Vec<PluginGraphPlugin> {
         let mut plugins = Vec::new();
         #[cfg(all(unix, not(target_os = "macos")))]
         for instance in &self.lv2_plugins {
@@ -3476,7 +3476,9 @@ impl Track {
                     audio_outputs: proc.audio_outputs().len(),
                     midi_inputs: proc.midi_input_count(),
                     midi_outputs: proc.midi_output_count(),
-                    state: serde_json::to_value(proc.snapshot_state()).ok(),
+                    state: include_state
+                        .then(|| serde_json::to_value(proc.snapshot_state()).ok())
+                        .flatten(),
                     bypassed: proc.is_bypassed(),
                 },
             );
@@ -3520,10 +3522,13 @@ impl Track {
                     audio_outputs: proc.audio_outputs().len(),
                     midi_inputs: proc.midi_input_count(),
                     midi_outputs: proc.midi_output_count(),
-                    state: proc
-                        .snapshot_state()
-                        .ok()
-                        .and_then(|state| serde_json::to_value(state).ok()),
+                    state: include_state
+                        .then(|| {
+                            proc.snapshot_state()
+                                .ok()
+                                .and_then(|state| serde_json::to_value(state).ok())
+                        })
+                        .flatten(),
                     bypassed: proc.is_bypassed(),
                 },
             );
