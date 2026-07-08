@@ -1075,6 +1075,14 @@ impl Engine {
         }
     }
 
+    fn active_transport_sample(&self) -> usize {
+        if self.session_clip_playback_enabled && self.playing {
+            self.session_transport_sample
+        } else {
+            self.transport_sample
+        }
+    }
+
     fn compute_modulator_values(
         &self,
         sample: usize,
@@ -5462,7 +5470,7 @@ impl Engine {
                     .await;
                 self.preload_track_clips().await;
                 {
-                    let echoes = self.apply_modulators(self.transport_sample);
+                    let echoes = self.apply_modulators(self.active_transport_sample());
                     for action in echoes {
                         self.notify_clients(Ok(action)).await;
                     }
@@ -5585,7 +5593,7 @@ impl Engine {
                     .await;
                 self.preload_track_clips().await;
                 {
-                    let echoes = self.apply_modulators(self.transport_sample);
+                    let echoes = self.apply_modulators(self.active_transport_sample());
                     for action in echoes {
                         self.notify_clients(Ok(action)).await;
                     }
@@ -5649,7 +5657,7 @@ impl Engine {
                 self.transport_sample = self.normalize_transport_sample(sample);
                 self.notified_loop_wrap_sample = None;
                 {
-                    let echoes = self.apply_modulators(self.transport_sample);
+                    let echoes = self.apply_modulators(self.active_transport_sample());
                     for action in echoes {
                         self.notify_clients(Ok(action)).await;
                     }
@@ -5751,7 +5759,7 @@ impl Engine {
             }
             Action::SetModulators(ref modulators) => {
                 self.modulators = modulators.clone();
-                let echoes = self.apply_modulators(self.transport_sample);
+                let echoes = self.apply_modulators(self.active_transport_sample());
                 for action in echoes {
                     self.notify_clients(Ok(action)).await;
                 }
@@ -9748,7 +9756,7 @@ impl Engine {
                             .saturating_add(self.current_cycle_samples());
                     }
                     {
-                        let echoes = self.apply_modulators(self.transport_sample);
+                        let echoes = self.apply_modulators(self.active_transport_sample());
                         for action in echoes {
                             self.notify_clients(Ok(action)).await;
                         }
