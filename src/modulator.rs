@@ -28,6 +28,73 @@ impl std::fmt::Display for ModulatorShape {
     }
 }
 
+/// Musical note division used for tempo-synced modulator rates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MusicalDivision {
+    Bar,
+    Half,
+    Beat,
+    Eighth,
+    Sixteenth,
+    ThirtySecond,
+    SixtyFourth,
+}
+
+impl MusicalDivision {
+    /// Convert this division to a frequency in Hz for the given tempo and time signature.
+    /// Bar length is computed from the time signature; beat refers to a quarter-note beat.
+    pub fn to_hz(self, bpm: f64, tsig_num: u16, tsig_denom: u16) -> f64 {
+        let beat_hz = bpm / 60.0;
+        let bar_hz = beat_hz / (tsig_num as f64 * 4.0 / tsig_denom.max(1) as f64);
+        match self {
+            Self::Bar => bar_hz,
+            Self::Half => beat_hz / 2.0,
+            Self::Beat => beat_hz,
+            Self::Eighth => beat_hz * 2.0,
+            Self::Sixteenth => beat_hz * 4.0,
+            Self::ThirtySecond => beat_hz * 8.0,
+            Self::SixtyFourth => beat_hz * 16.0,
+        }
+    }
+}
+
+impl std::fmt::Display for MusicalDivision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bar => write!(f, "1/1"),
+            Self::Half => write!(f, "1/2"),
+            Self::Beat => write!(f, "1/4"),
+            Self::Eighth => write!(f, "1/8"),
+            Self::Sixteenth => write!(f, "1/16"),
+            Self::ThirtySecond => write!(f, "1/32"),
+            Self::SixtyFourth => write!(f, "1/64"),
+        }
+    }
+}
+
+/// Modulator rate specified either as a fixed frequency or as a tempo-synced division.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ModulatorRate {
+    Hz(f32),
+    Musical(MusicalDivision),
+}
+
+impl Default for ModulatorRate {
+    fn default() -> Self {
+        Self::Hz(1.0)
+    }
+}
+
+impl ModulatorRate {
+    /// Return the effective frequency in Hz for the given transport timing.
+    pub fn effective_hz(&self, bpm: f64, tsig_num: u16, tsig_denom: u16) -> f64 {
+        match *self {
+            Self::Hz(hz) => f64::from(hz),
+            Self::Musical(div) => div.to_hz(bpm, tsig_num, tsig_denom),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModulatorTarget {
     TrackVolume {
@@ -97,7 +164,7 @@ pub struct Modulator {
     pub id: usize,
     pub name: String,
     pub shape: ModulatorShape,
-    pub rate_hz: f32,
+    pub rate: ModulatorRate,
     pub phase: f32,
     pub enabled: bool,
     pub targets: Vec<ModulatorTarget>,
@@ -130,17 +197,25 @@ impl Modulator {
             id,
             name: format!("Modulator {id}"),
             shape: ModulatorShape::default(),
-            rate_hz: 1.0,
+            rate: ModulatorRate::default(),
             phase: 0.0,
             enabled: true,
             targets: Vec::new(),
         }
     }
 
-    /// Evaluate the modulator at a given transport sample and sample rate.
+    /// Evaluate the modulator at a given transport sample, sample rate, and timing.
     /// Returns a normalized value in `[0, 1]`.
-    pub fn value_at(&self, sample: usize, sample_rate: f64) -> f32 {
-        let cycles = sample as f64 / sample_rate * self.rate_hz as f64 + self.phase as f64;
+    pub fn value_at(
+        &self,
+        sample: usize,
+        sample_rate: f64,
+        bpm: f64,
+        tsig_num: u16,
+        tsig_denom: u16,
+    ) -> f32 {
+        let rate_hz = self.rate.effective_hz(bpm, tsig_num, tsig_denom);
+        let cycles = sample as f64 / sample_rate * rate_hz + self.phase as f64;
         let phase = cycles.rem_euclid(1.0) as f32;
         let raw = match self.shape {
             ModulatorShape::Sine => (phase * 2.0 * std::f32::consts::PI).sin(),

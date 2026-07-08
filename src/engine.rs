@@ -1092,7 +1092,18 @@ impl Engine {
             .modulators
             .iter()
             .filter(|m| m.enabled)
-            .map(|m| (m.id, m.value_at(sample, sample_rate)))
+            .map(|m| {
+                (
+                    m.id,
+                    m.value_at(
+                        sample,
+                        sample_rate,
+                        self.tempo_bpm,
+                        self.tsig_num,
+                        self.tsig_denom,
+                    ),
+                )
+            })
             .collect();
         Arc::new(values)
     }
@@ -10393,7 +10404,7 @@ mod tests {
             id: 1,
             name: "LFO".to_string(),
             shape: crate::modulator::ModulatorShape::Sine,
-            rate_hz: 1.0,
+            rate: crate::modulator::ModulatorRate::Hz(1.0),
             phase: 0.0,
             enabled: true,
             targets: vec![crate::modulator::ModulatorTarget::TrackVolume {
@@ -10428,7 +10439,7 @@ mod tests {
             id: 1,
             name: "LFO".to_string(),
             shape: crate::modulator::ModulatorShape::Sine,
-            rate_hz: 1.0,
+            rate: crate::modulator::ModulatorRate::Hz(1.0),
             phase: 0.0,
             enabled: true,
             targets: vec![crate::modulator::ModulatorTarget::TrackBalance {
