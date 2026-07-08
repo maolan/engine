@@ -3416,6 +3416,7 @@ impl Track {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     pub fn unload_lv2_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
+        tracing::info!(track = %self.name, instance_id, "unload_lv2_plugin_instance start");
         let Some(index) = self
             .lv2_plugins
             .iter()
@@ -3427,12 +3428,33 @@ impl Track {
             ));
         };
         self.remove_lv2_instance(index);
+        tracing::info!(track = %self.name, instance_id, "unload_lv2_plugin_instance done");
         Ok(())
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn get_lv2_plugin_controls(
+        &self,
+        instance_id: usize,
+    ) -> Result<Vec<crate::message::Lv2ControlPortInfo>, String> {
+        let instance = self
+            .lv2_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Track '{}' does not have LV2 instance id: {}",
+                    self.name, instance_id
+                )
+            })?;
+        instance.processor.lock().control_ports()
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn remove_lv2_instance(&mut self, index: usize) {
+        tracing::info!(track = %self.name, index, "remove_lv2_instance start");
         let removed = self.lv2_plugins.remove(index);
+        let removed_id = removed.id;
         for port in removed.processor.lock().audio_inputs() {
             Self::disconnect_all(port);
         }
@@ -3440,10 +3462,11 @@ impl Track {
             Self::disconnect_all(port);
         }
         self.plugin_midi_connections.retain(|conn| {
-            conn.from_node != PluginGraphNode::Lv2PluginInstance(removed.id)
-                && conn.to_node != PluginGraphNode::Lv2PluginInstance(removed.id)
+            conn.from_node != PluginGraphNode::Lv2PluginInstance(removed_id)
+                && conn.to_node != PluginGraphNode::Lv2PluginInstance(removed_id)
         });
         self.invalidate_audio_route_cache();
+        tracing::info!(track = %self.name, removed_id, "remove_lv2_instance done");
     }
 
     fn prune_plugin_midi_connections(&mut self, node: PluginGraphNode) {

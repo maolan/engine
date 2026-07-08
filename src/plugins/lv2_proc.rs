@@ -13,6 +13,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
+fn wait_for_host_request_complete(
+    header: &ShmHeader,
+    events: &EventPair,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    loop {
+        if header.request_status.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err("Host did not respond to request".to_string());
+        }
+        match events.wait_host(timeout - elapsed) {
+            Ok(()) => {
+                std::sync::atomic::fence(Ordering::Acquire);
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(format!("Host did not respond to request: {e}")),
+        }
+    }
+}
+
 pub struct Lv2Processor {
     uri: String,
     name: String,
@@ -224,6 +249,7 @@ impl Lv2Processor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
+        tracing::info!("LV2 snapshot_state: sending request to host");
         header.request_type.store(1, Ordering::Release);
         header.request_status.store(0, Ordering::Release);
         if let Err(e) = events.signal_host() {
@@ -231,13 +257,14 @@ impl Lv2Processor {
             return Err(format!("Failed to signal host for state save: {}", e));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to state save: {}", e));
         }
 
         let status = header.request_status.load(Ordering::Acquire);
         let size = header.scratch_size.load(Ordering::Acquire) as usize;
+        tracing::info!(status, size, "LV2 snapshot_state: host responded");
         if status != 1 {
             header.request_type.store(0, Ordering::Release);
             return Err("State save failed in host".to_string());
@@ -274,7 +301,7 @@ impl Lv2Processor {
             return Err(format!("Failed to signal host for state restore: {}", e));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to state restore: {}", e));
         }
@@ -285,6 +312,114 @@ impl Lv2Processor {
             return Err("State restore failed in host".to_string());
         }
         Ok(())
+    }
+
+    fn deserialize_lv2_control_ports(
+        scratch: *const u8,
+        size: usize,
+    ) -> Result<Vec<crate::message::Lv2ControlPortInfo>, String> {
+        if size < 4 {
+            return Err("scratch too small for LV2 control ports".to_string());
+        }
+        let mut offset = 0usize;
+
+        let count = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+        offset += 4;
+
+        let mut ports = Vec::with_capacity(count);
+        for _ in 0..count {
+            if offset + 4 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let index = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) };
+            offset += 4;
+
+            if offset + 4 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let name_len =
+                unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+            offset += 4;
+            if offset + name_len > size {
+                return Err("scratch underflow".to_string());
+            }
+            let mut name_bytes = vec![0u8; name_len];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.add(offset),
+                    name_bytes.as_mut_ptr(),
+                    name_len,
+                );
+            }
+            offset += name_len;
+            let name = String::from_utf8(name_bytes).map_err(|e| e.to_string())?;
+
+            if offset + 12 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let min = f32::from_bits(unsafe {
+                std::ptr::read_unaligned(scratch.add(offset) as *const u32)
+            });
+            let max = f32::from_bits(unsafe {
+                std::ptr::read_unaligned(scratch.add(offset + 4) as *const u32)
+            });
+            let value = f32::from_bits(unsafe {
+                std::ptr::read_unaligned(scratch.add(offset + 8) as *const u32)
+            });
+            offset += 12;
+
+            ports.push(crate::message::Lv2ControlPortInfo {
+                index,
+                name,
+                min,
+                max,
+                value,
+            });
+        }
+
+        Ok(ports)
+    }
+
+    pub fn control_ports(&self) -> Result<Vec<crate::message::Lv2ControlPortInfo>, String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("LV2 processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+
+        tracing::info!("LV2 control_ports: sending request to host");
+        header.request_type.store(
+            maolan_plugin_protocol::protocol::REQUEST_LV2_CONTROL_PORTS,
+            Ordering::Release,
+        );
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for LV2 control ports: {e}"));
+        }
+
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to LV2 control ports: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        let size = header.scratch_size.load(Ordering::Acquire) as usize;
+        tracing::info!(status, size, "LV2 control_ports: host responded");
+        if status != 1 {
+            header.request_type.store(0, Ordering::Release);
+            return Err("LV2 control port enumeration failed in host".to_string());
+        }
+
+        let scratch = unsafe { scratch_ptr(ptr) };
+        let result = Self::deserialize_lv2_control_ports(scratch, size);
+        match &result {
+            Ok(ports) => tracing::info!(count = ports.len(), "LV2 control_ports: deserialized"),
+            Err(e) => tracing::error!("LV2 control_ports: deserialize failed: {e}"),
+        }
+        header.request_type.store(0, Ordering::Release);
+        result
     }
 
     pub fn set_resource_directory(&self, dir: &std::path::Path) -> Result<(), String> {
@@ -308,7 +443,7 @@ impl Lv2Processor {
             return Err(format!("Failed to signal host for resource directory: {e}"));
         }
 
-        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
             return Err(format!("Host did not respond to resource directory: {e}"));
         }
@@ -542,7 +677,11 @@ impl Lv2Processor {
 
 impl Drop for Lv2Processor {
     fn drop(&mut self) {
-        ipc::drop_host(&self.mapping, &self.events, &self.child, &self.shm_name);
+        let mapping = self.mapping.take();
+        let events = self.events.take();
+        let child = self.child.lock().take();
+        let shm_name = std::mem::take(&mut self.shm_name);
+        ipc::drop_host(mapping, events, child, shm_name);
     }
 }
 
@@ -567,6 +706,10 @@ impl UnsafeMutex<Lv2Processor> {
 
     pub fn drain_midi_outputs(&self) -> Vec<crate::midi::io::MidiEvent> {
         self.lock().drain_midi_outputs()
+    }
+
+    pub fn control_ports(&self) -> Result<Vec<crate::message::Lv2ControlPortInfo>, String> {
+        self.lock().control_ports()
     }
 }
 

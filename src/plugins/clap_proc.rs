@@ -125,7 +125,10 @@ impl ClapProcessor {
             .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
             .collect::<Vec<_>>();
 
-        let param_infos = Vec::new();
+        let param_infos = Self::fetch_parameter_infos(&mapping, &events).unwrap_or_else(|e| {
+            tracing::warn!("Failed to fetch CLAP parameter infos: {e}");
+            Vec::new()
+        });
 
         Ok(Self {
             path: plugin_spec.to_string(),
@@ -212,6 +215,136 @@ impl ClapProcessor {
 
     pub fn parameter_infos(&self) -> Vec<ClapParameterInfo> {
         self.param_infos.clone()
+    }
+
+    fn fetch_parameter_infos(
+        mapping: &ShmMapping,
+        events: &EventPair,
+    ) -> Result<Vec<ClapParameterInfo>, String> {
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+
+        tracing::info!("CLAP fetch_parameter_infos: sending request to host");
+        header
+            .request_type
+            .store(REQUEST_CLAP_PARAMETERS, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for CLAP parameters: {e}"));
+        }
+
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to CLAP parameters: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        let size = header.scratch_size.load(Ordering::Acquire) as usize;
+        tracing::info!(status, size, "CLAP fetch_parameter_infos: host responded");
+        if status != 1 {
+            header.request_type.store(0, Ordering::Release);
+            return Err("CLAP parameter enumeration failed in host".to_string());
+        }
+
+        let scratch = unsafe { scratch_ptr(ptr) };
+        let result = Self::deserialize_clap_parameters(scratch, size);
+        match &result {
+            Ok(params) => tracing::info!(
+                count = params.len(),
+                "CLAP fetch_parameter_infos: deserialized"
+            ),
+            Err(e) => tracing::error!("CLAP fetch_parameter_infos: deserialize failed: {e}"),
+        }
+        header.request_type.store(0, Ordering::Release);
+        result
+    }
+
+    fn deserialize_clap_parameters(
+        scratch: *const u8,
+        size: usize,
+    ) -> Result<Vec<ClapParameterInfo>, String> {
+        if size < 4 {
+            return Err("scratch too small for CLAP parameters".to_string());
+        }
+        let mut offset = 0usize;
+
+        let count = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+        offset += 4;
+
+        let mut params = Vec::with_capacity(count);
+        for _ in 0..count {
+            if offset + 4 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let id = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) };
+            offset += 4;
+
+            if offset + 4 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let name_len =
+                unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+            offset += 4;
+            if offset + name_len > size {
+                return Err("scratch underflow".to_string());
+            }
+            let mut name_bytes = vec![0u8; name_len];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.add(offset),
+                    name_bytes.as_mut_ptr(),
+                    name_len,
+                );
+            }
+            offset += name_len;
+            let name = String::from_utf8(name_bytes).map_err(|e| e.to_string())?;
+
+            if offset + 4 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let module_len =
+                unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+            offset += 4;
+            if offset + module_len > size {
+                return Err("scratch underflow".to_string());
+            }
+            let mut module_bytes = vec![0u8; module_len];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.add(offset),
+                    module_bytes.as_mut_ptr(),
+                    module_len,
+                );
+            }
+            offset += module_len;
+            let module = String::from_utf8(module_bytes).map_err(|e| e.to_string())?;
+
+            if offset + 24 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let min_value = f64::from_bits(unsafe {
+                std::ptr::read_unaligned(scratch.add(offset) as *const u64)
+            });
+            let max_value = f64::from_bits(unsafe {
+                std::ptr::read_unaligned(scratch.add(offset + 8) as *const u64)
+            });
+            let default_value = f64::from_bits(unsafe {
+                std::ptr::read_unaligned(scratch.add(offset + 16) as *const u64)
+            });
+            offset += 24;
+
+            params.push(ClapParameterInfo {
+                id,
+                name,
+                module,
+                min_value,
+                max_value,
+                default_value,
+            });
+        }
+
+        Ok(params)
     }
 
     pub fn parameter_values(&self) -> HashMap<u32, f64> {
@@ -741,7 +874,11 @@ impl ClapProcessor {
 
 impl Drop for ClapProcessor {
     fn drop(&mut self) {
-        ipc::drop_host(&self.mapping, &self.events, &self.child, &self.shm_name);
+        let mapping = self.mapping.take();
+        let events = self.events.take();
+        let child = self.child.lock().take();
+        let shm_name = std::mem::take(&mut self.shm_name);
+        ipc::drop_host(mapping, events, child, shm_name);
     }
 }
 

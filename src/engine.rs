@@ -7054,7 +7054,7 @@ impl Engine {
                     let cc_start = std::time::Instant::now();
                     let connectable_connections = track.connectable_connections();
                     let cc_ms = cc_start.elapsed().as_millis();
-                    tracing::info!(
+                    tracing::debug!(
                         %track_name,
                         include_state,
                         plugins_ms,
@@ -7065,7 +7065,7 @@ impl Engine {
                     (plugins, connections, connectable_connections)
                 };
                 let total_ms = start.elapsed().as_millis();
-                tracing::info!(
+                tracing::debug!(
                     %track_name,
                     total_ms,
                     plugins = plugins.len(),
@@ -7707,6 +7707,7 @@ impl Engine {
                 ref track_name,
                 instance_id,
             } => {
+                tracing::info!(%track_name, instance_id, "Engine handling TrackUnloadLv2PluginInstance");
                 if self
                     .reject_if_track_frozen(track_name, "LV2 plugin unloading")
                     .await
@@ -7733,6 +7734,7 @@ impl Engine {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
+                tracing::info!(%track_name, instance_id, "Engine TrackUnloadLv2PluginInstance complete");
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::TrackShowLv2Gui {
@@ -8340,6 +8342,29 @@ impl Engine {
                 }
             },
             Action::TrackVst3Parameters { .. } => {}
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackGetLv2PluginControls {
+                ref track_name,
+                instance_id,
+            } => match self.track_handle_or_err(track_name) {
+                Ok(track) => match track.lock().get_lv2_plugin_controls(instance_id) {
+                    Ok(controls) => {
+                        self.notify_clients(Ok(Action::TrackLv2PluginControls {
+                            track_name: track_name.clone(),
+                            instance_id,
+                            controls,
+                            instance_access_handle: None,
+                        }))
+                        .await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                },
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
             Action::TrackVst3SnapshotState {
                 ref track_name,
                 instance_id,

@@ -1,5 +1,4 @@
 use crate::audio::io::AudioIO;
-use crate::mutex::UnsafeMutex;
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::shm::ShmMapping;
@@ -112,32 +111,40 @@ pub fn bypass_copy_inputs_to_outputs(inputs: &[Arc<AudioIO>], outputs: &[Arc<Aud
 }
 
 pub fn drop_host(
-    mapping: &Option<ShmMapping>,
-    events: &Option<EventPair>,
-    child: &UnsafeMutex<Option<Child>>,
-    shm_name: &str,
+    mapping: Option<ShmMapping>,
+    events: Option<EventPair>,
+    child: Option<Child>,
+    shm_name: String,
 ) {
-    if let Some(mapping) = mapping
-        && let Some(events) = events
+    if let Some(ref mapping) = mapping
+        && let Some(ref events) = events
     {
         let header = unsafe { header_mut(mapping.as_ptr()) };
         header.shutdown_request.store(1, Ordering::Release);
         let _ = events.signal_host();
     }
-    let mut child_opt = child.lock().take();
-    if let Some(mut child) = child_opt.take() {
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            if child.try_wait().map(|s| s.is_some()).unwrap_or(true) {
-                break;
+
+    std::thread::spawn(move || {
+        tracing::info!(%shm_name, "drop_host: waiting for plugin host process to exit");
+        if let Some(mut child) = child {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                if child.try_wait().map(|s| s.is_some()).unwrap_or(true) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
+                tracing::warn!(%shm_name, "drop_host: plugin host did not exit in time, killing");
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
-        if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
-            let _ = child.kill();
-        }
-    }
-    let _ = ShmMapping::unlink(shm_name);
+        drop(mapping);
+        drop(events);
+        let _ = ShmMapping::unlink(&shm_name);
+        tracing::info!(%shm_name, "drop_host: cleanup complete");
+    });
 }
 
 pub fn find_plugin_host_binary() -> Option<PathBuf> {

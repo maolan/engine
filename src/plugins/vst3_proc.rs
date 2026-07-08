@@ -528,7 +528,11 @@ impl Vst3Processor {
 
 impl Drop for Vst3Processor {
     fn drop(&mut self) {
-        ipc::drop_host(&self.mapping, &self.events, &self.child, &self.shm_name);
+        let mapping = self.mapping.take();
+        let events = self.events.take();
+        let child = self.child.lock().take();
+        let shm_name = std::mem::take(&mut self.shm_name);
+        ipc::drop_host(mapping, events, child, shm_name);
     }
 }
 
