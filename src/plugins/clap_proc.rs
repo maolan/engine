@@ -834,8 +834,86 @@ impl ClapProcessor {
 
     pub fn gui_on_timer(&self, _timer_id: u32) {}
 
-    pub fn note_names(&self) -> std::collections::HashMap<u8, String> {
-        std::collections::HashMap::new()
+    fn deserialize_clap_note_names(
+        scratch: *const u8,
+        size: usize,
+    ) -> Result<HashMap<u8, String>, String> {
+        if size < 4 {
+            return Err("scratch too small for CLAP note names".to_string());
+        }
+        let mut offset = 0usize;
+        let count = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+        offset += 4;
+
+        let mut note_names = HashMap::with_capacity(count);
+        for _ in 0..count {
+            if offset + 4 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let note = unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) };
+            offset += 4;
+            if note > 127 {
+                return Err(format!("CLAP note name key out of range: {note}"));
+            }
+
+            if offset + 4 > size {
+                return Err("scratch underflow".to_string());
+            }
+            let name_len =
+                unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
+            offset += 4;
+            if offset + name_len > size {
+                return Err("scratch underflow".to_string());
+            }
+            let mut name_bytes = vec![0u8; name_len];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.add(offset),
+                    name_bytes.as_mut_ptr(),
+                    name_len,
+                );
+            }
+            offset += name_len;
+            let name = String::from_utf8(name_bytes).map_err(|e| e.to_string())?;
+            note_names.insert(note as u8, name);
+        }
+
+        Ok(note_names)
+    }
+
+    pub fn note_names(&self) -> Result<HashMap<u8, String>, String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("CLAP processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+
+        header
+            .request_type
+            .store(REQUEST_CLAP_NOTE_NAMES, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for CLAP note names: {e}"));
+        }
+
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to CLAP note names: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        let size = header.scratch_size.load(Ordering::Acquire) as usize;
+        if status != 1 {
+            header.request_type.store(0, Ordering::Release);
+            return Err("CLAP note name enumeration failed in host".to_string());
+        }
+
+        let scratch = unsafe { scratch_ptr(ptr) };
+        let result = Self::deserialize_clap_note_names(scratch, size);
+        header.request_type.store(0, Ordering::Release);
+        result
     }
 
     pub fn drain_echoed_parameters(&self) -> Vec<ParameterEvent> {
@@ -1006,7 +1084,7 @@ impl UnsafeMutex<ClapProcessor> {
         self.lock().gui_on_timer(timer_id);
     }
 
-    pub fn note_names(&self) -> std::collections::HashMap<u8, String> {
+    pub fn note_names(&self) -> Result<HashMap<u8, String>, String> {
         self.lock().note_names()
     }
 }

@@ -509,6 +509,11 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let track_name = args.next_string()?;
             Ok(Action::TrackGetClapNoteNames { track_name })
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        "/query/lv2_midnam" => {
+            let track_name = args.next_string()?;
+            Ok(Action::TrackGetLv2Midnam { track_name })
+        }
         "/query/vst3_graph" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackGetVst3Graph { track_name })
@@ -3404,6 +3409,20 @@ mod tests {
         assert!(matches!(
             parse_osc_request(&osc_packet("/query/midi_learn_report")).unwrap(),
             Action::RequestMidiLearnMappingsReport
+        ));
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn parses_lv2_midnam_query() {
+        let packet = osc_packet_with_args(
+            "/query/lv2_midnam",
+            "s",
+            &[OscArg::String("drums".to_string())],
+        );
+        assert!(matches!(
+            parse_osc_request(&packet).unwrap(),
+            Action::TrackGetLv2Midnam { track_name } if track_name == "drums"
         ));
     }
 

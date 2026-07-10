@@ -3884,8 +3884,41 @@ impl Track {
     pub fn get_clap_note_names(&self) -> std::collections::HashMap<u8, String> {
         let mut result = std::collections::HashMap::new();
         for instance in &self.clap_plugins {
-            for (k, v) in instance.processor.lock().note_names() {
-                result.insert(k, v);
+            match instance.processor.lock().note_names() {
+                Ok(names) => {
+                    for (k, v) in names {
+                        result.insert(k, v);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        track = %self.name,
+                        error = %e,
+                        "Failed to read CLAP note names"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn get_lv2_midnam(&self) -> std::collections::HashMap<u8, String> {
+        let mut result = std::collections::HashMap::new();
+        for instance in &self.lv2_plugins {
+            match instance.processor.lock().note_names() {
+                Ok(names) => {
+                    for (k, v) in names {
+                        result.insert(k, v);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        track = %self.name,
+                        error = %e,
+                        "Failed to read LV2 midnam note names"
+                    );
+                }
             }
         }
         result

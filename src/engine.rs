@@ -3902,6 +3902,35 @@ impl Engine {
                         ),
                     );
                 }
+                Ok(Action::TrackClapNoteNames {
+                    track_name,
+                    note_names,
+                }) => {
+                    let json = serde_json::to_string(note_names).unwrap_or_default();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet(
+                            "/response/clap_note_names",
+                            "ss",
+                            &[OscArg::String(track_name.clone()), OscArg::String(json)],
+                        ),
+                    );
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                Ok(Action::TrackLv2Midnam {
+                    track_name,
+                    note_names,
+                }) => {
+                    let json = serde_json::to_string(note_names).unwrap_or_default();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet(
+                            "/response/lv2_midnam",
+                            "ss",
+                            &[OscArg::String(track_name.clone()), OscArg::String(json)],
+                        ),
+                    );
+                }
                 _ => {}
             }
         }
@@ -10075,6 +10104,29 @@ impl Engine {
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_track_get_lv2_midnam(&mut self, a: Action) -> bool {
+        let Action::TrackGetLv2Midnam { ref track_name } = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let note_names = track.lock().get_lv2_midnam();
+        self.notify_clients(Ok(Action::TrackLv2Midnam {
+            track_name: track_name.clone(),
+            note_names,
+        }))
+        .await;
+
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
     async fn handle_list_lv2_plugins(&mut self, a: Action) -> bool {
         let Action::ListLv2Plugins = a else {
             return false;
@@ -10813,6 +10865,12 @@ impl Engine {
             }
             Action::TrackGetClapNoteNames { .. } => {
                 if Self::box_bool(self.handle_track_get_clap_note_names(a.clone())).await {
+                    return;
+                }
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackGetLv2Midnam { .. } => {
+                if Self::box_bool(self.handle_track_get_lv2_midnam(a.clone())).await {
                     return;
                 }
             }
