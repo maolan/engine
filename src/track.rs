@@ -2002,10 +2002,17 @@ impl Track {
                             Some(b) => b,
                             None => continue,
                         };
+                        let plugin_spec = match crate::plugins::resolve_plugin_identifier(
+                            PluginKind::Clap,
+                            uri,
+                        ) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
                         let processor = match crate::clap_proc::ClapProcessor::new(
                             self.sample_rate,
                             buffer_size,
-                            uri,
+                            &plugin_spec,
                             channels.max(1),
                             channels.max(1),
                             host_binary,
@@ -2023,9 +2030,17 @@ impl Track {
                             Some(b) => b,
                             None => continue,
                         };
+                        let plugin_path = match crate::plugins::resolve_plugin_identifier(
+                            PluginKind::Vst3,
+                            uri,
+                        ) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
                         let processor = match crate::vst3_proc::Vst3Processor::new(
                             self.sample_rate,
                             buffer_size,
+                            &plugin_path,
                             uri,
                             channels.max(1),
                             channels.max(1),
@@ -3518,8 +3533,8 @@ impl Track {
                     node: PluginGraphNode::Vst3PluginInstance(instance.id),
                     instance_id: instance.id,
                     format: "VST3".to_string(),
-                    uri: proc.path().to_string(),
-                    plugin_id: proc.path().to_string(),
+                    uri: proc.plugin_id().to_string(),
+                    plugin_id: proc.plugin_id().to_string(),
                     name: proc.name().to_string(),
                     main_audio_inputs: proc.main_audio_input_count(),
                     main_audio_outputs: proc.main_audio_output_count(),
@@ -3540,7 +3555,7 @@ impl Track {
                     node: PluginGraphNode::ClapPluginInstance(instance.id),
                     instance_id: instance.id,
                     format: "CLAP".to_string(),
-                    uri: proc.path().to_string(),
+                    uri: proc.plugin_id().to_string(),
                     plugin_id: proc.plugin_id().to_string(),
                     name: proc.name().to_string(),
                     main_audio_inputs: proc.main_audio_input_count(),
@@ -3618,20 +3633,20 @@ impl Track {
 
     pub fn load_clap_plugin(
         &mut self,
-        plugin_path: &str,
+        plugin_spec: &str,
         instance_id: Option<usize>,
     ) -> Result<(), String> {
-        let normalized = Self::normalize_clap_path(plugin_path);
+        let normalized = Self::normalize_clap_path(plugin_spec);
         let bundle_path = normalized
             .split_once("::")
             .map(|(path, _)| path)
             .unwrap_or(&normalized);
         let path = Path::new(bundle_path);
         if !path.exists() {
-            return Err(format!("CLAP plugin not found: {plugin_path}"));
+            return Err(format!("CLAP plugin not found: {plugin_spec}"));
         }
         if !crate::clap::is_supported_clap_binary(path) {
-            return Err(format!("Not a CLAP plugin path: {plugin_path}"));
+            return Err(format!("Not a CLAP plugin path: {plugin_spec}"));
         }
         let id = instance_id
             .filter(|&id| {
@@ -3656,7 +3671,7 @@ impl Track {
         let processor = Arc::new(UnsafeMutex::new(crate::clap_proc::ClapProcessor::new(
             self.sample_rate,
             buffer_size,
-            plugin_path,
+            plugin_spec,
             input_count,
             output_count,
             host_binary,
@@ -3666,14 +3681,15 @@ impl Track {
         Ok(())
     }
 
-    pub fn unload_clap_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
-        let normalized = Self::normalize_clap_path(plugin_path);
-        let Some(index) = self.clap_plugins.iter().position(|instance| {
-            Self::normalize_clap_path(instance.processor.lock().path()) == normalized
-        }) else {
+    pub fn unload_clap_plugin(&mut self, plugin_id: &str) -> Result<(), String> {
+        let Some(index) = self
+            .clap_plugins
+            .iter()
+            .position(|instance| instance.processor.lock().plugin_id() == plugin_id)
+        else {
             return Err(format!(
                 "Track '{}' does not have CLAP plugin loaded: {}",
-                self.name, plugin_path
+                self.name, plugin_id
             ));
         };
         let removed_id = self.clap_plugins[index].id;
@@ -3901,7 +3917,7 @@ impl Track {
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
         let state = instance.processor.lock().snapshot_state()?;
-        Ok((instance.processor.lock().path().to_string(), state))
+        Ok((instance.processor.lock().plugin_id().to_string(), state))
     }
 
     pub fn clap_restore_state(
@@ -3934,6 +3950,61 @@ impl Track {
         instance.processor.lock().restore_state(state)
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn lv2_snapshot_state(&self, instance_id: usize) -> Result<Vec<u8>, String> {
+        if let Some(instance) = self.lv2_plugins.iter().find(|i| i.id == instance_id) {
+            return instance.processor.lock().snapshot_state();
+        }
+        Err(format!(
+            "Track '{}' does not have LV2 instance id: {}",
+            self.name, instance_id
+        ))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn lv2_restore_state(&self, instance_id: usize, state: &[u8]) -> Result<(), String> {
+        if let Some(instance) = self.lv2_plugins.iter().find(|i| i.id == instance_id) {
+            return instance.processor.lock().restore_state(state);
+        }
+        Err(format!(
+            "Track '{}' does not have LV2 instance id: {}",
+            self.name, instance_id
+        ))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn clip_lv2_snapshot_state(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Vec<u8>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .lv2_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip LV2 instance {} not found", instance_id))?;
+        instance.processor.lock().snapshot_state()
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn clip_lv2_restore_state(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        state: &[u8],
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .lv2_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip LV2 instance {} not found", instance_id))?;
+        instance.processor.lock().restore_state(state)
+    }
+
     pub fn clap_snapshot_all_states(&self) -> Vec<(usize, String, crate::clap::ClapPluginState)> {
         self.clap_plugins
             .iter()
@@ -3941,7 +4012,7 @@ impl Track {
                 let proc = instance.processor.lock();
                 proc.snapshot_state()
                     .ok()
-                    .map(|state| (instance.id, proc.path().to_string(), state))
+                    .map(|state| (instance.id, proc.plugin_id().to_string(), state))
             })
             .collect()
     }
@@ -4089,6 +4160,7 @@ impl Track {
 
     pub fn load_vst3_plugin(
         &mut self,
+        plugin_id: &str,
         plugin_path: &str,
         instance_id: Option<usize>,
     ) -> Result<(), String> {
@@ -4108,6 +4180,7 @@ impl Track {
             self.sample_rate,
             buffer_size,
             plugin_path,
+            plugin_id,
             input_count,
             output_count,
             host_binary,
@@ -4129,17 +4202,15 @@ impl Track {
         Ok(())
     }
 
-    pub fn unload_vst3_plugin(&mut self, plugin_path: &str) -> Result<(), String> {
-        let Some(index) = self.vst3_plugins.iter().position(|instance| {
-            instance
-                .processor
-                .lock()
-                .path()
-                .eq_ignore_ascii_case(plugin_path)
-        }) else {
+    pub fn unload_vst3_plugin(&mut self, plugin_id: &str) -> Result<(), String> {
+        let Some(index) = self
+            .vst3_plugins
+            .iter()
+            .position(|instance| instance.processor.lock().plugin_id() == plugin_id)
+        else {
             return Err(format!(
                 "Track '{}' does not have VST3 plugin loaded: {}",
-                self.name, plugin_path
+                self.name, plugin_id
             ));
         };
         let removed = self.vst3_plugins.remove(index);
@@ -4362,6 +4433,22 @@ impl Track {
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip VST3 instance {} not found", instance_id))?;
         instance.processor.lock().snapshot_state()
+    }
+
+    pub fn clip_vst3_restore_state(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        state: &crate::vst3::state::Vst3PluginState,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .vst3_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip VST3 instance {} not found", instance_id))?;
+        instance.processor.lock().restore_state(state)
     }
 
     pub fn vst3_restore_state(

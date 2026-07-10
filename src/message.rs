@@ -5,6 +5,7 @@ use crate::lv2::Lv2PluginInfo;
 use crate::midi::io::MidiEvent;
 use crate::vst3::Vst3PluginInfo;
 use crate::{kind::Kind, modulator::Modulator, mutex::UnsafeMutex, track::Track};
+use std::net::SocketAddr;
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc::Sender;
 
@@ -45,13 +46,13 @@ pub struct HwMidiEvent {
     pub event: MidiEvent,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OfflineAutomationPoint {
     pub sample: usize,
     pub value: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum OfflineAutomationTarget {
     Volume,
     Balance,
@@ -78,9 +79,11 @@ pub enum OfflineAutomationTarget {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OfflineAutomationLane {
     pub target: OfflineAutomationTarget,
+    #[serde(default)]
+    pub visible: bool,
     pub points: Vec<OfflineAutomationPoint>,
 }
 
@@ -473,6 +476,25 @@ pub enum Action {
         lanes: serde_json::Value,
         mode: TrackAutomationMode,
     },
+    TrackAutomationToggleLane {
+        track_name: String,
+        target: OfflineAutomationTarget,
+    },
+    TrackAutomationInsertPoint {
+        track_name: String,
+        target: OfflineAutomationTarget,
+        sample: usize,
+        value: f32,
+    },
+    TrackAutomationDeletePoint {
+        track_name: String,
+        target: OfflineAutomationTarget,
+        sample: usize,
+    },
+    TrackAutomationSetMode {
+        track_name: String,
+        mode: TrackAutomationMode,
+    },
     SetSessionPath(String),
     BeginHistoryGroup,
     EndHistoryGroup,
@@ -609,6 +631,17 @@ pub enum Action {
     MeterSnapshot {
         hw_out_db: Arc<Vec<f32>>,
         track_meters: Arc<Vec<(String, Vec<f32>)>>,
+    },
+    RequestTrackList,
+    TrackList(Vec<String>),
+    RequestTransportState,
+    TransportState {
+        sample: usize,
+        tempo_bpm: f64,
+        playing: bool,
+        paused: bool,
+        tsig_num: u16,
+        tsig_denom: u16,
     },
     TrackToggleArm(String),
     TrackToggleMute(String),
@@ -782,6 +815,23 @@ pub enum Action {
     ClipSetLv2PluginState {
         track_name: String,
         clip_idx: usize,
+        instance_id: usize,
+        state: Vec<u8>,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackLv2SnapshotState {
+        track_name: String,
+        instance_id: usize,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    ClipLv2SnapshotState {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    TrackLv2StateSnapshot {
+        track_name: String,
         instance_id: usize,
         state: Vec<u8>,
     },
@@ -987,14 +1037,14 @@ pub enum Action {
     TrackClapStateSnapshot {
         track_name: String,
         instance_id: usize,
-        plugin_path: String,
+        plugin_id: String,
         state: crate::clap::ClapPluginState,
     },
     ClipClapStateSnapshot {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-        plugin_path: String,
+        plugin_id: String,
         state: crate::clap::ClapPluginState,
     },
     TrackClapStateDirty {
@@ -1025,12 +1075,12 @@ pub enum Action {
     },
     TrackLoadClapPlugin {
         track_name: String,
-        plugin_path: String,
+        plugin_id: String,
         instance_id: Option<usize>,
     },
     TrackUnloadClapPlugin {
         track_name: String,
-        plugin_path: String,
+        plugin_id: String,
     },
     TrackUnloadClapPluginInstance {
         track_name: String,
@@ -1042,12 +1092,12 @@ pub enum Action {
     },
     TrackLoadVst3Plugin {
         track_name: String,
-        plugin_path: String,
+        plugin_id: String,
         instance_id: Option<usize>,
     },
     TrackUnloadVst3Plugin {
         track_name: String,
-        plugin_path: String,
+        plugin_id: String,
     },
     TrackUnloadVst3PluginInstance {
         track_name: String,
@@ -1165,6 +1215,12 @@ pub enum Action {
     },
     TrackVst3RestoreState {
         track_name: String,
+        instance_id: usize,
+        state: crate::vst3::state::Vst3PluginState,
+    },
+    ClipVst3RestoreState {
+        track_name: String,
+        clip_idx: usize,
         instance_id: usize,
         state: crate::vst3::state::Vst3PluginState,
     },
@@ -1287,6 +1343,10 @@ pub enum Message {
     Channel(Sender<Self>),
 
     Request(Action),
+    OscRequest {
+        action: Action,
+        reply_to: SocketAddr,
+    },
     Response(Result<Action, String>),
     HWMidiEvents(Vec<HwMidiEvent>),
     HWMidiOutEvents(Vec<HwMidiEvent>),

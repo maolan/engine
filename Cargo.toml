@@ -1,6 +1,6 @@
 [package]
 name = "maolan-engine"
-version = "0.2.30"
+version = "0.2.31"
 edition = "2024"
 description = "Audio engine for the Maolan DAW with audio/MIDI tracks, routing, export, and out-of-process CLAP/VST3/LV2 plugin support"
 license = "BSD-2-Clause"
@@ -29,7 +29,7 @@ wide = "1.4.0"
 alsa = { version = "0.11.0" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.2", features = ["ioctl", "poll"] }
+nix = { version = "0.31.3", features = ["ioctl", "poll"] }
 jack = "0.13.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]

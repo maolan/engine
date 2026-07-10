@@ -48,6 +48,8 @@ pub struct ClapParamUpdate {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClapPluginInfo {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub path: String,
     pub capabilities: Option<ClapPluginCapabilities>,

@@ -534,6 +534,7 @@ mod tests {
         let lanes = vec![
             OfflineAutomationLane {
                 target: OfflineAutomationTarget::Volume,
+                visible: true,
                 points: vec![OfflineAutomationPoint {
                     sample: 0,
                     value: 0.0,
@@ -541,6 +542,7 @@ mod tests {
             },
             OfflineAutomationLane {
                 target: OfflineAutomationTarget::Balance,
+                visible: true,
                 points: vec![OfflineAutomationPoint {
                     sample: 0,
                     value: 1.0,
@@ -548,6 +550,7 @@ mod tests {
             },
             OfflineAutomationLane {
                 target: OfflineAutomationTarget::MidiCc { channel: 0, cc: 7 },
+                visible: true,
                 points: vec![OfflineAutomationPoint {
                     sample: 0,
                     value: 1.0,
@@ -591,6 +594,7 @@ mod tests {
         let mut track = Track::new("track".to_string(), 1, 1, 0, 1, 64, 48_000.0);
         let lanes = vec![OfflineAutomationLane {
             target: OfflineAutomationTarget::MidiCc { channel: 0, cc: 7 },
+            visible: true,
             points: vec![
                 OfflineAutomationPoint {
                     sample: 0,

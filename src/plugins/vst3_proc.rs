@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 pub struct Vst3Processor {
     path: String,
+    plugin_id: String,
     name: String,
     audio_inputs: Vec<Arc<AudioIO>>,
     audio_outputs: Vec<Arc<AudioIO>>,
@@ -45,6 +46,7 @@ impl Vst3Processor {
         sample_rate: f64,
         buffer_size: usize,
         plugin_path: &str,
+        plugin_id: &str,
         input_count: usize,
         output_count: usize,
         host_binary: PathBuf,
@@ -103,6 +105,7 @@ impl Vst3Processor {
 
         Ok(Self {
             path: plugin_path.to_string(),
+            plugin_id: plugin_id.to_string(),
             name,
             audio_inputs,
             audio_outputs,
@@ -406,6 +409,10 @@ impl Vst3Processor {
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
     }
 
     pub fn name(&self) -> &str {
@@ -871,7 +878,7 @@ mod tests {
     fn vst3_processor_crash_bypass() {
         let host_bin = find_host_binary();
 
-        let processor = Vst3Processor::new(48000.0, 256, "__crash__", 1, 1, host_bin)
+        let processor = Vst3Processor::new(48000.0, 256, "__crash__", "__crash__", 1, 1, host_bin)
             .expect("should create VST3 processor for crash test");
 
         processor.setup_audio_ports();

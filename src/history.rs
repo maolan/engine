@@ -1,5 +1,6 @@
 use crate::{
     audio::io::AudioIO,
+    engine::parse_automation_lanes,
     kind::Kind,
     message::{Action, ClipMoveFrom, ClipMoveTo},
     midi::io::MIDIIO,
@@ -130,6 +131,10 @@ pub fn should_record(action: &Action) -> bool {
         | Action::SetTempoMap { .. }
         | Action::SetModulators(_)
         | Action::SetTrackAutomationLanes { .. }
+        | Action::TrackAutomationToggleLane { .. }
+        | Action::TrackAutomationInsertPoint { .. }
+        | Action::TrackAutomationDeletePoint { .. }
+        | Action::TrackAutomationSetMode { .. }
         | Action::AddTrack { .. }
         | Action::RemoveTrack(_)
         | Action::RenameTrack { .. }
@@ -751,6 +756,74 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 mode: track_lock.automation_mode,
             })
         }
+        Action::TrackAutomationToggleLane { track_name, target } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let _lanes = parse_automation_lanes(&track_lock.automation_lanes);
+            Some(Action::TrackAutomationToggleLane {
+                track_name: track_name.clone(),
+                target: target.clone(),
+            })
+        }
+        Action::TrackAutomationInsertPoint {
+            track_name,
+            target,
+            sample,
+            value: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let lanes = parse_automation_lanes(&track_lock.automation_lanes);
+            let old_value = lanes
+                .iter()
+                .find(|lane| lane.target == *target)
+                .and_then(|lane| lane.points.iter().find(|p| p.sample == *sample))
+                .map(|p| p.value);
+            match old_value {
+                Some(value) => Some(Action::TrackAutomationInsertPoint {
+                    track_name: track_name.clone(),
+                    target: target.clone(),
+                    sample: *sample,
+                    value,
+                }),
+                None => Some(Action::TrackAutomationDeletePoint {
+                    track_name: track_name.clone(),
+                    target: target.clone(),
+                    sample: *sample,
+                }),
+            }
+        }
+        Action::TrackAutomationDeletePoint {
+            track_name,
+            target,
+            sample,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let lanes = parse_automation_lanes(&track_lock.automation_lanes);
+            let old_value = lanes
+                .iter()
+                .find(|lane| lane.target == *target)
+                .and_then(|lane| lane.points.iter().find(|p| p.sample == *sample))
+                .map(|p| p.value);
+            old_value.map(|value| Action::TrackAutomationInsertPoint {
+                track_name: track_name.clone(),
+                target: target.clone(),
+                sample: *sample,
+                value,
+            })
+        }
+        Action::TrackAutomationSetMode {
+            track_name,
+            mode: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackAutomationSetMode {
+                track_name: track_name.clone(),
+                mode: track_lock.automation_mode,
+            })
+        }
         Action::Connect {
             from_track,
             from_port,
@@ -911,7 +984,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
 
         Action::TrackLoadClapPlugin {
             track_name,
-            plugin_path: _,
+            plugin_id: _,
             ..
         } => {
             let track = state.tracks.get(track_name)?;
@@ -923,16 +996,16 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         }
         Action::TrackUnloadClapPlugin {
             track_name,
-            plugin_path,
+            plugin_id,
         } => Some(Action::TrackLoadClapPlugin {
             track_name: track_name.clone(),
-            plugin_path: plugin_path.clone(),
+            plugin_id: plugin_id.clone(),
             instance_id: None,
         }),
 
         Action::TrackLoadVst3Plugin {
             track_name,
-            plugin_path: _,
+            plugin_id: _,
             ..
         } => {
             let track = state.tracks.get(track_name)?;
@@ -1180,7 +1253,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
 
     if let Action::TrackUnloadClapPlugin {
         track_name,
-        plugin_path,
+        plugin_id,
     } = action
     {
         let track = state.tracks.get(track_name)?;
@@ -1188,13 +1261,13 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let instance = track
             .clap_plugins
             .iter()
-            .find(|p| p.processor.lock().path().eq_ignore_ascii_case(plugin_path))?;
+            .find(|p| p.processor.lock().plugin_id() == plugin_id)?;
         let id = instance.id;
         let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
         return Some(vec![
             Action::TrackLoadClapPlugin {
                 track_name: track_name.clone(),
-                plugin_path: plugin_path.clone(),
+                plugin_id: plugin_id.clone(),
                 instance_id: Some(id),
             },
             Action::TrackClapRestoreState {
@@ -1213,12 +1286,12 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
         let instance = track.clap_plugins.iter().find(|p| p.id == *instance_id)?;
-        let path = instance.processor.lock().path().to_string();
+        let plugin_id = instance.processor.lock().plugin_id().to_string();
         let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
         return Some(vec![
             Action::TrackLoadClapPlugin {
                 track_name: track_name.clone(),
-                plugin_path: path,
+                plugin_id,
                 instance_id: Some(*instance_id),
             },
             Action::TrackClapRestoreState {
@@ -1237,12 +1310,12 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
         let instance = track.vst3_plugins.iter().find(|p| p.id == *instance_id)?;
-        let path = instance.processor.lock().path().to_string();
+        let plugin_id = instance.processor.lock().plugin_id().to_string();
         let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
         return Some(vec![
             Action::TrackLoadVst3Plugin {
                 track_name: track_name.clone(),
-                plugin_path: path,
+                plugin_id,
                 instance_id: Some(*instance_id),
             },
             Action::TrackVst3RestoreState {
@@ -1464,11 +1537,11 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
 
             for instance in &track.vst3_plugins {
                 let id = instance.id;
-                let path = instance.processor.lock().path().to_string();
+                let plugin_id = instance.processor.lock().plugin_id().to_string();
                 if let Ok(state) = instance.processor.lock().snapshot_state() {
                     actions.push(Action::TrackLoadVst3Plugin {
                         track_name: track.name.clone(),
-                        plugin_path: path,
+                        plugin_id,
                         instance_id: Some(id),
                     });
                     actions.push(Action::TrackVst3RestoreState {
@@ -1479,10 +1552,10 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 }
             }
 
-            for (id, path, state) in track.clap_snapshot_all_states() {
+            for (id, plugin_id, state) in track.clap_snapshot_all_states() {
                 actions.push(Action::TrackLoadClapPlugin {
                     track_name: track.name.clone(),
-                    plugin_path: path,
+                    plugin_id,
                     instance_id: Some(id),
                 });
                 actions.push(Action::TrackClapRestoreState {
@@ -1810,7 +1883,7 @@ mod tests {
         }));
         assert!(should_record(&Action::TrackLoadVst3Plugin {
             track_name: "t".to_string(),
-            plugin_path: "/tmp/test.vst3".to_string(),
+            plugin_id: "/tmp/test.vst3".to_string(),
             instance_id: None,
         }));
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -2533,7 +2606,7 @@ mod tests {
         let inverse = create_inverse_action(
             &Action::TrackLoadVst3Plugin {
                 track_name: "t".to_string(),
-                plugin_path: "/tmp/test.vst3".to_string(),
+                plugin_id: "/tmp/test.vst3".to_string(),
                 instance_id: None,
             },
             &state,

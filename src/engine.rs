@@ -8,6 +8,7 @@ use std::fs::read_dir;
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
+    net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -20,6 +21,21 @@ use tokio::task::JoinHandle;
 use tracing::error;
 
 type HwDeviceInfo = (usize, usize, usize, ((usize, usize), (usize, usize)));
+
+pub fn parse_automation_lanes(
+    value: &serde_json::Value,
+) -> Vec<crate::message::OfflineAutomationLane> {
+    serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        if let Some(array) = value.as_array() {
+            array
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        } else {
+            vec![]
+        }
+    })
+}
 
 #[cfg(target_os = "linux")]
 use crate::hw::alsa::{HwDriver, HwOptions, MidiHub};
@@ -58,12 +74,13 @@ use crate::{
     kind::Kind,
     message::{
         Action, HwMidiEvent, LaunchQuantization, Message, MidiControllerData, MidiNoteData,
-        PluginKind, ProcessTask, SessionAction, SessionSlotState,
+        OfflineAutomationLane, OfflineAutomationPoint, PluginKind, ProcessTask, SessionAction,
+        SessionSlotState,
     },
     midi::clip::MIDIClip,
     midi::io::{MIDIIO, MidiEvent},
     mutex::UnsafeMutex,
-    osc::OscServer,
+    osc::{OscArg, OscServer, build_error_packet, build_osc_packet},
     routing,
     state::State,
     track::{SessionSlot, Track},
@@ -198,6 +215,8 @@ pub struct Engine {
     midi_hub: Arc<UnsafeMutex<MidiHub>>,
     hw_worker: Option<WorkerData>,
     osc_server: Option<OscServer>,
+    osc_reply_socket: Option<UdpSocket>,
+    osc_reply_target: Option<SocketAddr>,
     pending_hw_midi_events: Vec<MidiEvent>,
     pending_hw_midi_events_by_device: HashMap<String, Vec<MidiEvent>>,
     pending_hw_midi_out_events: Vec<MidiEvent>,
@@ -290,6 +309,59 @@ type MidiEditParseResult = (
 impl Engine {
     pub fn state(&self) -> Arc<UnsafeMutex<State>> {
         self.state.clone()
+    }
+
+    fn resolve_plugin_identifier(
+        &self,
+        kind: PluginKind,
+        identifier: &str,
+    ) -> Result<String, String> {
+        if identifier.is_empty() {
+            return Err("plugin identifier is empty".to_string());
+        }
+        if identifier.contains('/')
+            || identifier.contains('\\')
+            || identifier.contains("::")
+            || identifier.contains('#')
+            || identifier.contains("://")
+            || identifier.starts_with("file:")
+            || Path::new(identifier).exists()
+        {
+            return Ok(identifier.to_string());
+        }
+
+        match kind {
+            PluginKind::Clap => {
+                let plugins =
+                    crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap")
+                        .map_err(|e| format!("failed to scan CLAP plugins: {e}"))?;
+                plugins
+                    .into_iter()
+                    .find(|p| !p.id.is_empty() && p.id == identifier)
+                    .map(|p| p.path)
+                    .ok_or_else(|| format!("CLAP plugin ID not found: {identifier}"))
+            }
+            PluginKind::Vst3 => {
+                let plugins =
+                    crate::plugins::scan_plugins::<crate::plugins::types::Vst3PluginInfo>("vst3")
+                        .map_err(|e| format!("failed to scan VST3 plugins: {e}"))?;
+                plugins
+                    .into_iter()
+                    .find(|p| !p.id.is_empty() && p.id == identifier)
+                    .map(|p| p.path)
+                    .ok_or_else(|| format!("VST3 plugin ID not found: {identifier}"))
+            }
+            PluginKind::Lv2 => {
+                let plugins =
+                    crate::plugins::scan_plugins::<crate::plugins::types::Lv2PluginInfo>("lv2")
+                        .map_err(|e| format!("failed to scan LV2 plugins: {e}"))?;
+                plugins
+                    .into_iter()
+                    .find(|p| p.uri == identifier)
+                    .map(|p| p.uri)
+                    .ok_or_else(|| format!("LV2 plugin URI not found: {identifier}"))
+            }
+        }
     }
 
     fn timing_at_sample(&self, sample: usize) -> (f64, u16, u16) {
@@ -985,6 +1057,8 @@ impl Engine {
             midi_hub: Arc::new(UnsafeMutex::new(MidiHub::default())),
             hw_worker: None,
             osc_server: None,
+            osc_reply_socket: None,
+            osc_reply_target: None,
             pending_hw_midi_events: vec![],
             pending_hw_midi_events_by_device: HashMap::new(),
             pending_hw_midi_out_events: vec![],
@@ -3602,6 +3676,326 @@ impl Engine {
                 .is_err()
             {}
         }
+        if let Some(reply_to) = self.osc_reply_target {
+            match &action {
+                Err(reason) => {
+                    self.send_osc_reply(reply_to, &build_error_packet(reason));
+                }
+                Ok(Action::TrackList(names)) => {
+                    let args: Vec<OscArg> = names
+                        .iter()
+                        .map(|name| OscArg::String(name.clone()))
+                        .collect();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet("/response/tracks", &"s".repeat(names.len()), &args),
+                    );
+                }
+                Ok(Action::TransportState {
+                    sample,
+                    tempo_bpm,
+                    playing,
+                    paused: _,
+                    tsig_num,
+                    tsig_denom,
+                }) => {
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet(
+                            "/response/transport",
+                            "idffii",
+                            &[
+                                OscArg::Int(*sample as i32),
+                                OscArg::Int(if *playing { 1 } else { 0 }),
+                                OscArg::Float(*tempo_bpm as f32),
+                                OscArg::Float(0.0), // placeholder for future beat position
+                                OscArg::Int(*tsig_num as i32),
+                                OscArg::Int(*tsig_denom as i32),
+                            ],
+                        ),
+                    );
+                }
+                Ok(Action::MeterSnapshot {
+                    hw_out_db,
+                    track_meters,
+                }) => {
+                    let mut args: Vec<OscArg> = Vec::new();
+                    args.push(OscArg::Int(hw_out_db.len() as i32));
+                    for db in hw_out_db.iter() {
+                        args.push(OscArg::Float(*db));
+                    }
+                    args.push(OscArg::Int(track_meters.len() as i32));
+                    for (name, channels) in track_meters.iter() {
+                        args.push(OscArg::String(name.clone()));
+                        args.push(OscArg::Int(channels.len() as i32));
+                        for db in channels.iter() {
+                            args.push(OscArg::Float(*db));
+                        }
+                    }
+                    let types = args
+                        .iter()
+                        .map(|a| match a {
+                            OscArg::String(_) => 's',
+                            OscArg::Int(_) => 'i',
+                            OscArg::Float(_) => 'f',
+                        })
+                        .collect::<String>();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet("/response/meters", &types, &args),
+                    );
+                }
+                Ok(Action::TrackPluginGraph {
+                    track_name,
+                    plugins,
+                    connections: _,
+                    connectable_connections: _,
+                }) => {
+                    let mut args: Vec<OscArg> = vec![OscArg::String(track_name.clone())];
+                    args.push(OscArg::Int(plugins.len() as i32));
+                    for plugin in plugins.iter() {
+                        args.push(OscArg::Int(plugin.instance_id as i32));
+                        args.push(OscArg::String(plugin.format.clone()));
+                        args.push(OscArg::String(plugin.uri.clone()));
+                        args.push(OscArg::String(plugin.name.clone()));
+                        args.push(OscArg::Int(plugin.bypassed as i32));
+                    }
+                    let types = args
+                        .iter()
+                        .map(|a| match a {
+                            OscArg::String(_) => 's',
+                            OscArg::Int(_) => 'i',
+                            OscArg::Float(_) => 'f',
+                        })
+                        .collect::<String>();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet("/response/plugins", &types, &args),
+                    );
+                }
+                Ok(Action::ClapPlugins(plugins)) => {
+                    let args: Vec<OscArg> = plugins
+                        .iter()
+                        .map(|p| OscArg::String(format!("{}|{}", p.path, p.name)))
+                        .collect();
+                    let types = "s".repeat(args.len());
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet("/response/clap_plugins", &types, &args),
+                    );
+                }
+                Ok(Action::Vst3Plugins(plugins)) => {
+                    let args: Vec<OscArg> = plugins
+                        .iter()
+                        .map(|p| OscArg::String(format!("{}|{}", p.id, p.name)))
+                        .collect();
+                    let types = "s".repeat(args.len());
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet("/response/vst3_plugins", &types, &args),
+                    );
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                Ok(Action::Lv2Plugins(plugins)) => {
+                    let args: Vec<OscArg> = plugins
+                        .iter()
+                        .map(|p| OscArg::String(format!("{}|{}", p.uri, p.name)))
+                        .collect();
+                    let types = "s".repeat(args.len());
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet("/response/lv2_plugins", &types, &args),
+                    );
+                }
+                Ok(Action::ClapPluginsUnavailable { error })
+                | Ok(Action::Vst3PluginsUnavailable { error }) => {
+                    self.send_osc_reply(reply_to, &build_error_packet(error));
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                Ok(Action::Lv2PluginsUnavailable { error }) => {
+                    self.send_osc_reply(reply_to, &build_error_packet(error));
+                }
+                Ok(Action::TrackClapParameters {
+                    track_name,
+                    instance_id,
+                    parameters,
+                }) => {
+                    let json = serde_json::json!(
+                        parameters
+                            .iter()
+                            .map(|p| serde_json::json!({
+                                "id": p.id,
+                                "name": p.name,
+                                "module": p.module,
+                                "min_value": p.min_value,
+                                "max_value": p.max_value,
+                                "default_value": p.default_value,
+                            }))
+                            .collect::<Vec<_>>()
+                    )
+                    .to_string();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet(
+                            "/response/plugin_parameters",
+                            "siss",
+                            &[
+                                OscArg::String(track_name.clone()),
+                                OscArg::Int(*instance_id as i32),
+                                OscArg::String("clap".to_string()),
+                                OscArg::String(json),
+                            ],
+                        ),
+                    );
+                }
+                Ok(Action::TrackVst3Parameters {
+                    track_name,
+                    instance_id,
+                    parameters,
+                }) => {
+                    let json = serde_json::to_string(parameters).unwrap_or_default();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet(
+                            "/response/plugin_parameters",
+                            "siss",
+                            &[
+                                OscArg::String(track_name.clone()),
+                                OscArg::Int(*instance_id as i32),
+                                OscArg::String("vst3".to_string()),
+                                OscArg::String(json),
+                            ],
+                        ),
+                    );
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                Ok(Action::TrackLv2PluginControls {
+                    track_name,
+                    instance_id,
+                    controls,
+                    instance_access_handle: _,
+                }) => {
+                    let json = serde_json::json!(
+                        controls
+                            .iter()
+                            .map(|c| serde_json::json!({
+                                "index": c.index,
+                                "name": c.name,
+                                "min": c.min,
+                                "max": c.max,
+                                "value": c.value,
+                            }))
+                            .collect::<Vec<_>>()
+                    )
+                    .to_string();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet(
+                            "/response/plugin_parameters",
+                            "siss",
+                            &[
+                                OscArg::String(track_name.clone()),
+                                OscArg::Int(*instance_id as i32),
+                                OscArg::String("lv2".to_string()),
+                                OscArg::String(json),
+                            ],
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn send_osc_reply(&mut self, reply_to: SocketAddr, packet: &[u8]) {
+        if self.osc_reply_socket.is_none() {
+            self.osc_reply_socket = UdpSocket::bind("0.0.0.0:0").ok();
+        }
+        if let Some(socket) = self.osc_reply_socket.as_ref() {
+            let _ = socket.send_to(packet, reply_to);
+        }
+    }
+
+    async fn dispatch_request(&mut self, a: Action) {
+        match a {
+            Action::TrackOfflineBounceCancel { track_name } => {
+                if let Some(job) = self.offline_bounce_jobs.get(&track_name) {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Action::TrackOfflineBounceCancelAll => {
+                for job in self.offline_bounce_jobs.values() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            _ if !self.offline_bounce_jobs.is_empty() => {
+                self.pending_requests.push_back(a);
+            }
+            Action::OpenAudioDevice { .. }
+            | Action::OpenMidiInputDevice(_)
+            | Action::OpenMidiOutputDevice(_)
+            | Action::RequestMeterSnapshot
+            | Action::RequestTrackList
+            | Action::RequestTransportState
+            | Action::Quit
+            | Action::Log { .. }
+            | Action::Play
+            | Action::Pause
+            | Action::Stop
+            | Action::TransportPosition(_)
+            | Action::JumpToEnd
+            | Action::SetLoopEnabled(_)
+            | Action::SetLoopRange(_)
+            | Action::SetPunchEnabled(_)
+            | Action::SetPunchRange(_)
+            | Action::SetMetronomeEnabled(_)
+            | Action::SetTempo(_)
+            | Action::SetTimeSignature { .. }
+            | Action::SetTempoMap { .. }
+            | Action::SetOscEnabled(_)
+            | Action::SetClipPlaybackEnabled(_)
+            | Action::SetRecordEnabled(_)
+            | Action::SetStepRecording(_)
+            | Action::StepRecordMidiNote { .. }
+            | Action::SetSessionPath(_)
+            | Action::ClearHistory
+            | Action::BeginSessionRestore
+            | Action::PianoKey { .. }
+            | Action::ModifyMidiNotes { .. }
+            | Action::ModifyMidiControllers { .. }
+            | Action::DeleteMidiControllers { .. }
+            | Action::InsertMidiControllers { .. }
+            | Action::DeleteMidiNotes { .. }
+            | Action::InsertMidiNotes { .. }
+            | Action::SetMidiSysExEvents { .. }
+            | Action::Session(_) => {
+                self.handle_request(a).await;
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::ListLv2Plugins => {
+                self.handle_request(a).await;
+            }
+            Action::ListVst3Plugins => {
+                self.handle_request(a).await;
+            }
+            Action::ListClapPlugins => {
+                self.handle_request(a).await;
+            }
+            Action::ListClapPluginsWithCapabilities => {
+                self.handle_request(a).await;
+            }
+            _ => {
+                self.pending_requests.push_back(a);
+                if self.can_schedule_hw_cycle() {
+                    self.request_hw_cycle().await;
+                } else {
+                    while let Some(next) = self.pending_requests.pop_front() {
+                        self.handle_request(next).await;
+                    }
+                }
+            }
+        };
+        self.publish_clap_state_dirty().await;
     }
 
     fn spawn_plugin_host_stderr_reader(&self, stderr: std::process::ChildStderr, source: String) {
@@ -3646,6 +4040,10 @@ impl Engine {
     ) -> Result<Arc<UnsafeMutex<Box<Track>>>, String> {
         self.track_handle_by_name(track_name)
             .ok_or_else(|| format!("Track not found: {track_name}"))
+    }
+
+    fn parse_automation_lanes(value: &serde_json::Value) -> Vec<OfflineAutomationLane> {
+        parse_automation_lanes(value)
     }
 
     fn add_clip_to_track(&self, request: ClipAddRequest<'_>) {
@@ -5301,17 +5699,16 @@ impl Engine {
         }
     }
 
-    async fn handle_request_inner(&mut self, mut action_to_process: Action, record_history: bool) {
-        let a = action_to_process.clone();
-        let suppress_timing_history = self.playing
-            && matches!(
-                &action_to_process,
-                Action::SetTempo(_) | Action::SetTimeSignature { .. } | Action::SetTempoMap { .. }
-            );
+    fn prepare_inverse_actions(
+        &self,
+        action_to_process: &Action,
+        record_history: bool,
+        suppress_timing_history: bool,
+    ) -> Option<Vec<Action>> {
         let mut extra_inverse_actions: Vec<Action> = Vec::new();
         if record_history
             && !self.history_suspended
-            && let Action::RemoveTrack(ref track_name) = action_to_process
+            && let Action::RemoveTrack(track_name) = action_to_process
         {
             for route in self
                 .midi_hw_in_routes
@@ -5392,11 +5789,11 @@ impl Engine {
         }
         let mut inverse_actions = if record_history
             && !suppress_timing_history
-            && should_record(&action_to_process)
+            && should_record(action_to_process)
             && !self.history_suspended
         {
             let state = self.state.lock();
-            create_inverse_actions(&action_to_process, state).map(|mut actions| {
+            create_inverse_actions(action_to_process, state).map(|mut actions| {
                 actions.extend(extra_inverse_actions);
                 actions
             })
@@ -5404,7 +5801,7 @@ impl Engine {
             None
         };
         if record_history && !suppress_timing_history && !self.history_suspended {
-            match &action_to_process {
+            match action_to_process {
                 Action::SetTempo(_) => {
                     inverse_actions = Some(vec![Action::SetTempo(self.tempo_bpm)]);
                 }
@@ -5497,174 +5894,4420 @@ impl Engine {
                 _ => {}
             }
         }
+        inverse_actions
+    }
+
+    async fn handle_quit(&mut self, a: Action) {
+        self.flush_recordings().await;
+        // Stop the HW worker before notifying the GUI so the
+        // OSS audio channels are halted and closed from the
+        // worker's own thread. The GUI calls exit(0) upon
+        // receiving the Quit response, which skips Rust
+        // destructors. Without this, the kernel's dsp_close
+        // drains pending audio buffers for up to CHN_TIMEOUT
+        // (5s) during process teardown.
+        if let Some(worker) = self.hw_worker.take() {
+            if let Some(hw) = &self.hw_driver {
+                hw.lock().request_stop();
+            }
+            // Send MIDI panic (All Sound Off) for any active
+            // notes before stopping the worker.
+            let panic_events = self.panic_events_for_all_hw_midi_outputs();
+            if !panic_events.is_empty() {
+                let _ = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await;
+            }
+            // Send Quit to the worker so it stops its audio
+            // cycle loop and releases the driver.
+            if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
+                error!("Error sending quit message to HW worker: {e}");
+            }
+            worker
+                .handle
+                .await
+                .unwrap_or_else(|e| error!("Error waiting for HW worker to quit: {e}"));
+        }
+        // Explicitly close audio and MIDI fds before sending
+        // the Quit response. The GUI calls exit(0) upon
+        // receiving it, which skips destructors — any
+        // still-open device fd would trigger the kernel's
+        // 5-second drain during process teardown.
+        if let Some(hw) = &self.hw_driver {
+            hw.lock().close_fds();
+        }
+        self.midi_hub.lock().close_all();
+        self.hw_driver = None;
+        self.notify_clients(Ok(Action::Quit)).await;
+        self.ready_workers.clear();
+        while !self.workers.is_empty() {
+            let worker = self.workers.remove(0);
+            if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
+                error!("Error sending quit message to worker: {e}");
+            }
+            worker
+                .handle
+                .await
+                .unwrap_or_else(|e| error!("Error waiting for worker to quit: {e}"));
+        }
+        #[cfg(unix)]
+        {
+            self.jack_runtime = None;
+        }
+        self.osc_server = None;
+    }
+
+    async fn handle_add_track(
+        &mut self,
+        name: String,
+        audio_ins: usize,
+        midi_ins: usize,
+        audio_outs: usize,
+        midi_outs: usize,
+        folder: bool,
+    ) {
+        let tracks = &mut self.state.lock().tracks;
+        if tracks.contains_key(&name) {
+            self.notify_clients(Err(format!("Track {} already exists", name)))
+                .await;
+            return;
+        }
+        let maybe_hw = if let Some(oss) = &self.hw_driver {
+            let hw = oss.lock();
+            Some((hw.cycle_samples(), hw.sample_rate() as f64))
+        } else {
+            #[cfg(unix)]
+            if let Some(jack) = &self.jack_runtime {
+                let j = jack.lock();
+                Some((j.buffer_size, j.sample_rate as f64))
+            } else {
+                None
+            }
+            #[cfg(not(unix))]
+            None
+        };
+
+        if let Some((chsamples, sample_rate)) = maybe_hw {
+            let track = if folder {
+                Track::new_folder(
+                    name.clone(),
+                    audio_ins,
+                    audio_outs,
+                    midi_ins,
+                    midi_outs,
+                    chsamples,
+                    sample_rate,
+                )
+            } else {
+                Track::new(
+                    name.clone(),
+                    audio_ins,
+                    audio_outs,
+                    midi_ins,
+                    midi_outs,
+                    chsamples,
+                    sample_rate,
+                )
+            };
+            tracks.insert(name.clone(), Arc::new(UnsafeMutex::new(Box::new(track))));
+            if let Some(track) = tracks.get(&name) {
+                let t = track.lock();
+                t.set_clip_playback_enabled(self.clip_playback_enabled);
+                t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
+                t.set_session_base_dir(self.session_dir.clone());
+            }
+        } else {
+            self.notify_clients(Err(
+                "Engine needs to open audio device before adding audio track".to_string(),
+            ))
+            .await;
+        }
+    }
+
+    async fn handle_remove_track(&mut self, name: String, record_history: bool) {
+        let mut descendant_names = Vec::new();
+        self.collect_descendant_track_names(&name, &mut descendant_names);
+        let names_to_remove: Vec<String> = descendant_names
+            .iter()
+            .cloned()
+            .chain(std::iter::once(name.clone()))
+            .collect();
+
+        let combined_inverse = if record_history && !self.history_suspended {
+            let state = self.state.lock();
+            let mut inv = Vec::new();
+            for n in &names_to_remove {
+                if let Some(mut actions) =
+                    create_inverse_actions(&Action::RemoveTrack(n.clone()), state)
+                {
+                    inv.append(&mut actions);
+                }
+                for route in self.midi_hw_in_routes.iter().filter(|r| &r.to_track == n) {
+                    inv.push(Action::Connect {
+                        from_track: format!("midi:hw:in:{}", route.device),
+                        from_port: 0,
+                        to_track: route.to_track.clone(),
+                        to_port: route.to_port,
+                        kind: Kind::MIDI,
+                    });
+                }
+                for route in self
+                    .midi_hw_out_routes
+                    .iter()
+                    .filter(|r| &r.from_track == n)
+                {
+                    inv.push(Action::Connect {
+                        from_track: route.from_track.clone(),
+                        from_port: route.from_port,
+                        to_track: format!("midi:hw:out:{}", route.device),
+                        to_port: 0,
+                        kind: Kind::MIDI,
+                    });
+                }
+            }
+
+            // Reorder so all AddTrack actions come first, then everything else, then
+            // explicit Connect actions. This mirrors EndHistoryGroup and guarantees that
+            // tracks are recreated before they are re-parented or reconnected.
+            let mut add_tracks = Vec::new();
+            let mut connections = Vec::new();
+            let mut rest = Vec::new();
+            for action in inv {
+                match action {
+                    Action::AddTrack { .. } => add_tracks.push(action),
+                    Action::Connect { .. } => connections.push(action),
+                    _ => rest.push(action),
+                }
+            }
+            let mut ordered = add_tracks;
+            ordered.extend(rest);
+            ordered.extend(connections);
+            ordered
+        } else {
+            Vec::new()
+        };
+
+        for n in &descendant_names {
+            self.remove_single_track(n).await;
+            self.notify_clients(Ok(Action::RemoveTrack(n.clone())))
+                .await;
+        }
+        self.remove_single_track(&name).await;
+
+        if record_history && !self.history_suspended && !combined_inverse.is_empty() {
+            self.history.record(UndoEntry {
+                forward_actions: vec![Action::RemoveTrack(name.clone())],
+                inverse_actions: combined_inverse,
+            });
+        }
+    }
+
+    async fn handle_connect(
+        &mut self,
+        from_track: &str,
+        from_port: usize,
+        to_track: &str,
+        to_port: usize,
+        kind: Kind,
+    ) {
+        match kind {
+            Kind::Audio => {
+                let (from_audio_io, to_audio_io) =
+                    self.resolve_audio_route_ports(from_track, from_port, to_track, to_port);
+                match (from_audio_io, to_audio_io) {
+                    (Some(source), Some(target)) => {
+                        if from_track != "hw:in"
+                            && to_track != "hw:out"
+                            && self.check_if_leads_to_kind(Kind::Audio, to_track, from_track)
+                        {
+                            self.notify_clients(Err("Circular routing is not allowed!".into()))
+                                .await;
+                            return;
+                        }
+                        crate::audio::io::AudioIO::connect(&source, &target);
+                    }
+                    (None, _) => {
+                        self.notify_clients(Err(format!(
+                            "Source track '{}' not found",
+                            from_track
+                        )))
+                        .await;
+                    }
+                    (_, None) => {
+                        self.notify_clients(Err(format!(
+                            "Destination track '{}' not found",
+                            to_track
+                        )))
+                        .await;
+                    }
+                }
+            }
+            Kind::MIDI => {
+                let from_hw_in_device = Self::midi_hw_in_device(from_track);
+                let to_hw_out_device = Self::midi_hw_out_device(to_track);
+                let from_is_invalid_hw = Self::midi_hw_out_device(from_track).is_some();
+                let to_is_invalid_hw = Self::midi_hw_in_device(to_track).is_some();
+
+                if from_is_invalid_hw || to_is_invalid_hw {
+                    self.notify_clients(Err(
+                        "Invalid MIDI hardware connection direction".to_string()
+                    ))
+                    .await;
+                    return;
+                }
+
+                if from_hw_in_device.is_none()
+                    && to_hw_out_device.is_none()
+                    && self.check_if_leads_to_kind(Kind::MIDI, to_track, from_track)
+                {
+                    self.notify_clients(Err("Circular routing is not allowed!".into()))
+                        .await;
+                    return;
+                }
+
+                let state = self.state.lock();
+                let from_track_handle = state.tracks.get(from_track);
+                let to_track_handle = state.tracks.get(to_track);
+
+                if let (Some(from_device), Some(to_device)) = (from_hw_in_device, to_hw_out_device)
+                {
+                    let route = MidiHwThruRoute {
+                        from_device: from_device.to_string(),
+                        to_device: to_device.to_string(),
+                    };
+                    if !self.midi_hw_thru_routes.iter().any(|r| r == &route) {
+                        self.midi_hw_thru_routes.push(route);
+                    }
+                } else if let Some(device) = from_hw_in_device {
+                    if let Some(t_t) = to_track_handle {
+                        if t_t.lock().midi.ins.get(to_port).is_none() {
+                            self.notify_clients(Err(format!(
+                                "MIDI input port {} not found on track '{}'",
+                                to_port, to_track
+                            )))
+                            .await;
+                            return;
+                        }
+                        let route = MidiHwInRoute {
+                            device: device.to_string(),
+                            to_track: to_track.to_string(),
+                            to_port,
+                        };
+                        if !self.midi_hw_in_routes.iter().any(|r| r == &route) {
+                            self.midi_hw_in_routes.push(route);
+                        }
+                    } else {
+                        self.notify_clients(Err(format!(
+                            "MIDI destination track not found: {}",
+                            to_track
+                        )))
+                        .await;
+                    }
+                } else if let Some(device) = to_hw_out_device {
+                    if let Some(f_t) = from_track_handle {
+                        if f_t.lock().midi.outs.get(from_port).is_none() {
+                            self.notify_clients(Err(format!(
+                                "MIDI output port {} not found on track '{}'",
+                                from_port, from_track
+                            )))
+                            .await;
+                            return;
+                        }
+                        let route = MidiHwOutRoute {
+                            from_track: from_track.to_string(),
+                            from_port,
+                            device: device.to_string(),
+                        };
+                        if !self.midi_hw_out_routes.iter().any(|r| r == &route) {
+                            self.midi_hw_out_routes.push(route);
+                        }
+                    } else {
+                        self.notify_clients(Err(format!(
+                            "MIDI source track not found: {}",
+                            from_track
+                        )))
+                        .await;
+                    }
+                } else {
+                    match (from_track_handle, to_track_handle) {
+                        (Some(f_t), Some(t_t)) => {
+                            let to_in_res = t_t.lock().midi.ins.get(to_port).cloned();
+                            if let Some(to_in) = to_in_res {
+                                let from_track = f_t.lock();
+                                if let Err(e) = from_track.midi.connect_out(from_port, to_in) {
+                                    self.notify_clients(Err(e)).await;
+                                    return;
+                                }
+                                from_track.invalidate_midi_route_cache();
+                            } else {
+                                self.notify_clients(Err(format!(
+                                    "MIDI input port {} not found on track '{}'",
+                                    to_port, to_track
+                                )))
+                                .await;
+                            }
+                        }
+                        _ => {
+                            self.notify_clients(Err(format!(
+                                "MIDI tracks not found: {} or {}",
+                                from_track, to_track
+                            )))
+                            .await;
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    async fn handle_disconnect(&mut self, action: Action) {
+        let Action::Disconnect {
+            ref from_track,
+            from_port,
+            ref to_track,
+            to_port,
+            kind,
+        } = action
+        else {
+            return;
+        };
+
+        if kind == Kind::Audio {
+            if let Err(e) = self.disconnect_audio_route_and_notify(action.clone()).await {
+                self.notify_clients(Err(e)).await;
+            }
+        } else if kind == Kind::MIDI {
+            let from_hw_in_device = Self::midi_hw_in_device(from_track);
+            let to_hw_out_device = Self::midi_hw_out_device(to_track);
+
+            if let (Some(from_device), Some(to_device)) = (from_hw_in_device, to_hw_out_device) {
+                let before = self.midi_hw_thru_routes.len();
+                self.midi_hw_thru_routes
+                    .retain(|r| !(r.from_device == from_device && r.to_device == to_device));
+                if self.midi_hw_thru_routes.len() < before {
+                    self.notify_clients(Ok(action.clone())).await;
+                } else {
+                    self.notify_clients(Err(format!(
+                        "Disconnect failed: MIDI route not found ({} -> {})",
+                        from_track, to_track
+                    )))
+                    .await;
+                }
+                return;
+            }
+
+            if let Some(device) = from_hw_in_device {
+                let before = self.midi_hw_in_routes.len();
+                self.midi_hw_in_routes.retain(|r| {
+                    !(r.device == device && r.to_track == *to_track && r.to_port == to_port)
+                });
+                if self.midi_hw_in_routes.len() < before {
+                    self.notify_clients(Ok(action.clone())).await;
+                } else {
+                    self.notify_clients(Err(format!(
+                        "Disconnect failed: MIDI route not found ({} -> {})",
+                        from_track, to_track
+                    )))
+                    .await;
+                }
+                return;
+            }
+
+            if let Some(device) = to_hw_out_device {
+                let before = self.midi_hw_out_routes.len();
+                self.midi_hw_out_routes.retain(|r| {
+                    !(r.from_track == *from_track && r.from_port == from_port && r.device == device)
+                });
+                if self.midi_hw_out_routes.len() < before {
+                    self.notify_clients(Ok(action.clone())).await;
+                } else {
+                    self.notify_clients(Err(format!(
+                        "Disconnect failed: MIDI route not found ({} -> {})",
+                        from_track, to_track
+                    )))
+                    .await;
+                }
+                return;
+            }
+
+            let state = self.state.lock();
+            if let (Some(f_t), Some(t_t)) =
+                (state.tracks.get(from_track), state.tracks.get(to_track))
+                && let Some(to_in) = t_t.lock().midi.ins.get(to_port).cloned()
+            {
+                let from_track = f_t.lock();
+                if let Err(e) = from_track.midi.disconnect_out(from_port, &to_in) {
+                    self.notify_clients(Err(e)).await;
+                } else {
+                    from_track.invalidate_midi_route_cache();
+                    self.notify_clients(Ok(action.clone())).await;
+                }
+            } else {
+                self.notify_clients(Err(format!(
+                    "Disconnect failed: MIDI ports not found ({} -> {})",
+                    from_track, to_track
+                )))
+                .await;
+            }
+        }
+    }
+
+    async fn handle_request_session_diagnostics(&mut self) {
+        let (
+            track_count,
+            frozen_track_count,
+            audio_clip_count,
+            midi_clip_count,
+            lv2_instance_count,
+            vst3_instance_count,
+            clap_instance_count,
+        ) = {
+            let tracks = &self.state.lock().tracks;
+            let mut track_count = 0usize;
+            let mut frozen_track_count = 0usize;
+            let mut audio_clip_count = 0usize;
+            let mut midi_clip_count = 0usize;
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let mut lv2_instance_count = 0usize;
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            let lv2_instance_count = 0usize;
+            let mut vst3_instance_count = 0usize;
+            let mut clap_instance_count = 0usize;
+            for track in tracks.values() {
+                let t = track.lock();
+                track_count += 1;
+                if t.frozen {
+                    frozen_track_count += 1;
+                }
+                audio_clip_count += t.audio.clips.len();
+                midi_clip_count += t.midi.clips.len();
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    lv2_instance_count += t.lv2_plugins.len();
+                }
+                vst3_instance_count += t.vst3_plugins.len();
+                clap_instance_count += t.clap_plugins.len();
+            }
+            (
+                track_count,
+                frozen_track_count,
+                audio_clip_count,
+                midi_clip_count,
+                lv2_instance_count,
+                vst3_instance_count,
+                clap_instance_count,
+            )
+        };
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _lv2_instance_count = lv2_instance_count;
+        let pending_hw_midi_events = self.pending_hw_midi_events.len()
+            + self
+                .pending_hw_midi_events_by_device
+                .values()
+                .map(std::vec::Vec::len)
+                .sum::<usize>();
+        let sample_rate_hz = if let Some(hw) = &self.hw_driver {
+            hw.lock().sample_rate() as usize
+        } else {
+            #[cfg(unix)]
+            {
+                self.jack_runtime
+                    .as_ref()
+                    .map(|j| j.lock().sample_rate)
+                    .unwrap_or(0)
+            }
+            #[cfg(not(unix))]
+            0
+        };
+        let cycle_samples = self.current_cycle_samples();
+        self.notify_clients(Ok(Action::SessionDiagnosticsReport {
+            track_count,
+            frozen_track_count,
+            audio_clip_count,
+            midi_clip_count,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            lv2_instance_count,
+            vst3_instance_count,
+            clap_instance_count,
+            pending_requests: self.pending_requests.len(),
+            workers_total: self.workers.len(),
+            workers_ready: self.ready_workers.len(),
+            pending_hw_midi_events,
+            playing: self.playing,
+            transport_running: self.transport_running,
+            transport_sample: self.transport_sample,
+            tempo_bpm: self.tempo_bpm,
+            sample_rate_hz,
+            cycle_samples,
+        }))
+        .await;
+    }
+
+    async fn handle_request_midi_learn_mappings_report(&mut self) {
+        let mut lines = Vec::<String>::new();
+        let fmt_binding = |b: &crate::message::MidiLearnBinding| {
+            let device = b.device.as_deref().unwrap_or("*");
+            format!("{device} CH{} CC{}", b.channel + 1, b.cc)
+        };
+        if let Some(b) = self.global_midi_learn_play_pause.as_ref() {
+            lines.push(format!("Global PlayPause: {}", fmt_binding(b)));
+        }
+        if let Some(b) = self.global_midi_learn_stop.as_ref() {
+            lines.push(format!("Global Stop: {}", fmt_binding(b)));
+        }
+        if let Some(b) = self.global_midi_learn_record_toggle.as_ref() {
+            lines.push(format!("Global RecordToggle: {}", fmt_binding(b)));
+        }
+        for (track_name, track) in self.state.lock().tracks.iter() {
+            let t = track.lock();
+            if let Some(b) = t.midi_learn_volume.as_ref() {
+                lines.push(format!("{} Volume: {}", track_name, fmt_binding(b)));
+            }
+            if let Some(b) = t.midi_learn_balance.as_ref() {
+                lines.push(format!("{} Balance: {}", track_name, fmt_binding(b)));
+            }
+            if let Some(b) = t.midi_learn_mute.as_ref() {
+                lines.push(format!("{} Mute: {}", track_name, fmt_binding(b)));
+            }
+            if let Some(b) = t.midi_learn_solo.as_ref() {
+                lines.push(format!("{} Solo: {}", track_name, fmt_binding(b)));
+            }
+            if let Some(b) = t.midi_learn_arm.as_ref() {
+                lines.push(format!("{} Arm: {}", track_name, fmt_binding(b)));
+            }
+            if let Some(b) = t.midi_learn_input_monitor.as_ref() {
+                lines.push(format!("{} InputMonitor: {}", track_name, fmt_binding(b)));
+            }
+            if let Some(b) = t.midi_learn_disk_monitor.as_ref() {
+                lines.push(format!("{} DiskMonitor: {}", track_name, fmt_binding(b)));
+            }
+        }
+        for ((track_name, scene_index), binding) in &self.session_midi_learn_slots {
+            lines.push(format!(
+                "{} Slot {}: {}",
+                track_name,
+                scene_index + 1,
+                fmt_binding(binding)
+            ));
+        }
+        for (scene_index, binding) in &self.session_midi_learn_scenes {
+            lines.push(format!(
+                "Scene {}: {}",
+                scene_index + 1,
+                fmt_binding(binding)
+            ));
+        }
+        for (track_name, binding) in &self.session_midi_learn_stop_track {
+            lines.push(format!("{} Stop: {}", track_name, fmt_binding(binding)));
+        }
+        if let Some(binding) = self.session_midi_learn_stop_all.as_ref() {
+            lines.push(format!("Stop All Clips: {}", fmt_binding(binding)));
+        }
+        if lines.is_empty() {
+            lines.push("No MIDI learn mappings configured".to_string());
+        }
+        self.notify_clients(Ok(Action::MidiLearnMappingsReport { lines }))
+            .await;
+    }
+
+    async fn handle_track_set_parent(&mut self, track_name: &str, parent_name: Option<&str>) {
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return;
+            }
+        };
+        if parent_name == Some(track_name) {
+            self.notify_clients(Err("Track cannot be its own parent".to_string()))
+                .await;
+            return;
+        }
+
+        // Validate the new parent is a folder (if any).
+        if let Some(parent_name) = parent_name {
+            let state = self.state.lock();
+            let parent = state.tracks.get(parent_name);
+            if parent.is_none() {
+                self.notify_clients(Err(format!(
+                    "Parent track '{}' does not exist",
+                    parent_name
+                )))
+                .await;
+                return;
+            }
+            if !parent.unwrap().lock().is_folder {
+                self.notify_clients(Err(format!("Track '{}' is not a folder", parent_name)))
+                    .await;
+                return;
+            }
+        }
+
+        // Disconnect from the old parent and update its child list.
+        {
+            let old_parent_name = track.lock().parent_track.clone();
+            if let Some(old_parent_name) = old_parent_name {
+                let state = self.state.lock();
+                if let (Some(parent_arc), Some(child_arc)) = (
+                    state.tracks.get(&old_parent_name).cloned(),
+                    state.tracks.get(track_name).cloned(),
+                ) {
+                    {
+                        let parent = parent_arc.lock();
+                        parent.child_tracks.retain(|c| c.lock().name != *track_name);
+                    }
+                    {
+                        let child = child_arc.lock();
+                        let parent = parent_arc.lock();
+                        child.disconnect_from_parent(parent);
+                    }
+                }
+            }
+        }
+
+        let mut disconnect_actions = Vec::new();
+
+        // Remove all existing audio and MIDI connections involving this track.
+        {
+            let state = self.state.lock();
+            let hw_inputs = self.all_hw_input_audio_ports();
+            let hw_outputs = self.all_hw_output_audio_ports();
+            if let Some(child_arc) = state.tracks.get(track_name).cloned() {
+                let child = child_arc.lock();
+                for (port_idx, inp) in child.audio.ins.iter().enumerate() {
+                    let sources = inp.connections.lock().clone();
+                    for src in sources {
+                        let _ = AudioIO::disconnect(&src, inp);
+                        if let Some((src_name, src_port)) = self.find_audio_io_owner(state, &src) {
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: src_name,
+                                from_port: src_port,
+                                to_track: track_name.to_string(),
+                                to_port: port_idx,
+                                kind: Kind::Audio,
+                            });
+                        } else if let Some(src_port) = hw_inputs
+                            .iter()
+                            .position(|hw_in| std::sync::Arc::ptr_eq(hw_in, &src))
+                        {
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: "hw:in".to_string(),
+                                from_port: src_port,
+                                to_track: track_name.to_string(),
+                                to_port: port_idx,
+                                kind: Kind::Audio,
+                            });
+                        }
+                    }
+                }
+                for (port_idx, out) in child.audio.outs.iter().enumerate() {
+                    let targets = out.connections.lock().clone();
+                    for tgt in targets {
+                        let _ = AudioIO::disconnect(out, &tgt);
+                        if let Some((tgt_name, tgt_port)) = self.find_audio_io_owner(state, &tgt) {
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: track_name.to_string(),
+                                from_port: port_idx,
+                                to_track: tgt_name,
+                                to_port: tgt_port,
+                                kind: Kind::Audio,
+                            });
+                        } else if let Some(tgt_port) = hw_outputs
+                            .iter()
+                            .position(|hw_out| std::sync::Arc::ptr_eq(hw_out, &tgt))
+                        {
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: track_name.to_string(),
+                                from_port: port_idx,
+                                to_track: "hw:out".to_string(),
+                                to_port: tgt_port,
+                                kind: Kind::Audio,
+                            });
+                        }
+                    }
+                }
+
+                // Remove MIDI hardware routes.
+                for route in self
+                    .midi_hw_in_routes
+                    .iter()
+                    .filter(|r| r.to_track == track_name)
+                {
+                    disconnect_actions.push(Action::Disconnect {
+                        from_track: format!("midi:hw:in:{}", route.device),
+                        from_port: 0,
+                        to_track: track_name.to_string(),
+                        to_port: route.to_port,
+                        kind: Kind::MIDI,
+                    });
+                }
+                self.midi_hw_in_routes.retain(|r| r.to_track != track_name);
+
+                for route in self
+                    .midi_hw_out_routes
+                    .iter()
+                    .filter(|r| r.from_track == track_name)
+                {
+                    disconnect_actions.push(Action::Disconnect {
+                        from_track: track_name.to_string(),
+                        from_port: route.from_port,
+                        to_track: format!("midi:hw:out:{}", route.device),
+                        to_port: 0,
+                        kind: Kind::MIDI,
+                    });
+                }
+                self.midi_hw_out_routes
+                    .retain(|r| r.from_track != track_name);
+
+                // Remove track-to-track MIDI connections where this track is the source.
+                for (port_idx, out) in child.midi.outs.iter().enumerate() {
+                    let targets = out.lock().connections.clone();
+                    for tgt in targets {
+                        if let Some((tgt_name, tgt_port, _)) = self.find_midi_io_owner(state, &tgt)
+                        {
+                            let _ = MIDIIO::disconnect(out, &tgt);
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: track_name.to_string(),
+                                from_port: port_idx,
+                                to_track: tgt_name,
+                                to_port: tgt_port,
+                                kind: Kind::MIDI,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Remove track-to-track MIDI connections where this track is the target.
+            let child_input_arcs: Vec<_> =
+                if let Some(child_arc) = state.tracks.get(track_name).cloned() {
+                    let child = child_arc.lock();
+                    child.midi.ins.clone()
+                } else {
+                    Vec::new()
+                };
+            for (other_name, other_track) in &state.tracks {
+                if other_name.as_str() == track_name {
+                    continue;
+                }
+                let other = other_track.lock();
+                for (out_port, out) in other.midi.outs.iter().enumerate() {
+                    let targets = out.lock().connections.clone();
+                    for tgt in targets {
+                        if let Some(to_port) = child_input_arcs
+                            .iter()
+                            .position(|inp| std::sync::Arc::ptr_eq(inp, &tgt))
+                        {
+                            let _ = MIDIIO::disconnect(out, &tgt);
+                            disconnect_actions.push(Action::Disconnect {
+                                from_track: other_name.clone(),
+                                from_port: out_port,
+                                to_track: track_name.to_string(),
+                                to_port,
+                                kind: Kind::MIDI,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply the parent change.
+        {
+            track.lock().parent_track = parent_name.map(str::to_string);
+        }
+
+        // Connect to the new parent and add to its child list.
+        if let Some(parent_name) = parent_name {
+            let state = self.state.lock();
+            if let (Some(parent_arc), Some(child_arc)) = (
+                state.tracks.get(parent_name).cloned(),
+                state.tracks.get(track_name).cloned(),
+            ) {
+                {
+                    let parent = parent_arc.lock();
+                    parent.child_tracks.push(child_arc.clone());
+                }
+                {
+                    let child = child_arc.lock();
+                    let parent = parent_arc.lock();
+                    // Folder input -> child input (one-to-one when counts match).
+                    if parent.audio.ins.len() == child.audio.ins.len() {
+                        for (parent_in, child_in) in
+                            parent.audio.ins.iter().zip(child.audio.ins.iter())
+                        {
+                            Track::connect_directed_audio(parent_in, child_in);
+                        }
+                    }
+                    // Child output -> folder output (one-to-one when counts match).
+                    if parent.audio.outs.len() == child.audio.outs.len() {
+                        for (child_out, parent_out) in
+                            child.audio.outs.iter().zip(parent.audio.outs.iter())
+                        {
+                            AudioIO::connect(child_out, parent_out);
+                        }
+                    }
+                    // Folder MIDI input -> child MIDI input (one-to-one when counts match).
+                    if parent.midi.ins.len() == child.midi.ins.len() {
+                        for (parent_in, child_in) in
+                            parent.midi.ins.iter().zip(child.midi.ins.iter())
+                        {
+                            let child_in_lock = child_in.lock();
+                            if !child_in_lock
+                                .connections
+                                .iter()
+                                .any(|c| Arc::ptr_eq(c, parent_in))
+                            {
+                                child_in_lock.connections.push(parent_in.clone());
+                            }
+                        }
+                    }
+                    // Child MIDI output -> folder MIDI output (one-to-one when counts match).
+                    if parent.midi.outs.len() == child.midi.outs.len() {
+                        for (child_out, parent_out) in
+                            child.midi.outs.iter().zip(parent.midi.outs.iter())
+                        {
+                            let child_out_lock = child_out.lock();
+                            if !child_out_lock
+                                .connections
+                                .iter()
+                                .any(|c| Arc::ptr_eq(c, parent_out))
+                            {
+                                child_out_lock.connections.push(parent_out.clone());
+                            }
+                        }
+                    }
+                    child.invalidate_audio_route_cache();
+                    parent.invalidate_audio_route_cache();
+                    child.invalidate_midi_route_cache();
+                    parent.invalidate_midi_route_cache();
+                }
+            }
+        }
+
+        // Restore default input->output passthrough so audio/MIDI can flow
+        // through the track whether it is a root track or a folder child.
+        {
+            let state = self.state.lock();
+            if let Some(child_arc) = state.tracks.get(track_name).cloned() {
+                let child = child_arc.lock();
+                child.ensure_default_audio_passthrough();
+                child.ensure_default_midi_passthrough();
+            }
+        }
+
+        for action in disconnect_actions {
+            self.notify_clients(Ok(action)).await;
+        }
+
+        self.notify_clients(Ok(Action::TrackSetParent {
+            track_name: track_name.to_string(),
+            parent_name: parent_name.map(str::to_string),
+        }))
+        .await;
+    }
+
+    async fn handle_track_offline_bounce(&mut self, action: Action) {
+        let Action::TrackOfflineBounce {
+            track_name,
+            output_path,
+            start_sample,
+            length_samples,
+            automation_lanes,
+            apply_fader,
+        } = action
+        else {
+            return;
+        };
+        if self.offline_bounce_jobs.contains_key(&track_name) {
+            self.notify_clients(Err(format!(
+                "Offline bounce for track '{}' is already in progress",
+                track_name
+            )))
+            .await;
+            return;
+        }
+        if let Err(e) = self.track_handle_or_err(&track_name) {
+            self.notify_clients(Err(e)).await;
+            return;
+        }
+        if length_samples == 0 {
+            self.notify_clients(Err(format!(
+                "Track '{}' has no renderable content for offline bounce",
+                track_name
+            )))
+            .await;
+            return;
+        }
+        let Some(worker_index) = self.take_ready_worker_index() else {
+            self.pending_requests
+                .push_front(Action::TrackOfflineBounce {
+                    track_name,
+                    output_path,
+                    start_sample,
+                    length_samples,
+                    automation_lanes,
+                    apply_fader,
+                });
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.offline_bounce_jobs.insert(
+            track_name.clone(),
+            OfflineBounceJob {
+                cancel: cancel.clone(),
+            },
+        );
+        let track_name_clone = track_name.clone();
+        let worker = &self.workers[worker_index];
+        let job = crate::message::OfflineBounceWork {
+            state: self.state.clone(),
+            track_name,
+            output_path,
+            start_sample,
+            length_samples,
+            tempo_bpm: self.tempo_bpm,
+            tsig_num: self.tsig_num,
+            tsig_denom: self.tsig_denom,
+            automation_lanes,
+            cancel,
+            apply_fader,
+        };
+        if let Err(e) = worker.tx.send(Message::ProcessOfflineBounce(job)).await {
+            self.offline_bounce_jobs.remove(&track_name_clone);
+            self.notify_clients(Err(format!("Failed to schedule offline bounce: {e}")))
+                .await;
+        }
+    }
+
+    async fn handle_clip_move(&mut self, action: Action) {
+        let Action::ClipMove {
+            ref kind,
+            ref from,
+            ref to,
+            copy,
+        } = action
+        else {
+            return;
+        };
+        if let Some(from_track_handle) = self.state.lock().tracks.get(&from.track_name)
+            && let Some(to_track_handle) = self.state.lock().tracks.get(&to.track_name)
+        {
+            let from_track = from_track_handle.lock();
+            let to_track = to_track_handle.lock();
+            match kind {
+                Kind::Audio => {
+                    if from.clip_index >= from_track.audio.clips.len() {
+                        self.notify_clients(Err(format!(
+                            "Clip index {} is too high, as track {} has only {} clips!",
+                            from.clip_index,
+                            from_track.name.clone(),
+                            from_track.audio.clips.len(),
+                        )))
+                        .await;
+                        return;
+                    }
+                    if from_track.audio.ins.len() != to_track.audio.ins.len() {
+                        self.notify_clients(Err(format!(
+                            "Cannot move/copy audio clip from '{}' ({} inputs) to '{}' ({} inputs)",
+                            from_track.name,
+                            from_track.audio.ins.len(),
+                            to_track.name,
+                            to_track.audio.ins.len()
+                        )))
+                        .await;
+                        return;
+                    }
+                    let clip_copy = from_track.audio.clips[from.clip_index].clone();
+                    if !copy {
+                        from_track.audio.clips.remove(from.clip_index);
+                    }
+                    let mut clip_copy = clip_copy;
+                    clip_copy.start = to.sample_offset;
+                    let max_lane = to_track.audio.ins.len().saturating_sub(1);
+                    clip_copy.input_channel = to.input_channel.min(max_lane);
+                    to_track.audio.clips.push(clip_copy);
+                }
+                Kind::MIDI => {
+                    if from.clip_index >= from_track.midi.clips.len() {
+                        self.notify_clients(Err(format!(
+                            "Clip index {} is too high, as track {} has only {} clips!",
+                            from.clip_index,
+                            from_track.name.clone(),
+                            from_track.midi.clips.len(),
+                        )))
+                        .await;
+                        return;
+                    }
+                    let clip_copy = from_track.midi.clips[from.clip_index].clone();
+                    if !copy {
+                        from_track.midi.clips.remove(from.clip_index);
+                    }
+                    let mut clip_copy = clip_copy;
+                    clip_copy.start = to.sample_offset;
+                    let max_lane = to_track.midi.ins.len().saturating_sub(1);
+                    clip_copy.input_channel = to.input_channel.min(max_lane);
+                    to_track.midi.clips.push(clip_copy);
+                }
+            }
+        }
+    }
+
+    async fn handle_open_audio_device(&mut self, action: Action) -> (bool, Option<Action>) {
+        let Action::OpenAudioDevice {
+            device,
+            input_device,
+            sample_rate_hz,
+            bits,
+            exclusive,
+            period_frames,
+            nperiods,
+            sync_mode,
+            ..
+        } = action
+        else {
+            return (false, None);
+        };
+        #[cfg(unix)]
+        {
+            let request = AudioOpenRequest {
+                device: &device,
+                input_device: input_device.as_deref(),
+                sample_rate_hz,
+                bits,
+                exclusive,
+                period_frames,
+                nperiods,
+                sync_mode,
+            };
+            if self.maybe_open_jack_runtime(request).await.is_some() {
+                return (true, None);
+            }
+        }
+        let hw_opts = Self::build_hw_options(exclusive, period_frames, nperiods, sync_mode);
+        let open_result = self
+            .open_non_jack_audio_device(
+                &device,
+                input_device.as_deref(),
+                sample_rate_hz,
+                bits,
+                hw_opts,
+            )
+            .await;
+        match open_result {
+            Ok(()) => {}
+            Err(e) => {
+                error!("Failed to open audio device: {e}");
+                self.notify_clients(Err(e)).await;
+                return (true, None);
+            }
+        }
+        self.finalize_open_audio_device().await;
+        if let Some(hw) = &self.hw_driver {
+            let effective_action = {
+                let hw = hw.lock();
+                Action::OpenAudioDevice {
+                    device: device.clone(),
+                    input_device: input_device.clone(),
+                    sample_rate_hz: hw.sample_rate(),
+                    bits: hw.sample_bits(),
+                    exclusive,
+                    period_frames,
+                    nperiods,
+                    sync_mode,
+                    actual_period_frames: hw.cycle_samples(),
+                    input_channels: hw.input_channels(),
+                    output_channels: hw.output_channels(),
+                    bytes_per_frame: hw.frame_size_bytes(),
+                }
+            };
+            return (false, Some(effective_action));
+        }
+        (false, None)
+    }
+
+    async fn handle_jack_add_audio_input_port(&mut self, a: Action) -> bool {
+        #[cfg(unix)]
+        {
+            if let Some(jack) = self.jack_runtime.clone() {
+                let (input_channels, output_channels, rate) = {
+                    let jack = jack.lock();
+                    if let Err(e) = jack.add_audio_input_port() {
+                        self.notify_clients(Err(e)).await;
+                        return true;
+                    }
+                    (
+                        jack.input_channels(),
+                        jack.output_channels(),
+                        jack.sample_rate,
+                    )
+                };
+                self.publish_hw_infos(input_channels, output_channels, rate)
+                    .await;
+                self.notify_clients(Ok(a.clone())).await;
+            } else {
+                self.notify_clients(Err(
+                    "JACK runtime is not active; open the JACK backend first".to_string(),
+                ))
+                .await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.notify_clients(Err(
+                "JACK backend is not available on this platform build".to_string()
+            ))
+            .await;
+        }
+        false
+    }
+
+    async fn handle_jack_remove_audio_input_port(
+        &mut self,
+        _removed_port: usize,
+        a: Action,
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            let removed_port = _removed_port;
+            if let Some(jack) = self.jack_runtime.clone() {
+                let (removed_port, removed_io) = {
+                    let jack = jack.lock();
+                    let removed_port = Some(removed_port);
+                    let removed_io = removed_port.and_then(|port| jack.input_audio_port(port));
+                    match (removed_port, removed_io) {
+                        (Some(port), Some(io)) => (port, io),
+                        _ => {
+                            self.notify_clients(Err(
+                                "JACK audio input port index is out of range".to_string()
+                            ))
+                            .await;
+                            return true;
+                        }
+                    }
+                };
+                let reindex_notifications =
+                    self.reindex_notifications_for_removed_hw_input(removed_port);
+                for disconnect in
+                    self.disconnect_actions_for_removed_hw_input(removed_port, &removed_io)
+                {
+                    if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await {
+                        self.notify_clients(Err(e)).await;
+                        return true;
+                    }
+                }
+                let (input_channels, output_channels, rate) = {
+                    let jack = jack.lock();
+                    if let Err(e) = jack.remove_audio_input_port(removed_port) {
+                        self.notify_clients(Err(e)).await;
+                        return true;
+                    }
+                    (
+                        jack.input_channels(),
+                        jack.output_channels(),
+                        jack.sample_rate,
+                    )
+                };
+                for action in reindex_notifications {
+                    self.notify_clients(Ok(action)).await;
+                }
+                self.publish_hw_infos(input_channels, output_channels, rate)
+                    .await;
+                self.notify_clients(Ok(a.clone())).await;
+            } else {
+                self.notify_clients(Err(
+                    "JACK runtime is not active; open the JACK backend first".to_string(),
+                ))
+                .await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.notify_clients(Err(
+                "JACK backend is not available on this platform build".to_string()
+            ))
+            .await;
+        }
+        false
+    }
+
+    async fn handle_jack_add_audio_output_port(&mut self, a: Action) -> bool {
+        #[cfg(unix)]
+        {
+            if let Some(jack) = self.jack_runtime.clone() {
+                let (input_channels, output_channels, rate) = {
+                    let jack = jack.lock();
+                    if let Err(e) = jack.add_audio_output_port() {
+                        self.notify_clients(Err(e)).await;
+                        return true;
+                    }
+                    (
+                        jack.input_channels(),
+                        jack.output_channels(),
+                        jack.sample_rate,
+                    )
+                };
+                self.publish_hw_infos(input_channels, output_channels, rate)
+                    .await;
+                self.notify_clients(Ok(a.clone())).await;
+            } else {
+                self.notify_clients(Err(
+                    "JACK runtime is not active; open the JACK backend first".to_string(),
+                ))
+                .await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.notify_clients(Err(
+                "JACK backend is not available on this platform build".to_string()
+            ))
+            .await;
+        }
+        false
+    }
+
+    async fn handle_jack_remove_audio_output_port(
+        &mut self,
+        _removed_port: usize,
+        a: Action,
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            let removed_port = _removed_port;
+            if let Some(jack) = self.jack_runtime.clone() {
+                let (removed_port, removed_io) = {
+                    let jack = jack.lock();
+                    let removed_port = Some(removed_port);
+                    let removed_io = removed_port.and_then(|port| jack.output_audio_port(port));
+                    match (removed_port, removed_io) {
+                        (Some(port), Some(io)) => (port, io),
+                        _ => {
+                            self.notify_clients(Err(
+                                "JACK audio output port index is out of range".to_string(),
+                            ))
+                            .await;
+                            return true;
+                        }
+                    }
+                };
+                let reindex_notifications =
+                    self.reindex_notifications_for_removed_hw_output(removed_port);
+                for disconnect in
+                    self.disconnect_actions_for_removed_hw_output(removed_port, &removed_io)
+                {
+                    if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await {
+                        self.notify_clients(Err(e)).await;
+                        return true;
+                    }
+                }
+                let (input_channels, output_channels, rate) = {
+                    let jack = jack.lock();
+                    if let Err(e) = jack.remove_audio_output_port(removed_port) {
+                        self.notify_clients(Err(e)).await;
+                        return true;
+                    }
+                    (
+                        jack.input_channels(),
+                        jack.output_channels(),
+                        jack.sample_rate,
+                    )
+                };
+                for action in reindex_notifications {
+                    self.notify_clients(Ok(action)).await;
+                }
+                self.publish_hw_infos(input_channels, output_channels, rate)
+                    .await;
+                self.notify_clients(Ok(a.clone())).await;
+            } else {
+                self.notify_clients(Err(
+                    "JACK runtime is not active; open the JACK backend first".to_string(),
+                ))
+                .await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.notify_clients(Err(
+                "JACK backend is not available on this platform build".to_string()
+            ))
+            .await;
+        }
+        false
+    }
+
+    async fn handle_track_load_clap_plugin(
+        &mut self,
+        track_name: &str,
+        plugin_id: &str,
+        instance_id: Option<usize>,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "CLAP plugin loading")
+            .await
+        {
+            return true;
+        }
+        let resolved_plugin_path = match self.resolve_plugin_identifier(PluginKind::Clap, plugin_id)
+        {
+            Ok(path) => path,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before loading CLAP plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.load_clap_plugin(&resolved_plugin_path, instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        self.notify_clients(Ok(Action::Log {
+            source: "engine".to_string(),
+            message: format!("CLAP plugin loaded on track '{track_name}': {resolved_plugin_path}"),
+        }))
+        .await;
+        if let Some(instance) = track.clap_plugins.last()
+            && let Some(stderr) = instance.processor.lock().take_stderr()
+        {
+            let source = format!("clap:{resolved_plugin_path}");
+            self.spawn_plugin_host_stderr_reader(stderr, source);
+            self.notify_clients(Ok(Action::Log {
+                source: "engine".to_string(),
+                message: format!("Attached stderr reader for CLAP plugin on track '{track_name}'"),
+            }))
+            .await;
+        }
+        false
+    }
+
+    async fn handle_track_unload_clap_plugin(&mut self, track_name: &str, plugin_id: &str) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "CLAP plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_clap_plugin(plugin_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        false
+    }
+
+    async fn handle_track_unload_clap_plugin_instance(
+        &mut self,
+        track_name: &str,
+        instance_id: usize,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "CLAP plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_clap_plugin_instance(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        false
+    }
+
+    async fn handle_track_load_vst3_plugin(
+        &mut self,
+        track_name: &str,
+        plugin_id: &str,
+        instance_id: Option<usize>,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "VST3 plugin loading")
+            .await
+        {
+            return true;
+        }
+        let resolved_plugin_path = match self.resolve_plugin_identifier(PluginKind::Vst3, plugin_id)
+        {
+            Ok(path) => path,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before loading VST3 plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.load_vst3_plugin(plugin_id, &resolved_plugin_path, instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        if let Some(instance) = track.vst3_plugins.last()
+            && let Some(stderr) = instance.processor.lock().take_stderr()
+        {
+            let source = format!("vst3:{resolved_plugin_path}");
+            self.spawn_plugin_host_stderr_reader(stderr, source);
+        }
+        false
+    }
+
+    async fn handle_track_unload_vst3_plugin(&mut self, track_name: &str, plugin_id: &str) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "VST3 plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_vst3_plugin(plugin_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        false
+    }
+
+    async fn handle_track_unload_vst3_plugin_instance(
+        &mut self,
+        track_name: &str,
+        instance_id: usize,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "VST3 plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_vst3_plugin_instance(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_track_load_lv2_plugin(
+        &mut self,
+        track_name: &str,
+        plugin_uri: &str,
+        instance_id: Option<usize>,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "LV2 plugin loading")
+            .await
+        {
+            return true;
+        }
+        let resolved_plugin_uri = match self.resolve_plugin_identifier(PluginKind::Lv2, plugin_uri)
+        {
+            Ok(uri) => uri,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before loading LV2 plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.load_lv2_plugin(&resolved_plugin_uri, instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        if let Some(instance) = track.lv2_plugins.last()
+            && let Some(stderr) = instance.processor.lock().take_stderr()
+        {
+            let source = format!("lv2:{resolved_plugin_uri}");
+            self.spawn_plugin_host_stderr_reader(stderr, source);
+        }
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_track_unload_lv2_plugin(&mut self, track_name: &str, plugin_uri: &str) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "LV2 plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let resolved_plugin_uri = match self.resolve_plugin_identifier(PluginKind::Lv2, plugin_uri)
+        {
+            Ok(uri) => uri,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_lv2_plugin(&resolved_plugin_uri) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_track_unload_lv2_plugin_instance(
+        &mut self,
+        track_name: &str,
+        instance_id: usize,
+    ) -> bool {
+        tracing::info!(%track_name, instance_id, "Engine handling TrackUnloadLv2PluginInstance");
+        if self
+            .reject_if_track_frozen(track_name, "LV2 plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_lv2_plugin_instance(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        tracing::info!(%track_name, instance_id, "Engine TrackUnloadLv2PluginInstance complete");
+        false
+    }
+
+    async fn handle_play(&mut self, action: Action) -> bool {
+        let Action::Play = action else {
+            return false;
+        };
+
+        tracing::debug!(
+            "Action::Play pressed, transport_sample={}",
+            self.transport_sample
+        );
+        self.playing = true;
+        self.transport_running = true;
+        self.transport_restart_pending = true;
+        self.notified_loop_wrap_sample = None;
+        self.invalidate_track_cycle_state();
+        if let Some(driver) = self.hw_driver.as_mut() {
+            driver.lock().set_playing(true);
+        }
+        #[cfg(unix)]
+        if let Some(jack) = &self.jack_runtime
+            && let Err(e) = jack.lock().transport_start()
+        {
+            self.notify_clients(Err(e)).await;
+        }
+        self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+            .await;
+        self.preload_track_clips().await;
+        {
+            let echoes = self.apply_modulators(self.active_transport_sample());
+            for action in echoes {
+                self.notify_clients(Ok(action)).await;
+            }
+        }
+        let send_result = self.send_tasks().await;
+        tracing::debug!("send_tasks after Play returned finished={}", send_result);
+        if !self.awaiting_hwfinished
+            && !self.handling_hwfinished
+            && send_result
+            && self.hw_worker.is_some()
+        {
+            self.transport_restart_pending = false;
+            self.request_hw_cycle().await;
+        }
+
+        false
+    }
+
+    async fn handle_pause(&mut self, action: Action) -> bool {
+        let Action::Pause = action else {
+            return false;
+        };
+
+        self.clip_playback_enabled = false;
+        self.session_clip_playback_enabled = false;
+        for track in self.state.lock().tracks.values() {
+            let t = track.lock();
+            t.set_clip_playback_enabled(false);
+            t.set_session_clip_playback_enabled(false);
+        }
+        self.transport_running = false;
+        if !self.playing {
+            self.playing = true;
+            self.transport_restart_pending = true;
+            self.notified_loop_wrap_sample = None;
+            self.invalidate_track_cycle_state();
+            if let Some(driver) = self.hw_driver.as_mut() {
+                driver.lock().set_playing(true);
+            }
+            #[cfg(unix)]
+            if let Some(jack) = &self.jack_runtime
+                && let Err(e) = jack.lock().transport_start()
+            {
+                self.notify_clients(Err(e)).await;
+            }
+            self.preload_track_clips().await;
+            if !self.awaiting_hwfinished
+                && !self.handling_hwfinished
+                && self.send_tasks().await
+                && self.hw_worker.is_some()
+            {
+                self.transport_restart_pending = false;
+                self.request_hw_cycle().await;
+            }
+        }
+        self.notify_clients(Ok(Action::Pause)).await;
+        self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+            .await;
+
+        false
+    }
+
+    async fn handle_stop(&mut self, action: Action) -> bool {
+        let Action::Stop = action else {
+            return false;
+        };
+
+        self.playing = false;
+        self.transport_running = false;
+        self.transport_panic_flush_pending = false;
+        self.transport_restart_pending = false;
+        self.notified_loop_wrap_sample = None;
+        self.clip_playback_enabled = true;
+        self.session_clip_playback_enabled = false;
+        self.session_transport_sample = 0;
+        for track in self.state.lock().tracks.values() {
+            let t = track.lock();
+            t.set_clip_playback_enabled(true);
+            t.set_session_clip_playback_enabled(false);
+        }
+        self.invalidate_track_cycle_state();
+        if let Some(driver) = self.hw_driver.as_mut() {
+            driver.lock().set_playing(false);
+        }
+        #[cfg(unix)]
+        if let Some(jack) = &self.jack_runtime
+            && let Err(e) = jack.lock().transport_stop()
+        {
+            self.notify_clients(Err(e)).await;
+        }
+        let panic_events = self.note_off_events_for_all_active_tracks();
+        if let Some(worker) = &self.hw_worker {
+            if !panic_events.is_empty()
+                && let Err(e) = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await
+            {
+                error!("Error sending stop MIDI panic events {e}");
+            }
+        } else {
+            self.pending_hw_midi_out_events_by_device
+                .extend(panic_events);
+        }
+        self.reset_meters_after_stop();
+        self.flush_recordings().await;
+        self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+            .await;
+
+        false
+    }
+
+    async fn handle_session_play(&mut self, action: Action) -> bool {
+        let Action::SessionPlay = action else {
+            return false;
+        };
+
+        tracing::info!(
+            "Action::SessionPlay pressed, transport_sample={} playing={} transport_running={} clip_enabled={} session_enabled={}",
+            self.transport_sample,
+            self.playing,
+            self.transport_running,
+            self.clip_playback_enabled,
+            self.session_clip_playback_enabled
+        );
+        self.playing = true;
+        self.transport_running = false;
+        self.transport_restart_pending = true;
+        self.notified_loop_wrap_sample = None;
+        self.invalidate_track_cycle_state();
+        self.clip_playback_enabled = false;
+        self.session_clip_playback_enabled = true;
+        self.session_transport_sample = 0;
+        if let Some(driver) = self.hw_driver.as_mut() {
+            driver.lock().set_playing(true);
+        }
+        #[cfg(unix)]
+        if let Some(jack) = &self.jack_runtime
+            && let Err(e) = jack.lock().transport_start()
+        {
+            self.notify_clients(Err(e)).await;
+        }
+        self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+            .await;
+        self.preload_track_clips().await;
+        {
+            let echoes = self.apply_modulators(self.active_transport_sample());
+            for action in echoes {
+                self.notify_clients(Ok(action)).await;
+            }
+        }
+        let send_result = self.send_tasks().await;
+        tracing::info!(
+            "Action::SessionPlay send_result={} awaiting_hwfinished={} handling_hwfinished={} hw_worker={}",
+            send_result,
+            self.awaiting_hwfinished,
+            self.handling_hwfinished,
+            self.hw_worker.is_some()
+        );
+        if !self.awaiting_hwfinished
+            && !self.handling_hwfinished
+            && send_result
+            && self.hw_worker.is_some()
+        {
+            self.transport_restart_pending = false;
+            self.request_hw_cycle().await;
+        }
+
+        false
+    }
+
+    async fn handle_rename_track(&mut self, action: Action) -> bool {
+        let Action::RenameTrack {
+            ref old_name,
+            ref new_name,
+        } = action
+        else {
+            return false;
+        };
+
+        if self.state.lock().tracks.contains_key(new_name) {
+            self.notify_clients(Err(format!("Track '{}' already exists", new_name)))
+                .await;
+            return true;
+        }
+
+        let Some(track) = self.state.lock().tracks.remove(old_name) else {
+            self.notify_clients(Err(format!("Track '{}' not found", old_name)))
+                .await;
+            return true;
+        };
+
+        track.lock().name = new_name.clone();
+        self.state.lock().tracks.insert(new_name.clone(), track);
+        for other in self.state.lock().tracks.values() {
+            let other = other.lock();
+            if other.parent_track.as_deref() == Some(old_name.as_str()) {
+                other.parent_track = Some(new_name.clone());
+            }
+        }
+
+        if let Some(recording) = self.audio_recordings.remove(old_name) {
+            self.audio_recordings.insert(new_name.clone(), recording);
+        }
+        if let Some(recording) = self.midi_recordings.remove(old_name) {
+            self.midi_recordings.insert(new_name.clone(), recording);
+        }
+
+        for route in &mut self.midi_hw_in_routes {
+            if route.to_track == *old_name {
+                route.to_track = new_name.clone();
+            }
+        }
+        for route in &mut self.midi_hw_out_routes {
+            if route.from_track == *old_name {
+                route.from_track = new_name.clone();
+            }
+        }
+        if let Some((armed_track, target, device)) = self.pending_midi_learn.clone()
+            && armed_track == *old_name
+        {
+            self.pending_midi_learn = Some((new_name.clone(), target, device));
+        }
+
+        self.notify_clients(Ok(Action::RenameTrack {
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+        }))
+        .await;
+
+        false
+    }
+
+    async fn handle_track_set_midi_learn_binding(&mut self, action: Action) -> bool {
+        let Action::TrackSetMidiLearnBinding {
+            ref track_name,
+            target,
+            ref binding,
+        } = action
+        else {
+            return false;
+        };
+
+        if let Some(binding) = binding.as_ref() {
+            let conflicts = self.midi_learn_slot_conflicts(
+                binding,
+                Some(MidiLearnSlot::Track(track_name.clone(), target)),
+            );
+            if !conflicts.is_empty() {
+                self.notify_clients(Err(format!(
+                    "MIDI learn conflict for '{}' {:?}: {}",
+                    track_name,
+                    target,
+                    conflicts.join(", ")
+                )))
+                .await;
+                return true;
+            }
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        match target {
+            crate::message::TrackMidiLearnTarget::Volume => {
+                track.lock().midi_learn_volume = binding.clone();
+            }
+            crate::message::TrackMidiLearnTarget::Balance => {
+                track.lock().midi_learn_balance = binding.clone();
+            }
+            crate::message::TrackMidiLearnTarget::Mute => {
+                track.lock().midi_learn_mute = binding.clone();
+            }
+            crate::message::TrackMidiLearnTarget::Solo => {
+                track.lock().midi_learn_solo = binding.clone();
+            }
+            crate::message::TrackMidiLearnTarget::Arm => {
+                track.lock().midi_learn_arm = binding.clone();
+            }
+            crate::message::TrackMidiLearnTarget::InputMonitor => {
+                track.lock().midi_learn_input_monitor = binding.clone();
+            }
+            crate::message::TrackMidiLearnTarget::DiskMonitor => {
+                track.lock().midi_learn_disk_monitor = binding.clone();
+            }
+        }
+
+        false
+    }
+
+    async fn handle_set_session_midi_learn_binding(&mut self, action: Action) -> bool {
+        let Action::SetSessionMidiLearnBinding {
+            ref target,
+            ref binding,
+        } = action
+        else {
+            return false;
+        };
+
+        if let Some(binding) = binding.as_ref() {
+            let conflicts = self
+                .midi_learn_slot_conflicts(binding, Some(MidiLearnSlot::Session(target.clone())));
+            if !conflicts.is_empty() {
+                self.notify_clients(Err(format!(
+                    "Session MIDI learn conflict for {:?}: {}",
+                    target,
+                    conflicts.join(", ")
+                )))
+                .await;
+                return true;
+            }
+        }
+        match target {
+            crate::message::SessionMidiLearnTarget::Slot {
+                track_name,
+                scene_index,
+            } => {
+                if binding.is_some() {
+                    self.session_midi_learn_slots
+                        .insert((track_name.clone(), *scene_index), binding.clone().unwrap());
+                } else {
+                    self.session_midi_learn_slots
+                        .remove(&(track_name.clone(), *scene_index));
+                }
+            }
+            crate::message::SessionMidiLearnTarget::Scene(scene_index) => {
+                if binding.is_some() {
+                    self.session_midi_learn_scenes
+                        .insert(*scene_index, binding.clone().unwrap());
+                } else {
+                    self.session_midi_learn_scenes.remove(scene_index);
+                }
+            }
+            crate::message::SessionMidiLearnTarget::StopTrack(track_name) => {
+                if binding.is_some() {
+                    self.session_midi_learn_stop_track
+                        .insert(track_name.clone(), binding.clone().unwrap());
+                } else {
+                    self.session_midi_learn_stop_track.remove(track_name);
+                }
+            }
+            crate::message::SessionMidiLearnTarget::StopAll => {
+                self.session_midi_learn_stop_all = binding.clone();
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_get_plugin_graph(&mut self, action: Action) -> bool {
+        let Action::TrackGetPluginGraph {
+            ref track_name,
+            include_state,
+        } = action
+        else {
+            return false;
+        };
+
+        let start = std::time::Instant::now();
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let (plugins, connections, connectable_connections) = {
+            let track = track.lock();
+            let plugins_start = std::time::Instant::now();
+            let plugins = track.plugin_graph_plugins(include_state);
+            let plugins_ms = plugins_start.elapsed().as_millis();
+            let conns_start = std::time::Instant::now();
+            let connections = track.plugin_graph_connections();
+            let conns_ms = conns_start.elapsed().as_millis();
+            let cc_start = std::time::Instant::now();
+            let connectable_connections = track.connectable_connections();
+            let cc_ms = cc_start.elapsed().as_millis();
+            tracing::debug!(
+                %track_name,
+                include_state,
+                plugins_ms,
+                conns_ms,
+                cc_ms,
+                "TrackGetPluginGraph collected graph data"
+            );
+            (plugins, connections, connectable_connections)
+        };
+        let total_ms = start.elapsed().as_millis();
+        tracing::debug!(
+            %track_name,
+            total_ms,
+            plugins = plugins.len(),
+            connections = connections.len(),
+            connectable = connectable_connections.len(),
+            "TrackGetPluginGraph responding"
+        );
+        self.notify_clients(Ok(Action::TrackPluginGraph {
+            track_name: track_name.clone(),
+            plugins,
+            connections,
+            connectable_connections,
+        }))
+        .await;
+        true
+    }
+
+    async fn handle_add_clip(&mut self, action: Action) -> bool {
+        let Action::AddClip {
+            ref clip_id,
+            ref name,
+            ref track_name,
+            start,
+            length,
+            offset,
+            input_channel,
+            muted,
+            ref peaks_file,
+            kind,
+            fade_enabled,
+            fade_in_samples,
+            fade_out_samples,
+            ref source_name,
+            source_offset,
+            source_length,
+            ref preview_name,
+            ref pitch_correction_points,
+            pitch_correction_frame_likeness,
+            pitch_correction_inertia_ms,
+            pitch_correction_formant_compensation,
+            ref plugin_graph_json,
+        } = action
+        else {
+            return false;
+        };
+
+        self.add_clip_to_track(ClipAddRequest {
+            clip_id,
+            name,
+            track_name,
+            start,
+            length,
+            offset,
+            input_channel,
+            muted,
+            peaks_file: peaks_file.clone(),
+            kind,
+            fade_enabled,
+            fade_in_samples,
+            fade_out_samples,
+            source_name: source_name.clone(),
+            source_offset,
+            source_length,
+            preview_name: preview_name.clone(),
+            pitch_correction_points: pitch_correction_points.clone(),
+            pitch_correction_frame_likeness,
+            pitch_correction_inertia_ms,
+            pitch_correction_formant_compensation,
+            plugin_graph_json: plugin_graph_json.clone(),
+        });
+        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+            let track_name = track_name.clone();
+            tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+                tracing::debug!("Preloaded clips for track '{}' after AddClip", track_name);
+            });
+        }
+
+        false
+    }
+
+    async fn handle_transport_position(&mut self, a: Action) -> bool {
+        let Action::TransportPosition(sample) = a else {
+            return false;
+        };
+
+        self.transport_sample = self.normalize_transport_sample(sample);
+        self.notified_loop_wrap_sample = None;
+        {
+            let echoes = self.apply_modulators(self.active_transport_sample());
+            for action in echoes {
+                self.notify_clients(Ok(action)).await;
+            }
+        }
+        #[cfg(unix)]
+        if let Some(jack) = &self.jack_runtime
+            && let Err(e) = jack.lock().transport_locate(self.transport_sample)
+        {
+            self.notify_clients(Err(e)).await;
+        }
+        if self.playing {
+            self.transport_restart_pending = true;
+            self.invalidate_track_cycle_state();
+            self.transport_panic_flush_pending = self.hw_worker.is_some();
+            self.clear_hw_midi_output_state(true).await;
+            if !self.awaiting_hwfinished && !self.handling_hwfinished {
+                if self.hw_worker.is_some() {
+                    self.request_hw_cycle().await;
+                } else if self.send_tasks().await {
+                    self.transport_restart_pending = false;
+                    self.request_hw_cycle().await;
+                }
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_automation_insert_point(&mut self, a: Action) -> bool {
+        let Action::TrackAutomationInsertPoint {
+            ref track_name,
+            ref target,
+            sample,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+            let track = track.lock();
+            let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
+            let lane = match lanes.iter_mut().find(|lane| lane.target == *target) {
+                Some(lane) => lane,
+                None => {
+                    lanes.push(OfflineAutomationLane {
+                        target: target.clone(),
+                        visible: true,
+                        points: vec![],
+                    });
+                    lanes.last_mut().expect("just pushed")
+                }
+            };
+            if let Some(point) = lane.points.iter_mut().find(|p| p.sample == sample) {
+                point.value = value;
+            } else {
+                lane.points.push(OfflineAutomationPoint { sample, value });
+                lane.points.sort_unstable_by_key(|p| p.sample);
+            }
+            track.automation_lanes = serde_json::to_value(&lanes).unwrap_or_default();
+        }
+
+        false
+    }
+
+    async fn handle_set_global_midi_learn_binding(&mut self, a: Action) -> bool {
+        let Action::SetGlobalMidiLearnBinding {
+            target,
+            ref binding,
+        } = a
+        else {
+            return false;
+        };
+
+        if let Some(binding) = binding.as_ref() {
+            let conflicts =
+                self.midi_learn_slot_conflicts(binding, Some(MidiLearnSlot::Global(target)));
+            if !conflicts.is_empty() {
+                self.notify_clients(Err(format!(
+                    "Global MIDI learn conflict for {:?}: {}",
+                    target,
+                    conflicts.join(", ")
+                )))
+                .await;
+                return true;
+            }
+        }
+        match target {
+            crate::message::GlobalMidiLearnTarget::PlayPause => {
+                self.global_midi_learn_play_pause = binding.clone();
+            }
+            crate::message::GlobalMidiLearnTarget::Stop => {
+                self.global_midi_learn_stop = binding.clone();
+            }
+            crate::message::GlobalMidiLearnTarget::RecordToggle => {
+                self.global_midi_learn_record_toggle = binding.clone();
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_set_folder(&mut self, a: Action) -> bool {
+        let Action::TrackSetFolder {
+            ref track_name,
+            is_folder,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if is_folder {
+            let is_master = track.lock().is_master;
+            if is_master {
+                self.notify_clients(Err(format!(
+                    "Track '{}' is the master track and cannot be made a folder",
+                    track_name
+                )))
+                .await;
+                return true;
+            }
+        }
+        {
+            let track = track.lock();
+            track.is_folder = is_folder;
+            track.ensure_default_audio_passthrough();
+            track.ensure_default_midi_passthrough();
+        }
+        self.notify_clients(Ok(Action::TrackSetFolder {
+            track_name: track_name.clone(),
+            is_folder,
+        }))
+        .await;
+
+        false
+    }
+
+    async fn handle_track_set_session_slot(&mut self, a: Action) -> bool {
+        let Action::TrackSetSessionSlot {
+            ref track_name,
+            scene_index,
+            ref clip_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        match clip_id {
+            Some(id) => {
+                let play_enabled = track
+                    .session_slots
+                    .get(&scene_index)
+                    .map(|slot| slot.play_enabled)
+                    .unwrap_or(true);
+                track.session_slots.insert(
+                    scene_index,
+                    SessionSlot {
+                        clip_id: id.clone(),
+                        play_enabled,
+                    },
+                );
+            }
+            None => {
+                track.session_slots.remove(&scene_index);
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_connect_plugin_audio(&mut self, a: Action) -> bool {
+        let Action::TrackConnectPluginAudio {
+            ref track_name,
+            ref from_node,
+            from_port,
+            ref to_node,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "plugin routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().connect_plugin_audio(
+            from_node.clone(),
+            from_port,
+            to_node.clone(),
+            to_port,
+        ) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_connect_plugin_midi(&mut self, a: Action) -> bool {
+        let Action::TrackConnectPluginMidi {
+            ref track_name,
+            ref from_node,
+            from_port,
+            ref to_node,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "plugin routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) =
+            track
+                .lock()
+                .connect_plugin_midi(from_node.clone(), from_port, to_node.clone(), to_port)
+        {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_disconnect_plugin_audio(&mut self, a: Action) -> bool {
+        let Action::TrackDisconnectPluginAudio {
+            ref track_name,
+            ref from_node,
+            from_port,
+            ref to_node,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "plugin routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().disconnect_plugin_audio(
+            from_node.clone(),
+            from_port,
+            to_node.clone(),
+            to_port,
+        ) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_disconnect_plugin_midi(&mut self, a: Action) -> bool {
+        let Action::TrackDisconnectPluginMidi {
+            ref track_name,
+            ref from_node,
+            from_port,
+            ref to_node,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "plugin routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().disconnect_plugin_midi(
+            from_node.clone(),
+            from_port,
+            to_node.clone(),
+            to_port,
+        ) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_connect_audio(&mut self, a: Action) -> bool {
+        let Action::TrackConnectAudio {
+            ref track_name,
+            ref from,
+            from_port,
+            ref to,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) =
+            track
+                .lock()
+                .connect_audio_connectable(from.clone(), from_port, to.clone(), to_port)
+        {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_disconnect_audio(&mut self, a: Action) -> bool {
+        let Action::TrackDisconnectAudio {
+            ref track_name,
+            ref from,
+            from_port,
+            ref to,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) =
+            track
+                .lock()
+                .disconnect_audio_connectable(from.clone(), from_port, to.clone(), to_port)
+        {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_connect_midi(&mut self, a: Action) -> bool {
+        let Action::TrackConnectMidi {
+            ref track_name,
+            ref from,
+            from_port,
+            ref to,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) =
+            track
+                .lock()
+                .connect_midi_connectable(from.clone(), from_port, to.clone(), to_port)
+        {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_disconnect_midi(&mut self, a: Action) -> bool {
+        let Action::TrackDisconnectMidi {
+            ref track_name,
+            ref from,
+            from_port,
+            ref to,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "routing changes")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) =
+            track
+                .lock()
+                .disconnect_midi_connectable(from.clone(), from_port, to.clone(), to_port)
+        {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_set_plugin_resource_dir(&mut self, a: Action) -> bool {
+        let Action::TrackSetPluginResourceDir {
+            ref track_name,
+            instance_id,
+            ref format,
+            ref directory,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let dir = std::path::Path::new(directory);
+        let result = if format.eq_ignore_ascii_case("CLAP") {
+            track.lock().set_clap_plugin_resource_dir(instance_id, dir)
+        } else if format.eq_ignore_ascii_case("LV2") {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                track.lock().set_lv2_plugin_resource_dir(instance_id, dir)
+            }
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            Err("LV2 is not supported on this platform".to_string())
+        } else {
+            Err(format!(
+                "Unsupported plugin format for resource dir: {format}"
+            ))
+        };
+        if let Err(e) = result {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_clip_set_plugin_resource_dir(&mut self, a: Action) -> bool {
+        let Action::ClipSetPluginResourceDir {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            ref format,
+            ref directory,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let dir = std::path::Path::new(directory);
+        let track = track.lock();
+        let result = if format.eq_ignore_ascii_case("CLAP") {
+            track.clip_set_clap_plugin_resource_dir(clip_idx, instance_id, dir)
+        } else if format.eq_ignore_ascii_case("LV2") {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                track.clip_set_lv2_plugin_resource_dir(clip_idx, instance_id, dir)
+            }
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            Err("LV2 is not supported on this platform".to_string())
+        } else {
+            Err(format!(
+                "Unsupported plugin format for resource dir: {format}"
+            ))
+        };
+        if let Err(e) = result {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_clip_clap_file_references(&mut self, a: Action) -> bool {
+        let Action::ClipClapFileReferences {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            refs: _,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                let track = track.lock();
+                let refs = track
+                    .clip_clap_file_references(clip_idx, instance_id)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            track_name = %track_name,
+                            clip_idx,
+                            instance_id,
+                            error = %e,
+                            "Failed to enumerate clip CLAP file references"
+                        );
+                        Vec::new()
+                    });
+                self.notify_clients(Ok(Action::ClipClapFileReferences {
+                    track_name: track_name.clone(),
+                    clip_idx,
+                    instance_id,
+                    refs,
+                }))
+                .await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_track_set_clap_parameter(&mut self, a: Action) -> bool {
+        let Action::TrackSetClapParameter {
+            ref track_name,
+            instance_id,
+            param_id,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "CLAP parameter changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .set_clap_parameter(instance_id, param_id, value)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_clip_set_clap_parameter(&mut self, a: Action) -> bool {
+        let Action::ClipSetClapParameter {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            param_id,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "CLAP parameter changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) =
+                    track
+                        .lock()
+                        .clip_set_clap_parameter(clip_idx, instance_id, param_id, value)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_set_clap_parameter_at(&mut self, a: Action) -> bool {
+        let Action::TrackSetClapParameterAt {
+            ref track_name,
+            instance_id,
+            param_id,
+            value,
+            frame,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "CLAP parameter changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) =
+                    track
+                        .lock()
+                        .set_clap_parameter_at(instance_id, param_id, value, frame)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_begin_clap_parameter_edit(&mut self, a: Action) -> bool {
+        let Action::TrackBeginClapParameterEdit {
+            ref track_name,
+            instance_id,
+            param_id,
+            frame,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "CLAP parameter edit gestures")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .begin_clap_parameter_edit(instance_id, param_id, frame)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_end_clap_parameter_edit(&mut self, a: Action) -> bool {
+        let Action::TrackEndClapParameterEdit {
+            ref track_name,
+            instance_id,
+            param_id,
+            frame,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "CLAP parameter edit gestures")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .end_clap_parameter_edit(instance_id, param_id, frame)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_clap_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::TrackClapSnapshotState {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                let plugin_id = track
+                    .lock()
+                    .clap_plugins
+                    .iter()
+                    .find(|instance| instance.id == instance_id)
+                    .map(|instance| instance.processor.lock().plugin_id().to_string())
+                    .unwrap_or_default();
+                match track.lock().clap_snapshot_state(instance_id) {
+                    Ok(state) => {
+                        self.notify_clients(Ok(Action::TrackClapStateSnapshot {
+                            track_name: track_name.clone(),
+                            instance_id,
+                            plugin_id,
+                            state,
+                        }))
+                        .await;
+                    }
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_track_clap_restore_state(&mut self, a: Action) -> bool {
+        let Action::TrackClapRestoreState {
+            ref track_name,
+            instance_id,
+            ref state,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "CLAP state restore")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                            "Track '{}' is currently processing audio; stop playback before restoring CLAP state",
+                            track_name
+                        )))
+                        .await;
+            return true;
+        }
+        if let Err(e) = track.clap_restore_state(instance_id, state) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_clip_clap_restore_state(&mut self, a: Action) -> bool {
+        let Action::ClipClapRestoreState {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            ref state,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "CLAP state restore")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if track.audio.processing {
+            self.notify_clients(Err(format!(
+                            "Track '{}' is currently processing audio; stop playback before restoring CLAP state",
+                            track_name
+                        )))
+                        .await;
+            return true;
+        }
+        if let Err(e) = track.clip_clap_restore_state(clip_idx, instance_id, state) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_snapshot_all_clap_states(&mut self, a: Action) -> bool {
+        let Action::TrackSnapshotAllClapStates { ref track_name } = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let instances: Vec<_> = {
+            let locked = track.lock();
+            locked
+                .clap_plugins
+                .iter()
+                .map(|i| (i.id, i.processor.lock().plugin_id().to_string()))
+                .collect()
+        };
+        for (instance_id, plugin_id) in instances {
+            match track.lock().clap_snapshot_state(instance_id) {
+                Ok(state) => {
+                    self.notify_clients(Ok(Action::TrackClapStateSnapshot {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        plugin_id,
+                        state,
+                    }))
+                    .await;
+                }
+                Err(_e) => {}
+            }
+        }
+        self.notify_clients(Ok(Action::TrackSnapshotAllClapStatesDone {
+            track_name: track_name.clone(),
+        }))
+        .await;
+
+        false
+    }
+
+    async fn handle_track_set_vst3_parameter(&mut self, a: Action) -> bool {
+        let Action::TrackSetVst3Parameter {
+            ref track_name,
+            instance_id,
+            param_id,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "VST3 parameter changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .set_vst3_parameter(instance_id, param_id, value)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_set_plugin_bypassed(&mut self, a: Action) -> bool {
+        let Action::TrackSetPluginBypassed {
+            ref track_name,
+            instance_id,
+            ref format,
+            bypassed,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                let result = match format.as_str() {
+                    "CLAP" => track.lock().set_clap_plugin_bypassed(instance_id, bypassed),
+                    "VST3" => track.lock().set_vst3_plugin_bypassed(instance_id, bypassed),
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    "LV2" => track.lock().set_lv2_plugin_bypassed(instance_id, bypassed),
+                    _ => Err(format!("Unknown plugin format for bypass: {format}")),
+                };
+                if let Err(e) = result {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_track_connect_vst3_audio(&mut self, a: Action) -> bool {
+        let Action::TrackConnectVst3Audio {
+            ref track_name,
+            ref from_node,
+            from_port,
+            ref to_node,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "VST3 routing changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .connect_vst3_audio(from_node, from_port, to_node, to_port)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_disconnect_vst3_audio(&mut self, a: Action) -> bool {
+        let Action::TrackDisconnectVst3Audio {
+            ref track_name,
+            ref from_node,
+            from_port,
+            ref to_node,
+            to_port,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "VST3 routing changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .disconnect_vst3_audio(from_node, from_port, to_node, to_port)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_set_clip_pitch_correction(&mut self, a: Action) -> bool {
+        let Action::SetClipPitchCorrection {
+            ref track_name,
+            clip_index,
+            ref preview_name,
+            ref source_name,
+            source_offset,
+            source_length,
+            ref pitch_correction_points,
+            pitch_correction_frame_likeness,
+            pitch_correction_inertia_ms,
+            pitch_correction_formant_compensation,
+        } = a
+        else {
+            return false;
+        };
+
+        self.set_clip_pitch_correction(
+            track_name,
+            clip_index,
+            preview_name.clone(),
+            source_name.clone(),
+            source_offset,
+            source_length,
+            pitch_correction_points.clone(),
+            pitch_correction_frame_likeness,
+            pitch_correction_inertia_ms,
+            pitch_correction_formant_compensation,
+        );
+
+        false
+    }
+
+    async fn handle_set_loop_range(&mut self, a: Action) -> bool {
+        let Action::SetLoopRange(range) = a else {
+            return false;
+        };
+
+        self.loop_range_samples = range.and_then(|(start, end)| {
+            if end > start {
+                Some((start, end))
+            } else {
+                None
+            }
+        });
+        self.loop_enabled = self.loop_range_samples.is_some();
+        self.notified_loop_wrap_sample = None;
+        if self.loop_enabled
+            && let Some((loop_start, loop_end)) = self.loop_range_samples
+            && self.transport_sample >= loop_end
+        {
+            self.transport_sample = loop_start;
+            self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+                .await;
+        }
+
+        false
+    }
+
+    async fn handle_track_automation_toggle_lane(&mut self, a: Action) -> bool {
+        let Action::TrackAutomationToggleLane {
+            ref track_name,
+            ref target,
+        } = a
+        else {
+            return false;
+        };
+
+        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+            let track = track.lock();
+            let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
+            if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == *target) {
+                lane.visible = !lane.visible;
+            } else {
+                lanes.push(OfflineAutomationLane {
+                    target: target.clone(),
+                    visible: true,
+                    points: vec![],
+                });
+            }
+            track.automation_lanes = serde_json::to_value(&lanes).unwrap_or_default();
+        }
+
+        false
+    }
+
+    async fn handle_track_remove_audio_output(&mut self, a: Action) -> bool {
+        let Action::TrackRemoveAudioOutput(ref name) = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let (hw_outputs, track_inputs) = {
+            let state = self.state.lock();
+            let hw_outputs = self.all_hw_output_audio_ports();
+            let track_inputs = state
+                .tracks
+                .iter()
+                .filter(|(track_name, _)| *track_name != name)
+                .flat_map(|(_, handle)| handle.lock().audio.ins.clone())
+                .collect::<Vec<_>>();
+            (hw_outputs, track_inputs)
+        };
+        if let Err(e) = track.lock().remove_audio_output(&hw_outputs, &track_inputs) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_toggle_folder(&mut self, a: Action) -> bool {
+        let Action::TrackToggleFolder { ref track_name } = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        {
+            let t = track.lock();
+            t.folder_open = !t.folder_open;
+        }
+        self.notify_clients(Ok(Action::TrackToggleFolder {
+            track_name: track_name.clone(),
+        }))
+        .await;
+
+        self.notify_clients(Ok(Action::TrackSetFolder {
+            track_name: track_name.clone(),
+            is_folder: track.lock().is_folder,
+        }))
+        .await;
+
+        false
+    }
+
+    async fn handle_track_clear_plugins(&mut self, a: Action) -> bool {
+        let Action::TrackClearPlugins { ref track_name } = a else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "plugin graph editing")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        track.lock().clear_plugins();
+        self.notify_clients(Ok(Action::Log {
+            source: "engine".to_string(),
+            message: format!("Cleared plugins from track '{track_name}'"),
+        }))
+        .await;
+
+        false
+    }
+
+    async fn handle_track_clap_file_references(&mut self, a: Action) -> bool {
+        let Action::TrackClapFileReferences {
+            ref track_name,
+            instance_id,
+            refs: _,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                let refs = track.lock().clap_file_references(instance_id).unwrap_or_else(|e| {
+                            tracing::warn!(track_name = %track_name, instance_id, error = %e, "Failed to enumerate CLAP file references");
+                            Vec::new()
+                        });
+                self.notify_clients(Ok(Action::TrackClapFileReferences {
+                    track_name: track_name.clone(),
+                    instance_id,
+                    refs,
+                }))
+                .await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_track_update_clap_file_reference(&mut self, a: Action) -> bool {
+        let Action::TrackUpdateClapFileReference {
+            ref track_name,
+            instance_id,
+            index,
+            ref path,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track
+            .lock()
+            .update_clap_file_reference(instance_id, index, path)
+        {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_clip_update_clap_file_reference(&mut self, a: Action) -> bool {
+        let Action::ClipUpdateClapFileReference {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            index,
+            ref path,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) =
+            track
+                .lock()
+                .clip_update_clap_file_reference(clip_idx, instance_id, index, path)
+        {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_get_clap_parameters(&mut self, a: Action) -> bool {
+        let Action::TrackGetClapParameters {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().get_clap_parameters(instance_id) {
+                Ok(parameters) => {
+                    self.notify_clients(Ok(Action::TrackClapParameters {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        parameters,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_clip_clap_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::ClipClapSnapshotState {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().clip_clap_snapshot_state(clip_idx, instance_id) {
+                Ok((plugin_id, state)) => {
+                    self.notify_clients(Ok(Action::ClipClapStateSnapshot {
+                        track_name: track_name.clone(),
+                        clip_idx,
+                        instance_id,
+                        plugin_id,
+                        state,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_track_get_vst3_graph(&mut self, a: Action) -> bool {
+        let Action::TrackGetVst3Graph { ref track_name } = a else {
+            return false;
+        };
+
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                let t = track.lock();
+                let plugins = t.vst3_graph_plugins();
+                let connections = t.vst3_graph_connections();
+                self.notify_clients(Ok(Action::TrackVst3Graph {
+                    track_name: track_name.clone(),
+                    plugins,
+                    connections,
+                }))
+                .await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
+    async fn handle_track_get_vst3_parameters(&mut self, a: Action) -> bool {
+        let Action::TrackGetVst3Parameters {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().get_vst3_parameters(instance_id) {
+                Ok(parameters) => {
+                    self.notify_clients(Ok(Action::TrackVst3Parameters {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        parameters,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_track_get_lv2_plugin_controls(&mut self, a: Action) -> bool {
+        let Action::TrackGetLv2PluginControls {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().get_lv2_plugin_controls(instance_id) {
+                Ok(controls) => {
+                    self.notify_clients(Ok(Action::TrackLv2PluginControls {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        controls,
+                        instance_access_handle: None,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_track_lv2_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::TrackLv2SnapshotState {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().lv2_snapshot_state(instance_id) {
+                Ok(state) => {
+                    self.notify_clients(Ok(Action::TrackLv2StateSnapshot {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        state,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_clip_lv2_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::ClipLv2SnapshotState {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().clip_lv2_snapshot_state(clip_idx, instance_id) {
+                Ok(state) => {
+                    self.notify_clients(Ok(Action::ClipLv2StateSnapshot {
+                        track_name: track_name.clone(),
+                        clip_idx,
+                        instance_id,
+                        state,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_track_vst3_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::TrackVst3SnapshotState {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().vst3_snapshot_state(instance_id) {
+                Ok(state) => {
+                    self.notify_clients(Ok(Action::TrackVst3StateSnapshot {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        state,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_clip_vst3_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::ClipVst3SnapshotState {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().clip_vst3_snapshot_state(clip_idx, instance_id) {
+                Ok(state) => {
+                    self.notify_clients(Ok(Action::ClipVst3StateSnapshot {
+                        track_name: track_name.clone(),
+                        clip_idx,
+                        instance_id,
+                        state,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_add_grouped_clip(&mut self, a: Action) -> bool {
+        let Action::AddGroupedClip {
+            ref track_name,
+            kind,
+            ref audio_clip,
+            ref midi_clip,
+        } = a
+        else {
+            return false;
+        };
+
+        self.add_grouped_clip_to_track(track_name, kind, audio_clip.clone(), midi_clip.clone());
+        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+            let track_name = track_name.clone();
+            tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+                tracing::debug!(
+                    "Preloaded clips for track '{}' after AddGroupedClip",
+                    track_name
+                );
+            });
+        }
+
+        false
+    }
+
+    async fn handle_clear_all_midi_learn_bindings(&mut self, a: Action) -> bool {
+        let Action::ClearAllMidiLearnBindings = a else {
+            return false;
+        };
+
+        self.pending_midi_learn = None;
+        self.pending_global_midi_learn = None;
+        self.pending_session_midi_learn = None;
+        self.global_midi_learn_play_pause = None;
+        self.global_midi_learn_stop = None;
+        self.global_midi_learn_record_toggle = None;
+        self.session_midi_learn_slots.clear();
+        self.session_midi_learn_scenes.clear();
+        self.session_midi_learn_stop_track.clear();
+        self.session_midi_learn_stop_all = None;
+        self.midi_cc_gate.clear();
+        for track in self.state.lock().tracks.values() {
+            let t = track.lock();
+            t.midi_learn_volume = None;
+            t.midi_learn_balance = None;
+            t.midi_learn_mute = None;
+            t.midi_learn_solo = None;
+            t.midi_learn_arm = None;
+            t.midi_learn_input_monitor = None;
+            t.midi_learn_disk_monitor = None;
+        }
+
+        false
+    }
+
+    async fn handle_panic(&mut self, a: Action) -> bool {
+        let Action::Panic = a else {
+            return false;
+        };
+
+        let panic_events = self.panic_events_for_all_hw_midi_outputs();
+        if let Some(worker) = &self.hw_worker {
+            if !panic_events.is_empty() {
+                if let Err(e) = worker.tx.send(Message::ClearHWMidiOutEvents).await {
+                    error!("Error clearing HW MIDI queue for panic {e}");
+                }
+                self.midi_hub
+                    .lock()
+                    .write_events_blocking(&panic_events, Duration::from_millis(250));
+            }
+        } else if !panic_events.is_empty() {
+            self.pending_hw_midi_out_events_by_device
+                .extend(panic_events);
+        }
+
+        false
+    }
+
+    async fn handle_set_record_enabled(&mut self, a: Action) -> bool {
+        let Action::SetRecordEnabled(enabled) = a else {
+            return false;
+        };
+
+        self.record_enabled = enabled;
+        if !enabled {
+            if self.awaiting_hwfinished {
+                self.append_recorded_cycle();
+            }
+            self.flush_recordings().await;
+        } else if self.session_dir.is_none() {
+            self.notify_clients(Err(
+                "Recording enabled but session path is not set".to_string()
+            ))
+            .await;
+        }
+
+        false
+    }
+
+    async fn handle_track_automation_delete_point(&mut self, a: Action) -> bool {
+        let Action::TrackAutomationDeletePoint {
+            ref track_name,
+            ref target,
+            sample,
+        } = a
+        else {
+            return false;
+        };
+
+        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+            let track = track.lock();
+            let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
+            if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == *target) {
+                lane.points.retain(|point| point.sample != sample);
+            }
+            track.automation_lanes = serde_json::to_value(&lanes).unwrap_or_default();
+        }
+
+        false
+    }
+
+    async fn handle_track_add_audio_input(&mut self, a: Action) -> bool {
+        let Action::TrackAddAudioInput(ref name) = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().add_audio_input() {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_add_audio_output(&mut self, a: Action) -> bool {
+        let Action::TrackAddAudioOutput(ref name) = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().add_audio_output() {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_remove_audio_input(&mut self, a: Action) -> bool {
+        let Action::TrackRemoveAudioInput(ref name) = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().remove_audio_input() {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_midi_cc(&mut self, a: Action) -> bool {
+        let Action::TrackMidiCc {
+            ref track_name,
+            channel,
+            cc,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if let Some(track) = self.state.lock().tracks.get(track_name) {
+            track
+                .lock()
+                .pending_automation_midi_events
+                .push(MidiEvent::new(
+                    0,
+                    vec![0xB0 | channel.min(15), cc.min(127), value.min(127)],
+                ));
+        }
+
+        false
+    }
+
+    async fn handle_track_toggle_arm(&mut self, a: Action) -> bool {
+        let Action::TrackToggleArm(ref name) = a else {
+            return false;
+        };
+
+        if self.reject_if_track_frozen(name, "arming/disarming").await {
+            return true;
+        }
+        if let Some(track) = self.state.lock().tracks.get(name).cloned() {
+            track.lock().arm();
+            let armed = track.lock().armed;
+            if !armed && self.audio_recordings.contains_key(name) {
+                self.flush_track_recording(name).await;
+            }
+        } else {
+            tracing::warn!(
+                "TrackToggleArm for '{}' but track not found in engine",
+                name
+            );
+        }
+
+        false
+    }
+
+    async fn handle_track_set_midi_lane_channel(&mut self, a: Action) -> bool {
+        let Action::TrackSetMidiLaneChannel {
+            ref track_name,
+            lane,
+            channel,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        track.lock().set_midi_lane_channel(lane, channel);
+
+        false
+    }
+
+    async fn handle_track_set_frozen(&mut self, a: Action) -> bool {
+        let Action::TrackSetFrozen {
+            ref track_name,
+            frozen,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        track.lock().set_frozen(frozen);
+
+        false
+    }
+
+    async fn handle_track_set_session_slot_play_enabled(&mut self, a: Action) -> bool {
+        let Action::TrackSetSessionSlotPlayEnabled {
+            ref track_name,
+            scene_index,
+            enabled,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = track.lock();
+        if let Some(slot) = track.session_slots.get_mut(&scene_index) {
+            slot.play_enabled = enabled;
+        }
+
+        false
+    }
+
+    async fn handle_track_clear_default_passthrough(&mut self, a: Action) -> bool {
+        let Action::TrackClearDefaultPassthrough { ref track_name } = a else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "plugin graph editing")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        track.lock().clear_default_passthrough();
+
+        false
+    }
+
+    async fn handle_track_get_clap_note_names(&mut self, a: Action) -> bool {
+        let Action::TrackGetClapNoteNames { ref track_name } = a else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let note_names = track.lock().get_clap_note_names();
+        self.notify_clients(Ok(Action::TrackClapNoteNames {
+            track_name: track_name.clone(),
+            note_names,
+        }))
+        .await;
+
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_list_lv2_plugins(&mut self, a: Action) -> bool {
+        let Action::ListLv2Plugins = a else {
+            return false;
+        };
+
+        match crate::plugins::scan_plugins::<crate::plugins::types::Lv2PluginInfo>("lv2") {
+            Ok(plugins) => {
+                self.notify_clients(Ok(Action::Lv2Plugins(plugins))).await;
+            }
+            Err(e) => {
+                tracing::error!("LV2 plugin scan failed: {e}");
+                self.notify_clients(Ok(Action::Lv2PluginsUnavailable { error: e }))
+                    .await;
+            }
+        }
+        true
+    }
+
+    async fn handle_list_vst3_plugins(&mut self, a: Action) -> bool {
+        let Action::ListVst3Plugins = a else {
+            return false;
+        };
+
+        match crate::plugins::scan_plugins::<crate::plugins::types::Vst3PluginInfo>("vst3") {
+            Ok(plugins) => {
+                self.notify_clients(Ok(Action::Vst3Plugins(plugins))).await;
+            }
+            Err(e) => {
+                tracing::error!("VST3 plugin scan failed: {e}");
+                self.notify_clients(Ok(Action::Vst3PluginsUnavailable { error: e }))
+                    .await;
+            }
+        }
+        true
+    }
+
+    async fn handle_list_clap_plugins(&mut self, a: Action) -> bool {
+        let Action::ListClapPlugins = a else {
+            return false;
+        };
+
+        match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap") {
+            Ok(plugins) => {
+                self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
+            }
+            Err(e) => {
+                tracing::error!("CLAP plugin scan failed: {e}");
+                self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
+                    .await;
+            }
+        }
+        true
+    }
+
+    async fn handle_list_clap_plugins_with_capabilities(&mut self, a: Action) -> bool {
+        let Action::ListClapPluginsWithCapabilities = a else {
+            return false;
+        };
+
+        match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap") {
+            Ok(plugins) => {
+                self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
+            }
+            Err(e) => {
+                tracing::error!("CLAP plugin scan failed: {e}");
+                self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
+                    .await;
+            }
+        }
+        true
+    }
+
+    async fn handle_track_show_clap_gui(&mut self, a: Action) -> bool {
+        let Action::TrackShowClapGui {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().show_clap_gui(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_show_vst3_gui(&mut self, a: Action) -> bool {
+        let Action::TrackShowVst3Gui {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().show_vst3_gui(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn handle_track_show_lv2_gui(&mut self, a: Action) -> bool {
+        let Action::TrackShowLv2Gui {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().show_lv2_gui(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    async fn handle_track_vst3_restore_state(&mut self, a: Action) -> bool {
+        let Action::TrackVst3RestoreState {
+            ref track_name,
+            instance_id,
+            ref state,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track.lock().vst3_restore_state(instance_id, state) {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    async fn handle_set_clip_fade(&mut self, a: Action) -> bool {
+        let Action::SetClipFade {
+            ref track_name,
+            clip_index,
+            kind,
+            fade_enabled,
+            fade_in_samples,
+            fade_out_samples,
+        } = a
+        else {
+            return false;
+        };
+
+        self.set_clip_fade(
+            track_name,
+            clip_index,
+            kind,
+            fade_enabled,
+            fade_in_samples,
+            fade_out_samples,
+        );
+
+        false
+    }
+
+    #[inline]
+    fn box_bool<'a>(
+        fut: impl std::future::Future<Output = bool> + Send + 'a,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(fut)
+    }
+
+    async fn handle_request_inner(&mut self, mut action_to_process: Action, record_history: bool) {
+        let a = action_to_process.clone();
+        let suppress_timing_history = self.playing
+            && matches!(
+                &action_to_process,
+                Action::SetTempo(_) | Action::SetTimeSignature { .. } | Action::SetTempoMap { .. }
+            );
+        let mut inverse_actions = self.prepare_inverse_actions(
+            &action_to_process,
+            record_history,
+            suppress_timing_history,
+        );
 
         match action_to_process {
             Action::Play => {
-                tracing::debug!(
-                    "Action::Play pressed, transport_sample={}",
-                    self.transport_sample
-                );
-                self.playing = true;
-                self.transport_running = true;
-                self.transport_restart_pending = true;
-                self.notified_loop_wrap_sample = None;
-                self.invalidate_track_cycle_state();
-                if let Some(driver) = self.hw_driver.as_mut() {
-                    driver.lock().set_playing(true);
-                }
-                #[cfg(unix)]
-                if let Some(jack) = &self.jack_runtime
-                    && let Err(e) = jack.lock().transport_start()
-                {
-                    self.notify_clients(Err(e)).await;
-                }
-                self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
-                    .await;
-                self.preload_track_clips().await;
-                {
-                    let echoes = self.apply_modulators(self.active_transport_sample());
-                    for action in echoes {
-                        self.notify_clients(Ok(action)).await;
-                    }
-                }
-                let send_result = self.send_tasks().await;
-                tracing::debug!("send_tasks after Play returned finished={}", send_result);
-                if !self.awaiting_hwfinished
-                    && !self.handling_hwfinished
-                    && send_result
-                    && self.hw_worker.is_some()
-                {
-                    self.transport_restart_pending = false;
-                    self.request_hw_cycle().await;
+                if Self::box_bool(self.handle_play(a.clone())).await {
+                    return;
                 }
             }
             Action::Pause => {
-                self.clip_playback_enabled = false;
-                self.session_clip_playback_enabled = false;
-                for track in self.state.lock().tracks.values() {
-                    let t = track.lock();
-                    t.set_clip_playback_enabled(false);
-                    t.set_session_clip_playback_enabled(false);
+                if Self::box_bool(self.handle_pause(a.clone())).await {
+                    return;
                 }
-                self.transport_running = false;
-                if !self.playing {
-                    self.playing = true;
-                    self.transport_restart_pending = true;
-                    self.notified_loop_wrap_sample = None;
-                    self.invalidate_track_cycle_state();
-                    if let Some(driver) = self.hw_driver.as_mut() {
-                        driver.lock().set_playing(true);
-                    }
-                    #[cfg(unix)]
-                    if let Some(jack) = &self.jack_runtime
-                        && let Err(e) = jack.lock().transport_start()
-                    {
-                        self.notify_clients(Err(e)).await;
-                    }
-                    self.preload_track_clips().await;
-                    if !self.awaiting_hwfinished
-                        && !self.handling_hwfinished
-                        && self.send_tasks().await
-                        && self.hw_worker.is_some()
-                    {
-                        self.transport_restart_pending = false;
-                        self.request_hw_cycle().await;
-                    }
-                }
-                self.notify_clients(Ok(Action::Pause)).await;
-                self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
-                    .await;
             }
             Action::Stop => {
-                self.playing = false;
-                self.transport_running = false;
-                self.transport_panic_flush_pending = false;
-                self.transport_restart_pending = false;
-                self.notified_loop_wrap_sample = None;
-                self.clip_playback_enabled = true;
-                self.session_clip_playback_enabled = false;
-                self.session_transport_sample = 0;
-                for track in self.state.lock().tracks.values() {
-                    let t = track.lock();
-                    t.set_clip_playback_enabled(true);
-                    t.set_session_clip_playback_enabled(false);
+                if Self::box_bool(self.handle_stop(a.clone())).await {
+                    return;
                 }
-                self.invalidate_track_cycle_state();
-                if let Some(driver) = self.hw_driver.as_mut() {
-                    driver.lock().set_playing(false);
-                }
-                #[cfg(unix)]
-                if let Some(jack) = &self.jack_runtime
-                    && let Err(e) = jack.lock().transport_stop()
-                {
-                    self.notify_clients(Err(e)).await;
-                }
-                let panic_events = self.note_off_events_for_all_active_tracks();
-                if let Some(worker) = &self.hw_worker {
-                    if !panic_events.is_empty()
-                        && let Err(e) = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await
-                    {
-                        error!("Error sending stop MIDI panic events {e}");
-                    }
-                } else {
-                    self.pending_hw_midi_out_events_by_device
-                        .extend(panic_events);
-                }
-                self.reset_meters_after_stop();
-                self.flush_recordings().await;
-                self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
-                    .await;
             }
             Action::SessionPlay => {
-                tracing::info!(
-                    "Action::SessionPlay pressed, transport_sample={} playing={} transport_running={} clip_enabled={} session_enabled={}",
-                    self.transport_sample,
-                    self.playing,
-                    self.transport_running,
-                    self.clip_playback_enabled,
-                    self.session_clip_playback_enabled
-                );
-                self.playing = true;
-                self.transport_running = false;
-                self.transport_restart_pending = true;
-                self.notified_loop_wrap_sample = None;
-                self.invalidate_track_cycle_state();
-                self.clip_playback_enabled = false;
-                self.session_clip_playback_enabled = true;
-                self.session_transport_sample = 0;
-                if let Some(driver) = self.hw_driver.as_mut() {
-                    driver.lock().set_playing(true);
-                }
-                #[cfg(unix)]
-                if let Some(jack) = &self.jack_runtime
-                    && let Err(e) = jack.lock().transport_start()
-                {
-                    self.notify_clients(Err(e)).await;
-                }
-                self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
-                    .await;
-                self.preload_track_clips().await;
-                {
-                    let echoes = self.apply_modulators(self.active_transport_sample());
-                    for action in echoes {
-                        self.notify_clients(Ok(action)).await;
-                    }
-                }
-                let send_result = self.send_tasks().await;
-                tracing::info!(
-                    "Action::SessionPlay send_result={} awaiting_hwfinished={} handling_hwfinished={} hw_worker={}",
-                    send_result,
-                    self.awaiting_hwfinished,
-                    self.handling_hwfinished,
-                    self.hw_worker.is_some()
-                );
-                if !self.awaiting_hwfinished
-                    && !self.handling_hwfinished
-                    && send_result
-                    && self.hw_worker.is_some()
-                {
-                    self.transport_restart_pending = false;
-                    self.request_hw_cycle().await;
+                if Self::box_bool(self.handle_session_play(a.clone())).await {
+                    return;
                 }
             }
             Action::JumpToEnd => {
@@ -5673,19 +10316,8 @@ impl Engine {
                     .await;
             }
             Action::Panic => {
-                let panic_events = self.panic_events_for_all_hw_midi_outputs();
-                if let Some(worker) = &self.hw_worker {
-                    if !panic_events.is_empty() {
-                        if let Err(e) = worker.tx.send(Message::ClearHWMidiOutEvents).await {
-                            error!("Error clearing HW MIDI queue for panic {e}");
-                        }
-                        self.midi_hub
-                            .lock()
-                            .write_events_blocking(&panic_events, Duration::from_millis(250));
-                    }
-                } else if !panic_events.is_empty() {
-                    self.pending_hw_midi_out_events_by_device
-                        .extend(panic_events);
+                if Self::box_bool(self.handle_panic(a.clone())).await {
+                    return;
                 }
             }
             Action::Session(ref session_action) => {
@@ -5705,57 +10337,18 @@ impl Engine {
                     track.lock().set_session_clip_playback_enabled(enabled);
                 }
             }
-            Action::TransportPosition(sample) => {
-                self.transport_sample = self.normalize_transport_sample(sample);
-                self.notified_loop_wrap_sample = None;
-                {
-                    let echoes = self.apply_modulators(self.active_transport_sample());
-                    for action in echoes {
-                        self.notify_clients(Ok(action)).await;
-                    }
-                }
-                #[cfg(unix)]
-                if let Some(jack) = &self.jack_runtime
-                    && let Err(e) = jack.lock().transport_locate(self.transport_sample)
-                {
-                    self.notify_clients(Err(e)).await;
-                }
-                if self.playing {
-                    self.transport_restart_pending = true;
-                    self.invalidate_track_cycle_state();
-                    self.transport_panic_flush_pending = self.hw_worker.is_some();
-                    self.clear_hw_midi_output_state(true).await;
-                    if !self.awaiting_hwfinished && !self.handling_hwfinished {
-                        if self.hw_worker.is_some() {
-                            self.request_hw_cycle().await;
-                        } else if self.send_tasks().await {
-                            self.transport_restart_pending = false;
-                            self.request_hw_cycle().await;
-                        }
-                    }
+            Action::TransportPosition(..) => {
+                if Self::box_bool(self.handle_transport_position(a.clone())).await {
+                    return;
                 }
             }
             Action::SetLoopEnabled(enabled) => {
                 self.loop_enabled = enabled && self.loop_range_samples.is_some();
                 self.notified_loop_wrap_sample = None;
             }
-            Action::SetLoopRange(range) => {
-                self.loop_range_samples = range.and_then(|(start, end)| {
-                    if end > start {
-                        Some((start, end))
-                    } else {
-                        None
-                    }
-                });
-                self.loop_enabled = self.loop_range_samples.is_some();
-                self.notified_loop_wrap_sample = None;
-                if self.loop_enabled
-                    && let Some((loop_start, loop_end)) = self.loop_range_samples
-                    && self.transport_sample >= loop_end
-                {
-                    self.transport_sample = loop_start;
-                    self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
-                        .await;
+            Action::SetLoopRange(..) => {
+                if Self::box_bool(self.handle_set_loop_range(a.clone())).await {
+                    return;
                 }
             }
             Action::SetPunchEnabled(enabled) => {
@@ -5803,18 +10396,9 @@ impl Engine {
                     self.notify_clients(Err(err)).await;
                 }
             }
-            Action::SetRecordEnabled(enabled) => {
-                self.record_enabled = enabled;
-                if !enabled {
-                    if self.awaiting_hwfinished {
-                        self.append_recorded_cycle();
-                    }
-                    self.flush_recordings().await;
-                } else if self.session_dir.is_none() {
-                    self.notify_clients(Err(
-                        "Recording enabled but session path is not set".to_string()
-                    ))
-                    .await;
+            Action::SetRecordEnabled(..) => {
+                if Self::box_bool(self.handle_set_record_enabled(a.clone())).await {
+                    return;
                 }
             }
             Action::SetModulators(ref modulators) => {
@@ -5835,6 +10419,46 @@ impl Engine {
                     track.automation_mode = mode;
                 }
             }
+            Action::TrackAutomationToggleLane { .. } => {
+                if Self::box_bool(self.handle_track_automation_toggle_lane(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackAutomationInsertPoint { .. } => {
+                if Self::box_bool(self.handle_track_automation_insert_point(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackAutomationDeletePoint { .. } => {
+                if Self::box_bool(self.handle_track_automation_delete_point(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackAutomationSetMode {
+                ref track_name,
+                mode,
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+                    track.lock().automation_mode = mode;
+                }
+            }
+            Action::RequestTrackList => {
+                let names: Vec<String> = self.state.lock().tracks.keys().cloned().collect();
+                self.notify_clients(Ok(Action::TrackList(names))).await;
+            }
+            Action::TrackList(_) => {}
+            Action::RequestTransportState => {
+                self.notify_clients(Ok(Action::TransportState {
+                    sample: self.transport_sample,
+                    tempo_bpm: self.tempo_bpm,
+                    playing: self.playing,
+                    paused: !self.transport_running && self.playing,
+                    tsig_num: self.tsig_num,
+                    tsig_denom: self.tsig_denom,
+                }))
+                .await;
+            }
+            Action::TransportState { .. } => {}
             Action::SetStepRecording(enabled) => {
                 self.step_recording_enabled = enabled;
             }
@@ -5897,61 +10521,7 @@ impl Engine {
                 self.preload_track_clips_spawn();
             }
             Action::Quit => {
-                self.flush_recordings().await;
-                // Stop the HW worker before notifying the GUI so the
-                // OSS audio channels are halted and closed from the
-                // worker's own thread. The GUI calls exit(0) upon
-                // receiving the Quit response, which skips Rust
-                // destructors. Without this, the kernel's dsp_close
-                // drains pending audio buffers for up to CHN_TIMEOUT
-                // (5s) during process teardown.
-                if let Some(worker) = self.hw_worker.take() {
-                    if let Some(hw) = &self.hw_driver {
-                        hw.lock().request_stop();
-                    }
-                    // Send MIDI panic (All Sound Off) for any active
-                    // notes before stopping the worker.
-                    let panic_events = self.panic_events_for_all_hw_midi_outputs();
-                    if !panic_events.is_empty() {
-                        let _ = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await;
-                    }
-                    // Send Quit to the worker so it stops its audio
-                    // cycle loop and releases the driver.
-                    if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
-                        error!("Error sending quit message to HW worker: {e}");
-                    }
-                    worker
-                        .handle
-                        .await
-                        .unwrap_or_else(|e| error!("Error waiting for HW worker to quit: {e}"));
-                }
-                // Explicitly close audio and MIDI fds before sending
-                // the Quit response. The GUI calls exit(0) upon
-                // receiving it, which skips destructors — any
-                // still-open device fd would trigger the kernel's
-                // 5-second drain during process teardown.
-                if let Some(hw) = &self.hw_driver {
-                    hw.lock().close_fds();
-                }
-                self.midi_hub.lock().close_all();
-                self.hw_driver = None;
-                self.notify_clients(Ok(Action::Quit)).await;
-                self.ready_workers.clear();
-                while !self.workers.is_empty() {
-                    let worker = self.workers.remove(0);
-                    if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
-                        error!("Error sending quit message to worker: {e}");
-                    }
-                    worker
-                        .handle
-                        .await
-                        .unwrap_or_else(|e| error!("Error waiting for worker to quit: {e}"));
-                }
-                #[cfg(unix)]
-                {
-                    self.jack_runtime = None;
-                }
-                self.osc_server = None;
+                self.handle_quit(a.clone()).await;
                 return;
             }
             Action::AddTrack {
@@ -5962,260 +10532,43 @@ impl Engine {
                 midi_outs,
                 folder,
             } => {
-                let tracks = &mut self.state.lock().tracks;
-                if tracks.contains_key(name) {
-                    self.notify_clients(Err(format!("Track {} already exists", name)))
-                        .await;
-                    return;
-                }
-                let maybe_hw = if let Some(oss) = &self.hw_driver {
-                    let hw = oss.lock();
-                    Some((hw.cycle_samples(), hw.sample_rate() as f64))
-                } else {
-                    #[cfg(unix)]
-                    if let Some(jack) = &self.jack_runtime {
-                        let j = jack.lock();
-                        Some((j.buffer_size, j.sample_rate as f64))
-                    } else {
-                        None
-                    }
-                    #[cfg(not(unix))]
-                    None
-                };
-
-                if let Some((chsamples, sample_rate)) = maybe_hw {
-                    let track = if folder {
-                        Track::new_folder(
-                            name.clone(),
-                            audio_ins,
-                            audio_outs,
-                            midi_ins,
-                            midi_outs,
-                            chsamples,
-                            sample_rate,
-                        )
-                    } else {
-                        Track::new(
-                            name.clone(),
-                            audio_ins,
-                            audio_outs,
-                            midi_ins,
-                            midi_outs,
-                            chsamples,
-                            sample_rate,
-                        )
-                    };
-                    tracks.insert(name.clone(), Arc::new(UnsafeMutex::new(Box::new(track))));
-                    if let Some(track) = tracks.get(name) {
-                        let t = track.lock();
-                        t.set_clip_playback_enabled(self.clip_playback_enabled);
-                        t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
-                        t.set_session_base_dir(self.session_dir.clone());
-                    }
-                } else {
-                    self.notify_clients(Err(
-                        "Engine needs to open audio device before adding audio track".to_string(),
-                    ))
-                    .await;
-                }
-            }
-            Action::TrackAddAudioInput(ref name) => {
-                let track = match self.track_handle_or_err(name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().add_audio_input() {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            Action::TrackAddAudioOutput(ref name) => {
-                let track = match self.track_handle_or_err(name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().add_audio_output() {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            Action::TrackRemoveAudioInput(ref name) => {
-                let track = match self.track_handle_or_err(name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().remove_audio_input() {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            Action::TrackRemoveAudioOutput(ref name) => {
-                let track = match self.track_handle_or_err(name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let (hw_outputs, track_inputs) = {
-                    let state = self.state.lock();
-                    let hw_outputs = self.all_hw_output_audio_ports();
-                    let track_inputs = state
-                        .tracks
-                        .iter()
-                        .filter(|(track_name, _)| *track_name != name)
-                        .flat_map(|(_, handle)| handle.lock().audio.ins.clone())
-                        .collect::<Vec<_>>();
-                    (hw_outputs, track_inputs)
-                };
-                if let Err(e) = track.lock().remove_audio_output(&hw_outputs, &track_inputs) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            Action::RenameTrack {
-                ref old_name,
-                ref new_name,
-            } => {
-                if self.state.lock().tracks.contains_key(new_name) {
-                    self.notify_clients(Err(format!("Track '{}' already exists", new_name)))
-                        .await;
-                    return;
-                }
-
-                let Some(track) = self.state.lock().tracks.remove(old_name) else {
-                    self.notify_clients(Err(format!("Track '{}' not found", old_name)))
-                        .await;
-                    return;
-                };
-
-                track.lock().name = new_name.clone();
-                self.state.lock().tracks.insert(new_name.clone(), track);
-                for other in self.state.lock().tracks.values() {
-                    let other = other.lock();
-                    if other.parent_track.as_deref() == Some(old_name.as_str()) {
-                        other.parent_track = Some(new_name.clone());
-                    }
-                }
-
-                if let Some(recording) = self.audio_recordings.remove(old_name) {
-                    self.audio_recordings.insert(new_name.clone(), recording);
-                }
-                if let Some(recording) = self.midi_recordings.remove(old_name) {
-                    self.midi_recordings.insert(new_name.clone(), recording);
-                }
-
-                for route in &mut self.midi_hw_in_routes {
-                    if route.to_track == *old_name {
-                        route.to_track = new_name.clone();
-                    }
-                }
-                for route in &mut self.midi_hw_out_routes {
-                    if route.from_track == *old_name {
-                        route.from_track = new_name.clone();
-                    }
-                }
-                if let Some((armed_track, target, device)) = self.pending_midi_learn.clone()
-                    && armed_track == *old_name
-                {
-                    self.pending_midi_learn = Some((new_name.clone(), target, device));
-                }
-
-                self.notify_clients(Ok(Action::RenameTrack {
-                    old_name: old_name.clone(),
-                    new_name: new_name.clone(),
-                }))
+                self.handle_add_track(
+                    name.clone(),
+                    audio_ins,
+                    midi_ins,
+                    audio_outs,
+                    midi_outs,
+                    folder,
+                )
                 .await;
             }
+            Action::TrackAddAudioInput(..) => {
+                if Self::box_bool(self.handle_track_add_audio_input(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackAddAudioOutput(..) => {
+                if Self::box_bool(self.handle_track_add_audio_output(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackRemoveAudioInput(..) => {
+                if Self::box_bool(self.handle_track_remove_audio_input(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackRemoveAudioOutput(..) => {
+                if Self::box_bool(self.handle_track_remove_audio_output(a.clone())).await {
+                    return;
+                }
+            }
+            Action::RenameTrack { .. } => {
+                if Self::box_bool(self.handle_rename_track(a.clone())).await {
+                    return;
+                }
+            }
             Action::RemoveTrack(ref name) => {
-                let mut descendant_names = Vec::new();
-                self.collect_descendant_track_names(name, &mut descendant_names);
-                let names_to_remove: Vec<String> = descendant_names
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(name.clone()))
-                    .collect();
-
-                let combined_inverse = if record_history && !self.history_suspended {
-                    let state = self.state.lock();
-                    let mut inv = Vec::new();
-                    for n in &names_to_remove {
-                        if let Some(mut actions) =
-                            create_inverse_actions(&Action::RemoveTrack(n.clone()), state)
-                        {
-                            inv.append(&mut actions);
-                        }
-                        for route in self.midi_hw_in_routes.iter().filter(|r| &r.to_track == n) {
-                            inv.push(Action::Connect {
-                                from_track: format!("midi:hw:in:{}", route.device),
-                                from_port: 0,
-                                to_track: route.to_track.clone(),
-                                to_port: route.to_port,
-                                kind: Kind::MIDI,
-                            });
-                        }
-                        for route in self
-                            .midi_hw_out_routes
-                            .iter()
-                            .filter(|r| &r.from_track == n)
-                        {
-                            inv.push(Action::Connect {
-                                from_track: route.from_track.clone(),
-                                from_port: route.from_port,
-                                to_track: format!("midi:hw:out:{}", route.device),
-                                to_port: 0,
-                                kind: Kind::MIDI,
-                            });
-                        }
-                    }
-
-                    // Reorder so all AddTrack actions come first, then everything else, then
-                    // explicit Connect actions. This mirrors EndHistoryGroup and guarantees that
-                    // tracks are recreated before they are re-parented or reconnected.
-                    let mut add_tracks = Vec::new();
-                    let mut connections = Vec::new();
-                    let mut rest = Vec::new();
-                    for action in inv {
-                        match action {
-                            Action::AddTrack { .. } => add_tracks.push(action),
-                            Action::Connect { .. } => connections.push(action),
-                            _ => rest.push(action),
-                        }
-                    }
-                    let mut ordered = add_tracks;
-                    ordered.extend(rest);
-                    ordered.extend(connections);
-                    ordered
-                } else {
-                    Vec::new()
-                };
-
-                for n in &descendant_names {
-                    self.remove_single_track(n).await;
-                    self.notify_clients(Ok(Action::RemoveTrack(n.clone())))
-                        .await;
-                }
-                self.remove_single_track(name).await;
-
-                if record_history && !self.history_suspended && !combined_inverse.is_empty() {
-                    self.history.record(UndoEntry {
-                        forward_actions: vec![Action::RemoveTrack(name.clone())],
-                        inverse_actions: combined_inverse,
-                    });
-                }
-
-                // The outer code already computed a per-action inverse for the original
-                // RemoveTrack. We have recorded a combined inverse for the whole subtree, so
-                // suppress that default recording.
+                self.handle_remove_track(name.clone(), record_history).await;
                 inverse_actions = None;
             }
             Action::TrackLevel(ref name, level) => {
@@ -6247,20 +10600,9 @@ impl Engine {
                     track.lock().set_balance(balance);
                 }
             }
-            Action::TrackMidiCc {
-                ref track_name,
-                channel,
-                cc,
-                value,
-            } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
-                    track
-                        .lock()
-                        .pending_automation_midi_events
-                        .push(MidiEvent::new(
-                            0,
-                            vec![0xB0 | channel.min(15), cc.min(127), value.min(127)],
-                        ));
+            Action::TrackMidiCc { .. } => {
+                if Self::box_bool(self.handle_track_midi_cc(a.clone())).await {
+                    return;
                 }
             }
             Action::RequestMeterSnapshot => {
@@ -6273,21 +10615,9 @@ impl Engine {
             }
             Action::TrackMeters { .. } => {}
             Action::MeterSnapshot { .. } => {}
-            Action::TrackToggleArm(ref name) => {
-                if self.reject_if_track_frozen(name, "arming/disarming").await {
+            Action::TrackToggleArm(..) => {
+                if Self::box_bool(self.handle_track_toggle_arm(a.clone())).await {
                     return;
-                }
-                if let Some(track) = self.state.lock().tracks.get(name).cloned() {
-                    track.lock().arm();
-                    let armed = track.lock().armed;
-                    if !armed && self.audio_recordings.contains_key(name) {
-                        self.flush_track_recording(name).await;
-                    }
-                } else {
-                    tracing::warn!(
-                        "TrackToggleArm for '{}' but track not found in engine",
-                        name
-                    );
                 }
             }
             Action::TrackToggleMute(ref name) => {
@@ -6371,650 +10701,63 @@ impl Engine {
             Action::SessionArmMidiLearn { ref target } => {
                 self.pending_session_midi_learn = Some(target.clone());
             }
-            Action::TrackSetMidiLearnBinding {
-                ref track_name,
-                target,
-                ref binding,
-            } => {
-                if let Some(binding) = binding.as_ref() {
-                    let conflicts = self.midi_learn_slot_conflicts(
-                        binding,
-                        Some(MidiLearnSlot::Track(track_name.clone(), target)),
-                    );
-                    if !conflicts.is_empty() {
-                        self.notify_clients(Err(format!(
-                            "MIDI learn conflict for '{}' {:?}: {}",
-                            track_name,
-                            target,
-                            conflicts.join(", ")
-                        )))
-                        .await;
-                        return;
-                    }
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                match target {
-                    crate::message::TrackMidiLearnTarget::Volume => {
-                        track.lock().midi_learn_volume = binding.clone();
-                    }
-                    crate::message::TrackMidiLearnTarget::Balance => {
-                        track.lock().midi_learn_balance = binding.clone();
-                    }
-                    crate::message::TrackMidiLearnTarget::Mute => {
-                        track.lock().midi_learn_mute = binding.clone();
-                    }
-                    crate::message::TrackMidiLearnTarget::Solo => {
-                        track.lock().midi_learn_solo = binding.clone();
-                    }
-                    crate::message::TrackMidiLearnTarget::Arm => {
-                        track.lock().midi_learn_arm = binding.clone();
-                    }
-                    crate::message::TrackMidiLearnTarget::InputMonitor => {
-                        track.lock().midi_learn_input_monitor = binding.clone();
-                    }
-                    crate::message::TrackMidiLearnTarget::DiskMonitor => {
-                        track.lock().midi_learn_disk_monitor = binding.clone();
-                    }
+            Action::TrackSetMidiLearnBinding { .. } => {
+                if Self::box_bool(self.handle_track_set_midi_learn_binding(a.clone())).await {
+                    return;
                 }
             }
-            Action::SetGlobalMidiLearnBinding {
-                target,
-                ref binding,
-            } => {
-                if let Some(binding) = binding.as_ref() {
-                    let conflicts = self
-                        .midi_learn_slot_conflicts(binding, Some(MidiLearnSlot::Global(target)));
-                    if !conflicts.is_empty() {
-                        self.notify_clients(Err(format!(
-                            "Global MIDI learn conflict for {:?}: {}",
-                            target,
-                            conflicts.join(", ")
-                        )))
-                        .await;
-                        return;
-                    }
-                }
-                match target {
-                    crate::message::GlobalMidiLearnTarget::PlayPause => {
-                        self.global_midi_learn_play_pause = binding.clone();
-                    }
-                    crate::message::GlobalMidiLearnTarget::Stop => {
-                        self.global_midi_learn_stop = binding.clone();
-                    }
-                    crate::message::GlobalMidiLearnTarget::RecordToggle => {
-                        self.global_midi_learn_record_toggle = binding.clone();
-                    }
+            Action::SetGlobalMidiLearnBinding { .. } => {
+                if Self::box_bool(self.handle_set_global_midi_learn_binding(a.clone())).await {
+                    return;
                 }
             }
-            Action::SetSessionMidiLearnBinding {
-                ref target,
-                ref binding,
-            } => {
-                if let Some(binding) = binding.as_ref() {
-                    let conflicts = self.midi_learn_slot_conflicts(
-                        binding,
-                        Some(MidiLearnSlot::Session(target.clone())),
-                    );
-                    if !conflicts.is_empty() {
-                        self.notify_clients(Err(format!(
-                            "Session MIDI learn conflict for {:?}: {}",
-                            target,
-                            conflicts.join(", ")
-                        )))
-                        .await;
-                        return;
-                    }
-                }
-                match target {
-                    crate::message::SessionMidiLearnTarget::Slot {
-                        track_name,
-                        scene_index,
-                    } => {
-                        if binding.is_some() {
-                            self.session_midi_learn_slots.insert(
-                                (track_name.clone(), *scene_index),
-                                binding.clone().unwrap(),
-                            );
-                        } else {
-                            self.session_midi_learn_slots
-                                .remove(&(track_name.clone(), *scene_index));
-                        }
-                    }
-                    crate::message::SessionMidiLearnTarget::Scene(scene_index) => {
-                        if binding.is_some() {
-                            self.session_midi_learn_scenes
-                                .insert(*scene_index, binding.clone().unwrap());
-                        } else {
-                            self.session_midi_learn_scenes.remove(scene_index);
-                        }
-                    }
-                    crate::message::SessionMidiLearnTarget::StopTrack(track_name) => {
-                        if binding.is_some() {
-                            self.session_midi_learn_stop_track
-                                .insert(track_name.clone(), binding.clone().unwrap());
-                        } else {
-                            self.session_midi_learn_stop_track.remove(track_name);
-                        }
-                    }
-                    crate::message::SessionMidiLearnTarget::StopAll => {
-                        self.session_midi_learn_stop_all = binding.clone();
-                    }
+            Action::SetSessionMidiLearnBinding { .. } => {
+                if Self::box_bool(self.handle_set_session_midi_learn_binding(a.clone())).await {
+                    return;
                 }
             }
-            Action::TrackSetFolder {
-                ref track_name,
-                is_folder,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if is_folder {
-                    let is_master = track.lock().is_master;
-                    if is_master {
-                        self.notify_clients(Err(format!(
-                            "Track '{}' is the master track and cannot be made a folder",
-                            track_name
-                        )))
-                        .await;
-                        return;
-                    }
+            Action::TrackSetFolder { .. } => {
+                if Self::box_bool(self.handle_track_set_folder(a.clone())).await {
+                    return;
                 }
-                {
-                    let track = track.lock();
-                    track.is_folder = is_folder;
-                    track.ensure_default_audio_passthrough();
-                    track.ensure_default_midi_passthrough();
-                }
-                self.notify_clients(Ok(Action::TrackSetFolder {
-                    track_name: track_name.clone(),
-                    is_folder,
-                }))
-                .await;
             }
             Action::TrackSetParent {
                 ref track_name,
                 ref parent_name,
             } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if parent_name.as_deref() == Some(track_name.as_str()) {
-                    self.notify_clients(Err("Track cannot be its own parent".to_string()))
-                        .await;
-                    return;
-                }
-
-                // Validate the new parent is a folder (if any).
-                if let Some(parent_name) = parent_name {
-                    let state = self.state.lock();
-                    let parent = state.tracks.get(parent_name);
-                    if parent.is_none() {
-                        self.notify_clients(Err(format!(
-                            "Parent track '{}' does not exist",
-                            parent_name
-                        )))
-                        .await;
-                        return;
-                    }
-                    if !parent.unwrap().lock().is_folder {
-                        self.notify_clients(Err(format!(
-                            "Track '{}' is not a folder",
-                            parent_name
-                        )))
-                        .await;
-                        return;
-                    }
-                }
-
-                // Disconnect from the old parent and update its child list.
-                {
-                    let old_parent_name = track.lock().parent_track.clone();
-                    if let Some(old_parent_name) = old_parent_name {
-                        let state = self.state.lock();
-                        if let (Some(parent_arc), Some(child_arc)) = (
-                            state.tracks.get(&old_parent_name).cloned(),
-                            state.tracks.get(track_name).cloned(),
-                        ) {
-                            {
-                                let parent = parent_arc.lock();
-                                parent.child_tracks.retain(|c| c.lock().name != *track_name);
-                            }
-                            {
-                                let child = child_arc.lock();
-                                let parent = parent_arc.lock();
-                                child.disconnect_from_parent(parent);
-                            }
-                        }
-                    }
-                }
-
-                let mut disconnect_actions = Vec::new();
-
-                // Remove all existing audio and MIDI connections involving this track.
-                {
-                    let state = self.state.lock();
-                    let hw_inputs = self.all_hw_input_audio_ports();
-                    let hw_outputs = self.all_hw_output_audio_ports();
-                    if let Some(child_arc) = state.tracks.get(track_name).cloned() {
-                        let child = child_arc.lock();
-                        for (port_idx, inp) in child.audio.ins.iter().enumerate() {
-                            let sources = inp.connections.lock().clone();
-                            for src in sources {
-                                let _ = AudioIO::disconnect(&src, inp);
-                                if let Some((src_name, src_port)) =
-                                    self.find_audio_io_owner(state, &src)
-                                {
-                                    disconnect_actions.push(Action::Disconnect {
-                                        from_track: src_name,
-                                        from_port: src_port,
-                                        to_track: track_name.clone(),
-                                        to_port: port_idx,
-                                        kind: Kind::Audio,
-                                    });
-                                } else if let Some(src_port) = hw_inputs
-                                    .iter()
-                                    .position(|hw_in| std::sync::Arc::ptr_eq(hw_in, &src))
-                                {
-                                    disconnect_actions.push(Action::Disconnect {
-                                        from_track: "hw:in".to_string(),
-                                        from_port: src_port,
-                                        to_track: track_name.clone(),
-                                        to_port: port_idx,
-                                        kind: Kind::Audio,
-                                    });
-                                }
-                            }
-                        }
-                        for (port_idx, out) in child.audio.outs.iter().enumerate() {
-                            let targets = out.connections.lock().clone();
-                            for tgt in targets {
-                                let _ = AudioIO::disconnect(out, &tgt);
-                                if let Some((tgt_name, tgt_port)) =
-                                    self.find_audio_io_owner(state, &tgt)
-                                {
-                                    disconnect_actions.push(Action::Disconnect {
-                                        from_track: track_name.clone(),
-                                        from_port: port_idx,
-                                        to_track: tgt_name,
-                                        to_port: tgt_port,
-                                        kind: Kind::Audio,
-                                    });
-                                } else if let Some(tgt_port) = hw_outputs
-                                    .iter()
-                                    .position(|hw_out| std::sync::Arc::ptr_eq(hw_out, &tgt))
-                                {
-                                    disconnect_actions.push(Action::Disconnect {
-                                        from_track: track_name.clone(),
-                                        from_port: port_idx,
-                                        to_track: "hw:out".to_string(),
-                                        to_port: tgt_port,
-                                        kind: Kind::Audio,
-                                    });
-                                }
-                            }
-                        }
-
-                        // Remove MIDI hardware routes.
-                        for route in self
-                            .midi_hw_in_routes
-                            .iter()
-                            .filter(|r| r.to_track == *track_name)
-                        {
-                            disconnect_actions.push(Action::Disconnect {
-                                from_track: format!("midi:hw:in:{}", route.device),
-                                from_port: 0,
-                                to_track: track_name.clone(),
-                                to_port: route.to_port,
-                                kind: Kind::MIDI,
-                            });
-                        }
-                        self.midi_hw_in_routes.retain(|r| r.to_track != *track_name);
-
-                        for route in self
-                            .midi_hw_out_routes
-                            .iter()
-                            .filter(|r| r.from_track == *track_name)
-                        {
-                            disconnect_actions.push(Action::Disconnect {
-                                from_track: track_name.clone(),
-                                from_port: route.from_port,
-                                to_track: format!("midi:hw:out:{}", route.device),
-                                to_port: 0,
-                                kind: Kind::MIDI,
-                            });
-                        }
-                        self.midi_hw_out_routes
-                            .retain(|r| r.from_track != *track_name);
-
-                        // Remove track-to-track MIDI connections where this track is the source.
-                        for (port_idx, out) in child.midi.outs.iter().enumerate() {
-                            let targets = out.lock().connections.clone();
-                            for tgt in targets {
-                                if let Some((tgt_name, tgt_port, _)) =
-                                    self.find_midi_io_owner(state, &tgt)
-                                {
-                                    let _ = MIDIIO::disconnect(out, &tgt);
-                                    disconnect_actions.push(Action::Disconnect {
-                                        from_track: track_name.clone(),
-                                        from_port: port_idx,
-                                        to_track: tgt_name,
-                                        to_port: tgt_port,
-                                        kind: Kind::MIDI,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Remove track-to-track MIDI connections where this track is the target.
-                    let child_input_arcs: Vec<_> =
-                        if let Some(child_arc) = state.tracks.get(track_name).cloned() {
-                            let child = child_arc.lock();
-                            child.midi.ins.clone()
-                        } else {
-                            Vec::new()
-                        };
-                    for (other_name, other_track) in &state.tracks {
-                        if other_name == track_name {
-                            continue;
-                        }
-                        let other = other_track.lock();
-                        for (out_port, out) in other.midi.outs.iter().enumerate() {
-                            let targets = out.lock().connections.clone();
-                            for tgt in targets {
-                                if let Some(to_port) = child_input_arcs
-                                    .iter()
-                                    .position(|inp| std::sync::Arc::ptr_eq(inp, &tgt))
-                                {
-                                    let _ = MIDIIO::disconnect(out, &tgt);
-                                    disconnect_actions.push(Action::Disconnect {
-                                        from_track: other_name.clone(),
-                                        from_port: out_port,
-                                        to_track: track_name.clone(),
-                                        to_port,
-                                        kind: Kind::MIDI,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Apply the parent change.
-                {
-                    track.lock().parent_track = parent_name.clone();
-                }
-
-                // Connect to the new parent and add to its child list.
-                if let Some(parent_name) = parent_name {
-                    let state = self.state.lock();
-                    if let (Some(parent_arc), Some(child_arc)) = (
-                        state.tracks.get(parent_name).cloned(),
-                        state.tracks.get(track_name).cloned(),
-                    ) {
-                        {
-                            let parent = parent_arc.lock();
-                            parent.child_tracks.push(child_arc.clone());
-                        }
-                        {
-                            let child = child_arc.lock();
-                            let parent = parent_arc.lock();
-                            // Folder input -> child input (one-to-one when counts match).
-                            if parent.audio.ins.len() == child.audio.ins.len() {
-                                for (parent_in, child_in) in
-                                    parent.audio.ins.iter().zip(child.audio.ins.iter())
-                                {
-                                    Track::connect_directed_audio(parent_in, child_in);
-                                }
-                            }
-                            // Child output -> folder output (one-to-one when counts match).
-                            if parent.audio.outs.len() == child.audio.outs.len() {
-                                for (child_out, parent_out) in
-                                    child.audio.outs.iter().zip(parent.audio.outs.iter())
-                                {
-                                    AudioIO::connect(child_out, parent_out);
-                                }
-                            }
-                            // Folder MIDI input -> child MIDI input (one-to-one when counts match).
-                            if parent.midi.ins.len() == child.midi.ins.len() {
-                                for (parent_in, child_in) in
-                                    parent.midi.ins.iter().zip(child.midi.ins.iter())
-                                {
-                                    let child_in_lock = child_in.lock();
-                                    if !child_in_lock
-                                        .connections
-                                        .iter()
-                                        .any(|c| Arc::ptr_eq(c, parent_in))
-                                    {
-                                        child_in_lock.connections.push(parent_in.clone());
-                                    }
-                                }
-                            }
-                            // Child MIDI output -> folder MIDI output (one-to-one when counts match).
-                            if parent.midi.outs.len() == child.midi.outs.len() {
-                                for (child_out, parent_out) in
-                                    child.midi.outs.iter().zip(parent.midi.outs.iter())
-                                {
-                                    let child_out_lock = child_out.lock();
-                                    if !child_out_lock
-                                        .connections
-                                        .iter()
-                                        .any(|c| Arc::ptr_eq(c, parent_out))
-                                    {
-                                        child_out_lock.connections.push(parent_out.clone());
-                                    }
-                                }
-                            }
-                            child.invalidate_audio_route_cache();
-                            parent.invalidate_audio_route_cache();
-                            child.invalidate_midi_route_cache();
-                            parent.invalidate_midi_route_cache();
-                        }
-                    }
-                }
-
-                // Restore default input->output passthrough so audio/MIDI can flow
-                // through the track whether it is a root track or a folder child.
-                {
-                    let state = self.state.lock();
-                    if let Some(child_arc) = state.tracks.get(track_name).cloned() {
-                        let child = child_arc.lock();
-                        child.ensure_default_audio_passthrough();
-                        child.ensure_default_midi_passthrough();
-                    }
-                }
-
-                for action in disconnect_actions {
-                    self.notify_clients(Ok(action)).await;
-                }
-
-                self.notify_clients(Ok(Action::TrackSetParent {
-                    track_name: track_name.clone(),
-                    parent_name: parent_name.clone(),
-                }))
-                .await;
-            }
-            Action::TrackToggleFolder { ref track_name } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                {
-                    let t = track.lock();
-                    t.folder_open = !t.folder_open;
-                }
-                self.notify_clients(Ok(Action::TrackToggleFolder {
-                    track_name: track_name.clone(),
-                }))
-                .await;
-
-                self.notify_clients(Ok(Action::TrackSetFolder {
-                    track_name: track_name.clone(),
-                    is_folder: track.lock().is_folder,
-                }))
-                .await;
-            }
-            Action::TrackSetMidiLaneChannel {
-                ref track_name,
-                lane,
-                channel,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                track.lock().set_midi_lane_channel(lane, channel);
-            }
-            Action::TrackSetFrozen {
-                ref track_name,
-                frozen,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                track.lock().set_frozen(frozen);
-            }
-            Action::TrackSetSessionSlot {
-                ref track_name,
-                scene_index,
-                ref clip_id,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                match clip_id {
-                    Some(id) => {
-                        let play_enabled = track
-                            .session_slots
-                            .get(&scene_index)
-                            .map(|slot| slot.play_enabled)
-                            .unwrap_or(true);
-                        track.session_slots.insert(
-                            scene_index,
-                            SessionSlot {
-                                clip_id: id.clone(),
-                                play_enabled,
-                            },
-                        );
-                    }
-                    None => {
-                        track.session_slots.remove(&scene_index);
-                    }
-                }
-            }
-            Action::TrackSetSessionSlotPlayEnabled {
-                ref track_name,
-                scene_index,
-                enabled,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if let Some(slot) = track.session_slots.get_mut(&scene_index) {
-                    slot.play_enabled = enabled;
-                }
-            }
-            Action::TrackOfflineBounce {
-                track_name,
-                output_path,
-                start_sample,
-                length_samples,
-                automation_lanes,
-                apply_fader,
-            } => {
-                if self.offline_bounce_jobs.contains_key(&track_name) {
-                    self.notify_clients(Err(format!(
-                        "Offline bounce for track '{}' is already in progress",
-                        track_name
-                    )))
+                self.handle_track_set_parent(track_name.as_str(), parent_name.as_deref())
                     .await;
+            }
+            Action::TrackToggleFolder { .. } => {
+                if Self::box_bool(self.handle_track_toggle_folder(a.clone())).await {
                     return;
                 }
-                if let Err(e) = self.track_handle_or_err(&track_name) {
-                    self.notify_clients(Err(e)).await;
+            }
+            Action::TrackSetMidiLaneChannel { .. } => {
+                if Self::box_bool(self.handle_track_set_midi_lane_channel(a.clone())).await {
                     return;
                 }
-                if length_samples == 0 {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' has no renderable content for offline bounce",
-                        track_name
-                    )))
-                    .await;
+            }
+            Action::TrackSetFrozen { .. } => {
+                if Self::box_bool(self.handle_track_set_frozen(a.clone())).await {
                     return;
                 }
-                let Some(worker_index) = self.take_ready_worker_index() else {
-                    self.pending_requests
-                        .push_front(Action::TrackOfflineBounce {
-                            track_name,
-                            output_path,
-                            start_sample,
-                            length_samples,
-                            automation_lanes,
-                            apply_fader,
-                        });
+            }
+            Action::TrackSetSessionSlot { .. } => {
+                if Self::box_bool(self.handle_track_set_session_slot(a.clone())).await {
                     return;
-                };
-                let cancel = Arc::new(AtomicBool::new(false));
-                self.offline_bounce_jobs.insert(
-                    track_name.clone(),
-                    OfflineBounceJob {
-                        cancel: cancel.clone(),
-                    },
-                );
-                let track_name_clone = track_name.clone();
-                let worker = &self.workers[worker_index];
-                let job = crate::message::OfflineBounceWork {
-                    state: self.state.clone(),
-                    track_name,
-                    output_path,
-                    start_sample,
-                    length_samples,
-                    tempo_bpm: self.tempo_bpm,
-                    tsig_num: self.tsig_num,
-                    tsig_denom: self.tsig_denom,
-                    automation_lanes,
-                    cancel,
-                    apply_fader,
-                };
-                if let Err(e) = worker.tx.send(Message::ProcessOfflineBounce(job)).await {
-                    self.offline_bounce_jobs.remove(&track_name_clone);
-                    self.notify_clients(Err(format!("Failed to schedule offline bounce: {e}")))
-                        .await;
                 }
+            }
+            Action::TrackSetSessionSlotPlayEnabled { .. } => {
+                if self
+                    .handle_track_set_session_slot_play_enabled(a.clone())
+                    .await
+                {
+                    return;
+                }
+            }
+            Action::TrackOfflineBounce { .. } => {
+                self.handle_track_offline_bounce(action_to_process).await;
                 return;
             }
             Action::TrackOfflineBounceCancel { .. } => {}
@@ -7050,42 +10793,15 @@ impl Engine {
                     return;
                 }
             }
-            Action::TrackClearDefaultPassthrough { ref track_name } => {
-                if self
-                    .reject_if_track_frozen(track_name, "plugin graph editing")
-                    .await
-                {
+            Action::TrackClearDefaultPassthrough { .. } => {
+                if Self::box_bool(self.handle_track_clear_default_passthrough(a.clone())).await {
                     return;
                 }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                track.lock().clear_default_passthrough();
             }
-            Action::TrackClearPlugins { ref track_name } => {
-                if self
-                    .reject_if_track_frozen(track_name, "plugin graph editing")
-                    .await
-                {
+            Action::TrackClearPlugins { .. } => {
+                if Self::box_bool(self.handle_track_clear_plugins(a.clone())).await {
                     return;
                 }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                track.lock().clear_plugins();
-                self.notify_clients(Ok(Action::Log {
-                    source: "engine".to_string(),
-                    message: format!("Cleared plugins from track '{track_name}'"),
-                }))
-                .await;
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::ClipSetLv2PluginState { ref track_name, .. } => {
@@ -7095,455 +10811,113 @@ impl Engine {
                 )))
                 .await;
             }
-            Action::TrackGetClapNoteNames { ref track_name } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let note_names = track.lock().get_clap_note_names();
-                self.notify_clients(Ok(Action::TrackClapNoteNames {
-                    track_name: track_name.clone(),
-                    note_names,
-                }))
-                .await;
-            }
-            Action::TrackGetPluginGraph {
-                ref track_name,
-                include_state,
-            } => {
-                let start = std::time::Instant::now();
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let (plugins, connections, connectable_connections) = {
-                    let track = track.lock();
-                    let plugins_start = std::time::Instant::now();
-                    let plugins = track.plugin_graph_plugins(include_state);
-                    let plugins_ms = plugins_start.elapsed().as_millis();
-                    let conns_start = std::time::Instant::now();
-                    let connections = track.plugin_graph_connections();
-                    let conns_ms = conns_start.elapsed().as_millis();
-                    let cc_start = std::time::Instant::now();
-                    let connectable_connections = track.connectable_connections();
-                    let cc_ms = cc_start.elapsed().as_millis();
-                    tracing::debug!(
-                        %track_name,
-                        include_state,
-                        plugins_ms,
-                        conns_ms,
-                        cc_ms,
-                        "TrackGetPluginGraph collected graph data"
-                    );
-                    (plugins, connections, connectable_connections)
-                };
-                let total_ms = start.elapsed().as_millis();
-                tracing::debug!(
-                    %track_name,
-                    total_ms,
-                    plugins = plugins.len(),
-                    connections = connections.len(),
-                    connectable = connectable_connections.len(),
-                    "TrackGetPluginGraph responding"
-                );
-                self.notify_clients(Ok(Action::TrackPluginGraph {
-                    track_name: track_name.clone(),
-                    plugins,
-                    connections,
-                    connectable_connections,
-                }))
-                .await;
-                return;
-            }
-            Action::TrackPluginGraph { .. } => {}
-            Action::TrackConnectPluginAudio {
-                ref track_name,
-                ref from_node,
-                from_port,
-                ref to_node,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "plugin routing changes")
-                    .await
-                {
+            Action::TrackGetClapNoteNames { .. } => {
+                if Self::box_bool(self.handle_track_get_clap_note_names(a.clone())).await {
                     return;
                 }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().connect_plugin_audio(
-                    from_node.clone(),
-                    from_port,
-                    to_node.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            }
+            Action::TrackGetPluginGraph { .. } => {
+                if Self::box_bool(self.handle_track_get_plugin_graph(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackConnectPluginMidi {
-                ref track_name,
-                ref from_node,
-                from_port,
-                ref to_node,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "plugin routing changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().connect_plugin_midi(
-                    from_node.clone(),
-                    from_port,
-                    to_node.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackPluginGraph { .. } => {}
+            Action::TrackConnectPluginAudio { .. } => {
+                if Self::box_bool(self.handle_track_connect_plugin_audio(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackDisconnectPluginAudio {
-                ref track_name,
-                ref from_node,
-                from_port,
-                ref to_node,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "plugin routing changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().disconnect_plugin_audio(
-                    from_node.clone(),
-                    from_port,
-                    to_node.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackConnectPluginMidi { .. } => {
+                if Self::box_bool(self.handle_track_connect_plugin_midi(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackDisconnectPluginMidi {
-                ref track_name,
-                ref from_node,
-                from_port,
-                ref to_node,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "plugin routing changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().disconnect_plugin_midi(
-                    from_node.clone(),
-                    from_port,
-                    to_node.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackDisconnectPluginAudio { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_plugin_audio(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackConnectAudio {
-                ref track_name,
-                ref from,
-                from_port,
-                ref to,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "routing changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().connect_audio_connectable(
-                    from.clone(),
-                    from_port,
-                    to.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackDisconnectPluginMidi { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_plugin_midi(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackDisconnectAudio {
-                ref track_name,
-                ref from,
-                from_port,
-                ref to,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "routing changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().disconnect_audio_connectable(
-                    from.clone(),
-                    from_port,
-                    to.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackConnectAudio { .. } => {
+                if Self::box_bool(self.handle_track_connect_audio(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackConnectMidi {
-                ref track_name,
-                ref from,
-                from_port,
-                ref to,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "routing changes")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().connect_midi_connectable(
-                    from.clone(),
-                    from_port,
-                    to.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackDisconnectAudio { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_audio(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackDisconnectMidi {
-                ref track_name,
-                ref from,
-                from_port,
-                ref to,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "routing changes")
-                    .await
-                {
+            Action::TrackConnectMidi { .. } => {
+                if Self::box_bool(self.handle_track_connect_midi(a.clone())).await {
                     return;
                 }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().disconnect_midi_connectable(
-                    from.clone(),
-                    from_port,
-                    to.clone(),
-                    to_port,
-                ) {
-                    self.notify_clients(Err(e)).await;
+            }
+            Action::TrackDisconnectMidi { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_midi(a.clone())).await {
                     return;
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::ListLv2Plugins => {
-                match crate::plugins::scan_plugins::<crate::plugins::types::Lv2PluginInfo>("lv2") {
-                    Ok(plugins) => {
-                        self.notify_clients(Ok(Action::Lv2Plugins(plugins))).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("LV2 plugin scan failed: {e}");
-                        self.notify_clients(Ok(Action::Lv2PluginsUnavailable { error: e }))
-                            .await;
-                    }
+                if Self::box_bool(self.handle_list_lv2_plugins(a.clone())).await {
+                    return;
                 }
-                return;
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::Lv2Plugins(_) => {}
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::Lv2PluginsUnavailable { .. } => {}
             Action::ListVst3Plugins => {
-                match crate::plugins::scan_plugins::<crate::plugins::types::Vst3PluginInfo>("vst3")
-                {
-                    Ok(plugins) => {
-                        self.notify_clients(Ok(Action::Vst3Plugins(plugins))).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("VST3 plugin scan failed: {e}");
-                        self.notify_clients(Ok(Action::Vst3PluginsUnavailable { error: e }))
-                            .await;
-                    }
+                if Self::box_bool(self.handle_list_vst3_plugins(a.clone())).await {
+                    return;
                 }
-                return;
             }
             Action::Vst3Plugins(_) => {}
             Action::Vst3PluginsUnavailable { .. } => {}
             Action::ListClapPlugins => {
-                match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap")
-                {
-                    Ok(plugins) => {
-                        self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("CLAP plugin scan failed: {e}");
-                        self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
-                            .await;
-                    }
+                if Self::box_bool(self.handle_list_clap_plugins(a.clone())).await {
+                    return;
                 }
-                return;
             }
             Action::ListClapPluginsWithCapabilities => {
-                match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap")
+                if self
+                    .handle_list_clap_plugins_with_capabilities(a.clone())
+                    .await
                 {
-                    Ok(plugins) => {
-                        self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("CLAP plugin scan failed: {e}");
-                        self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
-                            .await;
-                    }
+                    return;
                 }
-                return;
             }
             Action::ClapPlugins(_) => {}
             Action::ClapPluginsUnavailable { .. } => {}
             Action::TrackLoadClapPlugin {
                 ref track_name,
-                ref plugin_path,
+                ref plugin_id,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "CLAP plugin loading")
+                    .handle_track_load_clap_plugin(
+                        track_name.as_str(),
+                        plugin_id.as_str(),
+                        instance_id,
+                    )
                     .await
                 {
                     return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before loading CLAP plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.load_clap_plugin(plugin_path, instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-                self.notify_clients(Ok(Action::Log {
-                    source: "engine".to_string(),
-                    message: format!("CLAP plugin loaded on track '{track_name}': {plugin_path}"),
-                }))
-                .await;
-                if let Some(instance) = track.clap_plugins.last()
-                    && let Some(stderr) = instance.processor.lock().take_stderr()
-                {
-                    let source = format!("clap:{plugin_path}");
-                    self.spawn_plugin_host_stderr_reader(stderr, source);
-                    self.notify_clients(Ok(Action::Log {
-                        source: "engine".to_string(),
-                        message: format!(
-                            "Attached stderr reader for CLAP plugin on track '{track_name}'"
-                        ),
-                    }))
-                    .await;
                 }
             }
             Action::TrackUnloadClapPlugin {
                 ref track_name,
-                ref plugin_path,
+                ref plugin_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "CLAP plugin unloading")
+                    .handle_track_unload_clap_plugin(track_name.as_str(), plugin_id.as_str())
                     .await
                 {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.unload_clap_plugin(plugin_path) {
-                    self.notify_clients(Err(e)).await;
                     return;
                 }
             }
@@ -7552,114 +10926,41 @@ impl Engine {
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "CLAP plugin unloading")
+                    .handle_track_unload_clap_plugin_instance(track_name.as_str(), instance_id)
                     .await
                 {
                     return;
                 }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.unload_clap_plugin_instance(instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
             }
-            Action::TrackShowClapGui {
-                ref track_name,
-                instance_id,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().show_clap_gui(instance_id) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackShowClapGui { .. } => {
+                if Self::box_bool(self.handle_track_show_clap_gui(a.clone())).await {
                     return;
                 }
             }
             Action::TrackLoadVst3Plugin {
                 ref track_name,
-                ref plugin_path,
+                ref plugin_id,
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "VST3 plugin loading")
+                    .handle_track_load_vst3_plugin(
+                        track_name.as_str(),
+                        plugin_id.as_str(),
+                        instance_id,
+                    )
                     .await
                 {
                     return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before loading VST3 plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.load_vst3_plugin(plugin_path, instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-                if let Some(instance) = track.vst3_plugins.last()
-                    && let Some(stderr) = instance.processor.lock().take_stderr()
-                {
-                    let source = format!("vst3:{plugin_path}");
-                    self.spawn_plugin_host_stderr_reader(stderr, source);
                 }
             }
             Action::TrackUnloadVst3Plugin {
                 ref track_name,
-                ref plugin_path,
+                ref plugin_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "VST3 plugin unloading")
+                    .handle_track_unload_vst3_plugin(track_name.as_str(), plugin_id.as_str())
                     .await
                 {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.unload_vst3_plugin(plugin_path) {
-                    self.notify_clients(Err(e)).await;
                     return;
                 }
             }
@@ -7668,45 +10969,14 @@ impl Engine {
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "VST3 plugin unloading")
+                    .handle_track_unload_vst3_plugin_instance(track_name.as_str(), instance_id)
                     .await
                 {
                     return;
                 }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.unload_vst3_plugin_instance(instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
             }
-            Action::TrackShowVst3Gui {
-                ref track_name,
-                instance_id,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().show_vst3_gui(instance_id) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackShowVst3Gui { .. } => {
+                if Self::box_bool(self.handle_track_show_vst3_gui(a.clone())).await {
                     return;
                 }
             }
@@ -7717,36 +10987,14 @@ impl Engine {
                 instance_id,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "LV2 plugin loading")
+                    .handle_track_load_lv2_plugin(
+                        track_name.as_str(),
+                        plugin_uri.as_str(),
+                        instance_id,
+                    )
                     .await
                 {
                     return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before loading LV2 plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.load_lv2_plugin(plugin_uri, instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-                if let Some(instance) = track.lv2_plugins.last()
-                    && let Some(stderr) = instance.processor.lock().take_stderr()
-                {
-                    let source = format!("lv2:{plugin_uri}");
-                    self.spawn_plugin_host_stderr_reader(stderr, source);
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -7755,29 +11003,9 @@ impl Engine {
                 ref plugin_uri,
             } => {
                 if self
-                    .reject_if_track_frozen(track_name, "LV2 plugin unloading")
+                    .handle_track_unload_lv2_plugin(track_name.as_str(), plugin_uri.as_str())
                     .await
                 {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.unload_lv2_plugin(plugin_uri) {
-                    self.notify_clients(Err(e)).await;
                     return;
                 }
             }
@@ -7786,929 +11014,191 @@ impl Engine {
                 ref track_name,
                 instance_id,
             } => {
-                tracing::info!(%track_name, instance_id, "Engine handling TrackUnloadLv2PluginInstance");
                 if self
-                    .reject_if_track_frozen(track_name, "LV2 plugin unloading")
+                    .handle_track_unload_lv2_plugin_instance(track_name.as_str(), instance_id)
                     .await
                 {
                     return;
                 }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.unload_lv2_plugin_instance(instance_id) {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-                tracing::info!(%track_name, instance_id, "Engine TrackUnloadLv2PluginInstance complete");
             }
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackShowLv2Gui {
-                ref track_name,
-                instance_id,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track.lock().show_lv2_gui(instance_id) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackShowLv2Gui { .. } => {
+                if Self::box_bool(self.handle_track_show_lv2_gui(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackSetPluginResourceDir {
-                ref track_name,
-                instance_id,
-                ref format,
-                ref directory,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let dir = std::path::Path::new(directory);
-                let result = if format.eq_ignore_ascii_case("CLAP") {
-                    track.lock().set_clap_plugin_resource_dir(instance_id, dir)
-                } else if format.eq_ignore_ascii_case("LV2") {
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    {
-                        track.lock().set_lv2_plugin_resource_dir(instance_id, dir)
-                    }
-                    #[cfg(not(all(unix, not(target_os = "macos"))))]
-                    Err("LV2 is not supported on this platform".to_string())
-                } else {
-                    Err(format!(
-                        "Unsupported plugin format for resource dir: {format}"
-                    ))
-                };
-                if let Err(e) = result {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackSetPluginResourceDir { .. } => {
+                if Self::box_bool(self.handle_track_set_plugin_resource_dir(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackClapFileReferences {
-                ref track_name,
-                instance_id,
-                refs: _,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => {
-                    let refs = track.lock().clap_file_references(instance_id).unwrap_or_else(|e| {
-                        tracing::warn!(track_name = %track_name, instance_id, error = %e, "Failed to enumerate CLAP file references");
-                        Vec::new()
-                    });
-                    self.notify_clients(Ok(Action::TrackClapFileReferences {
-                        track_name: track_name.clone(),
-                        instance_id,
-                        refs,
-                    }))
-                    .await;
-                }
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::TrackUpdateClapFileReference {
-                ref track_name,
-                instance_id,
-                index,
-                ref path,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) = track
-                    .lock()
-                    .update_clap_file_reference(instance_id, index, path)
-                {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackClapFileReferences { .. } => {
+                if Self::box_bool(self.handle_track_clap_file_references(a.clone())).await {
                     return;
                 }
             }
-            Action::ClipSetPluginResourceDir {
-                ref track_name,
-                clip_idx,
-                instance_id,
-                ref format,
-                ref directory,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let dir = std::path::Path::new(directory);
-                let track = track.lock();
-                let result = if format.eq_ignore_ascii_case("CLAP") {
-                    track.clip_set_clap_plugin_resource_dir(clip_idx, instance_id, dir)
-                } else if format.eq_ignore_ascii_case("LV2") {
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    {
-                        track.clip_set_lv2_plugin_resource_dir(clip_idx, instance_id, dir)
-                    }
-                    #[cfg(not(all(unix, not(target_os = "macos"))))]
-                    Err("LV2 is not supported on this platform".to_string())
-                } else {
-                    Err(format!(
-                        "Unsupported plugin format for resource dir: {format}"
-                    ))
-                };
-                if let Err(e) = result {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            Action::ClipClapFileReferences {
-                ref track_name,
-                clip_idx,
-                instance_id,
-                refs: _,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => {
-                    let track = track.lock();
-                    let refs = track
-                        .clip_clap_file_references(clip_idx, instance_id)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(
-                                track_name = %track_name,
-                                clip_idx,
-                                instance_id,
-                                error = %e,
-                                "Failed to enumerate clip CLAP file references"
-                            );
-                            Vec::new()
-                        });
-                    self.notify_clients(Ok(Action::ClipClapFileReferences {
-                        track_name: track_name.clone(),
-                        clip_idx,
-                        instance_id,
-                        refs,
-                    }))
-                    .await;
-                }
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::ClipUpdateClapFileReference {
-                ref track_name,
-                clip_idx,
-                instance_id,
-                index,
-                ref path,
-            } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                if let Err(e) =
-                    track
-                        .lock()
-                        .clip_update_clap_file_reference(clip_idx, instance_id, index, path)
-                {
-                    self.notify_clients(Err(e)).await;
-                    return;
-                }
-            }
-            Action::TrackSetClapParameter {
-                ref track_name,
-                instance_id,
-                param_id,
-                value,
-            } => {
+            Action::TrackUpdateClapFileReference { .. } => {
                 if self
-                    .reject_if_track_frozen(track_name, "CLAP parameter changes")
+                    .handle_track_update_clap_file_reference(a.clone())
                     .await
                 {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) =
-                            track
-                                .lock()
-                                .set_clap_parameter(instance_id, param_id, value)
-                        {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                }
             }
-            Action::ClipSetClapParameter {
-                ref track_name,
-                clip_idx,
-                instance_id,
-                param_id,
-                value,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "CLAP parameter changes")
-                    .await
-                {
+            Action::ClipSetPluginResourceDir { .. } => {
+                if Self::box_bool(self.handle_clip_set_plugin_resource_dir(a.clone())).await {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) = track.lock().clip_set_clap_parameter(
-                            clip_idx,
-                            instance_id,
-                            param_id,
-                            value,
-                        ) {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                }
             }
-            Action::TrackSetClapParameterAt {
-                ref track_name,
-                instance_id,
-                param_id,
-                value,
-                frame,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "CLAP parameter changes")
-                    .await
-                {
+            Action::ClipClapFileReferences { .. } => {
+                if Self::box_bool(self.handle_clip_clap_file_references(a.clone())).await {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) =
-                            track
-                                .lock()
-                                .set_clap_parameter_at(instance_id, param_id, value, frame)
-                        {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                }
             }
-            Action::TrackBeginClapParameterEdit {
-                ref track_name,
-                instance_id,
-                param_id,
-                frame,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "CLAP parameter edit gestures")
-                    .await
-                {
+            Action::ClipUpdateClapFileReference { .. } => {
+                if Self::box_bool(self.handle_clip_update_clap_file_reference(a.clone())).await {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) =
-                            track
-                                .lock()
-                                .begin_clap_parameter_edit(instance_id, param_id, frame)
-                        {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                }
             }
-            Action::TrackEndClapParameterEdit {
-                ref track_name,
-                instance_id,
-                param_id,
-                frame,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "CLAP parameter edit gestures")
-                    .await
-                {
+            Action::TrackSetClapParameter { .. } => {
+                if Self::box_bool(self.handle_track_set_clap_parameter(a.clone())).await {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) =
-                            track
-                                .lock()
-                                .end_clap_parameter_edit(instance_id, param_id, frame)
-                        {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
+            }
+            Action::ClipSetClapParameter { .. } => {
+                if Self::box_bool(self.handle_clip_set_clap_parameter(a.clone())).await {
+                    return;
                 }
             }
-            Action::TrackGetClapParameters {
-                ref track_name,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().get_clap_parameters(instance_id) {
-                    Ok(parameters) => {
-                        self.notify_clients(Ok(Action::TrackClapParameters {
-                            track_name: track_name.clone(),
-                            instance_id,
-                            parameters,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackSetClapParameterAt { .. } => {
+                if Self::box_bool(self.handle_track_set_clap_parameter_at(a.clone())).await {
+                    return;
                 }
-            },
+            }
+            Action::TrackBeginClapParameterEdit { .. } => {
+                if Self::box_bool(self.handle_track_begin_clap_parameter_edit(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackEndClapParameterEdit { .. } => {
+                if Self::box_bool(self.handle_track_end_clap_parameter_edit(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackGetClapParameters { .. } => {
+                if Self::box_bool(self.handle_track_get_clap_parameters(a.clone())).await {
+                    return;
+                }
+            }
             Action::TrackClapParameters { .. } => {}
-            Action::TrackClapSnapshotState {
-                ref track_name,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => {
-                    let plugin_path = track
-                        .lock()
-                        .clap_plugins
-                        .iter()
-                        .find(|instance| instance.id == instance_id)
-                        .map(|instance| instance.processor.lock().path().to_string())
-                        .unwrap_or_default();
-                    match track.lock().clap_snapshot_state(instance_id) {
-                        Ok(state) => {
-                            self.notify_clients(Ok(Action::TrackClapStateSnapshot {
-                                track_name: track_name.clone(),
-                                instance_id,
-                                plugin_path,
-                                state,
-                            }))
-                            .await;
-                        }
-                        Err(e) => {
-                            self.notify_clients(Err(e)).await;
-                        }
-                    }
+            Action::TrackClapSnapshotState { .. } => {
+                if Self::box_bool(self.handle_track_clap_snapshot_state(a.clone())).await {
+                    return;
                 }
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
+            }
+            Action::ClipClapSnapshotState { .. } => {
+                if Self::box_bool(self.handle_clip_clap_snapshot_state(a.clone())).await {
+                    return;
                 }
-            },
-            Action::ClipClapSnapshotState {
-                ref track_name,
-                clip_idx,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().clip_clap_snapshot_state(clip_idx, instance_id) {
-                    Ok((plugin_path, state)) => {
-                        self.notify_clients(Ok(Action::ClipClapStateSnapshot {
-                            track_name: track_name.clone(),
-                            clip_idx,
-                            instance_id,
-                            plugin_path,
-                            state,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
+            }
             Action::TrackClapStateSnapshot { .. } => {}
             Action::ClipClapStateSnapshot { .. } => {}
             Action::TrackClapStateDirty { .. } => {}
             Action::ClipClapStateDirty { .. } => {}
-            Action::TrackClapRestoreState {
-                ref track_name,
-                instance_id,
-                ref state,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "CLAP state restore")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before restoring CLAP state",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.clap_restore_state(instance_id, state) {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackClapRestoreState { .. } => {
+                if Self::box_bool(self.handle_track_clap_restore_state(a.clone())).await {
                     return;
                 }
             }
-            Action::ClipClapRestoreState {
-                ref track_name,
-                clip_idx,
-                instance_id,
-                ref state,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "CLAP state restore")
-                    .await
-                {
-                    return;
-                }
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let track = track.lock();
-                if track.audio.processing {
-                    self.notify_clients(Err(format!(
-                        "Track '{}' is currently processing audio; stop playback before restoring CLAP state",
-                        track_name
-                    )))
-                    .await;
-                    return;
-                }
-                if let Err(e) = track.clip_clap_restore_state(clip_idx, instance_id, state) {
-                    self.notify_clients(Err(e)).await;
+            Action::ClipClapRestoreState { .. } => {
+                if Self::box_bool(self.handle_clip_clap_restore_state(a.clone())).await {
                     return;
                 }
             }
-            Action::TrackSnapshotAllClapStates { ref track_name } => {
-                let track = match self.track_handle_or_err(track_name) {
-                    Ok(track) => track,
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                };
-                let instances: Vec<_> = {
-                    let locked = track.lock();
-                    locked
-                        .clap_plugins
-                        .iter()
-                        .map(|i| (i.id, i.processor.lock().path().to_string()))
-                        .collect()
-                };
-                for (instance_id, plugin_path) in instances {
-                    match track.lock().clap_snapshot_state(instance_id) {
-                        Ok(state) => {
-                            self.notify_clients(Ok(Action::TrackClapStateSnapshot {
-                                track_name: track_name.clone(),
-                                instance_id,
-                                plugin_path,
-                                state,
-                            }))
-                            .await;
-                        }
-                        Err(_e) => {}
-                    }
+            Action::TrackSnapshotAllClapStates { .. } => {
+                if Self::box_bool(self.handle_track_snapshot_all_clap_states(a.clone())).await {
+                    return;
                 }
-                self.notify_clients(Ok(Action::TrackSnapshotAllClapStatesDone {
-                    track_name: track_name.clone(),
-                }))
-                .await;
             }
             Action::TrackSnapshotAllClapStatesDone { .. } => {}
-            Action::TrackGetVst3Graph { ref track_name } => {
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        let t = track.lock();
-                        let plugins = t.vst3_graph_plugins();
-                        let connections = t.vst3_graph_connections();
-                        self.notify_clients(Ok(Action::TrackVst3Graph {
-                            track_name: track_name.clone(),
-                            plugins,
-                            connections,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
+            Action::TrackGetVst3Graph { .. } => {
+                if Self::box_bool(self.handle_track_get_vst3_graph(a.clone())).await {
+                    return;
                 }
             }
             Action::TrackVst3Graph { .. } => {}
-            Action::TrackSetVst3Parameter {
-                ref track_name,
-                instance_id,
-                param_id,
-                value,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "VST3 parameter changes")
-                    .await
-                {
+            Action::TrackSetVst3Parameter { .. } => {
+                if Self::box_bool(self.handle_track_set_vst3_parameter(a.clone())).await {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) =
-                            track
-                                .lock()
-                                .set_vst3_parameter(instance_id, param_id, value)
-                        {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
+            }
+            Action::TrackSetPluginBypassed { .. } => {
+                if Self::box_bool(self.handle_track_set_plugin_bypassed(a.clone())).await {
+                    return;
                 }
             }
-            Action::TrackSetPluginBypassed {
-                ref track_name,
-                instance_id,
-                ref format,
-                bypassed,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => {
-                    let result = match format.as_str() {
-                        "CLAP" => track.lock().set_clap_plugin_bypassed(instance_id, bypassed),
-                        "VST3" => track.lock().set_vst3_plugin_bypassed(instance_id, bypassed),
-                        #[cfg(all(unix, not(target_os = "macos")))]
-                        "LV2" => track.lock().set_lv2_plugin_bypassed(instance_id, bypassed),
-                        _ => Err(format!("Unknown plugin format for bypass: {format}")),
-                    };
-                    if let Err(e) = result {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                    self.notify_clients(Ok(a.clone())).await;
+            Action::TrackGetVst3Parameters { .. } => {
+                if Self::box_bool(self.handle_track_get_vst3_parameters(a.clone())).await {
+                    return;
                 }
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::TrackGetVst3Parameters {
-                ref track_name,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().get_vst3_parameters(instance_id) {
-                    Ok(parameters) => {
-                        self.notify_clients(Ok(Action::TrackVst3Parameters {
-                            track_name: track_name.clone(),
-                            instance_id,
-                            parameters,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
+            }
             Action::TrackVst3Parameters { .. } => {}
             #[cfg(all(unix, not(target_os = "macos")))]
-            Action::TrackGetLv2PluginControls {
-                ref track_name,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().get_lv2_plugin_controls(instance_id) {
-                    Ok(controls) => {
-                        self.notify_clients(Ok(Action::TrackLv2PluginControls {
-                            track_name: track_name.clone(),
-                            instance_id,
-                            controls,
-                            instance_access_handle: None,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
+            Action::TrackGetLv2PluginControls { .. } => {
+                if Self::box_bool(self.handle_track_get_lv2_plugin_controls(a.clone())).await {
+                    return;
                 }
-            },
-            Action::TrackVst3SnapshotState {
-                ref track_name,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().vst3_snapshot_state(instance_id) {
-                    Ok(state) => {
-                        self.notify_clients(Ok(Action::TrackVst3StateSnapshot {
-                            track_name: track_name.clone(),
-                            instance_id,
-                            state,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackLv2SnapshotState { .. } => {
+                if Self::box_bool(self.handle_track_lv2_snapshot_state(a.clone())).await {
+                    return;
                 }
-            },
-            Action::ClipVst3SnapshotState {
-                ref track_name,
-                clip_idx,
-                instance_id,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => match track.lock().clip_vst3_snapshot_state(clip_idx, instance_id) {
-                    Ok(state) => {
-                        self.notify_clients(Ok(Action::ClipVst3StateSnapshot {
-                            track_name: track_name.clone(),
-                            clip_idx,
-                            instance_id,
-                            state,
-                        }))
-                        .await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                },
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::ClipLv2SnapshotState { .. } => {
+                if Self::box_bool(self.handle_clip_lv2_snapshot_state(a.clone())).await {
+                    return;
                 }
-            },
+            }
+            Action::TrackVst3SnapshotState { .. } => {
+                if Self::box_bool(self.handle_track_vst3_snapshot_state(a.clone())).await {
+                    return;
+                }
+            }
+            Action::ClipVst3SnapshotState { .. } => {
+                if Self::box_bool(self.handle_clip_vst3_snapshot_state(a.clone())).await {
+                    return;
+                }
+            }
             Action::TrackVst3StateSnapshot { .. } => {}
             Action::ClipVst3StateSnapshot { .. } => {}
-            Action::TrackVst3RestoreState {
-                ref track_name,
-                instance_id,
-                ref state,
-            } => match self.track_handle_or_err(track_name) {
-                Ok(track) => {
-                    if let Err(e) = track.lock().vst3_restore_state(instance_id, state) {
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                    self.notify_clients(Ok(a.clone())).await;
-                }
-                Err(e) => {
-                    self.notify_clients(Err(e)).await;
-                }
-            },
-            Action::TrackConnectVst3Audio {
-                ref track_name,
-                ref from_node,
-                from_port,
-                ref to_node,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "VST3 routing changes")
-                    .await
-                {
+            Action::TrackVst3RestoreState { .. } => {
+                if Self::box_bool(self.handle_track_vst3_restore_state(a.clone())).await {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) = track
-                            .lock()
-                            .connect_vst3_audio(from_node, from_port, to_node, to_port)
-                        {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
-                }
             }
-            Action::TrackDisconnectVst3Audio {
-                ref track_name,
-                ref from_node,
-                from_port,
-                ref to_node,
-                to_port,
-            } => {
-                if self
-                    .reject_if_track_frozen(track_name, "VST3 routing changes")
-                    .await
-                {
+            Action::TrackConnectVst3Audio { .. } => {
+                if Self::box_bool(self.handle_track_connect_vst3_audio(a.clone())).await {
                     return;
                 }
-                match self.track_handle_or_err(track_name) {
-                    Ok(track) => {
-                        if let Err(e) = track
-                            .lock()
-                            .disconnect_vst3_audio(from_node, from_port, to_node, to_port)
-                        {
-                            self.notify_clients(Err(e)).await;
-                            return;
-                        }
-                        self.notify_clients(Ok(a.clone())).await;
-                    }
-                    Err(e) => {
-                        self.notify_clients(Err(e)).await;
-                    }
+            }
+            Action::TrackDisconnectVst3Audio { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_vst3_audio(a.clone())).await {
+                    return;
                 }
             }
-            Action::ClipMove {
-                ref kind,
-                ref from,
-                ref to,
-                copy,
-            } => {
-                if let Some(from_track_handle) = self.state.lock().tracks.get(&from.track_name)
-                    && let Some(to_track_handle) = self.state.lock().tracks.get(&to.track_name)
-                {
-                    let from_track = from_track_handle.lock();
-                    let to_track = to_track_handle.lock();
-                    match kind {
-                        Kind::Audio => {
-                            if from.clip_index >= from_track.audio.clips.len() {
-                                self.notify_clients(Err(format!(
-                                    "Clip index {} is too high, as track {} has only {} clips!",
-                                    from.clip_index,
-                                    from_track.name.clone(),
-                                    from_track.audio.clips.len(),
-                                )))
-                                .await;
-                                return;
-                            }
-                            if from_track.audio.ins.len() != to_track.audio.ins.len() {
-                                self.notify_clients(Err(format!(
-                                    "Cannot move/copy audio clip from '{}' ({} inputs) to '{}' ({} inputs)",
-                                    from_track.name,
-                                    from_track.audio.ins.len(),
-                                    to_track.name,
-                                    to_track.audio.ins.len()
-                                )))
-                                .await;
-                                return;
-                            }
-                            let clip_copy = from_track.audio.clips[from.clip_index].clone();
-                            if !copy {
-                                from_track.audio.clips.remove(from.clip_index);
-                            }
-                            let mut clip_copy = clip_copy;
-                            clip_copy.start = to.sample_offset;
-                            let max_lane = to_track.audio.ins.len().saturating_sub(1);
-                            clip_copy.input_channel = to.input_channel.min(max_lane);
-                            to_track.audio.clips.push(clip_copy);
-                        }
-                        Kind::MIDI => {
-                            if from.clip_index >= from_track.midi.clips.len() {
-                                self.notify_clients(Err(format!(
-                                    "Clip index {} is too high, as track {} has only {} clips!",
-                                    from.clip_index,
-                                    from_track.name.clone(),
-                                    from_track.midi.clips.len(),
-                                )))
-                                .await;
-                                return;
-                            }
-                            let clip_copy = from_track.midi.clips[from.clip_index].clone();
-                            if !copy {
-                                from_track.midi.clips.remove(from.clip_index);
-                            }
-                            let mut clip_copy = clip_copy;
-                            clip_copy.start = to.sample_offset;
-                            let max_lane = to_track.midi.ins.len().saturating_sub(1);
-                            clip_copy.input_channel = to.input_channel.min(max_lane);
-                            to_track.midi.clips.push(clip_copy);
-                        }
-                    }
+            Action::ClipMove { .. } => {
+                self.handle_clip_move(a.clone()).await;
+            }
+            Action::AddClip { .. } => {
+                if Self::box_bool(self.handle_add_clip(a.clone())).await {
+                    return;
                 }
             }
-            Action::AddClip {
-                ref clip_id,
-                ref name,
-                ref track_name,
-                start,
-                length,
-                offset,
-                input_channel,
-                muted,
-                ref peaks_file,
-                kind,
-                fade_enabled,
-                fade_in_samples,
-                fade_out_samples,
-                ref source_name,
-                source_offset,
-                source_length,
-                ref preview_name,
-                ref pitch_correction_points,
-                pitch_correction_frame_likeness,
-                pitch_correction_inertia_ms,
-                pitch_correction_formant_compensation,
-                ref plugin_graph_json,
-            } => {
-                self.add_clip_to_track(ClipAddRequest {
-                    clip_id,
-                    name,
-                    track_name,
-                    start,
-                    length,
-                    offset,
-                    input_channel,
-                    muted,
-                    peaks_file: peaks_file.clone(),
-                    kind,
-                    fade_enabled,
-                    fade_in_samples,
-                    fade_out_samples,
-                    source_name: source_name.clone(),
-                    source_offset,
-                    source_length,
-                    preview_name: preview_name.clone(),
-                    pitch_correction_points: pitch_correction_points.clone(),
-                    pitch_correction_frame_likeness,
-                    pitch_correction_inertia_ms,
-                    pitch_correction_formant_compensation,
-                    plugin_graph_json: plugin_graph_json.clone(),
-                });
-                if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-                    let track_name = track_name.clone();
-                    tokio::task::spawn_blocking(move || {
-                        track.lock().preload_clips();
-                        tracing::debug!("Preloaded clips for track '{}' after AddClip", track_name);
-                    });
-                }
-            }
-            Action::AddGroupedClip {
-                ref track_name,
-                kind,
-                ref audio_clip,
-                ref midi_clip,
-            } => {
-                self.add_grouped_clip_to_track(
-                    track_name,
-                    kind,
-                    audio_clip.clone(),
-                    midi_clip.clone(),
-                );
-                if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-                    let track_name = track_name.clone();
-                    tokio::task::spawn_blocking(move || {
-                        track.lock().preload_clips();
-                        tracing::debug!(
-                            "Preloaded clips for track '{}' after AddGroupedClip",
-                            track_name
-                        );
-                    });
+            Action::AddGroupedClip { .. } => {
+                if Self::box_bool(self.handle_add_grouped_clip(a.clone())).await {
+                    return;
                 }
             }
             Action::RemoveClip {
@@ -8734,22 +11224,10 @@ impl Engine {
             } => {
                 self.set_clip_source_name(track_name, clip_index, kind, name.clone());
             }
-            Action::SetClipFade {
-                ref track_name,
-                clip_index,
-                kind,
-                fade_enabled,
-                fade_in_samples,
-                fade_out_samples,
-            } => {
-                self.set_clip_fade(
-                    track_name,
-                    clip_index,
-                    kind,
-                    fade_enabled,
-                    fade_in_samples,
-                    fade_out_samples,
-                );
+            Action::SetClipFade { .. } => {
+                if Self::box_bool(self.handle_set_clip_fade(a.clone())).await {
+                    return;
+                }
             }
             Action::SetClipBounds {
                 ref track_name,
@@ -8786,30 +11264,10 @@ impl Engine {
             } => {
                 self.set_clip_plugin_graph_json(track_name, clip_index, plugin_graph_json.clone());
             }
-            Action::SetClipPitchCorrection {
-                ref track_name,
-                clip_index,
-                ref preview_name,
-                ref source_name,
-                source_offset,
-                source_length,
-                ref pitch_correction_points,
-                pitch_correction_frame_likeness,
-                pitch_correction_inertia_ms,
-                pitch_correction_formant_compensation,
-            } => {
-                self.set_clip_pitch_correction(
-                    track_name,
-                    clip_index,
-                    preview_name.clone(),
-                    source_name.clone(),
-                    source_offset,
-                    source_length,
-                    pitch_correction_points.clone(),
-                    pitch_correction_frame_likeness,
-                    pitch_correction_inertia_ms,
-                    pitch_correction_formant_compensation,
-                );
+            Action::SetClipPitchCorrection { .. } => {
+                if Self::box_bool(self.handle_set_clip_pitch_correction(a.clone())).await {
+                    return;
+                }
             }
             Action::Connect {
                 ref from_track,
@@ -8818,525 +11276,51 @@ impl Engine {
                 to_port,
                 kind,
             } => {
-                match kind {
-                    Kind::Audio => {
-                        let (from_audio_io, to_audio_io) = self
-                            .resolve_audio_route_ports(from_track, from_port, to_track, to_port);
-                        match (from_audio_io, to_audio_io) {
-                            (Some(source), Some(target)) => {
-                                if from_track != "hw:in"
-                                    && to_track != "hw:out"
-                                    && self.check_if_leads_to_kind(
-                                        Kind::Audio,
-                                        to_track,
-                                        from_track,
-                                    )
-                                {
-                                    self.notify_clients(Err(
-                                        "Circular routing is not allowed!".into()
-                                    ))
-                                    .await;
-                                    return;
-                                }
-                                crate::audio::io::AudioIO::connect(&source, &target);
-                            }
-                            (None, _) => {
-                                self.notify_clients(Err(format!(
-                                    "Source track '{}' not found",
-                                    from_track
-                                )))
-                                .await;
-                                return;
-                            }
-                            (_, None) => {
-                                self.notify_clients(Err(format!(
-                                    "Destination track '{}' not found",
-                                    to_track
-                                )))
-                                .await;
-                                return;
-                            }
-                        }
-                    }
-                    Kind::MIDI => {
-                        let from_hw_in_device = Self::midi_hw_in_device(from_track);
-                        let to_hw_out_device = Self::midi_hw_out_device(to_track);
-                        let from_is_invalid_hw = Self::midi_hw_out_device(from_track).is_some();
-                        let to_is_invalid_hw = Self::midi_hw_in_device(to_track).is_some();
-
-                        if from_is_invalid_hw || to_is_invalid_hw {
-                            self.notify_clients(Err(
-                                "Invalid MIDI hardware connection direction".to_string()
-                            ))
-                            .await;
-                            return;
-                        }
-
-                        if from_hw_in_device.is_none()
-                            && to_hw_out_device.is_none()
-                            && self.check_if_leads_to_kind(Kind::MIDI, to_track, from_track)
-                        {
-                            self.notify_clients(Err("Circular routing is not allowed!".into()))
-                                .await;
-                            return;
-                        }
-
-                        let state = self.state.lock();
-                        let from_track_handle = state.tracks.get(from_track);
-                        let to_track_handle = state.tracks.get(to_track);
-
-                        if let (Some(from_device), Some(to_device)) =
-                            (from_hw_in_device, to_hw_out_device)
-                        {
-                            let route = MidiHwThruRoute {
-                                from_device: from_device.to_string(),
-                                to_device: to_device.to_string(),
-                            };
-                            if !self.midi_hw_thru_routes.iter().any(|r| r == &route) {
-                                self.midi_hw_thru_routes.push(route);
-                            }
-                        } else if let Some(device) = from_hw_in_device {
-                            if let Some(t_t) = to_track_handle {
-                                if t_t.lock().midi.ins.get(to_port).is_none() {
-                                    self.notify_clients(Err(format!(
-                                        "MIDI input port {} not found on track '{}'",
-                                        to_port, to_track
-                                    )))
-                                    .await;
-                                    return;
-                                }
-                                let route = MidiHwInRoute {
-                                    device: device.to_string(),
-                                    to_track: to_track.to_string(),
-                                    to_port,
-                                };
-                                if !self.midi_hw_in_routes.iter().any(|r| r == &route) {
-                                    self.midi_hw_in_routes.push(route);
-                                }
-                            } else {
-                                self.notify_clients(Err(format!(
-                                    "MIDI destination track not found: {}",
-                                    to_track
-                                )))
-                                .await;
-                                return;
-                            }
-                        } else if let Some(device) = to_hw_out_device {
-                            if let Some(f_t) = from_track_handle {
-                                if f_t.lock().midi.outs.get(from_port).is_none() {
-                                    self.notify_clients(Err(format!(
-                                        "MIDI output port {} not found on track '{}'",
-                                        from_port, from_track
-                                    )))
-                                    .await;
-                                    return;
-                                }
-                                let route = MidiHwOutRoute {
-                                    from_track: from_track.to_string(),
-                                    from_port,
-                                    device: device.to_string(),
-                                };
-                                if !self.midi_hw_out_routes.iter().any(|r| r == &route) {
-                                    self.midi_hw_out_routes.push(route);
-                                }
-                            } else {
-                                self.notify_clients(Err(format!(
-                                    "MIDI source track not found: {}",
-                                    from_track
-                                )))
-                                .await;
-                                return;
-                            }
-                        } else {
-                            match (from_track_handle, to_track_handle) {
-                                (Some(f_t), Some(t_t)) => {
-                                    let to_in_res = t_t.lock().midi.ins.get(to_port).cloned();
-                                    if let Some(to_in) = to_in_res {
-                                        let from_track = f_t.lock();
-                                        if let Err(e) =
-                                            from_track.midi.connect_out(from_port, to_in)
-                                        {
-                                            self.notify_clients(Err(e)).await;
-                                            return;
-                                        }
-                                        from_track.invalidate_midi_route_cache();
-                                    } else {
-                                        self.notify_clients(Err(format!(
-                                            "MIDI input port {} not found on track '{}'",
-                                            to_port, to_track
-                                        )))
-                                        .await;
-                                        return;
-                                    }
-                                }
-                                _ => {
-                                    self.notify_clients(Err(format!(
-                                        "MIDI tracks not found: {} or {}",
-                                        from_track, to_track
-                                    )))
-                                    .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                };
+                self.handle_connect(
+                    from_track.as_str(),
+                    from_port,
+                    to_track.as_str(),
+                    to_port,
+                    kind,
+                )
+                .await;
             }
-            Action::Disconnect {
-                ref from_track,
-                from_port,
-                ref to_track,
-                to_port,
-                kind,
-            } => {
-                if kind == Kind::Audio {
-                    if let Err(e) = self.disconnect_audio_route_and_notify(a.clone()).await {
-                        self.notify_clients(Err(e)).await;
-                    }
-                } else if kind == Kind::MIDI {
-                    let from_hw_in_device = Self::midi_hw_in_device(from_track);
-                    let to_hw_out_device = Self::midi_hw_out_device(to_track);
-
-                    if let (Some(from_device), Some(to_device)) =
-                        (from_hw_in_device, to_hw_out_device)
-                    {
-                        let before = self.midi_hw_thru_routes.len();
-                        self.midi_hw_thru_routes.retain(|r| {
-                            !(r.from_device == from_device && r.to_device == to_device)
-                        });
-                        if self.midi_hw_thru_routes.len() < before {
-                            self.notify_clients(Ok(a.clone())).await;
-                        } else {
-                            self.notify_clients(Err(format!(
-                                "Disconnect failed: MIDI route not found ({} -> {})",
-                                from_track, to_track
-                            )))
-                            .await;
-                        }
-                        return;
-                    }
-
-                    if let Some(device) = from_hw_in_device {
-                        let before = self.midi_hw_in_routes.len();
-                        self.midi_hw_in_routes.retain(|r| {
-                            !(r.device == device && r.to_track == *to_track && r.to_port == to_port)
-                        });
-                        if self.midi_hw_in_routes.len() < before {
-                            self.notify_clients(Ok(a.clone())).await;
-                        } else {
-                            self.notify_clients(Err(format!(
-                                "Disconnect failed: MIDI route not found ({} -> {})",
-                                from_track, to_track
-                            )))
-                            .await;
-                        }
-                        return;
-                    }
-
-                    if let Some(device) = to_hw_out_device {
-                        let before = self.midi_hw_out_routes.len();
-                        self.midi_hw_out_routes.retain(|r| {
-                            !(r.from_track == *from_track
-                                && r.from_port == from_port
-                                && r.device == device)
-                        });
-                        if self.midi_hw_out_routes.len() < before {
-                            self.notify_clients(Ok(a.clone())).await;
-                        } else {
-                            self.notify_clients(Err(format!(
-                                "Disconnect failed: MIDI route not found ({} -> {})",
-                                from_track, to_track
-                            )))
-                            .await;
-                        }
-                        return;
-                    }
-
-                    let state = self.state.lock();
-                    if let (Some(f_t), Some(t_t)) =
-                        (state.tracks.get(from_track), state.tracks.get(to_track))
-                        && let Some(to_in) = t_t.lock().midi.ins.get(to_port).cloned()
-                    {
-                        let from_track = f_t.lock();
-                        if let Err(e) = from_track.midi.disconnect_out(from_port, &to_in) {
-                            self.notify_clients(Err(e)).await;
-                        } else {
-                            from_track.invalidate_midi_route_cache();
-                            self.notify_clients(Ok(a.clone())).await;
-                        }
-                    } else {
-                        self.notify_clients(Err(format!(
-                            "Disconnect failed: MIDI ports not found ({} -> {})",
-                            from_track, to_track
-                        )))
-                        .await;
-                    }
-                }
+            Action::Disconnect { .. } => {
+                self.handle_disconnect(a.clone()).await;
             }
-
-            Action::OpenAudioDevice {
-                ref device,
-                ref input_device,
-                sample_rate_hz,
-                bits,
-                exclusive,
-                period_frames,
-                nperiods,
-                sync_mode,
-                ..
-            } => {
-                #[cfg(unix)]
-                {
-                    let request = AudioOpenRequest {
-                        device,
-                        input_device: input_device.as_deref(),
-                        sample_rate_hz,
-                        bits,
-                        exclusive,
-                        period_frames,
-                        nperiods,
-                        sync_mode,
-                    };
-                    if self.maybe_open_jack_runtime(request).await.is_some() {
-                        return;
-                    }
+            Action::OpenAudioDevice { .. } => {
+                let (done, updated) = self.handle_open_audio_device(a.clone()).await;
+                if done {
+                    return;
                 }
-                let hw_opts = Self::build_hw_options(exclusive, period_frames, nperiods, sync_mode);
-                let open_result = self
-                    .open_non_jack_audio_device(
-                        device,
-                        input_device.as_deref(),
-                        sample_rate_hz,
-                        bits,
-                        hw_opts,
-                    )
-                    .await;
-                match open_result {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!("Failed to open audio device: {e}");
-                        self.notify_clients(Err(e)).await;
-                        return;
-                    }
-                }
-                self.finalize_open_audio_device().await;
-                if let Some(hw) = &self.hw_driver {
-                    let effective_action = {
-                        let hw = hw.lock();
-                        Action::OpenAudioDevice {
-                            device: device.clone(),
-                            input_device: input_device.clone(),
-                            sample_rate_hz: hw.sample_rate(),
-                            bits: hw.sample_bits(),
-                            exclusive,
-                            period_frames,
-                            nperiods,
-                            sync_mode,
-                            actual_period_frames: hw.cycle_samples(),
-                            input_channels: hw.input_channels(),
-                            output_channels: hw.output_channels(),
-                            bytes_per_frame: hw.frame_size_bytes(),
-                        }
-                    };
-                    action_to_process = effective_action;
+                if let Some(action) = updated {
+                    action_to_process = action;
                 }
             }
             Action::JackAddAudioInputPort => {
-                #[cfg(unix)]
-                {
-                    if let Some(jack) = self.jack_runtime.clone() {
-                        let (input_channels, output_channels, rate) = {
-                            let jack = jack.lock();
-                            if let Err(e) = jack.add_audio_input_port() {
-                                self.notify_clients(Err(e)).await;
-                                return;
-                            }
-                            (
-                                jack.input_channels(),
-                                jack.output_channels(),
-                                jack.sample_rate,
-                            )
-                        };
-                        self.publish_hw_infos(input_channels, output_channels, rate)
-                            .await;
-                        self.notify_clients(Ok(a.clone())).await;
-                    } else {
-                        self.notify_clients(Err(
-                            "JACK runtime is not active; open the JACK backend first".to_string(),
-                        ))
-                        .await;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    self.notify_clients(Err(
-                        "JACK backend is not available on this platform build".to_string(),
-                    ))
-                    .await;
+                if Self::box_bool(self.handle_jack_add_audio_input_port(a.clone())).await {
+                    return;
                 }
             }
             Action::JackRemoveAudioInputPort(_removed_port) => {
-                #[cfg(unix)]
+                if self
+                    .handle_jack_remove_audio_input_port(_removed_port, a.clone())
+                    .await
                 {
-                    let removed_port = _removed_port;
-                    if let Some(jack) = self.jack_runtime.clone() {
-                        let (removed_port, removed_io) = {
-                            let jack = jack.lock();
-                            let removed_port = Some(removed_port);
-                            let removed_io =
-                                removed_port.and_then(|port| jack.input_audio_port(port));
-                            match (removed_port, removed_io) {
-                                (Some(port), Some(io)) => (port, io),
-                                _ => {
-                                    self.notify_clients(Err(
-                                        "JACK audio input port index is out of range".to_string(),
-                                    ))
-                                    .await;
-                                    return;
-                                }
-                            }
-                        };
-                        let reindex_notifications =
-                            self.reindex_notifications_for_removed_hw_input(removed_port);
-                        for disconnect in
-                            self.disconnect_actions_for_removed_hw_input(removed_port, &removed_io)
-                        {
-                            if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await
-                            {
-                                self.notify_clients(Err(e)).await;
-                                return;
-                            }
-                        }
-                        let (input_channels, output_channels, rate) = {
-                            let jack = jack.lock();
-                            if let Err(e) = jack.remove_audio_input_port(removed_port) {
-                                self.notify_clients(Err(e)).await;
-                                return;
-                            }
-                            (
-                                jack.input_channels(),
-                                jack.output_channels(),
-                                jack.sample_rate,
-                            )
-                        };
-                        for action in reindex_notifications {
-                            self.notify_clients(Ok(action)).await;
-                        }
-                        self.publish_hw_infos(input_channels, output_channels, rate)
-                            .await;
-                        self.notify_clients(Ok(a.clone())).await;
-                    } else {
-                        self.notify_clients(Err(
-                            "JACK runtime is not active; open the JACK backend first".to_string(),
-                        ))
-                        .await;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    self.notify_clients(Err(
-                        "JACK backend is not available on this platform build".to_string(),
-                    ))
-                    .await;
+                    return;
                 }
             }
             Action::JackAddAudioOutputPort => {
-                #[cfg(unix)]
-                {
-                    if let Some(jack) = self.jack_runtime.clone() {
-                        let (input_channels, output_channels, rate) = {
-                            let jack = jack.lock();
-                            if let Err(e) = jack.add_audio_output_port() {
-                                self.notify_clients(Err(e)).await;
-                                return;
-                            }
-                            (
-                                jack.input_channels(),
-                                jack.output_channels(),
-                                jack.sample_rate,
-                            )
-                        };
-                        self.publish_hw_infos(input_channels, output_channels, rate)
-                            .await;
-                        self.notify_clients(Ok(a.clone())).await;
-                    } else {
-                        self.notify_clients(Err(
-                            "JACK runtime is not active; open the JACK backend first".to_string(),
-                        ))
-                        .await;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    self.notify_clients(Err(
-                        "JACK backend is not available on this platform build".to_string(),
-                    ))
-                    .await;
+                if Self::box_bool(self.handle_jack_add_audio_output_port(a.clone())).await {
+                    return;
                 }
             }
             Action::JackRemoveAudioOutputPort(_removed_port) => {
-                #[cfg(unix)]
+                if self
+                    .handle_jack_remove_audio_output_port(_removed_port, a.clone())
+                    .await
                 {
-                    let removed_port = _removed_port;
-                    if let Some(jack) = self.jack_runtime.clone() {
-                        let (removed_port, removed_io) = {
-                            let jack = jack.lock();
-                            let removed_port = Some(removed_port);
-                            let removed_io =
-                                removed_port.and_then(|port| jack.output_audio_port(port));
-                            match (removed_port, removed_io) {
-                                (Some(port), Some(io)) => (port, io),
-                                _ => {
-                                    self.notify_clients(Err(
-                                        "JACK audio output port index is out of range".to_string(),
-                                    ))
-                                    .await;
-                                    return;
-                                }
-                            }
-                        };
-                        let reindex_notifications =
-                            self.reindex_notifications_for_removed_hw_output(removed_port);
-                        for disconnect in
-                            self.disconnect_actions_for_removed_hw_output(removed_port, &removed_io)
-                        {
-                            if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await
-                            {
-                                self.notify_clients(Err(e)).await;
-                                return;
-                            }
-                        }
-                        let (input_channels, output_channels, rate) = {
-                            let jack = jack.lock();
-                            if let Err(e) = jack.remove_audio_output_port(removed_port) {
-                                self.notify_clients(Err(e)).await;
-                                return;
-                            }
-                            (
-                                jack.input_channels(),
-                                jack.output_channels(),
-                                jack.sample_rate,
-                            )
-                        };
-                        for action in reindex_notifications {
-                            self.notify_clients(Ok(action)).await;
-                        }
-                        self.publish_hw_infos(input_channels, output_channels, rate)
-                            .await;
-                        self.notify_clients(Ok(a.clone())).await;
-                    } else {
-                        self.notify_clients(Err(
-                            "JACK runtime is not active; open the JACK backend first".to_string(),
-                        ))
-                        .await;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    self.notify_clients(Err(
-                        "JACK backend is not available on this platform build".to_string(),
-                    ))
-                    .await;
+                    return;
                 }
             }
             Action::OpenMidiInputDevice(ref device) => {
@@ -9354,188 +11338,24 @@ impl Engine {
                 }
             }
             Action::RequestSessionDiagnostics => {
-                let (
-                    track_count,
-                    frozen_track_count,
-                    audio_clip_count,
-                    midi_clip_count,
-                    lv2_instance_count,
-                    vst3_instance_count,
-                    clap_instance_count,
-                ) = {
-                    let tracks = &self.state.lock().tracks;
-                    let mut track_count = 0usize;
-                    let mut frozen_track_count = 0usize;
-                    let mut audio_clip_count = 0usize;
-                    let mut midi_clip_count = 0usize;
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    let mut lv2_instance_count = 0usize;
-                    #[cfg(not(all(unix, not(target_os = "macos"))))]
-                    let lv2_instance_count = 0usize;
-                    let mut vst3_instance_count = 0usize;
-                    let mut clap_instance_count = 0usize;
-                    for track in tracks.values() {
-                        let t = track.lock();
-                        track_count += 1;
-                        if t.frozen {
-                            frozen_track_count += 1;
-                        }
-                        audio_clip_count += t.audio.clips.len();
-                        midi_clip_count += t.midi.clips.len();
-                        #[cfg(all(unix, not(target_os = "macos")))]
-                        {
-                            lv2_instance_count += t.lv2_plugins.len();
-                        }
-                        vst3_instance_count += t.vst3_plugins.len();
-                        clap_instance_count += t.clap_plugins.len();
-                    }
-                    (
-                        track_count,
-                        frozen_track_count,
-                        audio_clip_count,
-                        midi_clip_count,
-                        lv2_instance_count,
-                        vst3_instance_count,
-                        clap_instance_count,
-                    )
-                };
-                #[cfg(not(all(unix, not(target_os = "macos"))))]
-                let _lv2_instance_count = lv2_instance_count;
-                let pending_hw_midi_events = self.pending_hw_midi_events.len()
-                    + self
-                        .pending_hw_midi_events_by_device
-                        .values()
-                        .map(std::vec::Vec::len)
-                        .sum::<usize>();
-                let sample_rate_hz = if let Some(hw) = &self.hw_driver {
-                    hw.lock().sample_rate() as usize
-                } else {
-                    #[cfg(unix)]
-                    {
-                        self.jack_runtime
-                            .as_ref()
-                            .map(|j| j.lock().sample_rate)
-                            .unwrap_or(0)
-                    }
-                    #[cfg(not(unix))]
-                    0
-                };
-                let cycle_samples = self.current_cycle_samples();
-                self.notify_clients(Ok(Action::SessionDiagnosticsReport {
-                    track_count,
-                    frozen_track_count,
-                    audio_clip_count,
-                    midi_clip_count,
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    lv2_instance_count,
-                    vst3_instance_count,
-                    clap_instance_count,
-                    pending_requests: self.pending_requests.len(),
-                    workers_total: self.workers.len(),
-                    workers_ready: self.ready_workers.len(),
-                    pending_hw_midi_events,
-                    playing: self.playing,
-                    transport_running: self.transport_running,
-                    transport_sample: self.transport_sample,
-                    tempo_bpm: self.tempo_bpm,
-                    sample_rate_hz,
-                    cycle_samples,
-                }))
-                .await;
+                self.handle_request_session_diagnostics().await;
             }
             Action::RequestMidiLearnMappingsReport => {
-                let mut lines = Vec::<String>::new();
-                let fmt_binding = |b: &crate::message::MidiLearnBinding| {
-                    let device = b.device.as_deref().unwrap_or("*");
-                    format!("{device} CH{} CC{}", b.channel + 1, b.cc)
-                };
-                if let Some(b) = self.global_midi_learn_play_pause.as_ref() {
-                    lines.push(format!("Global PlayPause: {}", fmt_binding(b)));
-                }
-                if let Some(b) = self.global_midi_learn_stop.as_ref() {
-                    lines.push(format!("Global Stop: {}", fmt_binding(b)));
-                }
-                if let Some(b) = self.global_midi_learn_record_toggle.as_ref() {
-                    lines.push(format!("Global RecordToggle: {}", fmt_binding(b)));
-                }
-                for (track_name, track) in self.state.lock().tracks.iter() {
-                    let t = track.lock();
-                    if let Some(b) = t.midi_learn_volume.as_ref() {
-                        lines.push(format!("{} Volume: {}", track_name, fmt_binding(b)));
-                    }
-                    if let Some(b) = t.midi_learn_balance.as_ref() {
-                        lines.push(format!("{} Balance: {}", track_name, fmt_binding(b)));
-                    }
-                    if let Some(b) = t.midi_learn_mute.as_ref() {
-                        lines.push(format!("{} Mute: {}", track_name, fmt_binding(b)));
-                    }
-                    if let Some(b) = t.midi_learn_solo.as_ref() {
-                        lines.push(format!("{} Solo: {}", track_name, fmt_binding(b)));
-                    }
-                    if let Some(b) = t.midi_learn_arm.as_ref() {
-                        lines.push(format!("{} Arm: {}", track_name, fmt_binding(b)));
-                    }
-                    if let Some(b) = t.midi_learn_input_monitor.as_ref() {
-                        lines.push(format!("{} InputMonitor: {}", track_name, fmt_binding(b)));
-                    }
-                    if let Some(b) = t.midi_learn_disk_monitor.as_ref() {
-                        lines.push(format!("{} DiskMonitor: {}", track_name, fmt_binding(b)));
-                    }
-                }
-                for ((track_name, scene_index), binding) in &self.session_midi_learn_slots {
-                    lines.push(format!(
-                        "{} Slot {}: {}",
-                        track_name,
-                        scene_index + 1,
-                        fmt_binding(binding)
-                    ));
-                }
-                for (scene_index, binding) in &self.session_midi_learn_scenes {
-                    lines.push(format!(
-                        "Scene {}: {}",
-                        scene_index + 1,
-                        fmt_binding(binding)
-                    ));
-                }
-                for (track_name, binding) in &self.session_midi_learn_stop_track {
-                    lines.push(format!("{} Stop: {}", track_name, fmt_binding(binding)));
-                }
-                if let Some(binding) = self.session_midi_learn_stop_all.as_ref() {
-                    lines.push(format!("Stop All Clips: {}", fmt_binding(binding)));
-                }
-                if lines.is_empty() {
-                    lines.push("No MIDI learn mappings configured".to_string());
-                }
-                self.notify_clients(Ok(Action::MidiLearnMappingsReport { lines }))
-                    .await;
+                self.handle_request_midi_learn_mappings_report().await;
             }
             Action::ClearAllMidiLearnBindings => {
-                self.pending_midi_learn = None;
-                self.pending_global_midi_learn = None;
-                self.pending_session_midi_learn = None;
-                self.global_midi_learn_play_pause = None;
-                self.global_midi_learn_stop = None;
-                self.global_midi_learn_record_toggle = None;
-                self.session_midi_learn_slots.clear();
-                self.session_midi_learn_scenes.clear();
-                self.session_midi_learn_stop_track.clear();
-                self.session_midi_learn_stop_all = None;
-                self.midi_cc_gate.clear();
-                for track in self.state.lock().tracks.values() {
-                    let t = track.lock();
-                    t.midi_learn_volume = None;
-                    t.midi_learn_balance = None;
-                    t.midi_learn_mute = None;
-                    t.midi_learn_solo = None;
-                    t.midi_learn_arm = None;
-                    t.midi_learn_input_monitor = None;
-                    t.midi_learn_disk_monitor = None;
+                if Self::box_bool(self.handle_clear_all_midi_learn_bindings(a.clone())).await {
+                    return;
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::TrackLv2PluginControls { .. } => {}
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::ClipLv2PluginControls { .. } => {}
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackLv2StateSnapshot { .. } => {}
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::ClipLv2StateSnapshot { .. } => {}
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::TrackLv2Midnam { .. } => {}
             Action::TrackClapNoteNames { .. } => {}
@@ -9563,7 +11383,6 @@ impl Engine {
 
         self.notify_clients(Ok(action_to_process)).await;
     }
-
     pub async fn work(&mut self) {
         while let Some(message) = self.rx.recv().await {
             match message {
@@ -9631,83 +11450,12 @@ impl Engine {
                 }
 
                 Message::Request(a) => {
-                    match a {
-                        Action::TrackOfflineBounceCancel { track_name } => {
-                            if let Some(job) = self.offline_bounce_jobs.get(&track_name) {
-                                job.cancel.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Action::TrackOfflineBounceCancelAll => {
-                            for job in self.offline_bounce_jobs.values() {
-                                job.cancel.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        _ if !self.offline_bounce_jobs.is_empty() => {
-                            self.pending_requests.push_back(a);
-                        }
-                        Action::OpenAudioDevice { .. }
-                        | Action::OpenMidiInputDevice(_)
-                        | Action::OpenMidiOutputDevice(_)
-                        | Action::RequestMeterSnapshot
-                        | Action::Quit
-                        | Action::Log { .. }
-                        | Action::Play
-                        | Action::Pause
-                        | Action::Stop
-                        | Action::TransportPosition(_)
-                        | Action::JumpToEnd
-                        | Action::SetLoopEnabled(_)
-                        | Action::SetLoopRange(_)
-                        | Action::SetPunchEnabled(_)
-                        | Action::SetPunchRange(_)
-                        | Action::SetMetronomeEnabled(_)
-                        | Action::SetTempo(_)
-                        | Action::SetTimeSignature { .. }
-                        | Action::SetTempoMap { .. }
-                        | Action::SetOscEnabled(_)
-                        | Action::SetClipPlaybackEnabled(_)
-                        | Action::SetRecordEnabled(_)
-                        | Action::SetStepRecording(_)
-                        | Action::StepRecordMidiNote { .. }
-                        | Action::SetSessionPath(_)
-                        | Action::ClearHistory
-                        | Action::BeginSessionRestore
-                        | Action::PianoKey { .. }
-                        | Action::ModifyMidiNotes { .. }
-                        | Action::ModifyMidiControllers { .. }
-                        | Action::DeleteMidiControllers { .. }
-                        | Action::InsertMidiControllers { .. }
-                        | Action::DeleteMidiNotes { .. }
-                        | Action::InsertMidiNotes { .. }
-                        | Action::SetMidiSysExEvents { .. }
-                        | Action::Session(_) => {
-                            self.handle_request(a).await;
-                        }
-                        #[cfg(all(unix, not(target_os = "macos")))]
-                        Action::ListLv2Plugins => {
-                            self.handle_request(a).await;
-                        }
-                        Action::ListVst3Plugins => {
-                            self.handle_request(a).await;
-                        }
-                        Action::ListClapPlugins => {
-                            self.handle_request(a).await;
-                        }
-                        Action::ListClapPluginsWithCapabilities => {
-                            self.handle_request(a).await;
-                        }
-                        _ => {
-                            self.pending_requests.push_back(a);
-                            if self.can_schedule_hw_cycle() {
-                                self.request_hw_cycle().await;
-                            } else {
-                                while let Some(next) = self.pending_requests.pop_front() {
-                                    self.handle_request(next).await;
-                                }
-                            }
-                        }
-                    };
-                    self.publish_clap_state_dirty().await;
+                    self.dispatch_request(a).await;
+                }
+                Message::OscRequest { action, reply_to } => {
+                    self.osc_reply_target = Some(reply_to);
+                    self.dispatch_request(action).await;
+                    self.osc_reply_target = None;
                 }
                 Message::OfflineBounceFinished { result } => {
                     if let Ok(Action::TrackOfflineBounce { track_name, .. }) = &result {
@@ -10116,7 +11864,10 @@ mod tests {
             .expect("packet delivery timeout")
             .expect("osc message");
         match message {
-            Message::Request(Action::Play) => {}
+            Message::OscRequest {
+                action: Action::Play,
+                ..
+            } => {}
             other => panic!("unexpected osc message: {other:?}"),
         }
 

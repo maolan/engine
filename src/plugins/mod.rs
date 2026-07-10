@@ -24,6 +24,54 @@ struct ScanOutput<T> {
     warnings: Vec<ScanDiagnostic>,
 }
 
+use crate::message::PluginKind;
+
+pub fn resolve_plugin_identifier(kind: PluginKind, identifier: &str) -> Result<String, String> {
+    if identifier.is_empty() {
+        return Err("plugin identifier is empty".to_string());
+    }
+    if identifier.contains('/')
+        || identifier.contains('\\')
+        || identifier.contains("::")
+        || identifier.contains('#')
+        || identifier.contains("://")
+        || identifier.starts_with("file:")
+        || std::path::Path::new(identifier).exists()
+    {
+        return Ok(identifier.to_string());
+    }
+
+    match kind {
+        PluginKind::Clap => {
+            let plugins = scan_plugins::<ClapPluginInfo>("clap")
+                .map_err(|e| format!("failed to scan CLAP plugins: {e}"))?;
+            plugins
+                .into_iter()
+                .find(|p| !p.id.is_empty() && p.id == identifier)
+                .map(|p| p.path)
+                .ok_or_else(|| format!("CLAP plugin ID not found: {identifier}"))
+        }
+        PluginKind::Vst3 => {
+            let plugins = scan_plugins::<Vst3PluginInfo>("vst3")
+                .map_err(|e| format!("failed to scan VST3 plugins: {e}"))?;
+            plugins
+                .into_iter()
+                .find(|p| !p.id.is_empty() && p.id == identifier)
+                .map(|p| p.path)
+                .ok_or_else(|| format!("VST3 plugin ID not found: {identifier}"))
+        }
+        PluginKind::Lv2 => {
+            let plugins = scan_plugins::<Lv2PluginInfo>("lv2")
+                .map_err(|e| format!("failed to scan LV2 plugins: {e}"))?;
+            plugins
+                .into_iter()
+                .find(|p| p.uri == identifier)
+                .map(|p| p.uri)
+                .ok_or_else(|| format!("LV2 plugin URI not found: {identifier}"))
+        }
+    }
+}
+
 pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String> {
     let host_bin = ipc::find_plugin_host_binary().ok_or("maolan-plugin-host binary not found")?;
 
