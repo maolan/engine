@@ -1025,7 +1025,6 @@ impl Engine {
         self.transport_running = true;
         self.transport_restart_pending = true;
         self.notified_loop_wrap_sample = None;
-        self.invalidate_track_cycle_state();
         if let Some(driver) = self.hw_driver.as_mut() {
             driver.lock().set_playing(true);
         }
@@ -1044,15 +1043,11 @@ impl Engine {
                 self.notify_clients(Ok(action)).await;
             }
         }
-        let send_result = self.send_tasks().await;
-        tracing::debug!("send_tasks after Play returned finished={}", send_result);
-        if !self.awaiting_hwfinished
-            && !self.handling_hwfinished
-            && send_result
-            && self.hw_worker.is_some()
-        {
-            self.transport_restart_pending = false;
-            self.request_hw_cycle().await;
+        if !self.awaiting_hwfinished && !self.handling_hwfinished {
+            let completed = self.start_plan_cycle().await;
+            if completed {
+                self.transport_restart_pending = false;
+            }
         }
 
         false
@@ -1075,7 +1070,6 @@ impl Engine {
             self.playing = true;
             self.transport_restart_pending = true;
             self.notified_loop_wrap_sample = None;
-            self.invalidate_track_cycle_state();
             if let Some(driver) = self.hw_driver.as_mut() {
                 driver.lock().set_playing(true);
             }
@@ -1086,13 +1080,11 @@ impl Engine {
                 self.notify_clients(Err(e)).await;
             }
             self.preload_track_clips().await;
-            if !self.awaiting_hwfinished
-                && !self.handling_hwfinished
-                && self.send_tasks().await
-                && self.hw_worker.is_some()
-            {
-                self.transport_restart_pending = false;
-                self.request_hw_cycle().await;
+            if !self.awaiting_hwfinished && !self.handling_hwfinished {
+                let completed = self.start_plan_cycle().await;
+                if completed {
+                    self.transport_restart_pending = false;
+                }
             }
         }
         self.notify_clients(Ok(Action::Pause)).await;
@@ -1120,7 +1112,6 @@ impl Engine {
             t.set_clip_playback_enabled(true);
             t.set_session_clip_playback_enabled(false);
         }
-        self.invalidate_track_cycle_state();
         if let Some(driver) = self.hw_driver.as_mut() {
             driver.lock().set_playing(false);
         }
@@ -1166,7 +1157,6 @@ impl Engine {
         self.transport_running = false;
         self.transport_restart_pending = true;
         self.notified_loop_wrap_sample = None;
-        self.invalidate_track_cycle_state();
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = true;
         self.session_transport_sample = 0;
@@ -1188,21 +1178,11 @@ impl Engine {
                 self.notify_clients(Ok(action)).await;
             }
         }
-        let send_result = self.send_tasks().await;
-        tracing::info!(
-            "Action::SessionPlay send_result={} awaiting_hwfinished={} handling_hwfinished={} hw_worker={}",
-            send_result,
-            self.awaiting_hwfinished,
-            self.handling_hwfinished,
-            self.hw_worker.is_some()
-        );
-        if !self.awaiting_hwfinished
-            && !self.handling_hwfinished
-            && send_result
-            && self.hw_worker.is_some()
-        {
-            self.transport_restart_pending = false;
-            self.request_hw_cycle().await;
+        if !self.awaiting_hwfinished && !self.handling_hwfinished {
+            let completed = self.start_plan_cycle().await;
+            if completed {
+                self.transport_restart_pending = false;
+            }
         }
 
         false
@@ -1229,15 +1209,15 @@ impl Engine {
         }
         if self.playing {
             self.transport_restart_pending = true;
-            self.invalidate_track_cycle_state();
             self.transport_panic_flush_pending = self.hw_worker.is_some();
             self.clear_hw_midi_output_state(true).await;
+            // The running cycle (if any) finishes naturally — at most one
+            // block at the old position; the next dispatch reads the new
+            // transport sample.
             if !self.awaiting_hwfinished && !self.handling_hwfinished {
-                if self.hw_worker.is_some() {
-                    self.request_hw_cycle().await;
-                } else if self.send_tasks().await {
+                let completed = self.start_plan_cycle().await;
+                if completed {
                     self.transport_restart_pending = false;
-                    self.request_hw_cycle().await;
                 }
             }
         }

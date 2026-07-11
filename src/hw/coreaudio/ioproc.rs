@@ -112,6 +112,7 @@ impl SharedIOState {
         output_ports: &[Arc<AudioIO>],
         output_gain: f32,
         output_balance: f32,
+        plan_slot: Option<&crate::render_plan::PlanSlot>,
     ) -> Result<(), String> {
         let mut data = self
             .mutex
@@ -144,7 +145,19 @@ impl SharedIOState {
         if gap > 0 {
             data.xrun_count += 1;
 
-            ports::fill_ports_from_interleaved(input_ports, frames, false, |_, _| 0.0);
+            if let Some(slot) = plan_slot {
+                let plan = slot.load();
+                for &(_, buf) in &plan.hw_in_map {
+                    // Safety: the driver is the sole producer of hw_in arena
+                    // buffers, and this write happens before the engine starts
+                    // the cycle, so no node reads them concurrently.
+                    let arena = unsafe { &mut *plan.buffer_ptr(buf) };
+                    let end = frames.min(arena.len());
+                    arena[..end].fill(0.0);
+                }
+            } else {
+                ports::fill_ports_from_interleaved(input_ports, frames, false, |_, _| 0.0);
+            }
 
             data.overload = false;
             data.discontinuity = false;
@@ -154,30 +167,60 @@ impl SharedIOState {
         }
         data.last_host_time_nanos = current_nanos;
 
-        ports::fill_ports_from_interleaved(input_ports, frames, false, |ch, frame| {
-            data.input_frames
-                .get(ch)
-                .and_then(|buf| buf.get(frame).copied())
-                .unwrap_or(0.0)
-        });
+        if let Some(slot) = plan_slot {
+            let plan = slot.load();
+            for &(ch_idx, buf) in &plan.hw_in_map {
+                // Safety: the driver is the sole producer of hw_in arena
+                // buffers, and this write happens before the engine starts
+                // the cycle, so no node reads them concurrently.
+                let arena = unsafe { &mut *plan.buffer_ptr(buf) };
+                let end = frames.min(arena.len());
+                if let Some(src) = data.input_frames.get(ch_idx) {
+                    let copy_len = end.min(src.len());
+                    arena[..copy_len].copy_from_slice(&src[..copy_len]);
+                    arena[copy_len..end].fill(0.0);
+                } else {
+                    arena[..end].fill(0.0);
+                }
+            }
+        } else {
+            ports::fill_ports_from_interleaved(input_ports, frames, false, |ch, frame| {
+                data.input_frames
+                    .get(ch)
+                    .and_then(|buf| buf.get(frame).copied())
+                    .unwrap_or(0.0)
+            });
+        }
 
         for ch_buf in data.output_frames.iter_mut() {
             ch_buf[..frames].fill(0.0);
         }
-        ports::write_interleaved_from_ports(
-            output_ports,
-            frames,
-            output_gain,
-            output_balance,
-            false,
-            |ch, frame, sample| {
-                if let Some(buf) = data.output_frames.get_mut(ch) {
-                    if let Some(dst) = buf.get_mut(frame) {
-                        *dst = sample;
-                    }
+        let mut write_sample = |ch: usize, frame: usize, sample: f32| {
+            if let Some(buf) = data.output_frames.get_mut(ch) {
+                if let Some(dst) = buf.get_mut(frame) {
+                    *dst = sample;
                 }
-            },
-        );
+            }
+        };
+        if let Some(slot) = plan_slot {
+            let plan = slot.load();
+            ports::write_interleaved_from_arena(
+                &plan,
+                frames,
+                output_gain,
+                output_balance,
+                &mut write_sample,
+            );
+        } else {
+            ports::write_interleaved_from_ports(
+                output_ports,
+                frames,
+                output_gain,
+                output_balance,
+                false,
+                write_sample,
+            );
+        }
 
         data.output_ready = true;
 

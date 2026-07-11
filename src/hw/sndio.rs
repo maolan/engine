@@ -82,6 +82,9 @@ pub struct HwDriver {
     playback_temp_i16: Vec<i16>,
     playback_temp_i32: Vec<i32>,
     playing: bool,
+    /// Current render plan; when set, the RT cycle reads/writes plan arena
+    /// buffers instead of the legacy port buffers.
+    plan_slot: Option<Arc<crate::render_plan::PlanSlot>>,
 }
 
 impl std::fmt::Debug for HwDriver {
@@ -254,6 +257,7 @@ impl HwDriver {
             playback_temp_i16: vec![0; period_frames * channels_out],
             playback_temp_i32: vec![0; period_frames * channels_out],
             playing: false,
+            plan_slot: None,
         })
     }
 
@@ -298,8 +302,17 @@ impl HwDriver {
         self.playing = playing;
     }
 
+    pub fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
+        self.plan_slot = Some(slot);
+    }
+
     pub fn output_meter_linear(&self, gain: f32, balance: f32) -> Vec<f32> {
-        common::output_meter_linear(&self.audio_outs, gain, balance)
+        if let Some(slot) = &self.plan_slot {
+            let plan = slot.load();
+            common::output_meter_linear_from_plan(&plan, gain, balance)
+        } else {
+            common::output_meter_linear(&self.audio_outs, gain, balance)
+        }
     }
 
     pub fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {
@@ -367,13 +380,23 @@ impl HwDriver {
                     &mut self.capture_f32_buffer[..total_in],
                     1.0 / 128.0,
                 );
-                ports::fill_ports_from_interleaved_buffer(
-                    &self.audio_ins,
-                    frames,
-                    false,
-                    &self.capture_f32_buffer[..total_in],
-                    channels_in,
-                );
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::fill_arena_from_interleaved(
+                        &plan,
+                        frames,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                } else {
+                    ports::fill_ports_from_interleaved_buffer(
+                        &self.audio_ins,
+                        frames,
+                        false,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                }
             }
             2 if bits == 16 => {
                 if !le {
@@ -398,13 +421,23 @@ impl HwDriver {
                     &mut self.capture_f32_buffer[..total_in],
                     1.0 / 32768.0,
                 );
-                ports::fill_ports_from_interleaved_buffer(
-                    &self.audio_ins,
-                    frames,
-                    false,
-                    &self.capture_f32_buffer[..total_in],
-                    channels_in,
-                );
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::fill_arena_from_interleaved(
+                        &plan,
+                        frames,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                } else {
+                    ports::fill_ports_from_interleaved_buffer(
+                        &self.audio_ins,
+                        frames,
+                        false,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                }
             }
             4 if bits == 32 => {
                 if !le {
@@ -431,13 +464,23 @@ impl HwDriver {
                     &mut self.capture_f32_buffer[..total_in],
                     1.0 / 2147483648.0,
                 );
-                ports::fill_ports_from_interleaved_buffer(
-                    &self.audio_ins,
-                    frames,
-                    false,
-                    &self.capture_f32_buffer[..total_in],
-                    channels_in,
-                );
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::fill_arena_from_interleaved(
+                        &plan,
+                        frames,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                } else {
+                    ports::fill_ports_from_interleaved_buffer(
+                        &self.audio_ins,
+                        frames,
+                        false,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                }
             }
             4 if bits == 24 && msb => {
                 if !le {
@@ -467,19 +510,58 @@ impl HwDriver {
                     &mut self.capture_f32_buffer[..total_in],
                     1.0 / 8388608.0,
                 );
-                ports::fill_ports_from_interleaved_buffer(
-                    &self.audio_ins,
-                    frames,
-                    false,
-                    &self.capture_f32_buffer[..total_in],
-                    channels_in,
-                );
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::fill_arena_from_interleaved(
+                        &plan,
+                        frames,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                } else {
+                    ports::fill_ports_from_interleaved_buffer(
+                        &self.audio_ins,
+                        frames,
+                        false,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                }
             }
             _ => {
-                ports::fill_ports_from_interleaved(&self.audio_ins, frames, false, |ch, frame| {
-                    let idx = (frame * channels_in + ch) * bps;
-                    decode_sample(&self.capture_buffer[idx..idx + bps], bits, bps, le, msb)
-                });
+                if let Some(slot) = &self.plan_slot {
+                    // Decode into the interleaved f32 scratch buffer first, then
+                    // deinterleave into the plan arena like the other formats.
+                    for frame in 0..frames {
+                        for ch in 0..channels_in {
+                            let idx = (frame * channels_in + ch) * bps;
+                            self.capture_f32_buffer[frame * channels_in + ch] = decode_sample(
+                                &self.capture_buffer[idx..idx + bps],
+                                bits,
+                                bps,
+                                le,
+                                msb,
+                            );
+                        }
+                    }
+                    let plan = slot.load();
+                    ports::fill_arena_from_interleaved(
+                        &plan,
+                        frames,
+                        &self.capture_f32_buffer[..total_in],
+                        channels_in,
+                    );
+                } else {
+                    ports::fill_ports_from_interleaved(
+                        &self.audio_ins,
+                        frames,
+                        false,
+                        |ch, frame| {
+                            let idx = (frame * channels_in + ch) * bps;
+                            decode_sample(&self.capture_buffer[idx..idx + bps], bits, bps, le, msb)
+                        },
+                    );
+                }
             }
         }
 
@@ -487,19 +569,31 @@ impl HwDriver {
         match bps {
             1 if bits == 8 => {
                 self.playback_f32_buffer[..total_out].fill(0.0);
-                ports::write_interleaved_from_ports(
-                    &self.audio_outs,
-                    frames,
-                    self.output_gain_linear,
-                    self.output_balance,
-                    false,
-                    |ch, frame, sample| {
-                        let idx = frame * channels_out + ch;
-                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
-                            *dst = sample;
-                        }
-                    },
-                );
+                let mut write_sample = |ch: usize, frame: usize, sample: f32| {
+                    let idx = frame * channels_out + ch;
+                    if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                        *dst = sample;
+                    }
+                };
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::write_interleaved_from_arena(
+                        &plan,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        &mut write_sample,
+                    );
+                } else {
+                    ports::write_interleaved_from_ports(
+                        &self.audio_outs,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        false,
+                        write_sample,
+                    );
+                }
                 crate::simd::convert_f32_to_i8(
                     &self.playback_f32_buffer[..total_out],
                     unsafe {
@@ -513,19 +607,31 @@ impl HwDriver {
             }
             2 if bits == 16 => {
                 self.playback_f32_buffer[..total_out].fill(0.0);
-                ports::write_interleaved_from_ports(
-                    &self.audio_outs,
-                    frames,
-                    self.output_gain_linear,
-                    self.output_balance,
-                    false,
-                    |ch, frame, sample| {
-                        let idx = frame * channels_out + ch;
-                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
-                            *dst = sample;
-                        }
-                    },
-                );
+                let mut write_sample = |ch: usize, frame: usize, sample: f32| {
+                    let idx = frame * channels_out + ch;
+                    if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                        *dst = sample;
+                    }
+                };
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::write_interleaved_from_arena(
+                        &plan,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        &mut write_sample,
+                    );
+                } else {
+                    ports::write_interleaved_from_ports(
+                        &self.audio_outs,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        false,
+                        write_sample,
+                    );
+                }
                 crate::simd::convert_f32_to_i16(
                     &self.playback_f32_buffer[..total_out],
                     &mut self.playback_temp_i16[..total_out],
@@ -550,19 +656,31 @@ impl HwDriver {
             }
             4 if bits == 32 => {
                 self.playback_f32_buffer[..total_out].fill(0.0);
-                ports::write_interleaved_from_ports(
-                    &self.audio_outs,
-                    frames,
-                    self.output_gain_linear,
-                    self.output_balance,
-                    false,
-                    |ch, frame, sample| {
-                        let idx = frame * channels_out + ch;
-                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
-                            *dst = sample;
-                        }
-                    },
-                );
+                let mut write_sample = |ch: usize, frame: usize, sample: f32| {
+                    let idx = frame * channels_out + ch;
+                    if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                        *dst = sample;
+                    }
+                };
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::write_interleaved_from_arena(
+                        &plan,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        &mut write_sample,
+                    );
+                } else {
+                    ports::write_interleaved_from_ports(
+                        &self.audio_outs,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        false,
+                        write_sample,
+                    );
+                }
                 crate::simd::convert_f32_to_i32(
                     &self.playback_f32_buffer[..total_out],
                     &mut self.playback_temp_i32[..total_out],
@@ -589,19 +707,31 @@ impl HwDriver {
             }
             4 if bits == 24 && msb => {
                 self.playback_f32_buffer[..total_out].fill(0.0);
-                ports::write_interleaved_from_ports(
-                    &self.audio_outs,
-                    frames,
-                    self.output_gain_linear,
-                    self.output_balance,
-                    false,
-                    |ch, frame, sample| {
-                        let idx = frame * channels_out + ch;
-                        if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
-                            *dst = sample;
-                        }
-                    },
-                );
+                let mut write_sample = |ch: usize, frame: usize, sample: f32| {
+                    let idx = frame * channels_out + ch;
+                    if let Some(dst) = self.playback_f32_buffer.get_mut(idx) {
+                        *dst = sample;
+                    }
+                };
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::write_interleaved_from_arena(
+                        &plan,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        &mut write_sample,
+                    );
+                } else {
+                    ports::write_interleaved_from_ports(
+                        &self.audio_outs,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        false,
+                        write_sample,
+                    );
+                }
                 crate::simd::convert_f32_to_i24(
                     &self.playback_f32_buffer[..total_out],
                     &mut self.playback_temp_i32[..total_out],
@@ -630,24 +760,36 @@ impl HwDriver {
                 }
             }
             _ => {
-                ports::write_interleaved_from_ports(
-                    &self.audio_outs,
-                    frames,
-                    self.output_gain_linear,
-                    self.output_balance,
-                    false,
-                    |ch, frame, sample| {
-                        let idx = (frame * channels_out + ch) * bps;
-                        encode_sample(
-                            sample,
-                            bits,
-                            bps,
-                            le,
-                            msb,
-                            &mut self.playback_buffer[idx..idx + bps],
-                        );
-                    },
-                );
+                let mut write_sample = |ch: usize, frame: usize, sample: f32| {
+                    let idx = (frame * channels_out + ch) * bps;
+                    encode_sample(
+                        sample,
+                        bits,
+                        bps,
+                        le,
+                        msb,
+                        &mut self.playback_buffer[idx..idx + bps],
+                    );
+                };
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    ports::write_interleaved_from_arena(
+                        &plan,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        &mut write_sample,
+                    );
+                } else {
+                    ports::write_interleaved_from_ports(
+                        &self.audio_outs,
+                        frames,
+                        self.output_gain_linear,
+                        self.output_balance,
+                        false,
+                        write_sample,
+                    );
+                }
             }
         }
 

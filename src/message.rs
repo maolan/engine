@@ -1329,16 +1329,18 @@ pub enum Action {
 #[derive(Clone, Debug)]
 pub enum Message {
     Ready(usize),
-    Finished {
-        worker_id: usize,
-        task: ProcessTask,
-        output_linear: Vec<f32>,
-        process_epoch: usize,
-        parameter_updates: Vec<Action>,
-    },
     TracksFinished,
 
-    ProcessTask(ProcessTask),
+    /// Dispatch a render-plan node to a worker (Phase 2, see `LOCKLESS.md`).
+    NodeJob(crate::executor::NodeJob),
+    /// A worker completed a plan node. Stale `epoch`s are dropped.
+    NodeDone {
+        worker_id: usize,
+        epoch: u64,
+        node: u32,
+        output_linear: Vec<f32>,
+        parameter_updates: Vec<Action>,
+    },
     ProcessOfflineBounce(OfflineBounceWork),
     Channel(Sender<Self>),
 

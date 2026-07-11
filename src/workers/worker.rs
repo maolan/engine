@@ -1,9 +1,13 @@
 use crate::{
+    audio::io::AudioIO,
+    executor::NodeJob,
     message::{
         Action, Message, OfflineAutomationLane, OfflineAutomationPoint, OfflineAutomationTarget,
-        OfflineBounceWork, ProcessTask,
+        OfflineBounceWork, PluginKind, ProcessTask,
     },
     midi::io::MidiEvent,
+    render_plan::Op,
+    track::Track,
 };
 #[cfg(unix)]
 use nix::libc;
@@ -401,6 +405,118 @@ impl Worker {
             .expect("Failed to send message from worker");
     }
 
+    /// The output ports a plan task writes, in the same order the plan
+    /// compiler used for the node's `outs` buffers.
+    fn task_output_ports(t: &Track, task: &ProcessTask) -> Vec<Arc<AudioIO>> {
+        match task {
+            ProcessTask::Track(_) | ProcessTask::FolderOutput(_) => t.audio.outs.clone(),
+            ProcessTask::FolderInput(_) => Vec::new(),
+            ProcessTask::Plugin { kind, index, .. } => match kind {
+                PluginKind::Clap => t
+                    .clap_plugins
+                    .get(*index)
+                    .map(|p| p.processor.lock().audio_outputs().to_vec())
+                    .unwrap_or_default(),
+                PluginKind::Vst3 => t
+                    .vst3_plugins
+                    .get(*index)
+                    .map(|p| p.processor.lock().audio_outputs().to_vec())
+                    .unwrap_or_default(),
+                #[cfg(all(unix, not(target_os = "macos")))]
+                PluginKind::Lv2 => t
+                    .lv2_plugins
+                    .get(*index)
+                    .map(|p| p.processor.lock().audio_outputs().to_vec())
+                    .unwrap_or_default(),
+            },
+        }
+    }
+
+    /// Execute one node of a render plan (Phase 2, see `LOCKLESS.md`).
+    ///
+    /// `Sum`/`Zero` are pure arena ops. Task nodes run the legacy track body
+    /// (it still re-sums its inputs from the port graph — identical to the
+    /// plan's `Sum` result) and then copy their output ports into the arena
+    /// so downstream `Sum` nodes and the hardware drain see the result.
+    async fn process_node_job(&self, job: NodeJob) {
+        let NodeJob { epoch, plan, node } = job;
+        let (output_linear, parameter_updates) = match &plan.nodes[node as usize] {
+            Op::Zero { output } => {
+                // Safety: this worker executes this node; the plan's
+                // single-producer-chain invariant guarantees exclusive
+                // access to the output buffer.
+                unsafe { &mut *plan.buffer_ptr(*output) }.fill(0.0);
+                (Vec::new(), Vec::new())
+            }
+            Op::Sum { inputs, output } => {
+                // Safety: see `Op::Zero`; additionally, every input buffer's
+                // producer completed before this node was dispatched.
+                let out = unsafe { &mut *plan.buffer_ptr(*output) };
+                out.fill(0.0);
+                let mut sources = inputs.iter();
+                if let Some(&first) = sources.next() {
+                    let src = unsafe { plan.buffer(first) };
+                    crate::simd::copy_sanitized_inplace(out, src);
+                    if src.len() < out.len() {
+                        out[src.len()..].fill(0.0);
+                    }
+                }
+                for &input in sources {
+                    let src = unsafe { plan.buffer(input) };
+                    crate::simd::add_sanitized_inplace(out, src);
+                }
+                (Vec::new(), Vec::new())
+            }
+            Op::HwInput { .. } => {
+                // The hardware driver wrote this buffer before the cycle
+                // started; nothing to do.
+                (Vec::new(), Vec::new())
+            }
+            Op::Task { task, outs, .. } => {
+                let track = match task {
+                    ProcessTask::Track(t)
+                    | ProcessTask::FolderInput(t)
+                    | ProcessTask::FolderOutput(t) => t,
+                    ProcessTask::Plugin { track, .. } => track,
+                };
+                let t = track.lock();
+                match task {
+                    ProcessTask::Track(_) => t.process(),
+                    ProcessTask::FolderInput(_) => t.process_folder_input(),
+                    ProcessTask::FolderOutput(_) => t.process_folder_output(),
+                    ProcessTask::Plugin { kind, index, .. } => t.process_plugin(*kind, *index),
+                }
+                t.audio.processing = false;
+                let updates = std::mem::take(t.echoed_parameter_updates.lock());
+                let meter = t.output_meter_linear();
+                // Copy task outputs port -> arena for downstream Sum nodes
+                // and the hardware output drain.
+                for (port, &buf) in Self::task_output_ports(t, task).iter().zip(outs.iter()) {
+                    let src = port.buffer.lock();
+                    // Safety: this worker executes this node, the unique
+                    // producer of `buf` (see `Op::Zero`).
+                    let dst = unsafe { &mut *plan.buffer_ptr(buf) };
+                    let n = src.len().min(dst.len());
+                    dst[..n].copy_from_slice(&src[..n]);
+                    if n < dst.len() {
+                        dst[n..].fill(0.0);
+                    }
+                }
+                (meter, updates)
+            }
+        };
+        let _ = self
+            .tx
+            .send(Message::NodeDone {
+                worker_id: self.id,
+                epoch,
+                node,
+                output_linear,
+                parameter_updates,
+            })
+            .await;
+    }
+
     pub async fn work(&mut self) {
         crate::enable_flush_denormals_to_zero();
         if let Err(e) = Self::try_enable_realtime(self.realtime_priority) {
@@ -416,61 +532,11 @@ impl Worker {
                 Message::Request(Action::Quit) => {
                     return;
                 }
-                Message::ProcessTask(task) => {
-                    tracing::debug!("worker {} received task {:?}", self.id, task);
-                    let (output_linear, process_epoch, parameter_updates) = match &task {
-                        ProcessTask::Track(t) => {
-                            let track = t.lock();
-                            let process_epoch = track.process_epoch;
-                            track.process();
-                            track.audio.processing = false;
-                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
-                            (track.output_meter_linear(), process_epoch, updates)
-                        }
-                        ProcessTask::FolderInput(t) => {
-                            let track = t.lock();
-                            let process_epoch = track.process_epoch;
-                            track.process_folder_input();
-                            track.audio.processing = false;
-                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
-                            (track.output_meter_linear(), process_epoch, updates)
-                        }
-                        ProcessTask::FolderOutput(t) => {
-                            let track = t.lock();
-                            let process_epoch = track.process_epoch;
-                            track.process_folder_output();
-                            track.audio.processing = false;
-                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
-                            (track.output_meter_linear(), process_epoch, updates)
-                        }
-                        ProcessTask::Plugin { track, kind, index } => {
-                            let track = track.lock();
-                            let process_epoch = track.process_epoch;
-                            track.process_plugin(*kind, *index);
-                            track.audio.processing = false;
-                            let updates = std::mem::take(track.echoed_parameter_updates.lock());
-                            (track.output_meter_linear(), process_epoch, updates)
-                        }
-                    };
-                    tracing::debug!(
-                        "worker {} finished task {:?}, output_linear={:?}",
-                        self.id,
-                        task,
-                        output_linear
-                    );
-                    let _ = self
-                        .tx
-                        .send(Message::Finished {
-                            worker_id: self.id,
-                            task,
-                            output_linear,
-                            process_epoch,
-                            parameter_updates,
-                        })
-                        .await;
-                }
                 Message::ProcessOfflineBounce(job) => {
                     self.process_offline_bounce(job).await;
+                }
+                Message::NodeJob(job) => {
+                    self.process_node_job(job).await;
                 }
                 _ => {}
             }
@@ -615,6 +681,78 @@ mod tests {
         Worker::apply_freeze_automation_at_sample(&mut track, 2, &lanes);
         assert_eq!(track.pending_automation_midi_events.len(), 1);
         assert_eq!(track.pending_automation_midi_events[0].data[2], 25);
+    }
+
+    #[tokio::test]
+    async fn process_node_job_sums_arena_buffers() {
+        use crate::render_plan::{Op, RenderPlan};
+        use std::cell::UnsafeCell;
+        use std::collections::HashMap;
+
+        let (_rx_unused_tx, rx_unused) = channel(1);
+        let (tx, mut out_rx) = channel(8);
+        let worker = Worker {
+            id: 4,
+            rx: rx_unused,
+            tx,
+            realtime_priority: 0,
+        };
+        let collector = basedrop::Collector::new();
+        let plan = RenderPlan {
+            buffer_size: 4,
+            buffers: (0..3).map(|_| UnsafeCell::new(vec![0.0; 4])).collect(),
+            nodes: vec![Op::Sum {
+                inputs: vec![0, 1],
+                output: 2,
+            }],
+            indegree: vec![0],
+            dependents: vec![vec![]],
+            sources: vec![0],
+            hw_in_map: vec![],
+            hw_in_ports: vec![],
+            hw_out_map: vec![],
+            port_map: HashMap::new(),
+            forced: vec![],
+        };
+        // Safety: test thread, no node is executing yet.
+        unsafe {
+            (&mut *plan.buffer_ptr(0)).copy_from_slice(&[0.25, 0.5, 0.75, 1.0]);
+            (&mut *plan.buffer_ptr(1)).copy_from_slice(&[0.75, 0.5, 0.25, f32::NAN]);
+        }
+        let shared = std::sync::Arc::new(basedrop::Owned::new(&collector.handle(), plan));
+
+        worker
+            .process_node_job(crate::executor::NodeJob {
+                epoch: 1,
+                plan: shared.clone(),
+                node: 0,
+            })
+            .await;
+
+        // Safety: the job completed, so the Sum node's writes are done.
+        // The NaN in the second source is sanitized to 0 before adding.
+        unsafe {
+            assert_eq!(
+                &*shared.buffer_ptr(2),
+                &vec![1.0, 1.0, 1.0, 1.0],
+                "sanitized sum in the arena"
+            );
+        }
+        match out_rx.recv().await.expect("message") {
+            Message::NodeDone {
+                worker_id,
+                epoch,
+                node,
+                output_linear,
+                ..
+            } => {
+                assert_eq!(worker_id, 4);
+                assert_eq!(epoch, 1);
+                assert_eq!(node, 0);
+                assert!(output_linear.is_empty());
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[tokio::test]

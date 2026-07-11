@@ -46,7 +46,6 @@ const AFMT_S32_FOREIGN: u32 = AFMT_S32_BE;
 #[cfg(target_endian = "big")]
 const AFMT_S32_FOREIGN: u32 = AFMT_S32_LE;
 
-#[derive(Debug)]
 pub struct Audio {
     dsp: File,
     pub channels: Vec<Arc<AudioIO>>,
@@ -66,6 +65,23 @@ pub struct Audio {
     was_playing_last_cycle: bool,
     stop_fade_remaining_frames: usize,
     stop_fade_total_frames: usize,
+    /// Current render plan; when set, the RT cycle reads/writes plan arena
+    /// buffers instead of the legacy port buffers.
+    plan_slot: Option<Arc<crate::render_plan::PlanSlot>>,
+}
+
+// Manual impl: `basedrop::Owned` (inside `PlanSlot`) has no `Debug` impl.
+impl std::fmt::Debug for Audio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Audio")
+            .field("channels", &self.channels)
+            .field("input", &self.input)
+            .field("rate", &self.rate)
+            .field("format", &self.format)
+            .field("chsamples", &self.chsamples)
+            .field("frame_stamp", &self.frame_stamp)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Audio {
@@ -269,7 +285,12 @@ impl Audio {
             was_playing_last_cycle: false,
             stop_fade_remaining_frames: 0,
             stop_fade_total_frames: 0,
+            plan_slot: None,
         })
+    }
+
+    pub fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
+        self.plan_slot = Some(slot);
     }
 
     fn frame_size(&self) -> usize {
@@ -409,13 +430,23 @@ impl Audio {
                 &mut self.f32_buffer,
                 norm_factor,
             );
-            crate::hw::ports::fill_ports_from_interleaved_buffer(
-                &self.channels,
-                self.chsamples,
-                !all_connected,
-                &self.f32_buffer,
-                num_channels,
-            );
+            if let Some(slot) = &self.plan_slot {
+                let plan = slot.load();
+                crate::hw::ports::fill_arena_from_interleaved(
+                    &plan,
+                    self.chsamples,
+                    &self.f32_buffer,
+                    num_channels,
+                );
+            } else {
+                crate::hw::ports::fill_ports_from_interleaved_buffer(
+                    &self.channels,
+                    self.chsamples,
+                    !all_connected,
+                    &self.f32_buffer,
+                    num_channels,
+                );
+            }
         } else {
             let playing = self.playing.load(Ordering::Relaxed);
             if self.was_playing_last_cycle && !playing {
@@ -435,24 +466,36 @@ impl Audio {
                 }
                 let fade_remaining = self.stop_fade_remaining_frames;
                 let fade_total = self.stop_fade_total_frames.max(1);
-                crate::hw::ports::write_interleaved_from_ports(
-                    &self.channels,
-                    self.chsamples,
-                    output_gain,
-                    self.output_balance,
-                    !all_connected,
-                    |ch_idx, frame, sample| {
-                        let target_idx = frame * num_channels + ch_idx;
-                        let fade_gain = if !playing && fade_remaining > 0 {
-                            let progressed = self.chsamples.saturating_sub(fade_remaining) + frame;
-                            (1.0 - (progressed as f32 / fade_total as f32)).clamp(0.0, 1.0)
-                        } else {
-                            1.0
-                        };
-                        data_i32[target_idx] =
-                            (sample.clamp(-1.0, 1.0) * fade_gain * scale_factor) as i32;
-                    },
-                );
+                let mut write_sample = |ch_idx: usize, frame: usize, sample: f32| {
+                    let target_idx = frame * num_channels + ch_idx;
+                    let fade_gain = if !playing && fade_remaining > 0 {
+                        let progressed = self.chsamples.saturating_sub(fade_remaining) + frame;
+                        (1.0 - (progressed as f32 / fade_total as f32)).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    data_i32[target_idx] =
+                        (sample.clamp(-1.0, 1.0) * fade_gain * scale_factor) as i32;
+                };
+                if let Some(slot) = &self.plan_slot {
+                    let plan = slot.load();
+                    crate::hw::ports::write_interleaved_from_arena(
+                        &plan,
+                        self.chsamples,
+                        output_gain,
+                        self.output_balance,
+                        &mut write_sample,
+                    );
+                } else {
+                    crate::hw::ports::write_interleaved_from_ports(
+                        &self.channels,
+                        self.chsamples,
+                        output_gain,
+                        self.output_balance,
+                        !all_connected,
+                        write_sample,
+                    );
+                }
                 if !playing && self.stop_fade_remaining_frames > 0 {
                     self.stop_fade_remaining_frames = self
                         .stop_fade_remaining_frames

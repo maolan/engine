@@ -37,6 +37,9 @@ pub struct HwDriver {
     output_balance: f32,
     io_state: Arc<SharedIOState>,
     io_proc_handle: Option<IoProcHandle>,
+    /// Current render plan; when set, the RT cycle reads/writes plan arena
+    /// buffers instead of the legacy port buffers.
+    plan_slot: Option<Arc<crate::render_plan::PlanSlot>>,
 }
 
 impl HwDriver {
@@ -97,6 +100,7 @@ impl HwDriver {
             output_balance: 0.0,
             io_state,
             io_proc_handle: Some(io_proc_handle),
+            plan_slot: None,
         })
     }
 
@@ -141,6 +145,10 @@ impl HwDriver {
         self.output_balance = balance;
     }
 
+    pub fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
+        self.plan_slot = Some(slot);
+    }
+
     pub fn output_meter_db(&self, gain: f32, balance: f32) -> Vec<f32> {
         common::output_meter_db(&self.output_channels, gain, balance)
     }
@@ -177,6 +185,7 @@ impl crate::hw::traits::HwWorkerDriver for HwDriver {
             &self.output_channels,
             self.output_gain_linear,
             self.output_balance,
+            self.plan_slot.as_deref(),
         )
     }
 

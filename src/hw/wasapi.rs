@@ -46,6 +46,9 @@ pub struct HwDriver {
     output_channels: usize,
     playing: bool,
     stop_requested: Arc<AtomicBool>,
+    /// Current render plan; when set, the RT cycle reads/writes plan arena
+    /// buffers instead of the legacy port buffers.
+    plan_slot: Option<Arc<crate::render_plan::PlanSlot>>,
 }
 
 impl HwDriver {
@@ -182,6 +185,7 @@ impl HwDriver {
             output_channels,
             playing: false,
             stop_requested,
+            plan_slot: None,
         })
     }
 
@@ -229,12 +233,21 @@ impl HwDriver {
         self.output_balance = balance.clamp(-1.0, 1.0);
     }
 
+    pub fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
+        self.plan_slot = Some(slot);
+    }
+
     pub fn output_meter_db(&self, gain: f32, balance: f32) -> Vec<f32> {
         common::output_meter_db(&self.audio_outs, gain, balance)
     }
 
     pub fn output_meter_linear(&self, gain: f32, balance: f32) -> Vec<f32> {
-        common::output_meter_linear(&self.audio_outs, gain, balance)
+        if let Some(slot) = &self.plan_slot {
+            let plan = slot.load();
+            common::output_meter_linear_from_plan(&plan, gain, balance)
+        } else {
+            common::output_meter_linear(&self.audio_outs, gain, balance)
+        }
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
@@ -272,18 +285,31 @@ impl HwDriver {
         let consume_frames = have_frames.min(input_frames);
         let consume_samples = consume_frames.saturating_mul(input_channels);
 
-        for (ch_idx, io_port) in self.audio_ins.iter().enumerate() {
-            let dst = io_port.buffer.lock();
-            for frame in 0..input_frames.min(dst.len()) {
-                let src_idx = frame * input_channels + ch_idx;
-                let sample = if src_idx < consume_samples {
-                    self.input_queue[src_idx]
-                } else {
-                    0.0
-                };
-                dst[frame] = sample;
+        if let Some(slot) = &self.plan_slot {
+            // Slice off any queued samples beyond this cycle: the legacy path
+            // reads only `consume_samples` and zero-pads the rest, and
+            // `fill_arena_from_interleaved` zero-fills past the slice end.
+            let plan = slot.load();
+            crate::hw::ports::fill_arena_from_interleaved(
+                &plan,
+                input_frames,
+                &self.input_queue[..consume_samples],
+                input_channels,
+            );
+        } else {
+            for (ch_idx, io_port) in self.audio_ins.iter().enumerate() {
+                let dst = io_port.buffer.lock();
+                for frame in 0..input_frames.min(dst.len()) {
+                    let src_idx = frame * input_channels + ch_idx;
+                    let sample = if src_idx < consume_samples {
+                        self.input_queue[src_idx]
+                    } else {
+                        0.0
+                    };
+                    dst[frame] = sample;
+                }
+                io_port.finished.store(true, Ordering::Release);
             }
-            io_port.finished.store(true, Ordering::Release);
         }
 
         if consume_samples > 0 {
@@ -296,13 +322,29 @@ impl HwDriver {
         let balance = self.output_balance;
         let mut interleaved = vec![0.0_f32; frames.saturating_mul(channels)];
         if self.playing {
-            for (ch_idx, io_port) in self.audio_outs.iter().enumerate() {
-                io_port.process();
-                let src = io_port.buffer.lock();
-                let b = common::channel_balance_gain(channels, ch_idx, balance);
-                for (frame, src_sample) in src.iter().enumerate().take(frames) {
-                    let idx = frame * channels + ch_idx;
-                    interleaved[idx] = *src_sample * gain * b;
+            if let Some(slot) = &self.plan_slot {
+                let plan = slot.load();
+                crate::hw::ports::write_interleaved_from_arena(
+                    &plan,
+                    frames,
+                    gain,
+                    balance,
+                    |ch, frame, sample| {
+                        let idx = frame * channels + ch;
+                        if let Some(dst) = interleaved.get_mut(idx) {
+                            *dst = sample;
+                        }
+                    },
+                );
+            } else {
+                for (ch_idx, io_port) in self.audio_outs.iter().enumerate() {
+                    io_port.process();
+                    let src = io_port.buffer.lock();
+                    let b = common::channel_balance_gain(channels, ch_idx, balance);
+                    for (frame, src_sample) in src.iter().enumerate().take(frames) {
+                        let idx = frame * channels + ch_idx;
+                        interleaved[idx] = *src_sample * gain * b;
+                    }
                 }
             }
         }

@@ -7,6 +7,11 @@ pub trait HwWorkerDriver {
     fn run_cycle_for_worker(&mut self) -> Result<(), String>;
     fn run_assist_step_for_worker(&mut self) -> Result<bool, String>;
 
+    /// Give the driver the render-plan slot so its RT cycle can read/write
+    /// plan arena buffers instead of the legacy port buffers. Drivers that
+    /// do not support plan-based I/O yet ignore it.
+    fn set_plan_slot(&mut self, _slot: std::sync::Arc<crate::render_plan::PlanSlot>) {}
+
     /// File descriptors for async I/O via kqueue/AsyncFd.
     /// When both return `Some`, the HW worker uses an async select loop
     /// instead of the blocking assist thread.

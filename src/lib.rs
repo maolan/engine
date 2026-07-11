@@ -4,6 +4,7 @@ pub mod client;
 pub mod connectable;
 mod engine;
 pub use engine::Engine;
+pub mod executor;
 pub mod history;
 mod hw;
 pub mod kind;
@@ -12,7 +13,9 @@ mod midi;
 pub mod modulator;
 pub mod mutex;
 mod osc;
+mod plan_builder;
 pub mod plugins;
+pub mod render_plan;
 mod routing;
 #[cfg(unix)]
 mod rubberband;

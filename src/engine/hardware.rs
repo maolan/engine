@@ -191,6 +191,7 @@ impl Engine {
             "maolan",
             crate::hw::jack::Config::default(),
             self.tx.clone(),
+            self.plan_slot.clone(),
         ) {
             Ok(runtime) => {
                 let input_channels = runtime.input_channels();
@@ -207,6 +208,7 @@ impl Engine {
                 }
                 self.hw_driver = None;
                 self.jack_runtime = Some(Arc::new(UnsafeMutex::new(runtime)));
+                self.publish_hw_ports();
                 self.publish_hw_infos(input_channels, output_channels, rate)
                     .await;
                 for device in midi_inputs {
@@ -330,7 +332,6 @@ impl Engine {
             if matches!(play_sync, JackTransportPlaySync::Start) {
                 self.transport_restart_pending = false;
                 self.transport_panic_flush_pending = false;
-                self.invalidate_track_cycle_state();
                 self.notify_clients(Ok(Action::Play)).await;
             } else {
                 self.transport_panic_flush_pending = false;
@@ -432,7 +433,8 @@ impl Engine {
         hw_opts: HwOptions,
     ) -> Result<(), String> {
         let hw_profile_enabled = config::env_flag(config::HW_PROFILE_ENV);
-        let d = Self::open_hw_driver(device, input_device, sample_rate_hz, bits, hw_opts)?;
+        let mut d = Self::open_hw_driver(device, input_device, sample_rate_hz, bits, hw_opts)?;
+        d.set_plan_slot(self.plan_slot.clone());
         let (in_channels, out_channels, rate, (in_lat, out_lat)) = Self::hw_device_info(&d);
         if hw_profile_enabled {
             let label = Self::hw_profile_backend_label(device);
@@ -457,8 +459,22 @@ impl Engine {
             self.jack_runtime = None;
         }
         self.hw_driver = Some(Arc::new(UnsafeMutex::new(d)));
+        self.publish_hw_ports();
         self.publish_hw_infos(in_channels, out_channels, rate).await;
         Ok(())
+    }
+
+    /// Push the current hardware port list into the plan builder and request
+    /// a new render plan. Until the new plan is published, the old one keeps
+    /// executing.
+    pub(crate) fn publish_hw_ports(&mut self) {
+        let ports = crate::plan_builder::HwPorts {
+            ins: self.all_hw_input_audio_ports(),
+            outs: self.all_hw_output_audio_ports(),
+            buffer_size: self.current_cycle_samples(),
+        };
+        *self.hw_ports.lock().expect("hw ports mutex poisoned") = ports;
+        self.plan_builder.mark_dirty();
     }
 
     pub(crate) async fn finalize_open_audio_device(&mut self) {
@@ -603,6 +619,7 @@ impl Engine {
                         jack.sample_rate,
                     )
                 };
+                self.publish_hw_ports();
                 self.publish_hw_infos(input_channels, output_channels, rate)
                     .await;
                 self.notify_clients(Ok(a.clone())).await;
@@ -669,6 +686,7 @@ impl Engine {
                         jack.sample_rate,
                     )
                 };
+                self.publish_hw_ports();
                 for action in reindex_notifications {
                     self.notify_clients(Ok(action)).await;
                 }
@@ -708,6 +726,7 @@ impl Engine {
                         jack.sample_rate,
                     )
                 };
+                self.publish_hw_ports();
                 self.publish_hw_infos(input_channels, output_channels, rate)
                     .await;
                 self.notify_clients(Ok(a.clone())).await;
@@ -774,6 +793,7 @@ impl Engine {
                         jack.sample_rate,
                     )
                 };
+                self.publish_hw_ports();
                 for action in reindex_notifications {
                     self.notify_clients(Ok(action)).await;
                 }

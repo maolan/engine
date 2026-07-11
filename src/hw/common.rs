@@ -40,6 +40,25 @@ pub fn output_meter_db(audio_outs: &[Arc<AudioIO>], gain: f32, balance: f32) -> 
         .collect()
 }
 
+/// Meter the plan's hardware-output arena buffers (the driver drain source)
+/// instead of the legacy port buffers.
+pub fn output_meter_linear_from_plan(
+    plan: &crate::render_plan::RenderPlan,
+    gain: f32,
+    balance: f32,
+) -> Vec<f32> {
+    let ch_count = plan.hw_out_map.len();
+    let mut out = Vec::with_capacity(ch_count);
+    for (channel_idx, &(buf, _channel)) in plan.hw_out_map.iter().enumerate() {
+        let balance_gain = channel_balance_gain(ch_count, channel_idx, balance);
+        // Safety: called after the cycle completed (HWFinished handler /
+        // driver drain point) — no node writes these buffers now.
+        let buf = unsafe { plan.buffer(buf) };
+        out.push(crate::simd::peak_abs(buf) * gain * balance_gain);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{channel_balance_gain, output_meter_linear};

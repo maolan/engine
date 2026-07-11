@@ -138,8 +138,18 @@ impl HwDriver {
         self.playback.output_balance = balance;
     }
 
+    pub fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
+        self.capture.set_plan_slot(slot.clone());
+        self.playback.set_plan_slot(slot);
+    }
+
     pub fn output_meter_linear(&self, gain: f32, balance: f32) -> Vec<f32> {
-        common::output_meter_linear(&self.playback.channels, gain, balance)
+        if let Some(slot) = &self.playback.plan_slot {
+            let plan = slot.load();
+            common::output_meter_linear_from_plan(&plan, gain, balance)
+        } else {
+            common::output_meter_linear(&self.playback.channels, gain, balance)
+        }
     }
 
     pub fn start_input_trigger(&self) -> std::io::Result<()> {

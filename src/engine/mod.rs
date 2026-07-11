@@ -57,10 +57,7 @@ use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     history::{History, UndoEntry},
     kind::Kind,
-    message::{
-        Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, ProcessTask,
-        SessionSlotState,
-    },
+    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, SessionSlotState},
     midi::io::MidiEvent,
     mutex::UnsafeMutex,
     osc::OscServer,
@@ -210,7 +207,6 @@ pub struct Engine {
     pending_requests: VecDeque<Action>,
     awaiting_hwfinished: bool,
     handling_hwfinished: bool,
-    track_process_epoch: usize,
     transport_panic_flush_pending: bool,
     transport_restart_pending: bool,
     notified_loop_wrap_sample: Option<usize>,
@@ -254,11 +250,15 @@ pub struct Engine {
     last_session_report_publish: Option<Instant>,
     session_report_state: HashMap<(String, usize), SessionSlotState>,
     track_meter_linear_by_track: HashMap<String, Vec<f32>>,
-    task_processing_started_at: HashMap<String, Instant>,
-    cycle_tasks: Vec<ProcessTask>,
-    cycle_task_deps: HashMap<String, Vec<String>>,
-    cycle_tasks_running: Vec<ProcessTask>,
-    cycle_tasks_finished: Vec<ProcessTask>,
+    /// Phase 2 render-plan machinery (see `LOCKLESS.md`): the executor
+    /// drives per-cycle node dispatch, the builder thread recompiles and
+    /// publishes plans, `pending_node_jobs` buffers jobs when no worker is
+    /// free, and `hw_ports` is the snapshot the builder compiles against.
+    executor: crate::executor::CycleExecutor,
+    plan_builder: crate::plan_builder::PlanBuilder,
+    plan_slot: Arc<crate::render_plan::PlanSlot>,
+    hw_ports: Arc<std::sync::Mutex<crate::plan_builder::HwPorts>>,
+    pending_node_jobs: VecDeque<crate::executor::NodeJob>,
     latest_hw_out_meter_db: Arc<Vec<f32>>,
     latest_track_meter_snapshot: Arc<Vec<(String, Vec<f32>)>>,
     history: History,
@@ -1076,8 +1076,55 @@ mod tests {
         );
     }
 
+    fn plan_task_node(
+        plan: &crate::render_plan::RenderPlan,
+        name: &str,
+        want: fn(&crate::message::ProcessTask) -> bool,
+    ) -> usize {
+        use crate::message::ProcessTask;
+        use crate::render_plan::Op;
+        plan.nodes
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| match op {
+                Op::Task { task, .. } => {
+                    let track = match task {
+                        ProcessTask::Track(t)
+                        | ProcessTask::FolderInput(t)
+                        | ProcessTask::FolderOutput(t) => t,
+                        ProcessTask::Plugin { track, .. } => track,
+                    };
+                    if track.lock().name == name && want(task) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .expect("task node not found")
+    }
+
+    fn plan_reachable(plan: &crate::render_plan::RenderPlan, from: usize, to: usize) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([from as u32]);
+        while let Some(n) = queue.pop_front() {
+            for &d in &plan.dependents[n as usize] {
+                if d as usize == to {
+                    return true;
+                }
+                if seen.insert(d) {
+                    queue.push_back(d);
+                }
+            }
+        }
+        false
+    }
+
     #[test]
-    fn nested_folder_expands_in_task_graph() {
+    fn nested_folder_expands_in_render_plan() {
+        use crate::message::ProcessTask;
+
         let (mut engine, _client_rx) = make_engine_with_client();
         let outer = Track::new_folder("outer".to_string(), 2, 2, 0, 0, 64, 48_000.0);
         let inner = Track::new_folder("inner".to_string(), 2, 2, 0, 0, 64, 48_000.0);
@@ -1097,46 +1144,42 @@ mod tests {
             leaf.lock().parent_track = Some("inner".to_string());
         }
 
-        let (tasks, deps) = engine.build_task_graph();
-        let names: Vec<String> = tasks
-            .iter()
-            .map(|t| match t {
-                ProcessTask::Track(t) => format!("track:{}", t.lock().name.clone()),
-                ProcessTask::FolderInput(t) => format!("in:{}", t.lock().name.clone()),
-                ProcessTask::FolderOutput(t) => format!("out:{}", t.lock().name.clone()),
-                ProcessTask::Plugin { track, .. } => {
-                    format!("plugin:{}", track.lock().name.clone())
-                }
-            })
-            .collect();
+        let plan = {
+            let state = engine.state.lock();
+            crate::render_plan::RenderPlan::compile(state, &[], &[], 64)
+        };
+        plan.verify().expect("plan invariants");
 
-        let expected = vec![
-            "in:outer",
-            "in:inner",
-            "track:leaf",
-            "out:inner",
-            "out:outer",
-        ];
-        assert_eq!(names, expected, "task graph should expand nested folders");
+        let is_fi = |t: &ProcessTask| matches!(t, ProcessTask::FolderInput(_));
+        let is_fo = |t: &ProcessTask| matches!(t, ProcessTask::FolderOutput(_));
+        let is_track = |t: &ProcessTask| matches!(t, ProcessTask::Track(_));
+        let in_outer = plan_task_node(&plan, "outer", is_fi);
+        let in_inner = plan_task_node(&plan, "inner", is_fi);
+        let track_leaf = plan_task_node(&plan, "leaf", is_track);
+        let out_inner = plan_task_node(&plan, "inner", is_fo);
+        let out_outer = plan_task_node(&plan, "outer", is_fo);
 
-        // Each task should depend on the previous one.
-        for window in tasks.windows(2) {
-            let prev = &window[0];
-            let next = &window[1];
-            let prev_key = Engine::task_key(prev);
-            let next_key = Engine::task_key(next);
-            assert!(
-                deps.get(&next_key).is_some_and(|d| d.contains(&prev_key)),
-                "{:?} should depend on {:?}",
-                next,
-                prev
-            );
+        assert!(
+            in_outer < in_inner
+                && in_inner < track_leaf
+                && track_leaf < out_inner
+                && out_inner < out_outer,
+            "nested folder tasks should expand in topological order"
+        );
+        for (a, b) in [
+            (in_outer, in_inner),
+            (in_inner, track_leaf),
+            (track_leaf, out_inner),
+            (out_inner, out_outer),
+        ] {
+            assert!(plan_reachable(&plan, a, b), "{a} should reach {b}");
         }
+        assert!(plan.forced.is_empty(), "no feedback cycle");
     }
 
     #[test]
-    fn child_to_plugin_to_folder_output_task_graph_has_no_cycle() {
-        use crate::message::ConnectableRef;
+    fn child_to_plugin_to_folder_output_render_plan_has_no_cycle() {
+        use crate::message::{ConnectableRef, ProcessTask};
 
         let plugin_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1213,87 +1256,47 @@ mod tests {
                 .expect("connect plugin R to folder output R");
         }
 
-        let (tasks, deps) = engine.build_task_graph();
+        let plan = {
+            let state = engine.state.lock();
+            crate::render_plan::RenderPlan::compile(state, &[], &[], 64)
+        };
+        plan.verify().expect("plan invariants");
 
-        let folder_in_key = tasks
-            .iter()
-            .find(|t| matches!(t, ProcessTask::FolderInput(t) if t.lock().name == "folder"))
-            .map(Engine::task_key)
-            .expect("folder input task");
-        let child_key = tasks
-            .iter()
-            .find(|t| matches!(t, ProcessTask::Track(t) if t.lock().name == "child"))
-            .map(Engine::task_key)
-            .expect("child task");
-        let plugin_key = tasks
-            .iter()
-            .find(|t| {
-                matches!(
-                    t,
-                    ProcessTask::Plugin {
-                        track,
-                        kind: PluginKind::Clap,
-                        index: 0,
-                    } if track.lock().name == "folder"
-                )
-            })
-            .map(Engine::task_key)
-            .expect("plugin task");
-        let folder_out_key = tasks
-            .iter()
-            .find(|t| matches!(t, ProcessTask::FolderOutput(t) if t.lock().name == "folder"))
-            .map(Engine::task_key)
-            .expect("folder output task");
+        let folder_in = plan_task_node(&plan, "folder", |t| {
+            matches!(t, ProcessTask::FolderInput(_))
+        });
+        let child_task = plan_task_node(&plan, "child", |t| matches!(t, ProcessTask::Track(_)));
+        let plugin = plan_task_node(&plan, "folder", |t| {
+            matches!(
+                t,
+                ProcessTask::Plugin {
+                    kind: PluginKind::Clap,
+                    index: 0,
+                    ..
+                }
+            )
+        });
+        let folder_out = plan_task_node(&plan, "folder", |t| {
+            matches!(t, ProcessTask::FolderOutput(_))
+        });
 
         assert!(
-            deps.get(&child_key)
-                .is_some_and(|d| d.contains(&folder_in_key)),
+            plan_reachable(&plan, folder_in, child_task),
             "child task should depend on folder input"
         );
         assert!(
-            deps.get(&plugin_key)
-                .is_some_and(|d| d.contains(&folder_in_key) && d.contains(&child_key)),
+            plan_reachable(&plan, folder_in, plugin) && plan_reachable(&plan, child_task, plugin),
             "plugin task should depend on folder input and child"
         );
         assert!(
-            deps.get(&folder_out_key).is_some_and(|d| {
-                d.contains(&folder_in_key) && d.contains(&plugin_key) && d.contains(&child_key)
-            }),
+            plan_reachable(&plan, folder_in, folder_out)
+                && plan_reachable(&plan, plugin, folder_out)
+                && plan_reachable(&plan, child_task, folder_out),
             "folder output should depend on folder input, plugin, and child"
         );
-
-        fn has_cycle(deps: &HashMap<String, Vec<String>>) -> bool {
-            let mut state: HashMap<String, u8> = HashMap::new();
-            fn visit(
-                node: &str,
-                deps: &HashMap<String, Vec<String>>,
-                state: &mut HashMap<String, u8>,
-            ) -> bool {
-                match state.get(node).copied() {
-                    Some(1) => return true,
-                    Some(2) => return false,
-                    _ => {}
-                }
-                state.insert(node.to_string(), 1);
-                for next in deps.get(node).into_iter().flatten() {
-                    if visit(next, deps, state) {
-                        return true;
-                    }
-                }
-                state.insert(node.to_string(), 2);
-                false
-            }
-            for node in deps.keys() {
-                if visit(node, deps, &mut state) {
-                    return true;
-                }
-            }
-            false
-        }
-
         assert!(
-            !has_cycle(&deps),
-            "task graph should not contain a cycle when a plugin reads from a child track"
+            plan.forced.is_empty(),
+            "render plan should not contain a cycle when a plugin reads from a child track"
         );
     }
 

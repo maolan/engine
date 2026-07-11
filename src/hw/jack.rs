@@ -36,8 +36,7 @@ struct Process {
     audio_out_ports: Arc<UnsafeMutex<Vec<Port<AudioOut>>>>,
     midi_in_ports: Vec<Port<MidiIn>>,
     midi_out_ports: Vec<Port<MidiOut>>,
-    audio_in_bridges: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
-    audio_out_bridges: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
+    plan_slot: Arc<crate::render_plan::PlanSlot>,
     midi_in_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
     midi_out_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
     output_gain_linear: Arc<AtomicU32>,
@@ -48,19 +47,21 @@ struct Process {
 impl Process {
     fn copy_audio_inputs(&mut self, ps: &ProcessScope) {
         let audio_in_ports = self.audio_in_ports.lock();
-        let audio_in_bridges = self.audio_in_bridges.lock();
+        let plan = self.plan_slot.load();
         for (idx, port) in audio_in_ports.iter().enumerate() {
-            let Some(bridge) = audio_in_bridges.get(idx) else {
+            let Some(&(_channel, buf)) = plan.hw_in_map.get(idx) else {
                 continue;
             };
             let src = port.as_slice(ps);
-            let dst = bridge.buffer.lock();
+            // Safety: the driver is the sole producer of HwInput arena
+            // buffers; the engine only dispatches the cycle after receiving
+            // the HWFinished message sent at the end of this callback.
+            let dst = unsafe { &mut *plan.buffer_ptr(buf) };
             let n = src.len().min(dst.len());
             dst[..n].copy_from_slice(&src[..n]);
             if n < dst.len() {
                 dst[n..].fill(0.0);
             }
-            bridge.finished.store(true, Ordering::Release);
         }
     }
 
@@ -68,7 +69,7 @@ impl Process {
         let gain = f32::from_bits(self.output_gain_linear.load(Ordering::Relaxed));
         let balance = f32::from_bits(self.output_balance.load(Ordering::Relaxed)).clamp(-1.0, 1.0);
         let audio_out_ports = self.audio_out_ports.lock();
-        let audio_out_bridges = self.audio_out_bridges.lock();
+        let plan = self.plan_slot.load();
         let stereo = audio_out_ports.len() == 2;
         let left_gain = if stereo {
             (1.0 - balance).clamp(0.0, 1.0)
@@ -83,12 +84,14 @@ impl Process {
 
         for (idx, port) in audio_out_ports.iter_mut().enumerate() {
             let dst = port.as_mut_slice(ps);
-            let Some(bridge) = audio_out_bridges.get(idx) else {
+            let Some(&(buf, _channel)) = plan.hw_out_map.get(idx) else {
                 dst.fill(0.0);
                 continue;
             };
-            bridge.process();
-            let src = bridge.buffer.lock();
+            // Safety: the engine sends HWFinished only after the cycle
+            // completed, so every producer of these buffers has finished and
+            // no worker touches the arena during this callback.
+            let src = unsafe { plan.buffer(buf) };
             let n = src.len().min(dst.len());
             let balance_gain = if stereo {
                 if idx == 0 { left_gain } else { right_gain }
@@ -168,6 +171,7 @@ impl JackRuntime {
         client_name: &str,
         config: Config,
         tx_engine: Sender<crate::message::Message>,
+        plan_slot: Arc<crate::render_plan::PlanSlot>,
     ) -> Result<Self, String> {
         let (client, _status) = Client::new(client_name, ClientOptions::NO_START_SERVER)
             .map_err(|e| format!("Failed to create JACK client '{client_name}': {e}"))?;
@@ -227,8 +231,7 @@ impl JackRuntime {
             audio_out_ports: audio_out_ports.clone(),
             midi_in_ports,
             midi_out_ports,
-            audio_in_bridges: audio_in_bridges.clone(),
-            audio_out_bridges: audio_out_bridges.clone(),
+            plan_slot,
             midi_in_events: midi_in_events.clone(),
             midi_out_events: midi_out_events.clone(),
             output_gain_linear: output_gain_linear.clone(),

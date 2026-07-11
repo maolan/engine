@@ -22,7 +22,7 @@ use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     history::{History, UndoEntry},
     hw::traits::HwWorkerDriver,
-    message::{Action, HwMidiEvent, Message, PluginKind, ProcessTask, SessionSlotState},
+    message::{Action, HwMidiEvent, Message, ProcessTask, SessionSlotState},
     midi::io::MidiEvent,
     mutex::UnsafeMutex,
     osc::{OscArg, OscServer, build_error_packet, build_osc_packet},
@@ -112,11 +112,33 @@ impl Engine {
     }
 
     pub fn new(rx: Receiver<Message>, tx: Sender<Message>) -> Self {
+        let state = Arc::new(UnsafeMutex::new(State::default()));
+        // Phase 2 render-plan machinery: an initial (empty-session) plan is
+        // built synchronously; the builder thread republishes on demand.
+        let collector = basedrop::Collector::new();
+        let hw_ports = Arc::new(std::sync::Mutex::new(crate::plan_builder::HwPorts {
+            buffer_size: 1024,
+            ..Default::default()
+        }));
+        let initial_plan = {
+            let state_guard = state.lock();
+            crate::render_plan::RenderPlan::compile(state_guard, &[], &[], 1024)
+        };
+        let plan_slot = Arc::new(crate::render_plan::PlanSlot::from_pointee(
+            basedrop::Owned::new(&collector.handle(), initial_plan),
+        ));
+        let plan_builder = crate::plan_builder::PlanBuilder::spawn(
+            state.clone(),
+            hw_ports.clone(),
+            plan_slot.clone(),
+            collector,
+        );
+        let executor = crate::executor::CycleExecutor::new(plan_slot.clone());
         Self {
             rx,
             tx,
             clients: vec![],
-            state: Arc::new(UnsafeMutex::new(State::default())),
+            state,
             workers: vec![],
             hw_driver: None,
             #[cfg(unix)]
@@ -139,7 +161,6 @@ impl Engine {
             pending_requests: VecDeque::new(),
             awaiting_hwfinished: false,
             handling_hwfinished: false,
-            track_process_epoch: 0,
             transport_panic_flush_pending: false,
             transport_restart_pending: false,
             notified_loop_wrap_sample: None,
@@ -188,11 +209,11 @@ impl Engine {
             last_session_report_publish: None,
             session_report_state: HashMap::new(),
             track_meter_linear_by_track: HashMap::new(),
-            task_processing_started_at: HashMap::new(),
-            cycle_tasks: Vec::new(),
-            cycle_task_deps: HashMap::new(),
-            cycle_tasks_running: Vec::new(),
-            cycle_tasks_finished: Vec::new(),
+            executor,
+            plan_builder,
+            plan_slot,
+            hw_ports,
+            pending_node_jobs: VecDeque::new(),
             latest_hw_out_meter_db: Arc::new(Vec::new()),
             latest_track_meter_snapshot: Arc::new(Vec::new()),
             history: History::default(),
@@ -1064,67 +1085,6 @@ impl Engine {
         }
     }
 
-    pub(crate) fn invalidate_track_cycle_state(&mut self) {
-        self.track_process_epoch = self.track_process_epoch.saturating_add(1);
-        self.task_processing_started_at.clear();
-        self.cycle_tasks.clear();
-        self.cycle_task_deps.clear();
-        self.cycle_tasks_running.clear();
-        self.cycle_tasks_finished.clear();
-        let state = self.state.lock();
-        for track in state.tracks.values() {
-            let t = track.lock();
-            t.audio.finished = false;
-            t.audio.processing = false;
-        }
-    }
-
-    pub(crate) fn force_stalled_task_completions(&mut self) {
-        let now = Instant::now();
-        let running: Vec<ProcessTask> = self.cycle_tasks_running.clone();
-        for task in running {
-            let key = Self::task_key(&task);
-            let Some(started) = self.task_processing_started_at.get(&key).copied() else {
-                continue;
-            };
-            if now.duration_since(started) < Self::TRACK_PROCESS_TIMEOUT {
-                continue;
-            }
-            if Self::task_running_finished_contains(&self.cycle_tasks_finished, &task) {
-                self.task_processing_started_at.remove(&key);
-                continue;
-            }
-            let track = match &task {
-                ProcessTask::Track(t)
-                | ProcessTask::FolderInput(t)
-                | ProcessTask::FolderOutput(t) => t.clone(),
-                ProcessTask::Plugin { track, .. } => track.clone(),
-            };
-            {
-                let t = track.lock();
-                if t.audio.finished || !t.audio.processing {
-                    self.task_processing_started_at.remove(&key);
-                    continue;
-                }
-                for out in &t.audio.outs {
-                    out.buffer.lock().fill(0.0);
-                    out.finished.store(true, Ordering::Release);
-                }
-                t.audio.processing = false;
-                t.audio.finished = true;
-            }
-            self.cycle_tasks_running
-                .retain(|t| Self::task_key(t) != key);
-            self.cycle_tasks_finished.push(task.clone());
-            self.task_processing_started_at.remove(&key);
-            tracing::warn!(
-                "Task '{}' exceeded process timeout ({} ms); forcing silent completion for cycle",
-                Self::task_track_name(&task),
-                Self::TRACK_PROCESS_TIMEOUT.as_millis()
-            );
-        }
-    }
-
     pub(crate) fn should_publish_hw_out_meters(&mut self) -> bool {
         let now = Instant::now();
         match self.last_hw_out_meter_publish {
@@ -1224,33 +1184,13 @@ impl Engine {
         } else {
             #[cfg(unix)]
             {
-                if let Some(jack) = self.jack_runtime.clone() {
-                    let outs = jack.lock().audio_outs();
-                    let out_count = outs.len();
-                    let b = if out_count == 2 {
-                        self.hw_out_balance.clamp(-1.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let mut meters_linear = Vec::with_capacity(out_count);
-                    for (channel_idx, channel) in outs.iter().enumerate() {
-                        let balance_gain = if out_count == 2 {
-                            if channel_idx == 0 {
-                                (1.0 - b).clamp(0.0, 1.0)
-                            } else {
-                                (1.0 + b).clamp(0.0, 1.0)
-                            }
-                        } else {
-                            1.0
-                        };
-                        let buf = channel.buffer.lock();
-                        let peak = crate::simd::peak_abs(buf) * gain * balance_gain;
-                        meters_linear.push(peak);
-                    }
-                    meters_linear
-                } else {
+                if self.jack_runtime.is_none() {
                     return;
                 }
+                // Read the plan's hardware-output arena buffers (the driver
+                // drain source) instead of the legacy bridge ports.
+                let plan = self.executor.plan().clone();
+                crate::hw::common::output_meter_linear_from_plan(&plan, gain, self.hw_out_balance)
             }
             #[cfg(not(unix))]
             {
@@ -1306,158 +1246,6 @@ impl Engine {
         }
     }
 
-    pub(crate) fn build_task_graph(
-        &self,
-    ) -> (
-        Vec<ProcessTask>,
-        std::collections::HashMap<String, Vec<String>>,
-    ) {
-        let state = self.state.lock();
-        let ordered: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = state
-            .tracks
-            .iter()
-            .map(|(name, track)| (name.clone(), track.clone()))
-            .collect();
-        let mut tasks = Vec::new();
-        let mut deps = std::collections::HashMap::new();
-
-        for (_name, track) in &ordered {
-            let t = track.lock();
-            if t.parent_track.is_some() {
-                continue;
-            }
-            self.append_track_tasks(track.clone(), None, &mut tasks, &mut deps);
-        }
-
-        (tasks, deps)
-    }
-
-    pub(crate) fn append_track_tasks(
-        &self,
-        track: Arc<UnsafeMutex<Box<Track>>>,
-        predecessor: Option<String>,
-        tasks: &mut Vec<ProcessTask>,
-        deps: &mut std::collections::HashMap<String, Vec<String>>,
-    ) -> (String, String) {
-        use crate::message::ConnectableRef;
-        let t = track.lock();
-        if t.is_folder {
-            let folder_input = ProcessTask::FolderInput(track.clone());
-            let folder_input_key = Self::task_key(&folder_input);
-            tasks.push(folder_input.clone());
-            let folder_input_deps: Vec<_> = predecessor.into_iter().collect();
-            deps.insert(folder_input_key.clone(), folder_input_deps);
-
-            let mut source_keys: std::collections::HashMap<ConnectableRef, String> =
-                std::collections::HashMap::new();
-            let mut target_keys: std::collections::HashMap<ConnectableRef, String> =
-                std::collections::HashMap::new();
-            source_keys.insert(ConnectableRef::TrackInput, folder_input_key.clone());
-            target_keys.insert(ConnectableRef::TrackInput, folder_input_key.clone());
-
-            let mut plugin_keys: Vec<String> = Vec::new();
-            for idx in 0..t.clap_plugins.len() {
-                let plugin_task = ProcessTask::Plugin {
-                    track: track.clone(),
-                    kind: PluginKind::Clap,
-                    index: idx,
-                };
-                let plugin_key = Self::task_key(&plugin_task);
-                let id = t.clap_plugins[idx].id;
-                source_keys.insert(ConnectableRef::ClapPlugin(id), plugin_key.clone());
-                target_keys.insert(ConnectableRef::ClapPlugin(id), plugin_key.clone());
-                tasks.push(plugin_task);
-                deps.insert(plugin_key.clone(), vec![folder_input_key.clone()]);
-                plugin_keys.push(plugin_key);
-            }
-            for idx in 0..t.vst3_plugins.len() {
-                let plugin_task = ProcessTask::Plugin {
-                    track: track.clone(),
-                    kind: PluginKind::Vst3,
-                    index: idx,
-                };
-                let plugin_key = Self::task_key(&plugin_task);
-                let id = t.vst3_plugins[idx].id;
-                source_keys.insert(ConnectableRef::Vst3Plugin(id), plugin_key.clone());
-                target_keys.insert(ConnectableRef::Vst3Plugin(id), plugin_key.clone());
-                tasks.push(plugin_task);
-                deps.insert(plugin_key.clone(), vec![folder_input_key.clone()]);
-                plugin_keys.push(plugin_key);
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            for idx in 0..t.lv2_plugins.len() {
-                let plugin_task = ProcessTask::Plugin {
-                    track: track.clone(),
-                    kind: PluginKind::Lv2,
-                    index: idx,
-                };
-                let plugin_key = Self::task_key(&plugin_task);
-                let id = t.lv2_plugins[idx].id;
-                source_keys.insert(ConnectableRef::Lv2Plugin(id), plugin_key.clone());
-                target_keys.insert(ConnectableRef::Lv2Plugin(id), plugin_key.clone());
-                tasks.push(plugin_task);
-                deps.insert(plugin_key.clone(), vec![folder_input_key.clone()]);
-                plugin_keys.push(plugin_key);
-            }
-
-            let mut child_keys = Vec::new();
-            for child_track in &t.child_tracks {
-                let (child_first, child_last) = self.append_track_tasks(
-                    child_track.clone(),
-                    Some(folder_input_key.clone()),
-                    tasks,
-                    deps,
-                );
-                let child_name = child_track.lock().name.clone();
-                source_keys.insert(
-                    ConnectableRef::ChildTrack(child_name.clone()),
-                    child_last.clone(),
-                );
-                target_keys.insert(ConnectableRef::ChildTrack(child_name), child_first.clone());
-                child_keys.push((child_first, child_last.clone()));
-            }
-
-            let folder_output = ProcessTask::FolderOutput(track.clone());
-            let folder_output_key = Self::task_key(&folder_output);
-            source_keys.insert(ConnectableRef::TrackOutput, folder_output_key.clone());
-            target_keys.insert(ConnectableRef::TrackOutput, folder_output_key.clone());
-            tasks.push(folder_output.clone());
-            let mut folder_output_deps = vec![folder_input_key.clone()];
-            folder_output_deps.extend(plugin_keys);
-            folder_output_deps.extend(child_keys.iter().map(|(_, last)| last.clone()));
-            deps.insert(folder_output_key.clone(), folder_output_deps);
-
-            // Add cross-connectable dependencies based on the track's routing graph.
-            // This includes child->plugin, plugin->folder output, plugin->plugin, etc.
-            for conn in t.connectable_connections() {
-                let Some(source_key) = source_keys.get(&conn.from) else {
-                    continue;
-                };
-                let Some(target_key) = target_keys.get(&conn.to) else {
-                    continue;
-                };
-                if source_key == target_key {
-                    continue;
-                }
-                let entry = deps.entry(target_key.clone()).or_default();
-                if !entry.contains(source_key) {
-                    entry.push(source_key.clone());
-                }
-            }
-
-            (folder_input_key, folder_output_key)
-        } else {
-            let task = ProcessTask::Track(track.clone());
-            let task_key = Self::task_key(&task);
-            tasks.push(task.clone());
-            deps.insert(
-                task_key.clone(),
-                predecessor.into_iter().collect::<Vec<_>>(),
-            );
-            (task_key.clone(), task_key)
-        }
-    }
-
     pub(crate) fn task_track_name(task: &ProcessTask) -> String {
         match task {
             ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => {
@@ -1465,82 +1253,6 @@ impl Engine {
             }
             ProcessTask::Plugin { track, .. } => track.lock().name.clone(),
         }
-    }
-
-    pub(crate) fn task_key(task: &ProcessTask) -> String {
-        match task {
-            ProcessTask::Track(t) => format!("Track:{:p}", std::sync::Arc::as_ptr(t)),
-            ProcessTask::FolderInput(t) => {
-                format!("FolderInput:{:p}", std::sync::Arc::as_ptr(t))
-            }
-            ProcessTask::FolderOutput(t) => {
-                format!("FolderOutput:{:p}", std::sync::Arc::as_ptr(t))
-            }
-            ProcessTask::Plugin { track, kind, index } => format!(
-                "Plugin:{:?}:{:p}:{}",
-                kind,
-                std::sync::Arc::as_ptr(track),
-                index
-            ),
-        }
-    }
-
-    pub(crate) fn task_running_finished_contains(
-        haystack: &[ProcessTask],
-        needle: &ProcessTask,
-    ) -> bool {
-        let needle_key = Self::task_key(needle);
-        haystack.iter().any(|t| Self::task_key(t) == needle_key)
-    }
-
-    pub(crate) fn task_ready(&self, task: &ProcessTask) -> bool {
-        match task {
-            ProcessTask::Track(t) | ProcessTask::FolderInput(t) => {
-                let track = t.lock();
-                let ready = track.audio.ready();
-                if !ready {
-                    let task_kind = match task {
-                        ProcessTask::Track(_) => "Track",
-                        ProcessTask::FolderInput(_) => "FolderInput",
-                        _ => "?",
-                    };
-                    let mut input_status = Vec::new();
-                    for (idx, input) in track.audio.ins.iter().enumerate() {
-                        let finished = input.finished.load(Ordering::Acquire);
-                        let conn_count = input.connection_count.load(Ordering::Relaxed);
-                        let mut pending = Vec::new();
-                        for conn in input.connections.lock().iter() {
-                            pending.push(conn.finished.load(Ordering::Acquire));
-                        }
-                        input_status.push(format!(
-                            "in{}: finished={} conns={} pending_finished={:?}",
-                            idx, finished, conn_count, pending
-                        ));
-                    }
-                    tracing::info!(
-                        "task not ready for '{}' ({}): {}",
-                        track.name,
-                        task_kind,
-                        input_status.join(", ")
-                    );
-                }
-                ready
-            }
-            ProcessTask::Plugin { .. } | ProcessTask::FolderOutput(_) => true,
-        }
-    }
-
-    pub(crate) fn task_dependencies_satisfied(&self, task: &ProcessTask) -> bool {
-        let key = Self::task_key(task);
-        let Some(deps) = self.cycle_task_deps.get(&key) else {
-            return true;
-        };
-        let finished_keys: std::collections::HashSet<String> = self
-            .cycle_tasks_finished
-            .iter()
-            .map(Self::task_key)
-            .collect();
-        deps.iter().all(|d| finished_keys.contains(d))
     }
 
     pub(crate) fn prepare_task_track(&self, task: &ProcessTask) {
@@ -1557,127 +1269,159 @@ impl Engine {
         t.set_transport_sample(transport_sample);
         t.set_loop_config(self.loop_enabled, self.loop_range_samples);
         t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
-        t.process_epoch = self.track_process_epoch;
         t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
         t.set_session_clip_playback_enabled(self.session_clip_playback_enabled && self.playing);
         t.set_record_tap_enabled(self.playing && self.record_enabled);
         t.audio.processing = true;
     }
 
-    pub(crate) async fn send_tasks(&mut self) -> bool {
-        if !self.playing {
+    /// Copy this cycle's hardware input from the plan arena into the bridge
+    /// port buffers, so task bodies (which still read `port.buffer`) see the
+    /// current hardware input. Runs on the dispatcher at cycle start; the
+    /// driver itself only touches arena buffers.
+    pub(crate) fn copy_hw_inputs_to_ports(&self) {
+        let plan = self.executor.plan();
+        for (idx, port) in plan.hw_in_ports.iter().enumerate() {
+            let Some(&(_, buf)) = plan.hw_in_map.get(idx) else {
+                continue;
+            };
+            // Safety: cycle boundary — the driver finished writing these
+            // buffers before signalling cycle end, and no node of the new
+            // cycle has been dispatched yet.
+            let src = unsafe { plan.buffer(buf) };
+            let dst = port.buffer.lock();
+            let n = src.len().min(dst.len());
+            dst[..n].copy_from_slice(&src[..n]);
+            if n < dst.len() {
+                dst[n..].fill(0.0);
+            }
+            port.finished.store(true, Ordering::Release);
+        }
+    }
+
+    /// Dispatch queued node jobs to ready workers, buffering the rest until
+    /// a worker reports `Ready`. Returns true if the cycle completed while
+    /// dispatching (only possible via abandoned nodes).
+    pub(crate) async fn dispatch_node_jobs(&mut self, jobs: Vec<crate::executor::NodeJob>) -> bool {
+        self.pending_node_jobs.extend(jobs);
+        let mut cycle_complete = false;
+        while !self.pending_node_jobs.is_empty() {
+            let Some(worker_index) = self.take_ready_worker_index() else {
+                break;
+            };
+            let Some(job) = self.pending_node_jobs.pop_front() else {
+                break;
+            };
+            if let Some(crate::render_plan::Op::Task { task, .. }) =
+                job.plan.nodes.get(job.node as usize)
+            {
+                self.prepare_task_track(task);
+            }
+            let worker = &self.workers[worker_index];
+            if let Err(e) = worker.tx.send(Message::NodeJob(job.clone())).await {
+                error!("Failed to send node job to worker: {e}");
+                let outcome = self.executor.abandon_node(job.node, Instant::now());
+                self.log_silenced_nodes(&outcome.silenced);
+                cycle_complete |= outcome.cycle_complete;
+                self.pending_node_jobs.extend(outcome.jobs);
+            }
+        }
+        cycle_complete
+    }
+
+    /// Start the next audio cycle: pull any published plan, copy hardware
+    /// inputs, and dispatch the seed jobs. Returns true when the cycle
+    /// completed instantly (empty plan) and `on_all_tracks_finished` ran.
+    pub(crate) async fn start_plan_cycle(&mut self) -> bool {
+        if !self.playing || !self.executor.cycle_complete() {
             return false;
         }
         self.refresh_realtime_infection();
-        self.force_stalled_task_completions();
-
-        if self.cycle_tasks.is_empty() {
-            let (tasks, deps) = self.build_task_graph();
-            let task_names: Vec<String> = tasks.iter().map(Self::task_track_name).collect();
-            tracing::debug!(
-                "send_tasks rebuilt graph: {} tasks ({:?})",
-                tasks.len(),
-                task_names
-            );
-            self.cycle_tasks = tasks;
-            self.cycle_task_deps = deps;
-            self.cycle_tasks_running.clear();
-            self.cycle_tasks_finished.clear();
+        self.copy_hw_inputs_to_ports();
+        let jobs = self.executor.start_cycle(Instant::now());
+        if self.dispatch_node_jobs(jobs).await {
+            self.on_all_tracks_finished().await;
+            return true;
         }
+        false
+    }
 
-        let mut finished = true;
-        let mut dispatched = 0;
-        loop {
-            let next_task = {
-                let mut next = None;
-                tracing::debug!(
-                    "selecting next: cycle={} running={} finished={}",
-                    self.cycle_tasks.len(),
-                    self.cycle_tasks_running.len(),
-                    self.cycle_tasks_finished.len()
-                );
-                for task in &self.cycle_tasks {
-                    let in_running =
-                        Self::task_running_finished_contains(&self.cycle_tasks_running, task);
-                    let in_finished =
-                        Self::task_running_finished_contains(&self.cycle_tasks_finished, task);
-                    tracing::debug!(
-                        "checking task {} in_running={} in_finished={}",
-                        Self::task_track_name(task),
-                        in_running,
-                        in_finished
-                    );
-                    if in_finished || in_running {
-                        continue;
-                    }
-                    finished = false;
-                    if !self.task_dependencies_satisfied(task) {
-                        continue;
-                    }
-                    if !self.task_ready(task) {
-                        continue;
-                    }
-                    next = Some(task.clone());
-                    break;
-                }
-                next
-            };
-
-            let Some(task) = next_task else {
-                if !finished && dispatched == 0 {
-                    tracing::info!(
-                        "send_tasks returning finished={} (dispatched {})",
-                        finished,
-                        dispatched
-                    );
-                } else {
-                    tracing::debug!(
-                        "send_tasks returning finished={} (dispatched {})",
-                        finished,
-                        dispatched
-                    );
-                }
-                return finished;
-            };
-            let Some(worker_index) = self.take_ready_worker_index() else {
-                self.force_stalled_task_completions();
-                tracing::debug!(
-                    "send_tasks returning false (no ready worker; dispatched {})",
-                    dispatched
-                );
-                return false;
-            };
-
-            if Self::task_running_finished_contains(&self.cycle_tasks_finished, &task)
-                || Self::task_running_finished_contains(&self.cycle_tasks_running, &task)
-            {
-                continue;
-            }
-            dispatched += 1;
-            let task_key = Self::task_key(&task);
-            tracing::info!(
-                "send_tasks dispatching {} (running={} finished={})",
-                Self::task_track_name(&task),
-                self.cycle_tasks_running.len(),
-                self.cycle_tasks_finished.len()
-            );
-            self.prepare_task_track(&task);
-            self.cycle_tasks_running.push(task.clone());
+    /// Handle a worker completion: cascade the executor, publish meters and
+    /// parameter echoes, force timed-out nodes, and finish the cycle when
+    /// all nodes are done.
+    pub(crate) async fn on_node_done(
+        &mut self,
+        worker_id: usize,
+        epoch: u64,
+        node: u32,
+        output_linear: Vec<f32>,
+        parameter_updates: Vec<Action>,
+    ) {
+        self.push_ready_worker(worker_id);
+        let mut complete = self.dispatch_node_jobs(Vec::new()).await;
+        if epoch != self.executor.epoch() {
             tracing::debug!(
-                "inserted task {} -> running_size={}",
-                Self::task_track_name(&task),
-                self.cycle_tasks_running.len()
+                "dropping stale NodeDone (epoch {} vs {}) for node {}",
+                epoch,
+                self.executor.epoch(),
+                node
             );
-            self.task_processing_started_at
-                .insert(task_key.clone(), Instant::now());
-            let worker = &self.workers[worker_index];
-            if let Err(e) = worker.tx.send(Message::ProcessTask(task.clone())).await {
-                self.cycle_tasks_running
-                    .retain(|t| Self::task_key(t) != task_key);
-                self.task_processing_started_at.remove(&task_key);
-                self.notify_clients(Err(format!("Failed to send task to worker: {}", e)))
-                    .await;
-            }
+            return;
+        }
+        let plan = self.executor.plan().clone();
+        if let Some(crate::render_plan::Op::Task { task, .. }) = plan.nodes.get(node as usize) {
+            let track_name = Self::task_track_name(task);
+            self.track_meter_linear_by_track
+                .insert(track_name, output_linear);
+        }
+        for action in parameter_updates {
+            self.notify_clients(Ok(action)).await;
+        }
+        let now = Instant::now();
+        let (jobs, done) = self.executor.on_node_done(epoch, node, now);
+        complete |= done;
+        complete |= self.dispatch_node_jobs(jobs).await;
+        let outcome = self
+            .executor
+            .force_timeouts(now, Self::TRACK_PROCESS_TIMEOUT);
+        self.log_silenced_nodes(&outcome.silenced);
+        complete |= self.dispatch_node_jobs(outcome.jobs).await;
+        complete |= outcome.cycle_complete;
+        if complete {
+            self.on_all_tracks_finished().await;
+        }
+    }
+
+    /// Periodic tick (called from the engine loop's interval): force
+    /// timed-out nodes even when no worker message arrives.
+    pub(crate) async fn on_executor_tick(&mut self) {
+        if self.executor.cycle_complete() {
+            return;
+        }
+        let outcome = self
+            .executor
+            .force_timeouts(Instant::now(), Self::TRACK_PROCESS_TIMEOUT);
+        self.log_silenced_nodes(&outcome.silenced);
+        let mut complete = self.dispatch_node_jobs(outcome.jobs).await;
+        complete |= outcome.cycle_complete;
+        if complete {
+            self.on_all_tracks_finished().await;
+        }
+    }
+
+    pub(crate) fn log_silenced_nodes(&self, silenced: &[u32]) {
+        for &node in silenced {
+            let plan = self.executor.plan();
+            let name = match plan.nodes.get(node as usize) {
+                Some(crate::render_plan::Op::Task { task, .. }) => Self::task_track_name(task),
+                _ => format!("node {node}"),
+            };
+            tracing::warn!(
+                "Node {} ('{}') exceeded process timeout ({} ms); forced silent completion for cycle",
+                node,
+                name,
+                Self::TRACK_PROCESS_TIMEOUT.as_millis()
+            );
         }
     }
 
@@ -3144,66 +2888,39 @@ impl Engine {
         self.notify_clients(Ok(action_to_process)).await;
     }
     pub async fn work(&mut self) {
-        while let Some(message) = self.rx.recv().await {
+        // Periodic tick so timed-out nodes are force-completed even when no
+        // worker message arrives (e.g. a fully hung cycle).
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let message = tokio::select! {
+                message = self.rx.recv() => {
+                    let Some(message) = message else {
+                        break;
+                    };
+                    message
+                }
+                _ = tick.tick() => {
+                    self.on_executor_tick().await;
+                    continue;
+                }
+            };
             match message {
-                Message::Ready(id) => self.push_ready_worker(id),
-                Message::Finished {
-                    worker_id,
-                    task,
-                    output_linear,
-                    process_epoch,
-                    parameter_updates,
-                } => {
-                    tracing::debug!(
-                        "engine received Finished from worker {} for task {:?} (epoch {} vs {})",
-                        worker_id,
-                        task,
-                        process_epoch,
-                        self.track_process_epoch
-                    );
-                    self.push_ready_worker(worker_id);
-                    let task_key = Self::task_key(&task);
-                    self.task_processing_started_at.remove(&task_key);
-                    if process_epoch != self.track_process_epoch {
-                        if let Some(track) = self
-                            .state
-                            .lock()
-                            .tracks
-                            .get(&Self::task_track_name(&task))
-                            .cloned()
-                        {
-                            let t = track.lock();
-                            t.audio.finished = false;
-                            t.audio.processing = false;
-                        }
-                        continue;
-                    }
-                    self.cycle_tasks_running
-                        .retain(|t| Self::task_key(t) != task_key);
-                    self.cycle_tasks_finished.push(task.clone());
-                    let track_name = Self::task_track_name(&task);
-                    let peak = output_linear.iter().copied().fold(0.0_f32, |a, b| a.max(b));
-                    tracing::debug!(
-                        "Finished task for '{}' epoch={} output_peak={}",
-                        track_name,
-                        process_epoch,
-                        peak
-                    );
-                    self.track_meter_linear_by_track
-                        .insert(track_name.clone(), output_linear);
-                    for action in parameter_updates {
-                        self.notify_clients(Ok(action)).await;
-                    }
-                    self.force_stalled_task_completions();
-                    let all_finished = self.send_tasks().await;
-                    tracing::debug!(
-                        "engine after Finished for {}: all_finished={}",
-                        track_name,
-                        all_finished
-                    );
-                    if all_finished {
+                Message::Ready(id) => {
+                    self.push_ready_worker(id);
+                    if self.dispatch_node_jobs(Vec::new()).await {
                         self.on_all_tracks_finished().await;
                     }
+                }
+                Message::NodeDone {
+                    worker_id,
+                    epoch,
+                    node,
+                    output_linear,
+                    parameter_updates,
+                } => {
+                    self.on_node_done(worker_id, epoch, node, output_linear, parameter_updates)
+                        .await;
                 }
                 Message::Channel(s) => {
                     self.clients.push(s);
@@ -3211,11 +2928,15 @@ impl Engine {
 
                 Message::Request(a) => {
                     self.dispatch_request(a).await;
+                    // Any request may have changed the topology; the builder
+                    // coalesces bursts into a single plan rebuild.
+                    self.plan_builder.mark_dirty();
                 }
                 Message::OscRequest { action, reply_to } => {
                     self.osc_reply_target = Some(reply_to);
                     self.dispatch_request(action).await;
                     self.osc_reply_target = None;
+                    self.plan_builder.mark_dirty();
                 }
                 Message::OfflineBounceFinished { result } => {
                     if let Ok(Action::TrackOfflineBounce { track_name, .. }) = &result {
@@ -3341,16 +3062,7 @@ impl Engine {
                             self.notify_clients(Ok(action)).await;
                         }
                     }
-                    self.invalidate_track_cycle_state();
-                    let all_finished = self.send_tasks().await;
-                    tracing::debug!(
-                        "HWFinished send_tasks finished={} hw_worker={}",
-                        all_finished,
-                        self.hw_worker.is_some()
-                    );
-                    if all_finished && self.hw_worker.is_some() {
-                        self.request_hw_cycle().await;
-                    }
+                    self.start_plan_cycle().await;
                     #[cfg(unix)]
                     {
                         if self.jack_runtime.is_some() {
