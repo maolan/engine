@@ -1651,8 +1651,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             }
 
             for (from_port, out) in from_track.midi.outs.iter().enumerate() {
-                let conns: Vec<Arc<crate::mutex::UnsafeMutex<Box<MIDIIO>>>> =
-                    out.lock().connections.to_vec();
+                let conns: Vec<Arc<MIDIIO>> = out.connections();
                 for conn in conns {
                     for (to_name, to_track_handle) in &state.tracks {
                         let to_track = to_track_handle.lock();
@@ -1722,8 +1721,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 for (from_name, from_track_handle) in &state.tracks {
                     let from_track = from_track_handle.lock();
                     for (from_port, out) in from_track.midi.outs.iter().enumerate() {
-                        let conns: Vec<Arc<crate::mutex::UnsafeMutex<Box<MIDIIO>>>> =
-                            out.lock().connections.to_vec();
+                        let conns: Vec<Arc<MIDIIO>> = out.connections();
                         if from_name != to_name
                             && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
                             && !is_family(from_name)

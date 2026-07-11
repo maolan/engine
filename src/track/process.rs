@@ -254,23 +254,21 @@ impl Track {
         }
 
         let mut input_to_out = vec![Vec::<usize>::new(); self.midi.ins.len()];
-        let mut out_external_targets =
-            vec![Vec::<Arc<UnsafeMutex<Box<MIDIIO>>>>::new(); self.midi.outs.len()];
+        let mut out_external_targets = vec![Vec::<Arc<MIDIIO>>::new(); self.midi.outs.len()];
 
         for (out_idx, out) in self.midi.outs.iter().enumerate() {
-            let out_lock = out.lock();
-            for source in &out_lock.sources {
+            for source in out.sources() {
                 if let Some(input_idx) = self
                     .midi
                     .ins
                     .iter()
-                    .position(|input| Arc::ptr_eq(input, source))
+                    .position(|input| Arc::ptr_eq(input, &source))
                 {
                     input_to_out[input_idx].push(out_idx);
                 }
             }
-            for target in &out_lock.connections {
-                out_external_targets[out_idx].push(target.clone());
+            for target in out.connections() {
+                out_external_targets[out_idx].push(target);
             }
         }
 
@@ -518,13 +516,16 @@ impl Track {
                 self.mix_session_midi_into_inputs(&mut track_input_midi_events, frames);
             }
             for (lane, input) in self.midi.ins.iter().enumerate() {
-                let lock = input.lock();
-                lock.buffer.clear();
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle; sources it reads were
+                // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+                let mut buffer = unsafe { input.buffer_mut() };
+                buffer.clear();
                 if let Some(events) = track_input_midi_events.get(lane) {
-                    lock.buffer.extend_from_slice(events);
+                    buffer.extend_from_slice(events);
                 }
-                lock.buffer.sort_by_key(|event| event.frame);
-                lock.mark_finished();
+                buffer.sort_by_key(|event| event.frame);
+                input.mark_finished();
             }
             for (lane, audio_in) in self.audio.ins.iter().enumerate() {
                 if !self.input_monitor.get(lane).copied().unwrap_or(false) {
@@ -556,7 +557,9 @@ impl Track {
                 let child = child.lock();
                 for (i, events) in track_input_midi_events.iter().enumerate() {
                     if let Some(child_in) = child.midi.ins.get(i) {
-                        child_in.lock().buffer.extend_from_slice(events);
+                        // Safety: plan edge folder-input → child serializes
+                        // this write before the child's task runs.
+                        unsafe { child_in.buffer_mut() }.extend_from_slice(events);
                     }
                 }
             }
@@ -731,12 +734,14 @@ impl Track {
             let child = child.lock();
             for (out_idx, child_out) in child.midi.outs.iter().enumerate() {
                 if let Some(folder_out) = self.midi.outs.get(out_idx) {
-                    let events = {
-                        let child_out_lock = child_out.lock();
-                        child_out_lock.buffer.clone()
-                    };
+                    // Safety: plan edge child → folder-output serializes the
+                    // child's write before this read.
+                    let events = unsafe { child_out.buffer() }.to_vec();
                     if !events.is_empty() {
-                        folder_out.lock().buffer.extend_from_slice(&events);
+                        // Safety: plan single-writer invariant — the
+                        // folder-output task is the sole writer of its own
+                        // ports this cycle (LOCKLESS.md Phase 3).
+                        unsafe { folder_out.buffer_mut() }.extend_from_slice(&events);
                     }
                 }
             }

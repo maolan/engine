@@ -2,7 +2,6 @@
 use crate::clap::ClapMidiOutputEvent;
 use crate::connectable::{ConnectableConnection, ConnectableRef};
 use crate::message::{PluginGraphConnection, PluginGraphNode};
-use crate::mutex::UnsafeMutex;
 
 use super::*;
 use crate::kind::Kind;
@@ -250,13 +249,13 @@ impl Track {
             }
         }
         for (from_port, from_io) in self.midi.ins.iter().enumerate() {
-            for conn in from_io.lock().connections.iter() {
+            for conn in from_io.connections() {
                 if let Some((to_port, _)) = self
                     .midi
                     .outs
                     .iter()
                     .enumerate()
-                    .find(|(_, out_io)| Arc::ptr_eq(out_io, conn))
+                    .find(|(_, out_io)| Arc::ptr_eq(out_io, &conn))
                 {
                     connections.push(PluginGraphConnection {
                         from_node: PluginGraphNode::TrackInput,
@@ -359,7 +358,7 @@ impl Track {
         }
 
         // --- MIDI ---
-        type MidiSource = (Arc<UnsafeMutex<Box<MIDIIO>>>, ConnectableRef, usize);
+        type MidiSource = (Arc<MIDIIO>, ConnectableRef, usize);
         let mut midi_sources: Vec<MidiSource> = Vec::new();
         for (port, io) in self.midi.ins.iter().enumerate() {
             midi_sources.push((io.clone(), ConnectableRef::TrackInput, port));
@@ -391,30 +390,29 @@ impl Track {
             }
         }
 
-        let find_midi_source = |io: &Arc<UnsafeMutex<Box<MIDIIO>>>| {
+        let find_midi_source = |io: &Arc<MIDIIO>| {
             midi_sources
                 .iter()
                 .find(|(candidate, _, _)| Arc::ptr_eq(candidate, io))
                 .map(|(_, r, p)| (r.clone(), *p))
         };
 
-        let mut report_midi_targets =
-            |targets: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>, target_ref: ConnectableRef| {
-                for (port, target) in targets.iter().enumerate() {
-                    let source_list = target.lock().sources.clone();
-                    for source in source_list {
-                        if let Some((from_ref, from_port)) = find_midi_source(&source) {
-                            connections.push(ConnectableConnection {
-                                from: from_ref,
-                                from_port,
-                                to: target_ref.clone(),
-                                to_port: port,
-                                kind: Kind::MIDI,
-                            });
-                        }
+        let mut report_midi_targets = |targets: Vec<Arc<MIDIIO>>, target_ref: ConnectableRef| {
+            for (port, target) in targets.iter().enumerate() {
+                let source_list = target.sources();
+                for source in source_list {
+                    if let Some((from_ref, from_port)) = find_midi_source(&source) {
+                        connections.push(ConnectableConnection {
+                            from: from_ref,
+                            from_port,
+                            to: target_ref.clone(),
+                            to_port: port,
+                            kind: Kind::MIDI,
+                        });
                     }
                 }
-            };
+            }
+        };
 
         report_midi_targets(self.midi_outputs(), ConnectableRef::TrackOutput);
         for child in &self.child_tracks {
@@ -537,7 +535,7 @@ impl Track {
         &self,
         connectable: &ConnectableRef,
         port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         use crate::connectable::MidiPorts;
         match connectable {
             ConnectableRef::TrackInput => {
@@ -580,7 +578,7 @@ impl Track {
         &self,
         connectable: &ConnectableRef,
         port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         use crate::connectable::MidiPorts;
         match connectable {
             ConnectableRef::TrackOutput => self

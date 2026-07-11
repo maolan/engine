@@ -107,6 +107,11 @@ pub struct RenderPlan {
     /// `Arc` pointer identity of each `AudioIO` port → its arena buffer.
     /// Transition aid so control code can resolve ports without re-walking.
     pub port_map: HashMap<usize, BufferId>,
+    /// `(writer task, reader task)` pairs derived from MIDI connections
+    /// (Phase 3, see `LOCKLESS.md`). Event payloads stay in the `MIDIIO`
+    /// port buffers; these edges only guarantee that a port's producer task
+    /// completes before any task that merges it. Checked by `verify()`.
+    pub midi_edges: Vec<(NodeId, NodeId)>,
     /// Nodes whose dependencies may never be satisfied (feedback loops).
     /// The executor force-completes them after the task timeout, mirroring
     /// today's `!progressed` fallback in the dynamic scheduler.
@@ -200,6 +205,15 @@ impl RenderPlan {
             }
         }
 
+        // MIDI edges (producer task -> merging task) obey the same order.
+        for &(from, to) in &self.midi_edges {
+            if from >= to && !(forced.contains(&from) && forced.contains(&to)) {
+                return Err(format!(
+                    "midi edge {from} -> {to} violates topological order"
+                ));
+            }
+        }
+
         // Collect writers per buffer. `Track` and `FolderInput` tasks also
         // write their input buffers in place (clip audio is mixed into the
         // summed input today), so they count as chained writers of `ins`.
@@ -286,6 +300,14 @@ struct Builder {
     hw_in_map: Vec<(usize, BufferId)>,
     hw_in_ports: Vec<Arc<AudioIO>>,
     hw_out_map: Vec<(BufferId, usize)>,
+    /// `Arc` pointer identity of a MIDI port → the task that writes its
+    /// event buffer this cycle.
+    midi_writers: HashMap<usize, NodeId>,
+    /// `Arc` pointer identity of a MIDI port → the task that reads/merges it.
+    midi_readers: HashMap<usize, NodeId>,
+    /// Every registered MIDI port; walked in `finish` to derive MIDI edges.
+    midi_ports: Vec<Arc<crate::midi::io::MIDIIO>>,
+    midi_edges: Vec<(NodeId, NodeId)>,
 }
 
 impl Builder {
@@ -303,6 +325,77 @@ impl Builder {
             hw_in_map: Vec::new(),
             hw_in_ports: Vec::new(),
             hw_out_map: Vec::new(),
+            midi_writers: HashMap::new(),
+            midi_readers: HashMap::new(),
+            midi_ports: Vec::new(),
+            midi_edges: Vec::new(),
+        }
+    }
+
+    /// Register a track's own MIDI ports: inputs are written and read by the
+    /// track's first task (folder input / track body), outputs by its last
+    /// task (folder output / track body).
+    fn register_midi_track_ports(&mut self, t: &Track, first: NodeId, last: NodeId) {
+        for p in &t.midi.ins {
+            let key = Arc::as_ptr(p) as usize;
+            self.midi_writers.insert(key, first);
+            self.midi_readers.insert(key, first);
+            self.midi_ports.push(p.clone());
+        }
+        for p in &t.midi.outs {
+            let key = Arc::as_ptr(p) as usize;
+            self.midi_writers.insert(key, last);
+            self.midi_readers.insert(key, last);
+            self.midi_ports.push(p.clone());
+        }
+    }
+
+    /// Register a plugin's MIDI ports at the task that processes it (its own
+    /// node for folder plugins, the track task for inline plugins).
+    fn register_plugin_midi_ports(
+        &mut self,
+        t: &Track,
+        kind: PluginKind,
+        index: usize,
+        node: NodeId,
+    ) {
+        let (midi_ins, midi_outs): (
+            Vec<Arc<crate::midi::io::MIDIIO>>,
+            Vec<Arc<crate::midi::io::MIDIIO>>,
+        ) = match kind {
+            PluginKind::Clap => {
+                let proc = t.clap_plugins[index].processor.lock();
+                (
+                    proc.midi_input_ports().to_vec(),
+                    proc.midi_output_ports().to_vec(),
+                )
+            }
+            PluginKind::Vst3 => {
+                let proc = t.vst3_plugins[index].processor.lock();
+                (
+                    proc.midi_input_ports().to_vec(),
+                    proc.midi_output_ports().to_vec(),
+                )
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginKind::Lv2 => {
+                let proc = t.lv2_plugins[index].processor.lock();
+                (
+                    proc.midi_input_ports().to_vec(),
+                    proc.midi_output_ports().to_vec(),
+                )
+            }
+        };
+        for p in midi_ins {
+            let key = Arc::as_ptr(&p) as usize;
+            self.midi_writers.insert(key, node);
+            self.midi_readers.insert(key, node);
+            self.midi_ports.push(p);
+        }
+        for p in midi_outs {
+            let key = Arc::as_ptr(&p) as usize;
+            self.midi_writers.insert(key, node);
+            self.midi_ports.push(p);
         }
     }
 
@@ -419,6 +512,7 @@ impl Builder {
             for &out in &outs {
                 self.producer.insert(out, folder_output);
             }
+            self.register_midi_track_ports(t, folder_input, folder_output);
 
             // Cross-connectable edges within this folder's routing graph,
             // exactly as the legacy builder derived them.
@@ -446,6 +540,18 @@ impl Builder {
             self.register_task_ports(task, &ins, true);
             for &out in &outs {
                 self.producer.insert(out, task);
+            }
+            self.register_midi_track_ports(t, task, task);
+            // Inline plugins are processed inside the track task body.
+            for idx in 0..t.clap_plugins.len() {
+                self.register_plugin_midi_ports(t, PluginKind::Clap, idx, task);
+            }
+            for idx in 0..t.vst3_plugins.len() {
+                self.register_plugin_midi_ports(t, PluginKind::Vst3, idx, task);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            for idx in 0..t.lv2_plugins.len() {
+                self.register_plugin_midi_ports(t, PluginKind::Lv2, idx, task);
             }
             (task, task)
         }
@@ -493,6 +599,7 @@ impl Builder {
         for &out in &pouts {
             self.producer.insert(out, node);
         }
+        self.register_plugin_midi_ports(t, kind, index, node);
         node
     }
 
@@ -545,6 +652,26 @@ impl Builder {
             }
         }
 
+        // MIDI edges: for every registered port, order each source's writer
+        // task before the task that merges this port (Phase 3). Unregistered
+        // sources (e.g. ports outside any track) are skipped — their writers
+        // are serialized by the cycle boundary.
+        for port in self.midi_ports.clone() {
+            let key = Arc::as_ptr(&port) as usize;
+            let Some(&reader) = self.midi_readers.get(&key) else {
+                continue;
+            };
+            for source in port.sources() {
+                let src_key = Arc::as_ptr(&source) as usize;
+                let Some(&writer) = self.midi_writers.get(&src_key) else {
+                    continue;
+                };
+                if writer != reader && self.edges.insert((writer, reader)) {
+                    self.midi_edges.push((writer, reader));
+                }
+            }
+        }
+
         let n = self.nodes.len();
         let (order, forced) = topo_sort(n, &self.edges);
         let mut remap = vec![0u32; n];
@@ -571,6 +698,11 @@ impl Builder {
             .filter(|&i| indegree[i as usize] == 0)
             .collect();
         let forced: Vec<NodeId> = forced.iter().map(|&f| remap[f as usize]).collect();
+        let midi_edges: Vec<(NodeId, NodeId)> = self
+            .midi_edges
+            .iter()
+            .map(|&(from, to)| (remap[from as usize], remap[to as usize]))
+            .collect();
 
         let plan = RenderPlan {
             buffer_size: self.buffer_size,
@@ -583,6 +715,7 @@ impl Builder {
             hw_in_ports: self.hw_in_ports,
             hw_out_map: self.hw_out_map,
             port_map: self.port_map,
+            midi_edges,
             forced,
         };
         if let Err(e) = plan.verify() {
@@ -807,6 +940,42 @@ mod tests {
     }
 
     #[test]
+    fn midi_only_connection_inserts_ordering_edge() {
+        // Two tracks with no audio at all, linked only by a MIDI connection.
+        let a = Arc::new(UnsafeMutex::new(Box::new(Track::new(
+            "a".to_string(),
+            0,
+            0,
+            0,
+            1,
+            64,
+            48_000.0,
+        ))));
+        let b = Arc::new(UnsafeMutex::new(Box::new(Track::new(
+            "b".to_string(),
+            0,
+            0,
+            1,
+            0,
+            64,
+            48_000.0,
+        ))));
+        let a_out = a.lock().midi.outs[0].clone();
+        let b_in = b.lock().midi.ins[0].clone();
+        crate::midi::io::MIDIIO::connect(&a_out, &b_in);
+
+        let plan = RenderPlan::compile(&state_with(vec![a, b]), &[], &[], 64);
+        plan.verify().expect("invariants");
+
+        let task_a = task_node(&plan, "a", is_track);
+        let task_b = task_node(&plan, "b", is_track);
+        assert_eq!(plan.midi_edges, vec![(task_a as NodeId, task_b as NodeId)]);
+        assert!(task_a < task_b, "producer task ordered before consumer");
+        assert!(plan.dependents[task_a].contains(&(task_b as NodeId)));
+        assert!(plan.forced.is_empty());
+    }
+
+    #[test]
     fn feedback_cycle_is_broken_and_marked_forced() {
         let a = make_track("a", 1, 1);
         let b = make_track("b", 1, 1);
@@ -885,6 +1054,7 @@ mod tests {
             hw_in_ports: vec![],
             hw_out_map: vec![],
             port_map: HashMap::new(),
+            midi_edges: vec![],
             forced: vec![],
         }
     }

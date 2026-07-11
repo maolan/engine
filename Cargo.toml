@@ -26,6 +26,7 @@ uuid = { version = "1.15", features = ["v4"] }
 wide = "1.4.0"
 arc-swap = "1.9.2"
 basedrop = "0.1"
+rtrb = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = { version = "0.11.0" }

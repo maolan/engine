@@ -3,9 +3,13 @@ use jack::{
     AudioIn, AudioOut, Client, ClientOptions, Control, MidiIn, MidiOut, NotificationHandler, Port,
     ProcessHandler, ProcessScope, RawMidi, TransportPosition, TransportState,
 };
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
+
+/// Capacity of the SPSC MIDI rings between the JACK callback and the engine
+/// thread, in events. One ring-full covers ~85 note-ons per 12 ms cycle.
+const MIDI_RING_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -37,8 +41,14 @@ struct Process {
     midi_in_ports: Vec<Port<MidiIn>>,
     midi_out_ports: Vec<Port<MidiOut>>,
     plan_slot: Arc<crate::render_plan::PlanSlot>,
-    midi_in_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
-    midi_out_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
+    /// RT side of the MIDI-in ring: this callback is the sole producer, the
+    /// engine thread drains at the cycle boundary.
+    midi_in_producer: rtrb::Producer<MidiEvent>,
+    /// RT side of the MIDI-out ring: this callback is the sole consumer, the
+    /// engine thread produces after each completed cycle.
+    midi_out_consumer: rtrb::Consumer<MidiEvent>,
+    /// In-events dropped because the engine did not drain fast enough.
+    midi_in_dropped: Arc<AtomicU64>,
     output_gain_linear: Arc<AtomicU32>,
     output_balance: Arc<AtomicU32>,
     tx_engine: Sender<crate::message::Message>,
@@ -106,22 +116,25 @@ impl Process {
     }
 
     fn collect_midi_input(&mut self, ps: &ProcessScope) {
-        let out = self.midi_in_events.lock();
-        out.clear();
         for port in &self.midi_in_ports {
             for raw in port.iter(ps) {
-                out.push(MidiEvent::new(raw.time, raw.bytes.to_vec()));
+                let event = MidiEvent::new(raw.time, raw.bytes.to_vec());
+                if self.midi_in_producer.push(event).is_err() {
+                    self.midi_in_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
 
     fn emit_midi_output(&mut self, ps: &ProcessScope) {
         if self.midi_out_ports.is_empty() {
-            self.midi_out_events.lock().clear();
+            while self.midi_out_consumer.pop().is_ok() {}
             return;
         }
-        let events = self.midi_out_events.lock().clone();
-        self.midi_out_events.lock().clear();
+        let mut events = Vec::new();
+        while let Ok(event) = self.midi_out_consumer.pop() {
+            events.push(event);
+        }
         if events.is_empty() {
             return;
         }
@@ -156,8 +169,11 @@ pub struct JackRuntime {
     audio_out_ports: Arc<UnsafeMutex<Vec<Port<AudioOut>>>>,
     audio_ins: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
     audio_outs: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
-    midi_in_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
-    midi_out_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
+    /// Engine-thread ends of the MIDI rings. Mutexes are control-side only;
+    /// the JACK callback holds the bare ring ends.
+    midi_in_consumer: Mutex<rtrb::Consumer<MidiEvent>>,
+    midi_out_producer: Mutex<rtrb::Producer<MidiEvent>>,
+    midi_in_dropped: Arc<AtomicU64>,
     output_gain_linear: Arc<AtomicU32>,
     output_balance: Arc<AtomicU32>,
     midi_input_count: usize,
@@ -221,8 +237,9 @@ impl JackRuntime {
             midi_out_ports.push(p);
         }
 
-        let midi_in_events = Arc::new(UnsafeMutex::new(Vec::<MidiEvent>::new()));
-        let midi_out_events = Arc::new(UnsafeMutex::new(Vec::<MidiEvent>::new()));
+        let (midi_in_producer, midi_in_consumer) = rtrb::RingBuffer::new(MIDI_RING_CAPACITY);
+        let (midi_out_producer, midi_out_consumer) = rtrb::RingBuffer::new(MIDI_RING_CAPACITY);
+        let midi_in_dropped = Arc::new(AtomicU64::new(0));
         let output_gain_linear = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let output_balance = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
 
@@ -232,8 +249,9 @@ impl JackRuntime {
             midi_in_ports,
             midi_out_ports,
             plan_slot,
-            midi_in_events: midi_in_events.clone(),
-            midi_out_events: midi_out_events.clone(),
+            midi_in_producer,
+            midi_out_consumer,
+            midi_in_dropped: midi_in_dropped.clone(),
             output_gain_linear: output_gain_linear.clone(),
             output_balance: output_balance.clone(),
             tx_engine,
@@ -249,8 +267,9 @@ impl JackRuntime {
             audio_out_ports,
             audio_ins: audio_in_bridges,
             audio_outs: audio_out_bridges,
-            midi_in_events,
-            midi_out_events,
+            midi_in_consumer: Mutex::new(midi_in_consumer),
+            midi_out_producer: Mutex::new(midi_out_producer),
+            midi_in_dropped,
             output_gain_linear,
             output_balance,
             midi_input_count: config.midi_inputs,
@@ -261,15 +280,26 @@ impl JackRuntime {
     }
 
     pub fn read_events_into(&self, out: &mut Vec<MidiEvent>) {
-        let src = self.midi_in_events.lock();
         out.clear();
-        out.extend(src.iter().cloned());
+        let mut consumer = self.midi_in_consumer.lock().expect("midi ring poisoned");
+        while let Ok(event) = consumer.pop() {
+            out.push(event);
+        }
     }
 
     pub fn write_events(&self, events: &[MidiEvent]) {
-        let dst = self.midi_out_events.lock();
-        dst.clear();
-        dst.extend_from_slice(events);
+        let mut producer = self.midi_out_producer.lock().expect("midi ring poisoned");
+        for event in events {
+            if producer.push(event.clone()).is_err() {
+                self.midi_in_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// MIDI events dropped at a full ring since the last call (both
+    /// directions share the counter).
+    pub fn take_midi_events_dropped(&self) -> u64 {
+        self.midi_in_dropped.swap(0, Ordering::Relaxed)
     }
 
     pub fn set_output_gain_linear(&self, gain: f32) {

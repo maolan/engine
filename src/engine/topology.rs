@@ -1003,7 +1003,7 @@ impl Engine {
                 }
                 Kind::MIDI => {
                     for out_port in &current_track.midi.outs {
-                        let conns = out_port.lock().connections.clone();
+                        let conns = out_port.connections();
                         for conn in conns.iter() {
                             for (name, next_track_handle) in &state.tracks {
                                 let next_track = next_track_handle.lock();
@@ -1049,7 +1049,7 @@ impl Engine {
     pub(crate) fn find_midi_io_owner(
         &self,
         state: &crate::state::State,
-        io: &std::sync::Arc<crate::mutex::UnsafeMutex<Box<crate::midi::io::MIDIIO>>>,
+        io: &std::sync::Arc<crate::midi::io::MIDIIO>,
     ) -> Option<(String, usize, bool)> {
         for (name, track) in &state.tracks {
             let t = track.lock();
@@ -1878,7 +1878,7 @@ impl Engine {
 
                 // Remove track-to-track MIDI connections where this track is the source.
                 for (port_idx, out) in child.midi.outs.iter().enumerate() {
-                    let targets = out.lock().connections.clone();
+                    let targets = out.connections();
                     for tgt in targets {
                         if let Some((tgt_name, tgt_port, _)) = self.find_midi_io_owner(state, &tgt)
                         {
@@ -1909,7 +1909,7 @@ impl Engine {
                 }
                 let other = other_track.lock();
                 for (out_port, out) in other.midi.outs.iter().enumerate() {
-                    let targets = out.lock().connections.clone();
+                    let targets = out.connections();
                     for tgt in targets {
                         if let Some(to_port) = child_input_arcs
                             .iter()
@@ -1969,14 +1969,7 @@ impl Engine {
                         for (parent_in, child_in) in
                             parent.midi.ins.iter().zip(child.midi.ins.iter())
                         {
-                            let child_in_lock = child_in.lock();
-                            if !child_in_lock
-                                .connections
-                                .iter()
-                                .any(|c| Arc::ptr_eq(c, parent_in))
-                            {
-                                child_in_lock.connections.push(parent_in.clone());
-                            }
+                            child_in.add_connection(parent_in);
                         }
                     }
                     // Child MIDI output -> folder MIDI output (one-to-one when counts match).
@@ -1984,14 +1977,7 @@ impl Engine {
                         for (child_out, parent_out) in
                             child.midi.outs.iter().zip(parent.midi.outs.iter())
                         {
-                            let child_out_lock = child_out.lock();
-                            if !child_out_lock
-                                .connections
-                                .iter()
-                                .any(|c| Arc::ptr_eq(c, parent_out))
-                            {
-                                child_out_lock.connections.push(parent_out.clone());
-                            }
+                            child_out.add_connection(parent_out);
                         }
                     }
                     child.invalidate_audio_route_cache();

@@ -1652,7 +1652,7 @@ impl Track {
         &self,
         instance_id: usize,
         port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
@@ -1671,7 +1671,7 @@ impl Track {
         &self,
         instance_id: usize,
         port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         self.clap_plugins
             .iter()
             .find(|instance| instance.id == instance_id)
@@ -1690,7 +1690,7 @@ impl Track {
         &self,
         _instance_id: usize,
         _port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         Err("VST3 MIDI output ports not yet implemented".to_string())
     }
 
@@ -1698,7 +1698,7 @@ impl Track {
         &self,
         _instance_id: usize,
         _port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         Err("VST3 MIDI input ports not yet implemented".to_string())
     }
 
@@ -1707,7 +1707,7 @@ impl Track {
         &self,
         _instance_id: usize,
         _port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         Err("LV2 MIDI output ports not yet implemented".to_string())
     }
 
@@ -1716,7 +1716,7 @@ impl Track {
         &self,
         _instance_id: usize,
         _port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         Err("LV2 MIDI input ports not yet implemented".to_string())
     }
 
@@ -1786,7 +1786,7 @@ impl Track {
         &self,
         node: &PluginGraphNode,
         port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         match node {
             PluginGraphNode::TrackInput => self
                 .midi
@@ -1814,7 +1814,7 @@ impl Track {
         &self,
         node: &PluginGraphNode,
         port: usize,
-    ) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+    ) -> Result<Arc<MIDIIO>, String> {
         match node {
             PluginGraphNode::TrackInput => {
                 Err("Track input node cannot be MIDI target".to_string())
@@ -1915,7 +1915,9 @@ impl Track {
         if events.is_empty() {
             return;
         }
-        input.lock().buffer.extend_from_slice(events);
+        // Safety: engine thread writes before the cycle starts; no node is
+        // running.
+        unsafe { input.buffer_mut() }.extend_from_slice(events);
     }
 
     pub fn push_hw_midi_events_to_port(&mut self, port: usize, events: &[MidiEvent]) {
@@ -1925,7 +1927,9 @@ impl Track {
         if events.is_empty() {
             return;
         }
-        input.lock().buffer.extend_from_slice(events);
+        // Safety: engine thread writes before the cycle starts; no node is
+        // running.
+        unsafe { input.buffer_mut() }.extend_from_slice(events);
     }
 
     pub(crate) fn collect_track_input_midi_events(&mut self) -> Vec<Vec<MidiEvent>> {
@@ -1934,22 +1938,22 @@ impl Track {
         let midi_disk_active = self.midi_disk_monitor.iter().any(|&m| m);
         let clip_playback_active = midi_disk_active && self.clip_playback_enabled;
         for (lane, input) in self.midi.ins.iter().enumerate() {
-            let input_lock = input.lock();
-            self.record_tap_midi_in
-                .extend(input_lock.buffer.iter().cloned());
+            // Safety: plan single-writer invariant — this task is the sole
+            // writer of its own ports this cycle; sources it reads were
+            // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+            let mut buffer = unsafe { input.buffer_mut() };
+            self.record_tap_midi_in.extend(buffer.iter().cloned());
             let monitor = self.midi_input_monitor.get(lane).copied().unwrap_or(false);
             if clip_playback_active && !monitor {
-                input_lock.buffer.clear();
+                buffer.clear();
             } else if (monitor || self.record_tap_enabled)
                 && let Some(Some(channel)) = self.midi_lane_channels.get(lane)
             {
-                input_lock
-                    .buffer
-                    .retain(|event| Self::event_matches_midi_channel(event, *channel));
+                buffer.retain(|event| Self::event_matches_midi_channel(event, *channel));
             }
-            input_lock.buffer.sort_by_key(|event| event.frame);
-            input_lock.mark_finished();
-            events.push(input_lock.buffer.clone());
+            buffer.sort_by_key(|event| event.frame);
+            input.mark_finished();
+            events.push(buffer.clone());
         }
         self.record_tap_midi_in.sort_by_key(|e| e.frame);
         events
@@ -1967,13 +1971,18 @@ impl Track {
 
     pub(crate) fn route_track_inputs_to_track_outputs(&mut self, _input_events: &[Vec<MidiEvent>]) {
         for out in &self.midi.outs {
-            out.lock().buffer.clear();
+            // Safety: plan single-writer invariant — the folder-output task is
+            // the sole writer of its own ports this cycle (LOCKLESS.md
+            // Phase 3).
+            unsafe { out.buffer_mut() }.clear();
         }
         if !self.output_enabled || self.is_folder {
             return;
         }
         for out in &self.midi.outs {
-            out.lock().process();
+            // Safety: as above — sole writer; sources were produced by earlier
+            // plan nodes.
+            unsafe { out.process() };
         }
     }
 
@@ -1986,7 +1995,10 @@ impl Track {
             return;
         }
         for out in &self.midi.outs {
-            out.lock().buffer.extend_from_slice(&events);
+            // Safety: plan single-writer invariant — the folder-output task is
+            // the sole writer of its own ports this cycle (LOCKLESS.md
+            // Phase 3).
+            unsafe { out.buffer_mut() }.extend_from_slice(&events);
         }
     }
 
@@ -1999,7 +2011,10 @@ impl Track {
             return;
         }
         for out in &self.midi.outs {
-            out.lock().buffer.extend_from_slice(&events);
+            // Safety: plan single-writer invariant — the folder-output task is
+            // the sole writer of its own ports this cycle (LOCKLESS.md
+            // Phase 3).
+            unsafe { out.buffer_mut() }.extend_from_slice(&events);
         }
     }
 
@@ -2009,7 +2024,10 @@ impl Track {
             return;
         }
         for out in &self.midi.outs {
-            out.lock().buffer.extend_from_slice(plugin_events);
+            // Safety: plan single-writer invariant — the folder-output task is
+            // the sole writer of its own ports this cycle (LOCKLESS.md
+            // Phase 3).
+            unsafe { out.buffer_mut() }.extend_from_slice(plugin_events);
         }
     }
 
@@ -2023,7 +2041,10 @@ impl Track {
             let Some(out) = self.midi.outs.get(port) else {
                 continue;
             };
-            out.lock().buffer.push(event.event.clone());
+            // Safety: plan single-writer invariant — the folder-output task is
+            // the sole writer of its own ports this cycle (LOCKLESS.md
+            // Phase 3).
+            unsafe { out.buffer_mut() }.push(event.event.clone());
         }
     }
 
@@ -2197,9 +2218,12 @@ impl Track {
         let mut per_port: Vec<Vec<MidiEvent>> = ports
             .iter()
             .map(|port| {
-                let lock = port.lock();
-                lock.process();
-                lock.buffer.clone()
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle; sources it reads were
+                // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+                unsafe { port.process() };
+                // Safety: as above — this task just produced the buffer.
+                unsafe { port.buffer() }.to_vec()
             })
             .collect();
         if per_port.len() < midi_inputs {
@@ -2211,7 +2235,7 @@ impl Track {
     pub(crate) fn plugin_midi_input_ports_for_node(
         &self,
         node: &PluginGraphNode,
-    ) -> Vec<Arc<UnsafeMutex<Box<MIDIIO>>>> {
+    ) -> Vec<Arc<MIDIIO>> {
         match node {
             PluginGraphNode::ClapPluginInstance(instance_id) => self
                 .clap_plugins
@@ -2260,23 +2284,31 @@ impl Track {
                 continue;
             };
             if let Some(events) = node_events.get(&(conn.from_node.clone(), conn.from_port)) {
-                out.lock().buffer.extend_from_slice(events);
+                // Safety: plan single-writer invariant — the folder-output
+                // task is the sole writer of its own ports this cycle
+                // (LOCKLESS.md Phase 3).
+                unsafe { out.buffer_mut() }.extend_from_slice(events);
             }
         }
     }
 
     pub(crate) fn clear_local_midi_inputs(&self) {
         for input in &self.midi.ins {
-            input.lock().buffer.clear();
+            // Safety: plan edges serialize every consumer of the track inputs
+            // before this folder-output node runs; no reader is active now.
+            unsafe { input.buffer_mut() }.clear();
         }
     }
 
     pub(crate) fn collect_hw_midi_output_events(&mut self) {
         self.pending_hw_midi_out_events.clear();
         for (port, out) in self.midi.outs.iter().enumerate() {
+            // Safety: plan single-writer invariant — this folder-output task
+            // is the sole writer of these ports and just filled them this
+            // cycle (LOCKLESS.md Phase 3).
+            let buffer = unsafe { out.buffer() };
             self.pending_hw_midi_out_events.extend(
-                out.lock()
-                    .buffer
+                buffer
                     .iter()
                     .cloned()
                     .map(|event| HwMidiOutEvent { port, event }),

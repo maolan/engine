@@ -328,17 +328,20 @@ impl ClipPluginRuntime {
         }
     }
 
-    fn plugin_midi_inputs_ready(ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>]) -> bool {
-        ports.iter().all(|port| port.lock().ready())
+    fn plugin_midi_inputs_ready(ports: &[Arc<MIDIIO>]) -> bool {
+        ports.iter().all(|port| port.ready())
     }
 
-    fn prepare_plugin_midi_inputs(ports: &[Arc<UnsafeMutex<Box<MIDIIO>>>]) -> Vec<Vec<MidiEvent>> {
+    fn prepare_plugin_midi_inputs(ports: &[Arc<MIDIIO>]) -> Vec<Vec<MidiEvent>> {
         ports
             .iter()
             .map(|port| {
-                let lock = port.lock();
-                lock.process();
-                lock.buffer.clone()
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle; sources it reads were
+                // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+                unsafe { port.process() };
+                // Safety: as above — this task just produced the buffer.
+                unsafe { port.buffer() }.to_vec()
             })
             .collect()
     }
@@ -454,7 +457,7 @@ pub struct Track {
     audio_route_cache_dirty: bool,
     metronome_source: Option<Arc<AudioIO>>,
     midi_input_to_out_routes_cache: Vec<Vec<usize>>,
-    midi_out_external_targets_cache: Vec<Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>>,
+    midi_out_external_targets_cache: Vec<Vec<Arc<MIDIIO>>>,
     midi_route_cache_dirty: bool,
 
     pub pending_session_launches: Vec<PendingSessionLaunch>,
@@ -481,11 +484,11 @@ impl crate::connectable::AudioPorts for Track {
 }
 
 impl crate::connectable::MidiPorts for Track {
-    fn midi_inputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+    fn midi_inputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
         self.midi.ins.clone()
     }
 
-    fn midi_outputs(&self) -> Vec<Arc<UnsafeMutex<Box<crate::midi::io::MIDIIO>>>> {
+    fn midi_outputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
         self.midi.outs.clone()
     }
 }
@@ -529,15 +532,13 @@ mod tests {
         assert_eq!(track.midi.outs.len(), 2);
         assert!(
             track.midi.ins[0]
-                .lock()
-                .connections
+                .connections()
                 .iter()
                 .any(|conn| Arc::ptr_eq(conn, &track.midi.outs[0]))
         );
         assert!(
             track.midi.ins[0]
-                .lock()
-                .connections
+                .connections()
                 .iter()
                 .all(|conn| !Arc::ptr_eq(conn, &track.midi.outs[1]))
         );
@@ -1293,8 +1294,7 @@ mod tests {
         let child_out = track.child_tracks[0].lock().midi.outs[0].clone();
         assert!(
             track.midi.ins[0]
-                .lock()
-                .sources
+                .sources()
                 .iter()
                 .any(|s| Arc::ptr_eq(s, &child_out))
         );

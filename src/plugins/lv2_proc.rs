@@ -45,8 +45,8 @@ pub struct Lv2Processor {
     audio_outputs: Vec<Arc<AudioIO>>,
     main_audio_inputs: usize,
     main_audio_outputs: usize,
-    midi_input_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
-    midi_output_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
+    midi_input_ports: Vec<Arc<MIDIIO>>,
+    midi_output_ports: Vec<Arc<MIDIIO>>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
 
@@ -117,10 +117,10 @@ impl Lv2Processor {
         let midi_in_count = header.midi_in_port_count.load(Ordering::Acquire) as usize;
         let midi_out_count = header.midi_out_port_count.load(Ordering::Acquire) as usize;
         let midi_input_ports: Vec<_> = (0..midi_in_count)
-            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .map(|_| Arc::new(MIDIIO::new()))
             .collect();
         let midi_output_ports: Vec<_> = (0..midi_out_count)
-            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .map(|_| Arc::new(MIDIIO::new()))
             .collect();
 
         Ok(Self {
@@ -155,10 +155,14 @@ impl Lv2Processor {
 
     pub fn setup_midi_ports(&self) {
         for port in &self.midi_input_ports {
-            port.lock().setup();
+            // Safety: plan single-writer invariant — this task is the sole
+            // writer of its own ports this cycle; sources it reads were
+            // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+            unsafe { port.setup() };
         }
         for port in &self.midi_output_ports {
-            port.lock().setup();
+            // Safety: as above — sole writer of this port this cycle.
+            unsafe { port.setup() };
         }
     }
 
@@ -186,11 +190,11 @@ impl Lv2Processor {
         self.midi_output_ports.len()
     }
 
-    pub fn midi_input_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+    pub fn midi_input_ports(&self) -> &[Arc<MIDIIO>] {
         &self.midi_input_ports
     }
 
-    pub fn midi_output_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+    pub fn midi_output_ports(&self) -> &[Arc<MIDIIO>] {
         &self.midi_output_ports
     }
 
@@ -591,8 +595,12 @@ impl Lv2Processor {
                 let buf = midi_in_ring_ptr(ptr, port_idx);
                 let (w, r) = midi_in_indices(ptr, port_idx);
                 let ring = RingBuffer::new(buf, w, r, RING_CAPACITY);
-                let lock = port.lock();
-                for ev in &lock.buffer {
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle; this read is of the
+                // port's own buffer, which no other node touches now
+                // (LOCKLESS.md Phase 3).
+                let port_buffer = port.buffer();
+                for ev in port_buffer {
                     let data = {
                         let mut d = [0u8; 3];
                         for (i, b) in ev.data.iter().enumerate().take(3) {
@@ -608,7 +616,7 @@ impl Lv2Processor {
                         _pad: 0,
                     });
                 }
-                lock.mark_finished();
+                port.mark_finished();
             }
         }
 
@@ -634,17 +642,19 @@ impl Lv2Processor {
                 let buf = midi_out_ring_ptr(ptr, port_idx);
                 let (w, r) = midi_out_indices(ptr, port_idx);
                 let ring = RingBuffer::new(buf, w, r, RING_CAPACITY);
-                let lock = port.lock();
-                lock.buffer.clear();
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle (LOCKLESS.md Phase 3).
+                let mut port_buffer = port.buffer_mut();
+                port_buffer.clear();
                 while let Some(ev) = ring.pop() {
                     let event = MidiEvent {
                         frame: ev.sample_offset,
                         data: ev.data.to_vec(),
                     };
-                    lock.buffer.push(event.clone());
+                    port_buffer.push(event.clone());
                     output_events.push(event);
                 }
-                lock.mark_finished();
+                port.mark_finished();
             }
             *self.last_process_time.lock() = Instant::now();
             output_events

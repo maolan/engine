@@ -712,6 +712,7 @@ mod tests {
             hw_in_ports: vec![],
             hw_out_map: vec![],
             port_map: HashMap::new(),
+            midi_edges: vec![],
             forced: vec![],
         };
         // Safety: test thread, no node is executing yet.

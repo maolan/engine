@@ -1,12 +1,11 @@
 use super::{clip::MIDIClip, io::MIDIIO};
-use crate::mutex::UnsafeMutex;
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct MIDITrack {
     pub clips: Vec<MIDIClip>,
-    pub ins: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
-    pub outs: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
+    pub ins: Vec<Arc<MIDIIO>>,
+    pub outs: Vec<Arc<MIDIIO>>,
 }
 
 impl MIDITrack {
@@ -17,22 +16,16 @@ impl MIDITrack {
             outs: vec![],
         };
         for _ in 0..ins {
-            ret.ins
-                .push(Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))));
+            ret.ins.push(Arc::new(MIDIIO::new()));
         }
         for _ in 0..outs {
-            ret.outs
-                .push(Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))));
+            ret.outs.push(Arc::new(MIDIIO::new()));
         }
 
         ret
     }
 
-    pub fn connect_in(
-        &mut self,
-        index: usize,
-        to: Arc<UnsafeMutex<Box<MIDIIO>>>,
-    ) -> Result<(), String> {
+    pub fn connect_in(&mut self, index: usize, to: Arc<MIDIIO>) -> Result<(), String> {
         if index >= self.ins.len() {
             return Err(format!(
                 "Index {} is too high, as there are only {} ins",
@@ -45,11 +38,7 @@ impl MIDITrack {
         Ok(())
     }
 
-    pub fn connect_out(
-        &mut self,
-        index: usize,
-        to: Arc<UnsafeMutex<Box<MIDIIO>>>,
-    ) -> Result<(), String> {
+    pub fn connect_out(&mut self, index: usize, to: Arc<MIDIIO>) -> Result<(), String> {
         if index >= self.outs.len() {
             return Err(format!(
                 "Index {} is too high, as there are only {} outs",
@@ -62,11 +51,7 @@ impl MIDITrack {
         Ok(())
     }
 
-    pub fn disconnect_in(
-        &mut self,
-        index: usize,
-        to: &Arc<UnsafeMutex<Box<MIDIIO>>>,
-    ) -> Result<(), String> {
+    pub fn disconnect_in(&mut self, index: usize, to: &Arc<MIDIIO>) -> Result<(), String> {
         if index >= self.ins.len() {
             return Err(format!(
                 "Index {} is too high, as there are only {} ins",
@@ -78,11 +63,7 @@ impl MIDITrack {
         MIDIIO::disconnect(&myin, to)
     }
 
-    pub fn disconnect_out(
-        &mut self,
-        index: usize,
-        to: &Arc<UnsafeMutex<Box<MIDIIO>>>,
-    ) -> Result<(), String> {
+    pub fn disconnect_out(&mut self, index: usize, to: &Arc<MIDIIO>) -> Result<(), String> {
         if index >= self.outs.len() {
             return Err(format!(
                 "Index {} is too high, as there are only {} outs",

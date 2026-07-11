@@ -51,8 +51,8 @@ pub struct ClapProcessor {
     main_audio_outputs: usize,
     midi_input_count: usize,
     midi_output_count: usize,
-    midi_input_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
-    midi_output_ports: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
+    midi_input_ports: Vec<Arc<MIDIIO>>,
+    midi_output_ports: Vec<Arc<MIDIIO>>,
     param_infos: Vec<ClapParameterInfo>,
     param_values: UnsafeMutex<HashMap<u32, f64>>,
     bypassed: Arc<AtomicBool>,
@@ -119,10 +119,10 @@ impl ClapProcessor {
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
         let midi_input_ports = (0..actual_midi_in as usize)
-            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .map(|_| Arc::new(MIDIIO::new()))
             .collect::<Vec<_>>();
         let midi_output_ports = (0..actual_midi_out as usize)
-            .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+            .map(|_| Arc::new(MIDIIO::new()))
             .collect::<Vec<_>>();
 
         let param_infos = Self::fetch_parameter_infos(&mapping, &events).unwrap_or_else(|e| {
@@ -166,10 +166,14 @@ impl ClapProcessor {
 
     pub fn setup_midi_ports(&self) {
         for port in &self.midi_input_ports {
-            port.lock().setup();
+            // Safety: plan single-writer invariant — this task is the sole
+            // writer of its own ports this cycle; sources it reads were
+            // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+            unsafe { port.setup() };
         }
         for port in &self.midi_output_ports {
-            port.lock().setup();
+            // Safety: as above — sole writer of this port this cycle.
+            unsafe { port.setup() };
         }
     }
 
@@ -197,11 +201,11 @@ impl ClapProcessor {
         self.midi_output_count
     }
 
-    pub fn midi_input_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+    pub fn midi_input_ports(&self) -> &[Arc<MIDIIO>] {
         &self.midi_input_ports
     }
 
-    pub fn midi_output_ports(&self) -> &[Arc<UnsafeMutex<Box<MIDIIO>>>] {
+    pub fn midi_output_ports(&self) -> &[Arc<MIDIIO>] {
         &self.midi_output_ports
     }
 
@@ -646,17 +650,22 @@ impl ClapProcessor {
             // existing engine scheduling keeps working until plugin MIDI
             // connections are fully migrated to MIDIIO.
             if let Some(port0) = self.midi_input_ports.first() {
-                let port0_lock = port0.lock();
-                port0_lock.buffer.extend_from_slice(midi_in);
-                port0_lock.mark_finished();
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle; sources it reads were
+                // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+                let mut buffer = port0.buffer_mut();
+                buffer.extend_from_slice(midi_in);
+                port0.mark_finished();
             }
 
             for (port_idx, port) in self.midi_input_ports.iter().enumerate() {
-                let port_lock = port.lock();
                 let midi_buf = midi_in_ring_ptr(ptr, port_idx);
                 let (midi_w, midi_r) = midi_in_indices(ptr, port_idx);
                 let midi_ring = RingBuffer::new(midi_buf, midi_w, midi_r, RING_CAPACITY);
-                for ev in &port_lock.buffer {
+                // Safety: as above — sole writer this cycle; this read is of
+                // the port's own buffer, which no other node touches now.
+                let port_buffer = port.buffer();
+                for ev in port_buffer {
                     let midi_event = maolan_plugin_protocol::protocol::MidiEvent {
                         sample_offset: ev.frame,
                         data: [
@@ -705,21 +714,23 @@ impl ClapProcessor {
         let mut midi_out = Vec::new();
         unsafe {
             for (port_idx, port) in self.midi_output_ports.iter().enumerate() {
-                let port_lock = port.lock();
-                port_lock.buffer.clear();
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle (LOCKLESS.md Phase 3).
+                let mut port_buffer = port.buffer_mut();
+                port_buffer.clear();
                 let midi_out_buf = midi_out_ring_ptr(ptr, port_idx);
                 let (midi_out_w, midi_out_r) = midi_out_indices(ptr, port_idx);
                 let midi_out_ring =
                     RingBuffer::new(midi_out_buf, midi_out_w, midi_out_r, RING_CAPACITY);
                 while let Some(ev) = midi_out_ring.pop() {
                     let event = crate::midi::io::MidiEvent::new(ev.sample_offset, ev.data.to_vec());
-                    port_lock.buffer.push(event.clone());
+                    port_buffer.push(event.clone());
                     midi_out.push(ClapMidiOutputEvent {
                         port: port_idx,
                         event,
                     });
                 }
-                port_lock.mark_finished();
+                port.mark_finished();
             }
         }
 

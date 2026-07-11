@@ -1,6 +1,5 @@
 use crate::audio::io::AudioIO;
 use crate::midi::io::MIDIIO;
-use crate::mutex::UnsafeMutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -12,8 +11,8 @@ pub trait AudioPorts {
 
 /// A set of MIDI input/output ports.
 pub trait MidiPorts {
-    fn midi_inputs(&self) -> Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>;
-    fn midi_outputs(&self) -> Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>;
+    fn midi_inputs(&self) -> Vec<Arc<MIDIIO>>;
+    fn midi_outputs(&self) -> Vec<Arc<MIDIIO>>;
 }
 
 /// Anything that can participate in the engine's connection graph:
@@ -60,10 +59,7 @@ fn audio_input_port(connectable: &dyn AudioPorts, port: usize) -> Result<Arc<Aud
         .ok_or_else(|| format!("Audio input port {port} not found"))
 }
 
-fn midi_output_port(
-    connectable: &dyn MidiPorts,
-    port: usize,
-) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+fn midi_output_port(connectable: &dyn MidiPorts, port: usize) -> Result<Arc<MIDIIO>, String> {
     connectable
         .midi_outputs()
         .get(port)
@@ -71,10 +67,7 @@ fn midi_output_port(
         .ok_or_else(|| format!("MIDI output port {port} not found"))
 }
 
-fn midi_input_port(
-    connectable: &dyn MidiPorts,
-    port: usize,
-) -> Result<Arc<UnsafeMutex<Box<MIDIIO>>>, String> {
+fn midi_input_port(connectable: &dyn MidiPorts, port: usize) -> Result<Arc<MIDIIO>, String> {
     connectable
         .midi_inputs()
         .get(port)
@@ -140,14 +133,13 @@ mod tests {
     };
     use crate::audio::io::AudioIO;
     use crate::midi::io::MIDIIO;
-    use crate::mutex::UnsafeMutex;
     use std::sync::Arc;
 
     struct TestNode {
         audio_ins: Vec<Arc<AudioIO>>,
         audio_outs: Vec<Arc<AudioIO>>,
-        midi_ins: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
-        midi_outs: Vec<Arc<UnsafeMutex<Box<MIDIIO>>>>,
+        midi_ins: Vec<Arc<MIDIIO>>,
+        midi_outs: Vec<Arc<MIDIIO>>,
     }
 
     impl TestNode {
@@ -166,10 +158,10 @@ mod tests {
                     .map(|_| Arc::new(AudioIO::new(buffer_size)))
                     .collect(),
                 midi_ins: (0..midi_in_count)
-                    .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+                    .map(|_| Arc::new(MIDIIO::new()))
                     .collect(),
                 midi_outs: (0..midi_out_count)
-                    .map(|_| Arc::new(UnsafeMutex::new(Box::new(MIDIIO::new()))))
+                    .map(|_| Arc::new(MIDIIO::new()))
                     .collect(),
             }
         }
@@ -185,10 +177,10 @@ mod tests {
     }
 
     impl MidiPorts for TestNode {
-        fn midi_inputs(&self) -> Vec<Arc<UnsafeMutex<Box<MIDIIO>>>> {
+        fn midi_inputs(&self) -> Vec<Arc<MIDIIO>> {
             self.midi_ins.clone()
         }
-        fn midi_outputs(&self) -> Vec<Arc<UnsafeMutex<Box<MIDIIO>>>> {
+        fn midi_outputs(&self) -> Vec<Arc<MIDIIO>> {
             self.midi_outs.clone()
         }
     }
@@ -239,8 +231,7 @@ mod tests {
 
         assert!(
             target.midi_ins[0]
-                .lock()
-                .sources
+                .sources()
                 .iter()
                 .any(|s| Arc::ptr_eq(s, &source.midi_outs[0]))
         );
@@ -254,8 +245,8 @@ mod tests {
 
         disconnect_midi(&source, 0, &target, 0).unwrap();
 
-        assert!(target.midi_ins[0].lock().sources.is_empty());
-        assert!(source.midi_outs[0].lock().connections.is_empty());
+        assert!(target.midi_ins[0].sources().is_empty());
+        assert!(source.midi_outs[0].connections().is_empty());
     }
 
     #[test]

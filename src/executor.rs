@@ -379,6 +379,7 @@ mod tests {
             hw_in_ports: vec![],
             hw_out_map: vec![],
             port_map: HashMap::new(),
+            midi_edges: vec![],
             forced: vec![],
         }
     }

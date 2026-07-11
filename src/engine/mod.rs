@@ -1057,8 +1057,7 @@ mod tests {
         let child_midi_in = &child.midi.ins[0];
         assert!(
             child_midi_in
-                .lock()
-                .connections
+                .connections()
                 .iter()
                 .any(|c| Arc::ptr_eq(c, folder_midi_in)),
             "folder MIDI input should be routed to child MIDI input"
@@ -1068,8 +1067,7 @@ mod tests {
         let folder_midi_out = &folder.midi.outs[0];
         assert!(
             child_midi_out
-                .lock()
-                .connections
+                .connections()
                 .iter()
                 .any(|c| Arc::ptr_eq(c, folder_midi_out)),
             "child MIDI output should be routed to folder MIDI output"

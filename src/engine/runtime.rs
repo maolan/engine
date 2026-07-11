@@ -2970,6 +2970,12 @@ impl Engine {
                             if !in_events.is_empty() {
                                 self.pending_hw_midi_events.extend(in_events);
                             }
+                            let dropped = jack.lock().take_midi_events_dropped();
+                            if dropped > 0 {
+                                tracing::warn!(
+                                    "JACK MIDI ring full; {dropped} events dropped since last cycle"
+                                );
+                            }
                         }
                     }
                     #[cfg(unix)]
