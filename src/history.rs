@@ -1631,16 +1631,16 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                                 && (from_name == track_name || to_name == track_name)
                                 && !is_family(other_name)
                                 && seen_audio.insert((
-                                    from_name.clone(),
+                                    from_name.to_string(),
                                     from_port,
-                                    to_name.clone(),
+                                    to_name.to_string(),
                                     to_port,
                                 ))
                             {
                                 actions.push(Action::Connect {
-                                    from_track: from_name.clone(),
+                                    from_track: from_name.to_string(),
                                     from_port,
-                                    to_track: to_name.clone(),
+                                    to_track: to_name.to_string(),
                                     to_port,
                                     kind: Kind::Audio,
                                 });
@@ -1667,16 +1667,16 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                                 && (from_name == track_name || to_name == track_name)
                                 && !is_family(other_name)
                                 && seen_midi.insert((
-                                    from_name.clone(),
+                                    from_name.to_string(),
                                     from_port,
-                                    to_name.clone(),
+                                    to_name.to_string(),
                                     to_port,
                                 ))
                             {
                                 actions.push(Action::Connect {
-                                    from_track: from_name.clone(),
+                                    from_track: from_name.to_string(),
                                     from_port,
-                                    to_track: to_name.clone(),
+                                    to_track: to_name.to_string(),
                                     to_port,
                                     kind: Kind::MIDI,
                                 });
@@ -1701,16 +1701,16 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                             && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
                             && !is_family(from_name)
                             && seen_audio.insert((
-                                from_name.clone(),
+                                from_name.to_string(),
                                 from_port,
-                                to_name.clone(),
+                                to_name.to_string(),
                                 to_port,
                             ))
                         {
                             actions.push(Action::Connect {
-                                from_track: from_name.clone(),
+                                from_track: from_name.to_string(),
                                 from_port,
-                                to_track: to_name.clone(),
+                                to_track: to_name.to_string(),
                                 to_port,
                                 kind: Kind::Audio,
                             });
@@ -1728,16 +1728,16 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                             && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
                             && !is_family(from_name)
                             && seen_midi.insert((
-                                from_name.clone(),
+                                from_name.to_string(),
                                 from_port,
-                                to_name.clone(),
+                                to_name.to_string(),
                                 to_port,
                             ))
                         {
                             actions.push(Action::Connect {
-                                from_track: from_name.clone(),
+                                from_track: from_name.to_string(),
                                 from_port,
-                                to_track: to_name.clone(),
+                                to_track: to_name.to_string(),
                                 to_port,
                                 kind: Kind::MIDI,
                             });
