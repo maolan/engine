@@ -827,7 +827,9 @@ mod tests {
         {
             let buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
-            *processor.audio_inputs()[0].finished.lock() = true;
+            processor.audio_inputs()[0]
+                .finished
+                .store(true, Ordering::Release);
         }
 
         processor.process_with_audio_io(256);

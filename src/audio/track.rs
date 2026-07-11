@@ -1,5 +1,5 @@
 use super::{clip::AudioClip, io::AudioIO};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 #[derive(Clone, Debug)]
 pub struct AudioTrack {
@@ -77,7 +77,7 @@ impl AudioTrack {
             let out_samples = audio_out.buffer.lock();
 
             out_samples.copy_from_slice(in_samples);
-            *audio_out.finished.lock() = true;
+            audio_out.finished.store(true, Ordering::Release);
         }
         self.finished = true;
         self.processing = false;

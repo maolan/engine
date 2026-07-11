@@ -101,12 +101,12 @@ pub fn bypass_copy_inputs_to_outputs(inputs: &[Arc<AudioIO>], outputs: &[Arc<Aud
         for (d, s) in dst.iter_mut().zip(src.iter()) {
             *d = *s;
         }
-        *output.finished.lock() = true;
+        output.finished.store(true, Ordering::Release);
     }
     for output in outputs.iter().skip(inputs.len()) {
         let dst = output.buffer.lock();
         dst.fill(0.0);
-        *output.finished.lock() = true;
+        output.finished.store(true, Ordering::Release);
     }
 }
 
@@ -252,7 +252,7 @@ pub unsafe fn copy_outputs_from_shm(outputs: &[Arc<AudioIO>], ptr: *mut u8, fram
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), len);
         }
-        *output.finished.lock() = true;
+        output.finished.store(true, Ordering::Release);
     }
 }
 

@@ -1108,7 +1108,7 @@ impl Engine {
                 }
                 for out in &t.audio.outs {
                     out.buffer.lock().fill(0.0);
-                    *out.finished.lock() = true;
+                    out.finished.store(true, Ordering::Release);
                 }
                 t.audio.processing = false;
                 t.audio.finished = true;
@@ -1506,11 +1506,11 @@ impl Engine {
                     };
                     let mut input_status = Vec::new();
                     for (idx, input) in track.audio.ins.iter().enumerate() {
-                        let finished = *input.finished.lock();
+                        let finished = input.finished.load(Ordering::Acquire);
                         let conn_count = input.connection_count.load(Ordering::Relaxed);
                         let mut pending = Vec::new();
                         for conn in input.connections.lock().iter() {
-                            pending.push(*conn.finished.lock());
+                            pending.push(conn.finished.load(Ordering::Acquire));
                         }
                         input_status.push(format!(
                             "in{}: finished={} conns={} pending_finished={:?}",

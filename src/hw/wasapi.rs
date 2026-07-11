@@ -283,7 +283,7 @@ impl HwDriver {
                 };
                 dst[frame] = sample;
             }
-            *io_port.finished.lock() = true;
+            io_port.finished.store(true, Ordering::Release);
         }
 
         if consume_samples > 0 {

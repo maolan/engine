@@ -4,6 +4,7 @@ use jack::{
     ProcessHandler, ProcessScope, RawMidi, TransportPosition, TransportState,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Clone, Copy)]
@@ -39,8 +40,8 @@ struct Process {
     audio_out_bridges: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
     midi_in_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
     midi_out_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
-    output_gain_linear: Arc<UnsafeMutex<f32>>,
-    output_balance: Arc<UnsafeMutex<f32>>,
+    output_gain_linear: Arc<AtomicU32>,
+    output_balance: Arc<AtomicU32>,
     tx_engine: Sender<crate::message::Message>,
 }
 
@@ -59,13 +60,13 @@ impl Process {
             if n < dst.len() {
                 dst[n..].fill(0.0);
             }
-            *bridge.finished.lock() = true;
+            bridge.finished.store(true, Ordering::Release);
         }
     }
 
     fn copy_audio_outputs(&mut self, ps: &ProcessScope) {
-        let gain = *self.output_gain_linear.lock();
-        let balance = (*self.output_balance.lock()).clamp(-1.0, 1.0);
+        let gain = f32::from_bits(self.output_gain_linear.load(Ordering::Relaxed));
+        let balance = f32::from_bits(self.output_balance.load(Ordering::Relaxed)).clamp(-1.0, 1.0);
         let audio_out_ports = self.audio_out_ports.lock();
         let audio_out_bridges = self.audio_out_bridges.lock();
         let stereo = audio_out_ports.len() == 2;
@@ -154,8 +155,8 @@ pub struct JackRuntime {
     audio_outs: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
     midi_in_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
     midi_out_events: Arc<UnsafeMutex<Vec<MidiEvent>>>,
-    output_gain_linear: Arc<UnsafeMutex<f32>>,
-    output_balance: Arc<UnsafeMutex<f32>>,
+    output_gain_linear: Arc<AtomicU32>,
+    output_balance: Arc<AtomicU32>,
     midi_input_count: usize,
     midi_output_count: usize,
     pub sample_rate: usize,
@@ -218,8 +219,8 @@ impl JackRuntime {
 
         let midi_in_events = Arc::new(UnsafeMutex::new(Vec::<MidiEvent>::new()));
         let midi_out_events = Arc::new(UnsafeMutex::new(Vec::<MidiEvent>::new()));
-        let output_gain_linear = Arc::new(UnsafeMutex::new(1.0_f32));
-        let output_balance = Arc::new(UnsafeMutex::new(0.0_f32));
+        let output_gain_linear = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let output_balance = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
 
         let process = Process {
             audio_in_ports: audio_in_ports.clone(),
@@ -269,11 +270,13 @@ impl JackRuntime {
     }
 
     pub fn set_output_gain_linear(&self, gain: f32) {
-        *self.output_gain_linear.lock() = gain.max(0.0);
+        self.output_gain_linear
+            .store(gain.max(0.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_output_balance(&self, balance: f32) {
-        *self.output_balance.lock() = balance.clamp(-1.0, 1.0);
+        self.output_balance
+            .store(balance.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn input_channels(&self) -> usize {

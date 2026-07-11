@@ -49,15 +49,21 @@ pub fn fill_ports_from_interleaved_buffer(
                     }
 
                     if left_connected {
-                        *ports[0].finished.lock() = true;
+                        ports[0]
+                            .finished
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                     if right_connected {
-                        *ports[1].finished.lock() = true;
+                        ports[1]
+                            .finished
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
 
                     for (ch_idx, io_port) in ports.iter().enumerate().skip(2) {
                         if connected_only && !has_audio_connections(io_port) {
-                            *io_port.finished.lock() = true;
+                            io_port
+                                .finished
+                                .store(true, std::sync::atomic::Ordering::Release);
                             continue;
                         }
                         let channel_buf_lock = io_port.buffer.lock();
@@ -72,7 +78,9 @@ pub fn fill_ports_from_interleaved_buffer(
                                 break;
                             }
                         }
-                        *io_port.finished.lock() = true;
+                        io_port
+                            .finished
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                     return;
                 }
@@ -82,7 +90,9 @@ pub fn fill_ports_from_interleaved_buffer(
 
     for (ch_idx, io_port) in ports.iter().enumerate() {
         if connected_only && !has_audio_connections(io_port) {
-            *io_port.finished.lock() = true;
+            io_port
+                .finished
+                .store(true, std::sync::atomic::Ordering::Release);
             continue;
         }
         let channel_buf_lock = io_port.buffer.lock();
@@ -97,7 +107,9 @@ pub fn fill_ports_from_interleaved_buffer(
                 break;
             }
         }
-        *io_port.finished.lock() = true;
+        io_port
+            .finished
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -152,7 +164,9 @@ mod tests {
     ) {
         for (ch_idx, io_port) in ports.iter().enumerate() {
             if connected_only && !has_audio_connections(io_port) {
-                *io_port.finished.lock() = true;
+                io_port
+                    .finished
+                    .store(true, std::sync::atomic::Ordering::Release);
                 continue;
             }
             let channel_buf_lock = io_port.buffer.lock();
@@ -160,7 +174,9 @@ mod tests {
             for (frame, sample) in channel_samples.iter_mut().enumerate().take(frames) {
                 *sample = sample_at(ch_idx, frame);
             }
-            *io_port.finished.lock() = true;
+            io_port
+                .finished
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -181,8 +197,16 @@ mod tests {
 
         assert_eq!(connected.buffer.lock().as_slice()[..3], [0.0, 1.0, 2.0]);
         assert_eq!(disconnected.buffer.lock().as_slice()[..3], [0.0, 0.0, 0.0]);
-        assert!(*connected.finished.lock());
-        assert!(*disconnected.finished.lock());
+        assert!(
+            connected
+                .finished
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(
+            disconnected
+                .finished
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]

@@ -1151,7 +1151,7 @@ mod tests {
             for (j, sample) in buf.iter_mut().enumerate() {
                 *sample = (i * 1000 + j) as f32;
             }
-            *input.finished.lock() = true;
+            input.finished.store(true, Ordering::Release);
         }
 
         processor.process_with_audio_io(256);
@@ -1180,7 +1180,9 @@ mod tests {
         {
             let buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
-            *processor.audio_inputs()[0].finished.lock() = true;
+            processor.audio_inputs()[0]
+                .finished
+                .store(true, Ordering::Release);
         }
 
         // Give the aborted host a moment to be reaped so the crash is visible.
@@ -1235,7 +1237,7 @@ mod tests {
             for (j, sample) in buf.iter_mut().enumerate() {
                 *sample = (i * 1000 + j) as f32;
             }
-            *input.finished.lock() = true;
+            input.finished.store(true, Ordering::Release);
         }
 
         processor.process_with_audio_io(256);

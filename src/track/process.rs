@@ -895,7 +895,7 @@ impl Track {
             let next = peak_now.max(held);
             self.meter_peak_hold_linear[out_idx] = next;
             self.output_meter_linear_cache[out_idx] = next;
-            *audio_out.finished.lock() = true;
+            audio_out.finished.store(true, Ordering::Release);
         }
 
         self.last_render_block_silent = all_outputs_zero;

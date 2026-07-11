@@ -14,7 +14,7 @@ use crate::{
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 
 mod clip_render;
@@ -193,11 +193,11 @@ impl ClipPluginRuntime {
             let len = buffer.len().min(request_len);
             buffer.fill(0.0);
             buffer[..len].copy_from_slice(&samples[..len]);
-            *source.finished.lock() = true;
+            source.finished.store(true, Ordering::Release);
         }
         for source in self.input_sources.iter().skip(input_blocks.len()) {
             source.buffer.lock().fill(0.0);
-            *source.finished.lock() = true;
+            source.finished.store(true, Ordering::Release);
         }
 
         self.process_plugins_in_graph_order(request_len, &[], &mut HashMap::new());
@@ -208,7 +208,7 @@ impl ClipPluginRuntime {
                 output.process();
             } else {
                 output.buffer.lock().fill(0.0);
-                *output.finished.lock() = true;
+                output.finished.store(true, Ordering::Release);
             }
             let buffer = output.buffer.lock();
             outputs.push(

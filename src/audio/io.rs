@@ -1,14 +1,14 @@
 use crate::mutex::UnsafeMutex;
 use crate::simd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct AudioIO {
     pub connections: Arc<UnsafeMutex<Vec<Arc<Self>>>>,
     pub connection_count: Arc<AtomicUsize>,
     pub buffer: Arc<UnsafeMutex<Vec<f32>>>,
-    pub finished: Arc<UnsafeMutex<bool>>,
+    pub finished: Arc<AtomicBool>,
 }
 
 impl AudioIO {
@@ -17,7 +17,7 @@ impl AudioIO {
             connections: Arc::new(UnsafeMutex::new(vec![])),
             connection_count: Arc::new(AtomicUsize::new(0)),
             buffer: Arc::new(UnsafeMutex::new(vec![0.0; size])),
-            finished: Arc::new(UnsafeMutex::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -91,22 +91,22 @@ impl AudioIO {
                 }
             }
         }
-        *self.finished.lock() = true;
+        self.finished.store(true, Ordering::Release);
     }
 
     pub fn setup(&self) {
-        *self.finished.lock() = false;
+        self.finished.store(false, Ordering::Release);
     }
 
     pub fn ready(&self) -> bool {
-        if *self.finished.lock() {
+        if self.finished.load(Ordering::Acquire) {
             return true;
         }
         if self.connection_count.load(Ordering::Relaxed) == 0 {
             return true;
         }
         for conn in self.connections.lock() {
-            if !*conn.finished.lock() {
+            if !conn.finished.load(Ordering::Acquire) {
                 return false;
             }
         }
@@ -126,6 +126,7 @@ impl Eq for AudioIO {}
 mod tests {
     use super::AudioIO;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn process_with_no_connections_clears_buffer() {
@@ -135,14 +136,14 @@ mod tests {
         io.process();
 
         assert_eq!(io.buffer.lock().as_slice(), &[0.0, 0.0, 0.0]);
-        assert!(*io.finished.lock());
+        assert!(io.finished.load(Ordering::Relaxed));
     }
 
     #[test]
     fn process_with_one_connection_copies_source() {
         let source = Arc::new(AudioIO::new(3));
         source.buffer.lock().copy_from_slice(&[0.1, 0.2, 0.3]);
-        *source.finished.lock() = true;
+        source.finished.store(true, Ordering::Relaxed);
         let dest = Arc::new(AudioIO::new(3));
         AudioIO::connect(&source, &dest);
 
@@ -155,7 +156,7 @@ mod tests {
     fn process_with_mismatched_buffer_sizes_copies_overlap_only() {
         let source = Arc::new(AudioIO::new(2));
         source.buffer.lock().copy_from_slice(&[0.5, -0.25]);
-        *source.finished.lock() = true;
+        source.finished.store(true, Ordering::Relaxed);
         let dest = Arc::new(AudioIO::new(4));
         dest.buffer.lock().copy_from_slice(&[9.0, 9.0, 9.0, 9.0]);
         AudioIO::connect(&source, &dest);
@@ -171,8 +172,8 @@ mod tests {
         let b = Arc::new(AudioIO::new(3));
         a.buffer.lock().copy_from_slice(&[0.25, 0.5, 0.75]);
         b.buffer.lock().copy_from_slice(&[0.75, 0.5, 0.25]);
-        *a.finished.lock() = true;
-        *b.finished.lock() = true;
+        a.finished.store(true, Ordering::Relaxed);
+        b.finished.store(true, Ordering::Relaxed);
         let dest = Arc::new(AudioIO::new(3));
         AudioIO::connect(&a, &dest);
         AudioIO::connect(&b, &dest);
@@ -192,8 +193,8 @@ mod tests {
         b.buffer
             .lock()
             .copy_from_slice(&[0.75, f32::NEG_INFINITY, 0.25]);
-        *a.finished.lock() = true;
-        *b.finished.lock() = true;
+        a.finished.store(true, Ordering::Relaxed);
+        b.finished.store(true, Ordering::Relaxed);
         let dest = Arc::new(AudioIO::new(3));
         AudioIO::connect(&a, &dest);
         AudioIO::connect(&b, &dest);
@@ -210,7 +211,7 @@ mod tests {
         AudioIO::connect(&source, &dest);
 
         assert!(!dest.ready());
-        *source.finished.lock() = true;
+        source.finished.store(true, Ordering::Relaxed);
         assert!(dest.ready());
     }
 
