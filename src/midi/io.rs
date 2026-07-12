@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use std::cell::UnsafeCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidiEvent {
@@ -17,8 +17,7 @@ impl MidiEvent {
 
 /// MIDI port.
 ///
-/// Lock-free successor of the old `UnsafeMutex<Box<MIDIIO>>` (see
-/// `LOCKLESS.md` Phase 3):
+/// Lock-free MIDI port shape (see `LOCKLESS.md` Phase 3):
 ///
 /// - `sources` is published RCU-style by control-side connect/disconnect and
 ///   read on the RT path by `process()`.
@@ -37,8 +36,8 @@ pub struct MIDIIO {
     /// Ports that feed events into this port (consumers see producers here).
     sources: ArcSwap<Vec<Arc<MIDIIO>>>,
     /// Ports that this port feeds events into (producers see consumers here).
-    /// Control-side only.
-    connections: Mutex<Vec<Arc<MIDIIO>>>,
+    /// Control-side only, COW-published like `sources`.
+    connections: ArcSwap<Vec<Arc<MIDIIO>>>,
     buffer: UnsafeCell<Vec<MidiEvent>>,
     finished: AtomicBool,
 }
@@ -80,11 +79,10 @@ impl MIDIIO {
     /// `to.sources` contains `from` and `from.connections` contains `to`.
     /// Control-side only; publishes the new `sources` list RCU-style.
     pub fn connect(from: &Arc<MIDIIO>, to: &Arc<MIDIIO>) {
-        {
-            let mut conns = from.connections.lock().expect("midi connections poisoned");
-            if !conns.iter().any(|c| Arc::ptr_eq(c, to)) {
-                conns.push(to.clone());
-            }
+        let mut conns = from.connections.load_full().as_ref().clone();
+        if !conns.iter().any(|c| Arc::ptr_eq(c, to)) {
+            conns.push(to.clone());
+            from.connections.store(Arc::new(conns));
         }
         let mut sources = to.sources.load_full().as_ref().clone();
         if !sources.iter().any(|s| Arc::ptr_eq(s, from)) {
@@ -97,13 +95,12 @@ impl MIDIIO {
     /// Control-side only.
     pub fn disconnect(from: &Arc<MIDIIO>, to: &Arc<MIDIIO>) -> Result<(), String> {
         let mut removed = false;
-        {
-            let mut conns = from.connections.lock().expect("midi connections poisoned");
-            let before = conns.len();
-            conns.retain(|c| !Arc::ptr_eq(c, to));
-            if conns.len() < before {
-                removed = true;
-            }
+        let mut conns = from.connections.load_full().as_ref().clone();
+        let before = conns.len();
+        conns.retain(|c| !Arc::ptr_eq(c, to));
+        if conns.len() < before {
+            from.connections.store(Arc::new(conns));
+            removed = true;
         }
         let mut sources = to.sources.load_full().as_ref().clone();
         sources.retain(|s| !Arc::ptr_eq(s, from));
@@ -120,19 +117,17 @@ impl MIDIIO {
     /// reparenting, where events flow by direct buffer writes ordered by
     /// plan edges rather than by source merging.
     pub fn add_connection(&self, to: &Arc<MIDIIO>) {
-        let mut conns = self.connections.lock().expect("midi connections poisoned");
+        let mut conns = self.connections.load_full().as_ref().clone();
         if !conns.iter().any(|c| Arc::ptr_eq(c, to)) {
             conns.push(to.clone());
+            self.connections.store(Arc::new(conns));
         }
     }
 
     /// Control-side snapshot of the ports this port feeds. Used by routing
     /// queries and the plan compiler; never on the RT path.
     pub fn connections(&self) -> Vec<Arc<MIDIIO>> {
-        self.connections
-            .lock()
-            .expect("midi connections poisoned")
-            .clone()
+        self.connections.load_full().as_ref().clone()
     }
 
     /// Control-side snapshot of the ports feeding this port.

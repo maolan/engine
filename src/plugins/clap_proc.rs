@@ -1,19 +1,20 @@
 use crate::audio::io::AudioIO;
 use crate::midi::io::{MIDIIO, MidiEvent};
-use crate::mutex::UnsafeMutex;
 use crate::plugins::ipc;
 use crate::plugins::types::{
     ClapMidiOutputEvent, ClapParamUpdate, ClapParameterInfo, ClapTransportInfo,
 };
+use arc_swap::ArcSwapOption;
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, atomic::AtomicU32};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn wait_for_host_request_complete(
@@ -54,20 +55,36 @@ pub struct ClapProcessor {
     midi_input_ports: Vec<Arc<MIDIIO>>,
     midi_output_ports: Vec<Arc<MIDIIO>>,
     param_infos: Vec<ClapParameterInfo>,
-    param_values: UnsafeMutex<HashMap<u32, f64>>,
+    /// Current value of every known parameter, keyed by parameter id and
+    /// stored as `f64` bits. Pre-populated from `param_infos` at construction
+    /// and only ever touched through atomic loads/stores.
+    param_values: HashMap<u32, AtomicU64>,
     bypassed: Arc<AtomicBool>,
 
-    child: UnsafeMutex<Option<Child>>,
-    stderr: UnsafeMutex<Option<ChildStderr>>,
+    /// Host child process handle. Interior-mutable so `process_with_midi`
+    /// (which takes `&self`) can poll it with `try_wait`.
+    ///
+    /// Invariant: at any moment there is at most one accessor — either the
+    /// audio thread running this plugin's own plan task node (exactly one per
+    /// cycle), or control code running after the last `Arc` reference to this
+    /// processor is gone (`Drop`).
+    child: UnsafeCell<Option<Child>>,
+    /// Host stderr pipe; control-side only (`take_stderr`). RCU-published so
+    /// no blocking primitive is involved.
+    stderr: ArcSwapOption<ChildStderr>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
 
     crash_count: AtomicU32,
-    last_process_time: UnsafeMutex<Instant>,
 }
 
-pub type SharedClapProcessor = Arc<UnsafeMutex<ClapProcessor>>;
+// Safety: see the invariants on `child` and `stderr` above. Every other field
+// is either immutable after construction or synchronized on its own
+// (atomics / RCU).
+unsafe impl Sync for ClapProcessor {}
+
+pub type SharedClapProcessor = Arc<ClapProcessor>;
 
 impl ClapProcessor {
     pub fn new(
@@ -129,6 +146,10 @@ impl ClapProcessor {
             tracing::warn!("Failed to fetch CLAP parameter infos: {e}");
             Vec::new()
         });
+        let param_values = param_infos
+            .iter()
+            .map(|info| (info.id, AtomicU64::new(info.default_value.to_bits())))
+            .collect();
 
         Ok(Self {
             path: plugin_spec.to_string(),
@@ -143,16 +164,26 @@ impl ClapProcessor {
             midi_input_ports,
             midi_output_ports,
             param_infos,
-            param_values: UnsafeMutex::new(HashMap::new()),
+            param_values,
             bypassed: Arc::new(AtomicBool::new(false)),
-            child: UnsafeMutex::new(Some(child)),
-            stderr: UnsafeMutex::new(stderr),
+            child: UnsafeCell::new(Some(child)),
+            stderr: ArcSwapOption::from_pointee(stderr),
             mapping: Some(mapping),
             events: Some(events),
             shm_name,
             crash_count: AtomicU32::new(0),
-            last_process_time: UnsafeMutex::new(Instant::now()),
         })
+    }
+
+    /// Access the host child process handle.
+    ///
+    /// # Safety
+    /// The caller must be the sole accessor of `child` at this time: either
+    /// the audio thread running this plugin's own plan task node (exactly one
+    /// per cycle), or control code running after the last `Arc` reference to
+    /// this processor is gone.
+    unsafe fn with_child<R>(&self, f: impl FnOnce(&mut Option<Child>) -> R) -> R {
+        f(unsafe { &mut *self.child.get() })
     }
 
     pub fn setup_audio_ports(&self) {
@@ -352,7 +383,10 @@ impl ClapProcessor {
     }
 
     pub fn parameter_values(&self) -> HashMap<u32, f64> {
-        self.param_values.lock().clone()
+        self.param_values
+            .iter()
+            .map(|(&id, value)| (id, f64::from_bits(value.load(Ordering::Relaxed))))
+            .collect()
     }
 
     pub fn set_parameter(&self, param_id: u32, value: f64) -> Result<(), String> {
@@ -360,7 +394,11 @@ impl ClapProcessor {
     }
 
     pub fn set_parameter_at(&self, param_id: u32, value: f64, _frame: u32) -> Result<(), String> {
-        self.param_values.lock().insert(param_id, value);
+        if let Some(slot) = self.param_values.get(&param_id) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        } else {
+            tracing::warn!("CLAP set_parameter_at: unknown parameter id {param_id}");
+        }
 
         if let Some(ref mapping) = self.mapping {
             let ring = unsafe {
@@ -605,18 +643,23 @@ impl ClapProcessor {
 
         self.setup_midi_ports();
 
-        {
-            let child = self.child.lock();
-            if let Some(ref mut c) = child.as_mut() {
-                match c.try_wait() {
-                    Ok(Some(status)) if !status.success() => {
-                        self.crash_count.fetch_add(1, Ordering::Relaxed);
-                        ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
-                        return Vec::new();
-                    }
-                    _ => {}
+        // Safety: the sole RT accessor of `child` is this processor's own
+        // plan task node, which runs exactly once per cycle.
+        let crashed = unsafe {
+            self.with_child(|child| {
+                if let Some(c) = child.as_mut()
+                    && let Ok(Some(status)) = c.try_wait()
+                    && !status.success()
+                {
+                    self.crash_count.fetch_add(1, Ordering::Relaxed);
+                    return true;
                 }
-            }
+                false
+            })
+        };
+        if crashed {
+            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            return Vec::new();
         }
 
         let (mapping, events) = match (&self.mapping, &self.events) {
@@ -695,16 +738,22 @@ impl ClapProcessor {
             return Vec::new();
         }
 
-        {
-            let child = self.child.lock();
-            if let Some(ref mut c) = child.as_mut()
-                && let Ok(Some(status)) = c.try_wait()
-                && !status.success()
-            {
-                self.crash_count.fetch_add(1, Ordering::Relaxed);
-                ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
-                return Vec::new();
-            }
+        // Safety: same single-accessor invariant as the pre-process check.
+        let crashed = unsafe {
+            self.with_child(|child| {
+                if let Some(c) = child.as_mut()
+                    && let Ok(Some(status)) = c.try_wait()
+                    && !status.success()
+                {
+                    self.crash_count.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                false
+            })
+        };
+        if crashed {
+            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            return Vec::new();
         }
 
         unsafe {
@@ -734,7 +783,6 @@ impl ClapProcessor {
             }
         }
 
-        *self.last_process_time.lock() = Instant::now();
         midi_out
     }
 
@@ -751,7 +799,9 @@ impl ClapProcessor {
     }
 
     pub fn take_stderr(&self) -> Option<ChildStderr> {
-        self.stderr.lock().take()
+        // Control-side only: the EC is the sole accessor, so after `swap`
+        // the `Arc` is unique and `try_unwrap` cannot fail in practice.
+        self.stderr.swap(None).and_then(|s| Arc::try_unwrap(s).ok())
     }
 
     pub fn begin_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {
@@ -965,138 +1015,9 @@ impl Drop for ClapProcessor {
     fn drop(&mut self) {
         let mapping = self.mapping.take();
         let events = self.events.take();
-        let child = self.child.lock().take();
+        let child = self.child.get_mut().take();
         let shm_name = std::mem::take(&mut self.shm_name);
         ipc::drop_host(mapping, events, child, shm_name);
-    }
-}
-
-crate::impl_ipc_processor_wrapper!(ClapProcessor);
-
-impl UnsafeMutex<ClapProcessor> {
-    pub fn process_with_midi(
-        &self,
-        frames: usize,
-        midi_events: &[MidiEvent],
-        transport: ClapTransportInfo,
-    ) -> Vec<ClapMidiOutputEvent> {
-        self.lock()
-            .process_with_midi(frames, midi_events, transport)
-    }
-
-    pub fn is_bypassed(&self) -> bool {
-        self.lock().is_bypassed()
-    }
-
-    pub fn parameter_infos(&self) -> Vec<ClapParameterInfo> {
-        self.lock().parameter_infos()
-    }
-
-    pub fn set_parameter(&self, param_id: u32, value: f64) -> Result<(), String> {
-        self.lock().set_parameter(param_id, value)
-    }
-
-    pub fn set_parameter_at(&self, param_id: u32, value: f64, frame: u32) -> Result<(), String> {
-        self.lock().set_parameter_at(param_id, value, frame)
-    }
-
-    pub fn begin_parameter_edit_at(&self, param_id: u32, frame: u32) -> Result<(), String> {
-        self.lock().begin_parameter_edit_at(param_id, frame)
-    }
-
-    pub fn end_parameter_edit_at(&self, param_id: u32, frame: u32) -> Result<(), String> {
-        self.lock().end_parameter_edit_at(param_id, frame)
-    }
-
-    pub fn snapshot_state(&self) -> Result<crate::plugins::types::ClapPluginState, String> {
-        self.lock().snapshot_state()
-    }
-
-    pub fn restore_state(
-        &self,
-        state: &crate::plugins::types::ClapPluginState,
-    ) -> Result<(), String> {
-        self.lock().restore_state(state)
-    }
-
-    pub fn take_state_dirty(&self) -> bool {
-        self.lock().take_state_dirty()
-    }
-
-    pub fn path(&self) -> String {
-        self.lock().path().to_string()
-    }
-
-    pub fn plugin_id(&self) -> String {
-        self.lock().plugin_id().to_string()
-    }
-
-    pub fn ui_begin_session(&self) {
-        self.lock().ui_begin_session();
-    }
-
-    pub fn ui_end_session(&self) {
-        self.lock().ui_end_session();
-    }
-
-    pub fn ui_should_close(&self) -> bool {
-        self.lock().ui_should_close()
-    }
-
-    pub fn ui_take_due_timers(&self) -> Vec<u32> {
-        self.lock().ui_take_due_timers()
-    }
-
-    pub fn ui_take_param_updates(&self) -> Vec<ClapParamUpdate> {
-        self.lock().ui_take_param_updates()
-    }
-
-    pub fn ui_take_state_update(&self) -> Option<crate::plugins::types::ClapPluginState> {
-        self.lock().ui_take_state_update()
-    }
-
-    pub fn gui_info(&self) -> Result<crate::plugins::types::ClapGuiInfo, String> {
-        self.lock().gui_info()
-    }
-
-    pub fn gui_create(&self, api: &str, is_floating: bool) -> Result<(), String> {
-        self.lock().gui_create(api, is_floating)
-    }
-
-    pub fn gui_get_size(&self) -> Result<(u32, u32), String> {
-        self.lock().gui_get_size()
-    }
-
-    pub fn gui_set_parent_x11(&self, window: usize) -> Result<(), String> {
-        self.lock().gui_set_parent_x11(window)
-    }
-
-    pub fn gui_set_floating_mode(&self, floating: bool) -> Result<(), String> {
-        self.lock().gui_set_floating_mode(floating)
-    }
-
-    pub fn gui_show(&self) -> Result<(), String> {
-        self.lock().gui_show()
-    }
-
-    pub fn gui_hide(&self) {
-        self.lock().gui_hide();
-    }
-
-    pub fn gui_destroy(&self) {
-        self.lock().gui_destroy();
-    }
-
-    pub fn gui_on_main_thread(&self) {
-        self.lock().gui_on_main_thread();
-    }
-
-    pub fn gui_on_timer(&self, timer_id: u32) {
-        self.lock().gui_on_timer(timer_id);
-    }
-
-    pub fn note_names(&self) -> Result<HashMap<u8, String>, String> {
-        self.lock().note_names()
     }
 }
 
@@ -1158,7 +1079,7 @@ mod tests {
         processor.setup_audio_ports();
 
         for (i, input) in processor.audio_inputs().iter().enumerate() {
-            let buf = input.buffer.lock();
+            let mut buf = input.buffer.lock();
             for (j, sample) in buf.iter_mut().enumerate() {
                 *sample = (i * 1000 + j) as f32;
             }
@@ -1189,7 +1110,7 @@ mod tests {
         processor.setup_audio_ports();
 
         {
-            let buf = processor.audio_inputs()[0].buffer.lock();
+            let mut buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
             processor.audio_inputs()[0]
                 .finished
@@ -1240,11 +1161,11 @@ mod tests {
 
         assert_eq!(track.clap_plugins.len(), 1);
 
-        let processor = track.clap_plugins[0].processor.lock();
+        let processor = track.clap_plugins[0].processor.clone();
         processor.setup_audio_ports();
 
         for (i, input) in processor.audio_inputs().iter().enumerate() {
-            let buf = input.buffer.lock();
+            let mut buf = input.buffer.lock();
             for (j, sample) in buf.iter_mut().enumerate() {
                 *sample = (i * 1000 + j) as f32;
             }

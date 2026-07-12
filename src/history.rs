@@ -8,6 +8,7 @@ use crate::{
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 fn audio_clip_to_data(clip: &crate::audio::clip::AudioClip) -> crate::message::AudioClipData {
     crate::message::AudioClipData {
@@ -236,13 +237,13 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         Action::TrackLevel(name, _new_level) => {
             let track = state.tracks.get(name)?;
             let track_lock = track.lock();
-            Some(Action::TrackLevel(name.clone(), track_lock.level))
+            Some(Action::TrackLevel(name.clone(), track_lock.level()))
         }
 
         Action::TrackBalance(name, _new_balance) => {
             let track = state.tracks.get(name)?;
             let track_lock = track.lock();
-            Some(Action::TrackBalance(name.clone(), track_lock.balance))
+            Some(Action::TrackBalance(name.clone(), track_lock.balance()))
         }
 
         Action::TrackToggleArm(name) => Some(Action::TrackToggleArm(name.clone())),
@@ -331,6 +332,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 track_name: track_name.clone(),
                 scene_index: *scene_index,
                 clip_id: track_lock
+                    .rt
                     .session_slots
                     .get(scene_index)
                     .map(|slot| slot.clip_id.clone()),
@@ -344,6 +346,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let enabled = track_lock
+                .rt
                 .session_slots
                 .get(scene_index)
                 .map(|slot| slot.play_enabled)
@@ -393,8 +396,8 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let clip_index = match kind {
-                Kind::Audio => track_lock.audio.clips.len(),
-                Kind::MIDI => track_lock.midi.clips.len(),
+                Kind::Audio => track_lock.audio.clips().len(),
+                Kind::MIDI => track_lock.midi.clips().len(),
             };
             Some(Action::RemoveClip {
                 track_name: track_name.clone(),
@@ -409,8 +412,8 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let clip_index = match kind {
-                Kind::Audio => track_lock.audio.clips.len(),
-                Kind::MIDI => track_lock.midi.clips.len(),
+                Kind::Audio => track_lock.audio.clips().len(),
+                Kind::MIDI => track_lock.midi.clips().len(),
             };
             Some(Action::RemoveClip {
                 track_name: track_name.clone(),
@@ -434,7 +437,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let clip_idx = clip_indices[0];
             match kind {
                 Kind::Audio => {
-                    let clip = track_lock.audio.clips.get(clip_idx)?;
+                    let clip = track_lock.audio.clips().get(clip_idx).cloned()?;
                     if clip.grouped_clips.is_empty() {
                         let length = clip.end.saturating_sub(clip.start);
                         Some(Action::AddClip {
@@ -466,13 +469,13 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                         Some(Action::AddGroupedClip {
                             track_name: track_name.clone(),
                             kind: Kind::Audio,
-                            audio_clip: Some(audio_clip_to_data(clip)),
+                            audio_clip: Some(audio_clip_to_data(&clip)),
                             midi_clip: None,
                         })
                     }
                 }
                 Kind::MIDI => {
-                    let clip = track_lock.midi.clips.get(clip_idx)?;
+                    let clip = track_lock.midi.clips().get(clip_idx).cloned()?;
                     if clip.grouped_clips.is_empty() {
                         let length = clip.end.saturating_sub(clip.start);
                         Some(Action::AddClip {
@@ -504,7 +507,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                             track_name: track_name.clone(),
                             kind: Kind::MIDI,
                             audio_clip: None,
-                            midi_clip: Some(midi_clip_to_data(clip)),
+                            midi_clip: Some(midi_clip_to_data(&clip)),
                         })
                     }
                 }
@@ -520,8 +523,20 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let old_name = match kind {
-                Kind::Audio => track_lock.audio.clips.get(*clip_index)?.name.clone(),
-                Kind::MIDI => track_lock.midi.clips.get(*clip_index)?.name.clone(),
+                Kind::Audio => track_lock
+                    .audio
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
+                Kind::MIDI => track_lock
+                    .midi
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
             };
             Some(Action::RenameClip {
                 track_name: track_name.clone(),
@@ -542,11 +557,11 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 let source_lock = source_track.lock();
                 match kind {
                     Kind::Audio => {
-                        let clip = source_lock.audio.clips.get(from.clip_index)?;
+                        let clip = source_lock.audio.clips().get(from.clip_index).cloned()?;
                         (clip.start, clip.input_channel)
                     }
                     Kind::MIDI => {
-                        let clip = source_lock.midi.clips.get(from.clip_index)?;
+                        let clip = source_lock.midi.clips().get(from.clip_index).cloned()?;
                         (clip.start, clip.input_channel)
                     }
                 }
@@ -556,8 +571,8 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 let dest_track = state.tracks.get(&to.track_name)?;
                 let dest_lock = dest_track.lock();
                 let clip_idx = match kind {
-                    Kind::Audio => dest_lock.audio.clips.len(),
-                    Kind::MIDI => dest_lock.midi.clips.len(),
+                    Kind::Audio => dest_lock.audio.clips().len(),
+                    Kind::MIDI => dest_lock.midi.clips().len(),
                 };
                 Some(Action::RemoveClip {
                     track_name: to.track_name.clone(),
@@ -569,16 +584,16 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 let dest_lock = dest_track.lock();
                 let dest_len = match kind {
                     Kind::Audio => {
-                        if dest_lock.audio.clips.is_empty() {
+                        if dest_lock.audio.clips().is_empty() {
                             return None;
                         }
-                        dest_lock.audio.clips.len()
+                        dest_lock.audio.clips().len()
                     }
                     Kind::MIDI => {
-                        if dest_lock.midi.clips.is_empty() {
+                        if dest_lock.midi.clips().is_empty() {
                             return None;
                         }
-                        dest_lock.midi.clips.len()
+                        dest_lock.midi.clips().len()
                     }
                 };
                 let moved_clip_index = if from.track_name == to.track_name {
@@ -612,7 +627,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track_lock = track.lock();
             match kind {
                 Kind::Audio => {
-                    let clip = track_lock.audio.clips.get(*clip_index)?;
+                    let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
                     Some(Action::SetClipFade {
                         track_name: track_name.clone(),
                         clip_index: *clip_index,
@@ -642,7 +657,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track_lock = track.lock();
             match kind {
                 Kind::Audio => {
-                    let clip = track_lock.audio.clips.get(*clip_index)?;
+                    let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
                     Some(Action::SetClipBounds {
                         track_name: track_name.clone(),
                         clip_index: *clip_index,
@@ -653,7 +668,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                     })
                 }
                 Kind::MIDI => {
-                    let clip = track_lock.midi.clips.get(*clip_index)?;
+                    let clip = track_lock.midi.clips().get(*clip_index).cloned()?;
                     Some(Action::SetClipBounds {
                         track_name: track_name.clone(),
                         clip_index: *clip_index,
@@ -674,8 +689,8 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let muted = match kind {
-                Kind::Audio => track_lock.audio.clips.get(*clip_index)?.muted,
-                Kind::MIDI => track_lock.midi.clips.get(*clip_index)?.muted,
+                Kind::Audio => track_lock.audio.clips().get(*clip_index).cloned()?.muted,
+                Kind::MIDI => track_lock.midi.clips().get(*clip_index).cloned()?.muted,
             };
             Some(Action::SetClipMuted {
                 track_name: track_name.clone(),
@@ -693,8 +708,20 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
             let name = match kind {
-                Kind::Audio => track_lock.audio.clips.get(*clip_index)?.name.clone(),
-                Kind::MIDI => track_lock.midi.clips.get(*clip_index)?.name.clone(),
+                Kind::Audio => track_lock
+                    .audio
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
+                Kind::MIDI => track_lock
+                    .midi
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
             };
             Some(Action::SetClipSourceName {
                 track_name: track_name.clone(),
@@ -710,7 +737,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         } => {
             let track = state.tracks.get(track_name)?;
             let track_lock = track.lock();
-            let clip = track_lock.audio.clips.get(*clip_index)?;
+            let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
             Some(Action::SetClipPitchCorrection {
                 track_name: track_name.clone(),
                 clip_index: *clip_index,
@@ -733,7 +760,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track_lock = track.lock();
             let plugin_graph_json = track_lock
                 .audio
-                .clips
+                .clips()
                 .get(*clip_index)
                 .map(|clip| clip.plugin_graph_json.clone())
                 .unwrap_or_default();
@@ -753,7 +780,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             Some(Action::SetTrackAutomationLanes {
                 track_name: track_name.clone(),
                 lanes: track_lock.automation_lanes.clone(),
-                mode: track_lock.automation_mode,
+                mode: track_lock.automation_mode(),
             })
         }
         Action::TrackAutomationToggleLane { track_name, target } => {
@@ -821,7 +848,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track_lock = track.lock();
             Some(Action::TrackAutomationSetMode {
                 track_name: track_name.clone(),
-                mode: track_lock.automation_mode,
+                mode: track_lock.automation_mode(),
             })
         }
         Action::Connect {
@@ -991,7 +1018,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = track.lock();
             Some(Action::TrackUnloadClapPluginInstance {
                 track_name: track_name.clone(),
-                instance_id: track.next_clap_instance_id,
+                instance_id: track.next_clap_instance_id.load(Ordering::Relaxed),
             })
         }
         Action::TrackUnloadClapPlugin {
@@ -1012,7 +1039,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = track.lock();
             Some(Action::TrackUnloadVst3PluginInstance {
                 track_name: track_name.clone(),
-                instance_id: track.next_vst3_instance_id,
+                instance_id: track.next_vst3_instance_id.load(Ordering::Relaxed),
             })
         }
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -1025,7 +1052,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             let track = track.lock();
             Some(Action::TrackUnloadLv2PluginInstance {
                 track_name: track_name.clone(),
-                instance_id: track.next_lv2_instance_id,
+                instance_id: track.next_lv2_instance_id.load(Ordering::Relaxed),
             })
         }
         Action::TrackSetClapParameter {
@@ -1049,7 +1076,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             ..
         } => {
             let track = state.tracks.get(track_name)?;
-            let track = track.lock();
+            let mut track = track.lock();
             let (_, snapshot) = track
                 .clip_clap_snapshot_state(*clip_idx, *instance_id)
                 .ok()?;
@@ -1087,18 +1114,18 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                     .clap_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
-                    .map(|i| i.processor.lock().is_bypassed()),
+                    .map(|i| i.processor.is_bypassed()),
                 "VST3" => track
                     .vst3_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
-                    .map(|i| i.processor.lock().is_bypassed()),
+                    .map(|i| i.processor.is_bypassed()),
                 #[cfg(all(unix, not(target_os = "macos")))]
                 "LV2" => track
                     .lv2_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
-                    .map(|i| i.processor.lock().is_bypassed()),
+                    .map(|i| i.processor.is_bypassed()),
                 _ => None,
             };
             Some(Action::TrackSetPluginBypassed {
@@ -1261,9 +1288,9 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let instance = track
             .clap_plugins
             .iter()
-            .find(|p| p.processor.lock().plugin_id() == plugin_id)?;
+            .find(|p| p.processor.plugin_id() == plugin_id)?;
         let id = instance.id;
-        let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
         return Some(vec![
             Action::TrackLoadClapPlugin {
                 track_name: track_name.clone(),
@@ -1286,8 +1313,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
         let instance = track.clap_plugins.iter().find(|p| p.id == *instance_id)?;
-        let plugin_id = instance.processor.lock().plugin_id().to_string();
-        let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
+        let plugin_id = instance.processor.plugin_id().to_string();
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
         return Some(vec![
             Action::TrackLoadClapPlugin {
                 track_name: track_name.clone(),
@@ -1310,8 +1337,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
         let instance = track.vst3_plugins.iter().find(|p| p.id == *instance_id)?;
-        let plugin_id = instance.processor.lock().plugin_id().to_string();
-        let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
+        let plugin_id = instance.processor.plugin_id().to_string();
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
         return Some(vec![
             Action::TrackLoadVst3Plugin {
                 track_name: track_name.clone(),
@@ -1335,8 +1362,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         let track = state.tracks.get(track_name)?;
         let track = track.lock();
         let instance = track.lv2_plugins.iter().find(|p| p.id == *instance_id)?;
-        let uri = instance.processor.lock().uri().to_string();
-        let state_snapshot = instance.processor.lock().snapshot_state().ok()?;
+        let uri = instance.processor.uri().to_string();
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
         return Some(vec![
             Action::TrackLoadLv2Plugin {
                 track_name: track_name.clone(),
@@ -1377,22 +1404,24 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 actions.push(Action::TrackAddAudioOutput(track.name.clone()));
             }
 
-            if track.level != 0.0 {
-                actions.push(Action::TrackLevel(track.name.clone(), track.level));
+            let level = track.level();
+            if level != 0.0 {
+                actions.push(Action::TrackLevel(track.name.clone(), level));
             }
-            if track.balance != 0.0 {
-                actions.push(Action::TrackBalance(track.name.clone(), track.balance));
+            let balance = track.balance();
+            if balance != 0.0 {
+                actions.push(Action::TrackBalance(track.name.clone(), balance));
             }
-            if track.armed {
+            if track.armed() {
                 actions.push(Action::TrackToggleArm(track.name.clone()));
             }
-            if track.muted {
+            if track.muted() {
                 actions.push(Action::TrackToggleMute(track.name.clone()));
             }
-            if track.soloed {
+            if track.soloed() {
                 actions.push(Action::TrackToggleSolo(track.name.clone()));
             }
-            for (lane, &monitor) in track.input_monitor.iter().enumerate() {
+            for (lane, &monitor) in track.input_monitor().iter().enumerate() {
                 if monitor {
                     actions.push(Action::TrackToggleInputMonitor {
                         track_name: track.name.clone(),
@@ -1400,7 +1429,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     });
                 }
             }
-            for (lane, &monitor) in track.disk_monitor.iter().enumerate() {
+            for (lane, &monitor) in track.disk_monitor().iter().enumerate() {
                 if !monitor {
                     actions.push(Action::TrackToggleDiskMonitor {
                         track_name: track.name.clone(),
@@ -1408,7 +1437,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     });
                 }
             }
-            for (lane, &monitor) in track.midi_input_monitor.iter().enumerate() {
+            for (lane, &monitor) in track.midi_input_monitor().iter().enumerate() {
                 if monitor {
                     actions.push(Action::TrackToggleMidiInputMonitor {
                         track_name: track.name.clone(),
@@ -1416,7 +1445,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     });
                 }
             }
-            for (lane, &monitor) in track.midi_disk_monitor.iter().enumerate() {
+            for (lane, &monitor) in track.midi_disk_monitor().iter().enumerate() {
                 if !monitor {
                     actions.push(Action::TrackToggleMidiDiskMonitor {
                         track_name: track.name.clone(),
@@ -1479,7 +1508,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     binding: track.midi_learn_disk_monitor.clone(),
                 });
             }
-            for clip in &track.audio.clips {
+            for clip in track.audio.clips().iter() {
                 let length = clip.end.saturating_sub(clip.start).max(1);
                 actions.push(Action::AddClip {
                     clip_id: clip.id.clone(),
@@ -1507,7 +1536,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     plugin_graph_json: clip.plugin_graph_json.clone(),
                 });
             }
-            for clip in &track.midi.clips {
+            for clip in track.midi.clips().iter() {
                 let length = clip.end.saturating_sub(clip.start).max(1);
                 actions.push(Action::AddClip {
                     clip_id: clip.id.clone(),
@@ -1537,8 +1566,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
 
             for instance in &track.vst3_plugins {
                 let id = instance.id;
-                let plugin_id = instance.processor.lock().plugin_id().to_string();
-                if let Ok(state) = instance.processor.lock().snapshot_state() {
+                let plugin_id = instance.processor.plugin_id().to_string();
+                if let Ok(state) = instance.processor.snapshot_state() {
                     actions.push(Action::TrackLoadVst3Plugin {
                         track_name: track.name.clone(),
                         plugin_id,
@@ -1568,8 +1597,8 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
             #[cfg(all(unix, not(target_os = "macos")))]
             for instance in &track.lv2_plugins {
                 let id = instance.id;
-                let uri = instance.processor.lock().uri().to_string();
-                if let Ok(state) = instance.processor.lock().snapshot_state() {
+                let uri = instance.processor.uri().to_string();
+                if let Ok(state) = instance.processor.snapshot_state() {
                     actions.push(Action::TrackLoadLv2Plugin {
                         track_name: track.name.clone(),
                         plugin_uri: uri,
@@ -1758,17 +1787,13 @@ mod tests {
     use crate::kind::Kind;
 
     use crate::message::{MidiLearnBinding, TrackMidiLearnTarget};
-    use crate::mutex::UnsafeMutex;
     use crate::plugins::types::Vst3PluginState;
     use crate::track::Track;
     use std::sync::Arc;
 
     fn make_state_with_track(track: Track) -> State {
         let mut state = State::default();
-        state.tracks.insert(
-            track.name.clone(),
-            Arc::new(UnsafeMutex::new(Box::new(track))),
-        );
+        state.tracks.insert(track.name.clone(), Arc::new(track));
         state
     }
 
@@ -1916,11 +1941,10 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_add_clip_targets_next_clip_index() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track
             .audio
-            .clips
-            .push(AudioClip::new("existing".to_string(), 0, 16));
+            .push_clip(AudioClip::new("existing".to_string(), 0, 16));
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -1968,10 +1992,10 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_bounds_restores_previous_audio_bounds() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut clip = AudioClip::new("clip".to_string(), 10, 30);
         clip.offset = 7;
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2009,8 +2033,8 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_bounds_restores_previous_midi_bounds() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
-        track.midi.clips.push(crate::midi::clip::MIDIClip {
+        let track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        track.midi.push_clip(crate::midi::clip::MIDIClip {
             name: "pattern.mid".to_string(),
             start: 24,
             end: 120,
@@ -2054,16 +2078,16 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_muted_restores_audio_and_midi_flags() {
-        let mut track = Track::new("t".to_string(), 1, 1, 1, 1, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 1, 1, 64, 48_000.0);
         let mut audio_clip = AudioClip::new("audio.wav".to_string(), 0, 16);
         audio_clip.muted = true;
-        track.audio.clips.push(audio_clip);
+        track.audio.push_clip(audio_clip);
         let midi_clip = crate::midi::clip::MIDIClip {
             name: "pattern.mid".to_string(),
             muted: false,
             ..Default::default()
         };
-        track.midi.clips.push(midi_clip);
+        track.midi.push_clip(midi_clip);
         let state = make_state_with_track(track);
 
         let audio_inverse = create_inverse_action(
@@ -2107,11 +2131,10 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_rename_clip_restores_previous_name() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track
             .audio
-            .clips
-            .push(AudioClip::new("before.wav".to_string(), 0, 16));
+            .push_clip(AudioClip::new("before.wav".to_string(), 0, 16));
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2133,13 +2156,13 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_audio_clip_restores_peaks_file() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
         clip.offset = 12;
         clip.input_channel = 0;
         clip.muted = true;
         clip.peaks_file = Some("peaks/clip.json".to_string());
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2181,12 +2204,12 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_audio_clip_restores_group() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut group = AudioClip::new("Group".to_string(), 48, 144);
         group
             .grouped_clips
             .push(AudioClip::new("child.wav".to_string(), 0, 32));
-        track.audio.clips.push(group);
+        track.audio.push_clip(group);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2220,8 +2243,8 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_midi_clip_restores_clip() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
-        track.midi.clips.push(crate::midi::clip::MIDIClip {
+        let track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        track.midi.push_clip(crate::midi::clip::MIDIClip {
             name: "pattern.mid".to_string(),
             start: 48,
             end: 144,
@@ -2269,14 +2292,14 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_midi_clip_restores_group() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
         let mut group = crate::midi::clip::MIDIClip::new("Group".to_string(), 32, 160);
         group.grouped_clips.push(crate::midi::clip::MIDIClip::new(
             "child.mid".to_string(),
             0,
             48,
         ));
-        track.midi.clips.push(group);
+        track.midi.push_clip(group);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2310,7 +2333,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_audio_clip_preserves_child_metadata() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut child = AudioClip::new("child.wav".to_string(), 4, 40);
         child.peaks_file = Some("peaks/child.json".to_string());
         child.pitch_correction_source_name = Some("source.wav".to_string());
@@ -2330,7 +2353,7 @@ mod tests {
         child.plugin_graph_json = Some(serde_json::json!({"plugins":[],"connections":[]}));
         let mut group = AudioClip::new("Group".to_string(), 48, 144);
         group.grouped_clips.push(child);
-        track.audio.clips.push(group);
+        track.audio.push_clip(group);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2366,11 +2389,11 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_midi_clip_preserves_child_structure() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
         let child = crate::midi::clip::MIDIClip::new("child.mid".to_string(), 0, 48);
         let mut group = crate::midi::clip::MIDIClip::new("Group".to_string(), 32, 160);
         group.grouped_clips.push(child);
-        track.midi.clips.push(group);
+        track.midi.push_clip(group);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2399,7 +2422,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_pitch_correction_restores_previous_values() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut clip = AudioClip::new("audio.wav".to_string(), 0, 128);
         clip.pitch_correction_preview_name = Some("audio_preview.wav".to_string());
         clip.pitch_correction_source_name = Some("audio_source.wav".to_string());
@@ -2415,7 +2438,7 @@ mod tests {
         clip.pitch_correction_frame_likeness = Some(0.4);
         clip.pitch_correction_inertia_ms = Some(250);
         clip.pitch_correction_formant_compensation = Some(false);
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2466,25 +2489,17 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_clip_copy_targets_new_destination_clip() {
-        let mut source = Track::new("src".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let source = Track::new("src".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         source
             .audio
-            .clips
-            .push(AudioClip::new("source.wav".to_string(), 12, 48));
-        let mut dest = Track::new("dst".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+            .push_clip(AudioClip::new("source.wav".to_string(), 12, 48));
+        let dest = Track::new("dst".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         dest.audio
-            .clips
-            .push(AudioClip::new("existing.wav".to_string(), 0, 24));
+            .push_clip(AudioClip::new("existing.wav".to_string(), 0, 24));
 
         let mut state = State::default();
-        state.tracks.insert(
-            source.name.clone(),
-            Arc::new(UnsafeMutex::new(Box::new(source))),
-        );
-        state.tracks.insert(
-            dest.name.clone(),
-            Arc::new(UnsafeMutex::new(Box::new(dest))),
-        );
+        state.tracks.insert(source.name.clone(), Arc::new(source));
+        state.tracks.insert(dest.name.clone(), Arc::new(dest));
 
         let inverse = create_inverse_action(
             &Action::ClipMove {
@@ -2520,12 +2535,12 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_same_track_clip_move_reverses_last_destination_clip() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut original = AudioClip::new("clip.wav".to_string(), 20, 40);
         original.input_channel = 2;
         let moved = AudioClip::new("moved.wav".to_string(), 80, 32);
-        track.audio.clips.push(original);
-        track.audio.clips.push(moved);
+        track.audio.push_clip(original);
+        track.audio.push_clip(moved);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2597,8 +2612,8 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_vst3_load_uses_next_runtime_instance_id() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        track.next_vst3_instance_id = 42;
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track.next_vst3_instance_id.store(42, Ordering::Relaxed);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2626,8 +2641,8 @@ mod tests {
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
     fn create_inverse_action_for_lv2_load_uses_next_runtime_instance_id() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        track.next_lv2_instance_id = 5;
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track.next_lv2_instance_id.store(5, Ordering::Relaxed);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -2687,13 +2702,13 @@ mod tests {
     #[test]
     fn create_inverse_actions_for_remove_track_restores_io_flags_and_bindings() {
         let mut track = Track::new("t".to_string(), 1, 1, 1, 1, 64, 48_000.0);
-        track.level = -3.0;
-        track.balance = 0.25;
-        track.armed = true;
-        track.muted = true;
-        track.soloed = true;
-        track.input_monitor = vec![true];
-        track.disk_monitor = vec![false];
+        track.set_level(-3.0);
+        track.set_balance(0.25);
+        track.armed.store(true, Ordering::Relaxed);
+        track.set_muted(true);
+        track.soloed.store(true, Ordering::Relaxed);
+        track.set_input_monitor(vec![true]);
+        track.set_disk_monitor(vec![false]);
         track.midi_learn_volume = Some(binding(10));
         track.audio.ins.push(Arc::new(AudioIO::new(64)));
         track.audio.outs.push(Arc::new(AudioIO::new(64)));
@@ -2773,14 +2788,8 @@ mod tests {
         let mut state = State::default();
         let folder = Track::new_folder("folder".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let child = Track::new("child".to_string(), 1, 1, 0, 0, 64, 48_000.0);
-        state.tracks.insert(
-            "folder".to_string(),
-            Arc::new(UnsafeMutex::new(Box::new(folder))),
-        );
-        state.tracks.insert(
-            "child".to_string(),
-            Arc::new(UnsafeMutex::new(Box::new(child))),
-        );
+        state.tracks.insert("folder".to_string(), Arc::new(folder));
+        state.tracks.insert("child".to_string(), Arc::new(child));
         {
             let folder_arc = state.tracks.get("folder").unwrap().clone();
             let child_arc = state.tracks.get("child").unwrap().clone();
@@ -2831,6 +2840,7 @@ mod tests {
     fn create_inverse_action_for_track_set_session_slot_restores_previous_clip() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track
+            .rt
             .session_slots
             .insert(0, crate::track::SessionSlot::new("old-clip".to_string()));
         let state = make_state_with_track(track);
@@ -2863,6 +2873,7 @@ mod tests {
     fn create_inverse_action_for_track_set_session_slot_clear_restores_none() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track
+            .rt
             .session_slots
             .insert(0, crate::track::SessionSlot::new("old-clip".to_string()));
         let state = make_state_with_track(track);
@@ -2895,9 +2906,10 @@ mod tests {
     fn create_inverse_action_for_track_set_session_slot_play_enabled_restores_previous_flag() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track
+            .rt
             .session_slots
             .insert(0, crate::track::SessionSlot::new("clip".to_string()));
-        track.session_slots.get_mut(&0).unwrap().play_enabled = false;
+        track.rt.session_slots.get_mut(&0).unwrap().play_enabled = false;
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(

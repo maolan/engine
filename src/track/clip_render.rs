@@ -1,7 +1,6 @@
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
 use crate::message::{PluginGraphNode, PluginKind};
-use crate::mutex::UnsafeMutex;
 #[cfg(unix)]
 use crate::rubberband::LivePitchShifter;
 
@@ -13,7 +12,7 @@ use std::{collections::HashSet, path::Path, sync::Arc};
 
 impl Track {
     pub(crate) fn invalidate_midi_clip_cache(&mut self, clip_name: &str) {
-        self.midi_clip_cache.remove(clip_name);
+        self.rt.midi_clip_cache.remove(clip_name);
     }
 
     pub(crate) fn load_audio_clip_buffer(path: &Path) -> Option<AudioClipBuffer> {
@@ -40,7 +39,7 @@ impl Track {
     }
 
     pub(crate) fn clip_buffer(&mut self, clip_name: &str) -> Option<Arc<AudioClipBuffer>> {
-        if let Some(cached) = self.audio_clip_cache.get(clip_name) {
+        if let Some(cached) = self.rt.audio_clip_cache.get(clip_name) {
             return Some(cached.clone());
         }
         let path = self.resolve_clip_path(clip_name);
@@ -56,7 +55,8 @@ impl Track {
             );
         }
         let loaded = Arc::new(loaded);
-        self.audio_clip_cache
+        self.rt
+            .audio_clip_cache
             .insert(clip_name.to_string(), loaded.clone());
         Some(loaded)
     }
@@ -268,7 +268,7 @@ impl Track {
                         };
                         runtime
                             .clap_plugins
-                            .push(ClapInstance::new(id, Arc::new(UnsafeMutex::new(processor))));
+                            .push(ClapInstance::new(id, Arc::new(processor)));
                         runtime_nodes.push(PluginGraphNode::ClapPluginInstance(id));
                     }
                     "VST3" | "vst3" => {
@@ -297,7 +297,7 @@ impl Track {
                         };
                         runtime
                             .vst3_plugins
-                            .push(Vst3Instance::new(id, Arc::new(UnsafeMutex::new(processor))));
+                            .push(Vst3Instance::new(id, Arc::new(processor)));
                         runtime_nodes.push(PluginGraphNode::Vst3PluginInstance(id));
                     }
                     #[cfg(all(unix, not(target_os = "macos")))]
@@ -319,7 +319,7 @@ impl Track {
                         };
                         runtime
                             .lv2_plugins
-                            .push(Lv2Instance::new(id, Arc::new(UnsafeMutex::new(processor))));
+                            .push(Lv2Instance::new(id, Arc::new(processor)));
                         #[cfg(all(unix, not(target_os = "macos")))]
                         runtime_nodes.push(PluginGraphNode::Lv2PluginInstance(id));
                     }
@@ -383,12 +383,15 @@ impl Track {
         }
         let input_count = input_blocks.len().max(1);
         let runtime_key = Self::clip_plugin_runtime_key(clip, input_count, input_count);
-        if !self.clip_plugin_tracks.contains_key(&runtime_key) {
+        if !self.rt.clip_plugin_tracks.contains_key(&runtime_key) {
             let runtime =
-                self.build_clip_plugin_runtime(clip, input_count, self.process_block_size)?;
-            self.clip_plugin_tracks.insert(runtime_key.clone(), runtime);
+                self.build_clip_plugin_runtime(clip, input_count, self.process_block_size())?;
+            self.rt
+                .clip_plugin_tracks
+                .insert(runtime_key.clone(), runtime);
         }
         let runtime = self
+            .rt
             .clip_plugin_tracks
             .get_mut(&runtime_key)
             .ok_or_else(|| "Missing clip plugin runtime".to_string())?;
@@ -528,7 +531,7 @@ impl Track {
         }
 
         let playback_name = Self::clip_playback_name(clip);
-        let buffer = match self.audio_clip_cache.get(playback_name).cloned() {
+        let buffer = match self.rt.audio_clip_cache.get(playback_name).cloned() {
             Some(buffer) => buffer,
             None => {
                 tracing::warn!(
@@ -568,7 +571,8 @@ impl Track {
             let key = Self::clip_pitch_key(clip);
             let corrected = {
                 let shifter =
-                    self.clip_pitch_shifters
+                    self.rt
+                        .clip_pitch_shifters
                         .entry(key)
                         .or_insert_with(|| ClipPitchShifter {
                             shifter: LivePitchShifter::new(
@@ -744,7 +748,7 @@ impl Track {
         }
         let input_lane = clip.input_channel.min(input_events.len().saturating_sub(1));
         if !self
-            .midi_disk_monitor
+            .midi_disk_monitor()
             .get(input_lane)
             .copied()
             .unwrap_or(true)
@@ -752,7 +756,7 @@ impl Track {
             return;
         }
         let clip_end = clip_start.saturating_add(clip_len);
-        let Some(events) = self.midi_clip_cache.get(&clip.name) else {
+        let Some(events) = self.rt.midi_clip_cache.get(&clip.name) else {
             return;
         };
         for (segment_start, segment_end, out_offset) in segments {
@@ -853,7 +857,7 @@ impl Track {
         clip_idx: usize,
         channels: usize,
     ) -> Result<&mut ClipPluginRuntime, String> {
-        let clip = self.audio.clips.get(clip_idx).cloned().ok_or_else(|| {
+        let clip = self.audio.clips().get(clip_idx).cloned().ok_or_else(|| {
             format!(
                 "Track '{}' has no audio clip at index {}",
                 self.name, clip_idx
@@ -866,12 +870,15 @@ impl Track {
             ));
         }
         let runtime_key = Self::clip_plugin_runtime_key(&clip, channels, channels);
-        if !self.clip_plugin_tracks.contains_key(&runtime_key) {
+        if !self.rt.clip_plugin_tracks.contains_key(&runtime_key) {
             let runtime =
-                self.build_clip_plugin_runtime(&clip, channels, self.process_block_size)?;
-            self.clip_plugin_tracks.insert(runtime_key.clone(), runtime);
+                self.build_clip_plugin_runtime(&clip, channels, self.process_block_size())?;
+            self.rt
+                .clip_plugin_tracks
+                .insert(runtime_key.clone(), runtime);
         }
         let runtime = self
+            .rt
             .clip_plugin_tracks
             .get_mut(&runtime_key)
             .ok_or_else(|| "Missing clip plugin runtime".to_string())?;
@@ -913,11 +920,11 @@ impl Track {
     pub(crate) fn preload_audio_clip_cache(&mut self) {
         let missing: Vec<String> = self
             .audio
-            .clips
+            .clips()
             .iter()
             .filter_map(|clip| {
                 let clip_name = Self::clip_playback_name(clip);
-                if self.audio_clip_cache.contains_key(clip_name) {
+                if self.rt.audio_clip_cache.contains_key(clip_name) {
                     None
                 } else {
                     Some(clip_name.to_string())
@@ -943,7 +950,7 @@ impl Track {
                     "Slow preload_audio_clip_cache for track '{}' took {:.1}ms for {} clips",
                     self.name,
                     total,
-                    self.audio.clips.len()
+                    self.audio.clips().len()
                 );
             }
         }
@@ -1050,13 +1057,14 @@ impl Track {
     }
 
     pub(crate) fn midi_clip_events(&mut self, clip_name: &str) -> Option<MidiClipEvents> {
-        if let Some(cached) = self.midi_clip_cache.get(clip_name) {
+        if let Some(cached) = self.rt.midi_clip_cache.get(clip_name) {
             return Some(cached.clone());
         }
         let path = self.resolve_clip_path(clip_name);
         let loaded = Self::load_midi_clip_events(&path, self.sample_rate)?;
         let loaded = Arc::new(loaded);
-        self.midi_clip_cache
+        self.rt
+            .midi_clip_cache
             .insert(clip_name.to_string(), loaded.clone());
         Some(loaded)
     }
@@ -1064,10 +1072,10 @@ impl Track {
     pub(crate) fn preload_midi_clip_cache(&mut self) {
         let missing: Vec<String> = self
             .midi
-            .clips
+            .clips()
             .iter()
             .filter_map(|clip| {
-                if self.midi_clip_cache.contains_key(&clip.name) {
+                if self.rt.midi_clip_cache.contains_key(&clip.name) {
                     None
                 } else {
                     Some(clip.name.clone())
@@ -1093,7 +1101,7 @@ impl Track {
                     "Slow preload_midi_clip_cache for track '{}' took {:.1}ms for {} clips",
                     self.name,
                     total,
-                    self.midi.clips.len()
+                    self.midi.clips().len()
                 );
             }
         }
@@ -1108,31 +1116,31 @@ impl Track {
         if frames == 0 {
             return vec![];
         }
-        if !self.loop_enabled {
+        if !self.rt.loop_enabled {
             return vec![(
-                self.transport_sample,
-                self.transport_sample.saturating_add(frames),
+                self.rt.transport_sample,
+                self.rt.transport_sample.saturating_add(frames),
                 0,
             )];
         }
-        let Some((loop_start, loop_end)) = self.loop_range_samples else {
+        let Some((loop_start, loop_end)) = self.rt.loop_range_samples else {
             return vec![(
-                self.transport_sample,
-                self.transport_sample.saturating_add(frames),
+                self.rt.transport_sample,
+                self.rt.transport_sample.saturating_add(frames),
                 0,
             )];
         };
         if loop_end <= loop_start {
             return vec![(
-                self.transport_sample,
-                self.transport_sample.saturating_add(frames),
+                self.rt.transport_sample,
+                self.rt.transport_sample.saturating_add(frames),
                 0,
             )];
         }
         let mut segments = Vec::new();
         let mut remaining = frames;
         let mut out_offset = 0usize;
-        let mut current = self.transport_sample;
+        let mut current = self.rt.transport_sample;
         while remaining > 0 {
             let segment_end_limit = loop_end;
             let take = segment_end_limit.saturating_sub(current).min(remaining);
@@ -1163,7 +1171,7 @@ impl Track {
             "mix_clip_audio_into_inputs for '{}' frames={} clips={}",
             self.name,
             frames,
-            self.audio.clips.len()
+            self.audio.clips().len()
         );
         if frames == 0 || self.audio.ins.is_empty() {
             return;
@@ -1171,7 +1179,7 @@ impl Track {
 
         let mut active_clip_plugin_keys = HashSet::new();
         let segments = self.cycle_segments(frames);
-        for clip in self.audio.clips.clone() {
+        for clip in self.audio.clips().iter() {
             if clip.muted {
                 tracing::debug!("mix_clip_audio_into_inputs clip '{}' muted", clip.name);
                 continue;
@@ -1186,7 +1194,7 @@ impl Track {
                     clip_end,
                     segment_start,
                     segment_end,
-                    self.transport_sample
+                    self.rt.transport_sample
                 );
                 if clip_end <= *segment_start || clip_start >= *segment_end {
                     tracing::debug!(
@@ -1211,7 +1219,7 @@ impl Track {
                 }
                 let render_start = std::time::Instant::now();
                 let Some(processed_blocks) = self.render_audio_clip_segment(
-                    &clip,
+                    clip,
                     0,
                     from,
                     copy_len,
@@ -1240,10 +1248,15 @@ impl Track {
                     processed_blocks.first().and_then(|b| b.first())
                 );
                 for in_channel in 0..self.audio.ins.len() {
-                    if !self.disk_monitor.get(in_channel).copied().unwrap_or(false) {
+                    if !self
+                        .disk_monitor()
+                        .get(in_channel)
+                        .copied()
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
-                    let in_samples = self.audio.ins[in_channel].buffer.lock();
+                    let mut in_samples = self.audio.ins[in_channel].buffer.lock();
                     let processed = processed_blocks
                         .get(in_channel)
                         .or_else(|| processed_blocks.first());
@@ -1259,7 +1272,8 @@ impl Track {
                 }
             }
         }
-        self.clip_plugin_tracks
+        self.rt
+            .clip_plugin_tracks
             .retain(|key, _| active_clip_plugin_keys.contains(key));
     }
 
@@ -1272,7 +1286,7 @@ impl Track {
             return;
         }
         let segments = self.cycle_segments(frames);
-        for clip in &self.midi.clips {
+        for clip in self.midi.clips().iter() {
             self.collect_midi_clip_events_recursive(clip, 0, input_events, frames, &segments);
         }
         for events in input_events.iter_mut() {

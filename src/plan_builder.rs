@@ -15,18 +15,18 @@
 //! buffer arena happens here, off every real-time path.
 
 use crate::audio::io::AudioIO;
-use crate::mutex::UnsafeMutex;
 use crate::render_plan::{PlanSlot, RenderPlan};
-use crate::state::State;
+use crate::state::StateSlot;
+use arc_swap::ArcSwap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Hardware ports and block size the builder compiles into each plan. The
 /// engine replaces this snapshot whenever a driver opens/closes or the
-/// buffer size changes; the builder only reads it. A plain `std` mutex on
-/// the control side — never touched on the real-time path.
+/// buffer size changes; the builder only reads it. Published RCU-style
+/// (`ArcSwap`) — no blocking primitive on either side.
 #[derive(Clone, Default)]
 pub struct HwPorts {
     pub ins: Vec<Arc<AudioIO>>,
@@ -47,8 +47,8 @@ impl PlanBuilder {
     /// published right away. `collector` moves to the builder thread, which
     /// becomes the only place plan memory is actually freed.
     pub fn spawn(
-        state: Arc<UnsafeMutex<State>>,
-        hw: Arc<Mutex<HwPorts>>,
+        state: Arc<StateSlot>,
+        hw: Arc<ArcSwap<HwPorts>>,
         slot: Arc<PlanSlot>,
         collector: basedrop::Collector,
     ) -> Self {
@@ -86,8 +86,8 @@ impl Drop for PlanBuilder {
 }
 
 fn builder_loop(
-    state: Arc<UnsafeMutex<State>>,
-    hw: Arc<Mutex<HwPorts>>,
+    state: Arc<StateSlot>,
+    hw: Arc<ArcSwap<HwPorts>>,
     slot: Arc<PlanSlot>,
     mut collector: basedrop::Collector,
     dirty: Arc<AtomicBool>,
@@ -107,11 +107,9 @@ fn builder_loop(
             ins,
             outs,
             buffer_size,
-        } = hw.lock().expect("hw ports poisoned").clone();
-        let plan = {
-            let state = state.lock();
-            RenderPlan::compile(state, &ins, &outs, buffer_size.max(1))
-        };
+        } = hw.load_full().as_ref().clone();
+        let state = state.load_full();
+        let plan = RenderPlan::compile(&state, &ins, &outs, buffer_size.max(1));
         slot.store(Arc::new(basedrop::Owned::new(&collector.handle(), plan)));
         // Free whatever retired plans have been fully released since the
         // last build (the swapped-out one included, once workers let go).

@@ -4,6 +4,9 @@ pub trait HwWorkerDriver {
     fn cycle_samples(&self) -> usize;
     fn sample_rate(&self) -> i32;
     fn request_stop(&mut self) {}
+    fn close_fds(&mut self) {}
+    fn set_playing(&mut self, _playing: bool) {}
+    fn set_output_gain_balance(&mut self, _gain: f32, _balance: f32) {}
     fn run_cycle_for_worker(&mut self) -> Result<(), String>;
     fn run_assist_step_for_worker(&mut self) -> Result<bool, String>;
 
@@ -26,6 +29,13 @@ pub trait HwWorkerDriver {
 }
 
 pub trait HwMidiHub {
+    fn open_input(&mut self, _device: &str) -> Result<(), String> {
+        Err("Hardware MIDI input devices are not supported by this backend".to_string())
+    }
+    fn open_output(&mut self, _device: &str) -> Result<(), String> {
+        Err("Hardware MIDI output devices are not supported by this backend".to_string())
+    }
+    fn close_all(&mut self) {}
     fn read_events_into(&mut self, out: &mut Vec<HwMidiEvent>);
     fn read_events_blocking_into(&mut self, out: &mut Vec<HwMidiEvent>) {
         self.read_events_into(out);
@@ -58,6 +68,18 @@ macro_rules! impl_hw_worker_traits_for_driver {
 
             fn sample_rate(&self) -> i32 {
                 self.sample_rate()
+            }
+
+            fn close_fds(&mut self) {
+                self.close_fds()
+            }
+
+            fn set_playing(&mut self, playing: bool) {
+                self.set_playing(playing)
+            }
+
+            fn set_output_gain_balance(&mut self, gain: f32, balance: f32) {
+                self.set_output_gain_balance(gain, balance)
             }
 
             fn run_cycle_for_worker(&mut self) -> Result<(), String> {
@@ -98,6 +120,18 @@ macro_rules! impl_hw_device_for_driver {
 macro_rules! impl_hw_midi_hub_traits {
     ($hub:ty) => {
         impl $crate::hw::traits::HwMidiHub for $hub {
+            fn open_input(&mut self, device: &str) -> Result<(), String> {
+                <$hub>::open_input(self, device)
+            }
+
+            fn open_output(&mut self, device: &str) -> Result<(), String> {
+                <$hub>::open_output(self, device)
+            }
+
+            fn close_all(&mut self) {
+                <$hub>::close_all(self);
+            }
+
             fn read_events_into(&mut self, out: &mut Vec<$crate::message::HwMidiEvent>) {
                 <$hub>::read_events_into(self, out);
             }

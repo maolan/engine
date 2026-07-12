@@ -426,12 +426,16 @@ impl Engine {
             .ok_or_else(|| format!("Track not found: {track_name}"))?;
         let (clip_name, clip_path, sample_rate, clip_start) = {
             let track = track_handle.lock();
-            if clip_index >= track.midi.clips.len() {
+            if clip_index >= track.midi.clips().len() {
                 return Err(format!(
                     "Invalid MIDI clip index {clip_index} for '{track_name}'"
                 ));
             }
-            let clip = &track.midi.clips[clip_index];
+            let Some(clip) = track.midi.clips().get(clip_index).cloned() else {
+                return Err(format!(
+                    "Invalid MIDI clip index {clip_index} for '{track_name}'"
+                ));
+            };
             let clip_name = clip.name.clone();
             let clip_path = track.resolve_clip_path(&clip_name);
             (clip_name, clip_path, track.sample_rate, clip.start)
@@ -854,7 +858,7 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.muted != wanted {
+                    if t.muted() != wanted {
                         mapped_actions.push(Action::TrackToggleMute(track_name.clone()));
                     }
                 }
@@ -863,7 +867,7 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.soloed != wanted {
+                    if t.soloed() != wanted {
                         mapped_actions.push(Action::TrackToggleSolo(track_name.clone()));
                     }
                 }
@@ -872,7 +876,7 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.armed != wanted {
+                    if t.armed() != wanted {
                         mapped_actions.push(Action::TrackToggleArm(track_name.clone()));
                     }
                 }
@@ -881,7 +885,7 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.input_monitor.first() != Some(&wanted) {
+                    if t.input_monitor().first() != Some(&wanted) {
                         mapped_actions.push(Action::TrackToggleInputMonitor {
                             track_name: track_name.clone(),
                             lane: 0,
@@ -893,7 +897,7 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.disk_monitor.first() != Some(&wanted) {
+                    if t.disk_monitor().first() != Some(&wanted) {
                         mapped_actions.push(Action::TrackToggleDiskMonitor {
                             track_name: track_name.clone(),
                             lane: 0,
@@ -1014,7 +1018,7 @@ impl Engine {
                     if let Some(track) = self.state.lock().tracks.get(track_name) {
                         let can_toggle = {
                             let t = track.lock();
-                            t.is_master || !t.is_folder
+                            t.is_master() || !t.is_folder
                         };
                         if can_toggle {
                             track.lock().toggle_master();
@@ -1361,7 +1365,7 @@ impl Engine {
         self.session_midi_learn_stop_all = None;
         self.midi_cc_gate.clear();
         for track in self.state.lock().tracks.values() {
-            let t = track.lock();
+            let mut t = track.lock();
             t.midi_learn_volume = None;
             t.midi_learn_balance = None;
             t.midi_learn_mute = None;
@@ -1385,13 +1389,17 @@ impl Engine {
                 if let Err(e) = worker.tx.send(Message::ClearHWMidiOutEvents).await {
                     error!("Error clearing HW MIDI queue for panic {e}");
                 }
-                self.midi_hub
-                    .lock()
-                    .write_events_blocking(&panic_events, Duration::from_millis(250));
+                if let Err(e) = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await {
+                    error!("Error sending HW MIDI panic events {e}");
+                }
             }
         } else if !panic_events.is_empty() {
-            self.pending_hw_midi_out_events_by_device
-                .extend(panic_events);
+            if let Some(midi_hub) = self.midi_hub.as_mut() {
+                midi_hub.write_events_blocking(&panic_events, Duration::from_millis(250));
+            } else {
+                self.pending_hw_midi_out_events_by_device
+                    .extend(panic_events);
+            }
         }
 
         false

@@ -23,8 +23,9 @@
 
 use crate::audio::io::AudioIO;
 use crate::message::{PluginKind, ProcessTask};
-use crate::mutex::UnsafeMutex;
 use crate::render_plan::{NodeId, Op, PlanSlot, SharedPlan};
+use crate::state::TrackHandle;
+#[cfg(test)]
 use crate::track::Track;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -293,7 +294,7 @@ impl CycleExecutor {
 
 /// Mirror of the legacy `force_stalled_task_completions` port handling:
 /// silence the task's output ports and mark it finished/not-processing.
-fn silence_task_ports(track: &Arc<UnsafeMutex<Box<Track>>>, task: &ProcessTask) {
+fn silence_task_ports(track: &TrackHandle, task: &ProcessTask) {
     let t = track.lock();
     let output_ports: Vec<Arc<AudioIO>> = match task {
         ProcessTask::Track(_) | ProcessTask::FolderOutput(_) => t.audio.outs.clone(),
@@ -302,18 +303,18 @@ fn silence_task_ports(track: &Arc<UnsafeMutex<Box<Track>>>, task: &ProcessTask) 
             PluginKind::Clap => t
                 .clap_plugins
                 .get(*index)
-                .map(|p| p.processor.lock().audio_outputs().to_vec())
+                .map(|p| p.processor.audio_outputs().to_vec())
                 .unwrap_or_default(),
             PluginKind::Vst3 => t
                 .vst3_plugins
                 .get(*index)
-                .map(|p| p.processor.lock().audio_outputs().to_vec())
+                .map(|p| p.processor.audio_outputs().to_vec())
                 .unwrap_or_default(),
             #[cfg(all(unix, not(target_os = "macos")))]
             PluginKind::Lv2 => t
                 .lv2_plugins
                 .get(*index)
-                .map(|p| p.processor.lock().audio_outputs().to_vec())
+                .map(|p| p.processor.audio_outputs().to_vec())
                 .unwrap_or_default(),
         },
     };
@@ -321,8 +322,8 @@ fn silence_task_ports(track: &Arc<UnsafeMutex<Box<Track>>>, task: &ProcessTask) 
         out.buffer.lock().fill(0.0);
         out.finished.store(true, Ordering::Release);
     }
-    t.audio.processing = false;
-    t.audio.finished = true;
+    t.audio.set_processing(false);
+    t.audio.set_finished(true);
 }
 
 #[cfg(test)]
@@ -346,7 +347,7 @@ mod tests {
 
     /// Chain plan: two source tasks -> sum -> sink task.
     /// Buffers: 0 = task A out, 1 = task B out, 2 = sink in, 3 = sink out.
-    fn chain_plan(track: &Arc<UnsafeMutex<Box<Track>>>) -> RenderPlan {
+    fn chain_plan(track: &TrackHandle) -> RenderPlan {
         let nodes = vec![
             Op::Task {
                 task: ProcessTask::Track(track.clone()),
@@ -384,16 +385,8 @@ mod tests {
         }
     }
 
-    fn make_track(name: &str) -> Arc<UnsafeMutex<Box<Track>>> {
-        Arc::new(UnsafeMutex::new(Box::new(Track::new(
-            name.to_string(),
-            1,
-            1,
-            0,
-            0,
-            8,
-            48_000.0,
-        ))))
+    fn make_track(name: &str) -> TrackHandle {
+        Arc::new(Track::new(name.to_string(), 1, 1, 0, 0, 8, 48_000.0))
     }
 
     #[test]
@@ -580,8 +573,8 @@ mod tests {
 
         // The track's legacy port flags were set so dependent bodies proceed.
         let t = track.lock();
-        assert!(t.audio.finished);
-        assert!(!t.audio.processing);
+        assert!(t.audio.finished());
+        assert!(!t.audio.processing());
         for out in &t.audio.outs {
             assert!(out.finished.load(Ordering::Acquire));
             assert!(out.buffer.lock().iter().all(|&s| s == 0.0));

@@ -2,7 +2,6 @@ use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 #[cfg(target_os = "macos")]
 use crate::clap::ClapMidiOutputEvent;
 use crate::message::{PluginGraphConnection, PluginGraphNode};
-use crate::mutex::UnsafeMutex;
 #[cfg(unix)]
 use crate::rubberband::LivePitchShifter;
 
@@ -11,10 +10,16 @@ use crate::{
     audio::io::AudioIO,
     midi::io::{MIDIIO, MidiEvent},
 };
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::{
+    cell::UnsafeCell,
     collections::{HashMap, HashSet},
+    ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
+    },
 };
 
 mod clip_render;
@@ -131,20 +136,20 @@ impl ClipPluginRuntime {
                 .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
-                .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
+                .and_then(|instance| instance.processor.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip CLAP output port: {id}:{port}")),
             PluginGraphNode::Vst3PluginInstance(id) => self
                 .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
-                .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
+                .and_then(|instance| instance.processor.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip VST3 output port: {id}:{port}")),
             #[cfg(all(unix, not(target_os = "macos")))]
             PluginGraphNode::Lv2PluginInstance(id) => self
                 .lv2_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
-                .and_then(|instance| instance.processor.lock().audio_outputs().get(port).cloned())
+                .and_then(|instance| instance.processor.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip LV2 output port: {id}:{port}")),
             PluginGraphNode::TrackOutput => Err("Clip output cannot be audio source".to_string()),
         }
@@ -162,20 +167,20 @@ impl ClipPluginRuntime {
                 .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
-                .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
+                .and_then(|instance| instance.processor.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip CLAP input port: {id}:{port}")),
             PluginGraphNode::Vst3PluginInstance(id) => self
                 .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
-                .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
+                .and_then(|instance| instance.processor.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip VST3 input port: {id}:{port}")),
             #[cfg(all(unix, not(target_os = "macos")))]
             PluginGraphNode::Lv2PluginInstance(id) => self
                 .lv2_plugins
                 .iter()
                 .find(|instance| instance.id == *id)
-                .and_then(|instance| instance.processor.lock().audio_inputs().get(port).cloned())
+                .and_then(|instance| instance.processor.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip LV2 input port: {id}:{port}")),
             PluginGraphNode::TrackInput => Err("Clip input cannot be audio target".to_string()),
         }
@@ -189,7 +194,7 @@ impl ClipPluginRuntime {
     ) -> Vec<Vec<f32>> {
         self.setup_ports();
         for (source, samples) in self.input_sources.iter().zip(input_blocks.iter()) {
-            let buffer = source.buffer.lock();
+            let mut buffer = source.buffer.lock();
             let len = buffer.len().min(request_len);
             buffer.fill(0.0);
             buffer[..len].copy_from_slice(&samples[..len]);
@@ -244,7 +249,7 @@ impl ClipPluginRuntime {
                 if *done {
                     continue;
                 }
-                let processor = self.clap_plugins[idx].processor.lock();
+                let processor = self.clap_plugins[idx].processor.clone();
                 let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
@@ -275,7 +280,7 @@ impl ClipPluginRuntime {
                 if *done {
                     continue;
                 }
-                let processor = self.vst3_plugins[idx].processor.lock();
+                let processor = self.vst3_plugins[idx].processor.clone();
                 let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
@@ -301,7 +306,7 @@ impl ClipPluginRuntime {
                 if *done {
                     continue;
                 }
-                let processor = self.lv2_plugins[idx].processor.lock();
+                let processor = self.lv2_plugins[idx].processor.clone();
                 let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
@@ -378,20 +383,151 @@ pub struct PlayingSessionClip {
     pub active_midi_notes: HashSet<(u8, u8)>,
 }
 
+/// Per-cycle (real-time) state of a [`Track`].
+#[derive(Debug)]
+pub struct TrackRt {
+    pub echoed_parameter_updates: Vec<crate::message::Action>,
+    pub pending_hw_midi_out_events: Vec<HwMidiOutEvent>,
+    pub pending_modulator_midi_events: Vec<MidiEvent>,
+    pub pending_automation_midi_events: Vec<MidiEvent>,
+    last_render_block_silent: bool,
+    pub process_epoch: usize,
+    pub transport_sample: usize,
+    pub loop_enabled: bool,
+    pub loop_range_samples: Option<(usize, usize)>,
+    pub tempo_bpm: f64,
+    pub tsig_num: u16,
+    pub tsig_denom: u16,
+    pub clip_playback_enabled: bool,
+    session_clip_playback_enabled: bool,
+    output_meter_linear_cache: Vec<f32>,
+    meter_peak_hold_linear: Vec<f32>,
+    pub record_tap_outs: Vec<Vec<f32>>,
+    pub record_tap_midi_in: Vec<MidiEvent>,
+    record_tap_enabled: bool,
+    audio_clip_cache: HashMap<String, Arc<AudioClipBuffer>>,
+    clip_plugin_tracks: HashMap<String, ClipPluginRuntime>,
+    #[cfg(unix)]
+    pub(crate) clip_pitch_shifters: HashMap<String, ClipPitchShifter>,
+    midi_clip_cache: HashMap<String, MidiClipEvents>,
+    internal_output_routes_cache: Vec<Vec<Arc<AudioIO>>>,
+    audio_route_cache_dirty: bool,
+    midi_input_to_out_routes_cache: Vec<Vec<usize>>,
+    midi_out_external_targets_cache: Vec<Vec<Arc<MIDIIO>>>,
+    midi_route_cache_dirty: bool,
+    pub pending_session_launches: Vec<PendingSessionLaunch>,
+    pub playing_session_clips: Vec<PlayingSessionClip>,
+    pending_session_midi_note_offs: Vec<MidiEvent>,
+    pub session_slots: HashMap<usize, SessionSlot>,
+    folder_input_midi_events: Vec<Vec<MidiEvent>>,
+    folder_plugin_midi_node_events: HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+    folder_processed_midi_plugins: HashSet<PluginGraphNode>,
+    folder_clip_playback_active: bool,
+    folder_record_tap_input_snapshots: Vec<Vec<f32>>,
+}
+
+impl TrackRt {
+    fn new(audio_outs: usize, buffer_size: usize) -> Self {
+        Self {
+            echoed_parameter_updates: Vec::new(),
+            pending_hw_midi_out_events: vec![],
+            pending_modulator_midi_events: vec![],
+            pending_automation_midi_events: vec![],
+            last_render_block_silent: true,
+            process_epoch: 0,
+            transport_sample: 0,
+            loop_enabled: false,
+            loop_range_samples: None,
+            tempo_bpm: 120.0,
+            tsig_num: 4,
+            tsig_denom: 4,
+            clip_playback_enabled: true,
+            session_clip_playback_enabled: false,
+            output_meter_linear_cache: vec![0.0; audio_outs],
+            meter_peak_hold_linear: vec![0.0; audio_outs],
+            record_tap_outs: vec![vec![0.0; buffer_size]; audio_outs],
+            record_tap_midi_in: vec![],
+            record_tap_enabled: false,
+            audio_clip_cache: HashMap::new(),
+            clip_plugin_tracks: HashMap::new(),
+            #[cfg(unix)]
+            clip_pitch_shifters: HashMap::new(),
+            midi_clip_cache: HashMap::new(),
+            internal_output_routes_cache: Vec::new(),
+            audio_route_cache_dirty: true,
+            midi_input_to_out_routes_cache: Vec::new(),
+            midi_out_external_targets_cache: Vec::new(),
+            midi_route_cache_dirty: true,
+            pending_session_launches: Vec::new(),
+            playing_session_clips: Vec::new(),
+            pending_session_midi_note_offs: Vec::new(),
+            session_slots: HashMap::new(),
+            folder_input_midi_events: Vec::new(),
+            folder_plugin_midi_node_events: HashMap::new(),
+            folder_processed_midi_plugins: HashSet::new(),
+            folder_clip_playback_active: false,
+            folder_record_tap_input_snapshots: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TrackRtCell(UnsafeCell<TrackRt>);
+
+impl TrackRtCell {
+    fn new(rt: TrackRt) -> Self {
+        Self(UnsafeCell::new(rt))
+    }
+
+    /// Mutable RT access is valid only in writer windows guaranteed by the
+    /// render plan: dispatcher cycle setup, one track/folder task body, or
+    /// the offline bounce worker while live plan cycles are suspended.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) fn with_rt<R>(&self, f: impl FnOnce(&mut TrackRt) -> R) -> R {
+        f(unsafe { &mut *self.0.get() })
+    }
+
+    /// Read-only RT access is for plan windows where no writer is active,
+    /// primarily the folder plugin fan-out between FolderInput and
+    /// FolderOutput.
+    pub(crate) fn rt_read(&self) -> &TrackRt {
+        unsafe { &*self.0.get() }
+    }
+}
+
+impl Deref for TrackRtCell {
+    type Target = TrackRt;
+
+    fn deref(&self) -> &Self::Target {
+        self.rt_read()
+    }
+}
+
+impl DerefMut for TrackRtCell {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.get_mut()
+    }
+}
+
 #[derive(Debug)]
 pub struct Track {
+    pub rt: TrackRtCell,
     pub name: String,
-    pub level: f32,
-    pub balance: f32,
-    pub armed: bool,
-    pub muted: bool,
-    pub phase_inverted: bool,
-    pub soloed: bool,
-    pub is_master: bool,
-    pub input_monitor: Vec<bool>,
-    pub disk_monitor: Vec<bool>,
-    pub midi_input_monitor: Vec<bool>,
-    pub midi_disk_monitor: Vec<bool>,
+    // Atomic scalars (5b-iv-1): single-location control values written by the
+    // dispatcher and read by the RT plan. Relaxed ordering is sufficient —
+    // cross-thread happens-before comes from the plan-dispatch channel and
+    // cycle barriers (see LOCKLESS.md).
+    pub level: AtomicU32,
+    pub balance: AtomicU32,
+    pub armed: AtomicBool,
+    pub muted: AtomicBool,
+    pub phase_inverted: AtomicBool,
+    pub soloed: AtomicBool,
+    pub is_master: AtomicBool,
+    input_monitor: ArcSwap<Vec<bool>>,
+    disk_monitor: ArcSwap<Vec<bool>>,
+    midi_input_monitor: ArcSwap<Vec<bool>>,
+    midi_disk_monitor: ArcSwap<Vec<bool>>,
     pub color: Option<crate::message::TrackColor>,
     pub midi_learn_volume: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_balance: Option<crate::message::MidiLearnBinding>,
@@ -401,13 +537,13 @@ pub struct Track {
     pub midi_learn_input_monitor: Option<crate::message::MidiLearnBinding>,
     pub midi_learn_disk_monitor: Option<crate::message::MidiLearnBinding>,
     pub is_folder: bool,
-    pub folder_open: bool,
+    pub folder_open: AtomicBool,
     pub parent_track: Option<String>,
-    pub child_tracks: Vec<Arc<UnsafeMutex<Box<Track>>>>,
+    pub child_tracks: Vec<Arc<Track>>,
     pub automation_lanes: serde_json::Value,
-    pub automation_mode: crate::message::TrackAutomationMode,
-    pub frozen: bool,
-    pub midi_lane_channels: Vec<Option<u8>>,
+    pub automation_mode: AtomicU8,
+    pub frozen: AtomicBool,
+    midi_lane_channels: ArcSwap<Vec<Option<u8>>>,
     primary_audio_ins: usize,
     primary_audio_outs: usize,
     pub audio: AudioTrack,
@@ -418,60 +554,51 @@ pub struct Track {
     pub lv2_plugins: Vec<Lv2Instance>,
     pub plugin_midi_connections: Vec<PluginGraphConnection>,
 
-    pub echoed_parameter_updates: UnsafeMutex<Vec<crate::message::Action>>,
-    pub pending_hw_midi_out_events: Vec<HwMidiOutEvent>,
-    pub pending_modulator_midi_events: Vec<MidiEvent>,
-    pub pending_automation_midi_events: Vec<MidiEvent>,
-    pub next_clap_instance_id: usize,
-    pub next_vst3_instance_id: usize,
+    pub next_clap_instance_id: AtomicUsize,
+    pub next_vst3_instance_id: AtomicUsize,
     #[cfg(all(unix, not(target_os = "macos")))]
-    pub next_lv2_instance_id: usize,
-    pub next_plugin_instance_id: usize,
+    pub next_lv2_instance_id: AtomicUsize,
+    pub next_plugin_instance_id: AtomicUsize,
     pub sample_rate: f64,
-    process_block_size: usize,
+    process_block_size: AtomicUsize,
     force_realtime_domain: bool,
     shared_realtime_mixed: bool,
-    last_render_block_silent: bool,
-    pub output_enabled: bool,
-    pub process_epoch: usize,
-    pub transport_sample: usize,
-    pub loop_enabled: bool,
-    pub loop_range_samples: Option<(usize, usize)>,
-    pub tempo_bpm: f64,
-    pub tsig_num: u16,
-    pub tsig_denom: u16,
-    pub clip_playback_enabled: bool,
-    pub metronome_enabled: bool,
-    output_meter_linear_cache: Vec<f32>,
-    meter_peak_hold_linear: Vec<f32>,
-    pub record_tap_outs: Vec<Vec<f32>>,
-    pub record_tap_midi_in: Vec<MidiEvent>,
+    pub output_enabled: AtomicBool,
+    pub metronome_enabled: AtomicBool,
     pub session_base_dir: Option<PathBuf>,
-    record_tap_enabled: bool,
-    audio_clip_cache: HashMap<String, Arc<AudioClipBuffer>>,
-    clip_plugin_tracks: HashMap<String, ClipPluginRuntime>,
-    #[cfg(unix)]
-    pub(crate) clip_pitch_shifters: HashMap<String, ClipPitchShifter>,
-    midi_clip_cache: HashMap<String, MidiClipEvents>,
-    internal_output_routes_cache: Vec<Vec<Arc<AudioIO>>>,
-    audio_route_cache_dirty: bool,
-    metronome_source: Option<Arc<AudioIO>>,
-    midi_input_to_out_routes_cache: Vec<Vec<usize>>,
-    midi_out_external_targets_cache: Vec<Vec<Arc<MIDIIO>>>,
-    midi_route_cache_dirty: bool,
-
-    pub pending_session_launches: Vec<PendingSessionLaunch>,
-    pub playing_session_clips: Vec<PlayingSessionClip>,
-    pending_session_midi_note_offs: Vec<MidiEvent>,
-    pub session_slots: HashMap<usize, SessionSlot>,
-    session_clip_playback_enabled: bool,
-
-    folder_input_midi_events: Vec<Vec<MidiEvent>>,
-    folder_plugin_midi_node_events: HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
-    folder_processed_midi_plugins: HashSet<PluginGraphNode>,
-    folder_clip_playback_active: bool,
-    folder_record_tap_input_snapshots: Vec<Vec<f32>>,
+    metronome_source: ArcSwapOption<AudioIO>,
 }
+
+pub struct TrackGuard {
+    ptr: *mut Track,
+}
+
+unsafe impl Send for TrackGuard {}
+
+impl Deref for TrackGuard {
+    type Target = Track;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl DerefMut for TrackGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.ptr }
+    }
+}
+
+impl Track {
+    pub fn lock(&self) -> TrackGuard {
+        TrackGuard {
+            ptr: std::ptr::from_ref(self).cast_mut(),
+        }
+    }
+}
+
+unsafe impl Sync for Track {}
+unsafe impl Send for Track {}
 
 impl crate::connectable::AudioPorts for Track {
     fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
@@ -498,9 +625,9 @@ mod tests {
     use super::{AudioClipBuffer, HwMidiOutEvent, Track};
     use crate::audio::clip::AudioClip;
     use crate::audio::io::AudioIO;
-    use crate::mutex::UnsafeMutex;
     use crate::{kind::Kind, message::PluginGraphNode};
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn default_audio_passthrough_uses_minimum_port_count() {
@@ -573,13 +700,13 @@ mod tests {
         source.buffer.lock()[1] = -0.25;
         AudioIO::connect(&source, &track.audio.ins[0]);
 
-        track.input_monitor = vec![false];
+        track.set_input_monitor(vec![false]);
         track.process();
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.0);
         assert_eq!(out[1], 0.0);
 
-        track.input_monitor = vec![true];
+        track.set_input_monitor(vec![true]);
         track.process();
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.5);
@@ -589,12 +716,12 @@ mod tests {
     #[test]
     fn clip_playback_audible_with_input_monitor_off() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
         let mut clip = AudioClip::new("clip".to_string(), 0, 4);
         clip.fade_enabled = false;
-        track.audio.clips.push(clip);
-        track.audio_clip_cache.insert(
+        track.audio.push_clip(clip);
+        track.rt.audio_clip_cache.insert(
             "clip".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -610,10 +737,10 @@ mod tests {
     #[test]
     fn record_tap_captures_live_input_with_disk_monitor_on_and_input_monitor_off() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.armed = true;
-        track.record_tap_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.armed.store(true, Ordering::Relaxed);
+        track.rt.record_tap_enabled = true;
         let source = Arc::new(AudioIO::new(8));
         source.buffer.lock()[0] = 0.5;
         source.buffer.lock()[1] = -0.25;
@@ -621,17 +748,17 @@ mod tests {
 
         track.process();
 
-        assert_eq!(track.record_tap_outs[0][0], 0.5);
-        assert_eq!(track.record_tap_outs[0][1], -0.25);
+        assert_eq!(track.rt.record_tap_outs[0][0], 0.5);
+        assert_eq!(track.rt.record_tap_outs[0][1], -0.25);
     }
 
     #[test]
     fn record_tap_falls_back_to_direct_input_when_no_internal_route_exists() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.armed = true;
-        track.record_tap_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.armed.store(true, Ordering::Relaxed);
+        track.rt.record_tap_enabled = true;
         track.clear_default_passthrough();
         let source = Arc::new(AudioIO::new(8));
         source.buffer.lock()[0] = 0.25;
@@ -640,20 +767,20 @@ mod tests {
 
         track.process();
 
-        assert_eq!(track.record_tap_outs[0][0], 0.25);
-        assert_eq!(track.record_tap_outs[0][1], -0.5);
+        assert_eq!(track.rt.record_tap_outs[0][0], 0.25);
+        assert_eq!(track.rt.record_tap_outs[0][1], -0.5);
     }
 
     #[test]
     fn clip_playback_respects_clip_playback_enabled_flag() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = false;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = false;
         let mut clip = AudioClip::new("clip".to_string(), 0, 4);
         clip.fade_enabled = false;
-        track.audio.clips.push(clip);
-        track.audio_clip_cache.insert(
+        track.audio.push_clip(clip);
+        track.rt.audio_clip_cache.insert(
             "clip".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -665,7 +792,7 @@ mod tests {
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.0);
 
-        track.clip_playback_enabled = true;
+        track.rt.clip_playback_enabled = true;
         track.process();
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.8);
@@ -680,8 +807,8 @@ mod tests {
         right.buffer.lock()[0] = 0.75;
         AudioIO::connect(&left, &track.audio.ins[0]);
         AudioIO::connect(&right, &track.audio.ins[1]);
-        track.input_monitor = vec![true; 2];
-        track.disk_monitor = vec![false; 2];
+        track.set_input_monitor(vec![true; 2]);
+        track.set_disk_monitor(vec![false; 2]);
 
         track.process();
         let out_l = track.audio.outs[0].buffer.lock().to_vec();
@@ -863,21 +990,21 @@ mod tests {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
 
         track.set_transport_timing(0.0, 0, 0);
-        assert_eq!(track.tempo_bpm, 1.0);
-        assert_eq!(track.tsig_num, 1);
-        assert_eq!(track.tsig_denom, 1);
+        assert_eq!(track.rt.tempo_bpm, 1.0);
+        assert_eq!(track.rt.tsig_num, 1);
+        assert_eq!(track.rt.tsig_denom, 1);
 
         track.set_loop_config(true, Some((128, 256)));
-        assert!(track.loop_enabled);
-        assert_eq!(track.loop_range_samples, Some((128, 256)));
+        assert!(track.rt.loop_enabled);
+        assert_eq!(track.rt.loop_range_samples, Some((128, 256)));
     }
 
     #[test]
     fn cycle_segments_wrap_across_loop_boundary() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.transport_sample = 14;
-        track.loop_enabled = true;
-        track.loop_range_samples = Some((10, 16));
+        track.rt.transport_sample = 14;
+        track.rt.loop_enabled = true;
+        track.rt.loop_range_samples = Some((10, 16));
 
         let segments = track.cycle_segments(6);
         assert_eq!(segments, vec![(14, 16, 0), (10, 14, 2)]);
@@ -886,15 +1013,15 @@ mod tests {
     #[test]
     fn offline_bounce_restores_transport_and_monitor_state() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.transport_sample = 123;
-        track.disk_monitor = vec![false];
-        track.input_monitor = vec![true];
-        track.clip_playback_enabled = false;
-        track.output_enabled = false;
-        track.loop_enabled = true;
-        track.loop_range_samples = Some((32, 64));
-        track.armed = true;
-        track.pending_hw_midi_out_events.push(HwMidiOutEvent {
+        track.rt.transport_sample = 123;
+        track.set_disk_monitor(vec![false]);
+        track.set_input_monitor(vec![true]);
+        track.rt.clip_playback_enabled = false;
+        track.set_output_enabled(false);
+        track.rt.loop_enabled = true;
+        track.rt.loop_range_samples = Some((32, 64));
+        track.armed.store(true, Ordering::Relaxed);
+        track.rt.pending_hw_midi_out_events.push(HwMidiOutEvent {
             port: 0,
             event: crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100]),
         });
@@ -903,42 +1030,42 @@ mod tests {
         assert_eq!(channels, 1);
         assert_eq!(rendered.len(), 4);
 
-        assert_eq!(track.transport_sample, 123);
-        assert!(!track.disk_monitor.first().copied().unwrap_or(false));
-        assert!(track.input_monitor.first().copied().unwrap_or(false));
-        assert!(!track.clip_playback_enabled);
-        assert!(!track.output_enabled);
-        assert!(track.loop_enabled);
-        assert_eq!(track.loop_range_samples, Some((32, 64)));
-        assert!(track.armed);
-        assert_eq!(track.pending_hw_midi_out_events.len(), 1);
+        assert_eq!(track.rt.transport_sample, 123);
+        assert!(!track.disk_monitor().first().copied().unwrap_or(false));
+        assert!(track.input_monitor().first().copied().unwrap_or(false));
+        assert!(!track.rt.clip_playback_enabled);
+        assert!(!track.output_enabled());
+        assert!(track.rt.loop_enabled);
+        assert_eq!(track.rt.loop_range_samples, Some((32, 64)));
+        assert!(track.armed());
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 1);
     }
 
     #[test]
     fn midi_only_track_clip_playback_generates_hw_midi_events() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
-        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
             0,
             8,
         ));
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "clip.mid".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100])]),
         );
 
         track.process();
 
-        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
-        assert_eq!(track.pending_hw_midi_out_events[0].port, 0);
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(track.rt.pending_hw_midi_out_events[0].port, 0);
         assert_eq!(
-            track.pending_hw_midi_out_events[0].event,
+            track.rt.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
         );
         assert_eq!(
-            track.pending_hw_midi_out_events[1].event,
+            track.rt.pending_hw_midi_out_events[1].event,
             crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
         );
     }
@@ -946,27 +1073,27 @@ mod tests {
     #[test]
     fn midi_clip_emits_note_off_at_exact_clip_end() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
-        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
             0,
             8,
         ));
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "clip.mid".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100]), (8, vec![0x80, 60, 64])]),
         );
 
         track.process();
 
-        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 2);
         assert_eq!(
-            track.pending_hw_midi_out_events[0].event,
+            track.rt.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
         );
         assert_eq!(
-            track.pending_hw_midi_out_events[1].event,
+            track.rt.pending_hw_midi_out_events[1].event,
             crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
         );
     }
@@ -974,29 +1101,29 @@ mod tests {
     #[test]
     fn midi_clip_emits_note_off_at_exact_loop_end() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
-        track.loop_enabled = true;
-        track.loop_range_samples = Some((0, 8));
-        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.rt.loop_enabled = true;
+        track.rt.loop_range_samples = Some((0, 8));
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
             0,
             8,
         ));
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "clip.mid".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100]), (8, vec![0x80, 60, 64])]),
         );
 
         track.process();
 
-        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 2);
         assert_eq!(
-            track.pending_hw_midi_out_events[0].event,
+            track.rt.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
         );
         assert_eq!(
-            track.pending_hw_midi_out_events[1].event,
+            track.rt.pending_hw_midi_out_events[1].event,
             crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
         );
     }
@@ -1004,30 +1131,30 @@ mod tests {
     #[test]
     fn midi_clip_orders_loop_boundary_note_off_before_next_note_on() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
-        track.transport_sample = 6;
-        track.loop_enabled = true;
-        track.loop_range_samples = Some((0, 8));
-        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.rt.transport_sample = 6;
+        track.rt.loop_enabled = true;
+        track.rt.loop_range_samples = Some((0, 8));
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
             0,
             8,
         ));
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "clip.mid".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100]), (8, vec![0x80, 60, 64])]),
         );
 
         track.process();
 
-        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 2);
         assert_eq!(
-            track.pending_hw_midi_out_events[0].event,
+            track.rt.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(2, vec![0x80, 60, 64])
         );
         assert_eq!(
-            track.pending_hw_midi_out_events[1].event,
+            track.rt.pending_hw_midi_out_events[1].event,
             crate::midi::io::MidiEvent::new(2, vec![0x90, 60, 100])
         );
     }
@@ -1035,27 +1162,27 @@ mod tests {
     #[test]
     fn midi_clip_sends_note_off_at_clip_end_when_source_note_ends_later() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
-        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
             0,
             8,
         ));
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "clip.mid".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100]), (12, vec![0x80, 60, 64])]),
         );
 
         track.process();
 
-        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 2);
         assert_eq!(
-            track.pending_hw_midi_out_events[0].event,
+            track.rt.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100])
         );
         assert_eq!(
-            track.pending_hw_midi_out_events[1].event,
+            track.rt.pending_hw_midi_out_events[1].event,
             crate::midi::io::MidiEvent::new(7, vec![0x80, 60, 64])
         );
     }
@@ -1063,30 +1190,30 @@ mod tests {
     #[test]
     fn midi_clip_orders_synthetic_loop_note_off_before_next_note_on() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
-        track.transport_sample = 6;
-        track.loop_enabled = true;
-        track.loop_range_samples = Some((0, 8));
-        track.midi.clips.push(crate::midi::clip::MIDIClip::new(
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.rt.transport_sample = 6;
+        track.rt.loop_enabled = true;
+        track.rt.loop_range_samples = Some((0, 8));
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
             "clip.mid".to_string(),
             0,
             8,
         ));
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "clip.mid".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100]), (12, vec![0x80, 60, 64])]),
         );
 
         track.process();
 
-        assert_eq!(track.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 2);
         assert_eq!(
-            track.pending_hw_midi_out_events[0].event,
+            track.rt.pending_hw_midi_out_events[0].event,
             crate::midi::io::MidiEvent::new(2, vec![0x80, 60, 64])
         );
         assert_eq!(
-            track.pending_hw_midi_out_events[1].event,
+            track.rt.pending_hw_midi_out_events[1].event,
             crate::midi::io::MidiEvent::new(2, vec![0x90, 60, 100])
         );
     }
@@ -1094,7 +1221,7 @@ mod tests {
     #[test]
     fn midi_lane_channel_filters_monitored_input() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.midi_input_monitor = vec![true];
+        track.set_midi_input_monitor(vec![true]);
         track.set_midi_lane_channel(0, Some(1));
         track.push_hw_midi_events_to_port(
             0,
@@ -1114,13 +1241,13 @@ mod tests {
             crate::midi::io::MidiEvent::new(1, vec![0x91, 61, 101])
         );
         assert_eq!(events[0][1], crate::midi::io::MidiEvent::new(2, vec![0xF8]));
-        assert_eq!(track.record_tap_midi_in.len(), 3);
+        assert_eq!(track.rt.record_tap_midi_in.len(), 3);
     }
 
     #[test]
     fn midi_lane_channel_omni_does_not_filter_input() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.midi_input_monitor = vec![true];
+        track.set_midi_input_monitor(vec![true]);
         track.set_midi_lane_channel(0, None);
         track.push_hw_midi_events_to_port(
             0,
@@ -1139,8 +1266,8 @@ mod tests {
     #[test]
     fn grouped_audio_playback_sums_child_buffers() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
 
         let mut active_child = AudioClip::new("active".to_string(), 0, 4);
         active_child.fade_enabled = false;
@@ -1151,15 +1278,15 @@ mod tests {
         let mut group = AudioClip::new("group".to_string(), 0, 4);
         group.fade_enabled = false;
         group.grouped_clips = vec![active_child, muted_child];
-        track.audio.clips.push(group);
-        track.audio_clip_cache.insert(
+        track.audio.push_clip(group);
+        track.rt.audio_clip_cache.insert(
             "active".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
                 samples: vec![0.6, 0.0, 0.0, 0.0],
             }),
         );
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "muted".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1208,15 +1335,7 @@ mod tests {
     #[test]
     fn connectable_connections_reports_child_to_folder_output() {
         let mut folder = Track::new_folder("Folder".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        let child = Arc::new(UnsafeMutex::new(Box::new(Track::new(
-            "Child".to_string(),
-            1,
-            1,
-            0,
-            0,
-            8,
-            48_000.0,
-        ))));
+        let child = Arc::new(Track::new("Child".to_string(), 1, 1, 0, 0, 8, 48_000.0));
         {
             let child_lock = child.lock();
             AudioIO::connect(&child_lock.audio.outs[0], &folder.audio.outs[0]);
@@ -1237,15 +1356,7 @@ mod tests {
     fn connect_audio_connectable_links_child_output_to_track_input() {
         let mut track = Track::new("Parent".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         track.clear_default_passthrough();
-        let child = Arc::new(UnsafeMutex::new(Box::new(Track::new(
-            "Child".to_string(),
-            1,
-            1,
-            0,
-            0,
-            8,
-            48_000.0,
-        ))));
+        let child = Arc::new(Track::new("Child".to_string(), 1, 1, 0, 0, 8, 48_000.0));
         track.child_tracks.push(child);
 
         track
@@ -1271,15 +1382,7 @@ mod tests {
     fn connect_midi_connectable_links_child_output_to_track_input() {
         let mut track = Track::new("Parent".to_string(), 0, 0, 1, 1, 8, 48_000.0);
         track.clear_default_passthrough();
-        let child = Arc::new(UnsafeMutex::new(Box::new(Track::new(
-            "Child".to_string(),
-            0,
-            0,
-            1,
-            1,
-            8,
-            48_000.0,
-        ))));
+        let child = Arc::new(Track::new("Child".to_string(), 0, 0, 1, 1, 8, 48_000.0));
         track.child_tracks.push(child);
 
         track
@@ -1316,38 +1419,38 @@ mod tests {
 
     #[test]
     fn folder_track_cannot_become_master() {
-        let mut track = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
-        assert!(!track.is_master);
+        let track = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        assert!(!track.is_master());
 
         track.toggle_master();
-        assert!(!track.is_master);
+        assert!(!track.is_master());
 
         track.set_master(true);
-        assert!(!track.is_master);
+        assert!(!track.is_master());
     }
 
     #[test]
     fn master_track_can_be_unmastered_even_when_folder() {
-        let mut track = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
-        track.is_master = true;
+        let track = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.is_master.store(true, Ordering::Relaxed);
 
         track.toggle_master();
-        assert!(!track.is_master);
+        assert!(!track.is_master());
 
         track.set_master(true);
-        assert!(!track.is_master);
+        assert!(!track.is_master());
     }
 
     #[test]
     fn normal_track_can_be_toggled_master() {
-        let mut track = Track::new("t".to_string(), 2, 2, 0, 0, 64, 48_000.0);
-        assert!(!track.is_master);
+        let track = Track::new("t".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        assert!(!track.is_master());
 
         track.toggle_master();
-        assert!(track.is_master);
+        assert!(track.is_master());
 
         track.toggle_master();
-        assert!(!track.is_master);
+        assert!(!track.is_master());
     }
 
     #[test]
@@ -1441,18 +1544,18 @@ mod tests {
     #[test]
     fn session_audio_launch_plays_referenced_clip() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         // Place the arrangement clip far after the current transport so only the
         // session playback path contributes audio.
         let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
         clip.id = "clip-1".to_string();
         clip.fade_enabled = false;
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
 
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1479,16 +1582,16 @@ mod tests {
     #[test]
     fn session_audio_stop_at_boundary_halts_playback() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1016);
         clip.id = "clip-1".to_string();
         clip.fade_enabled = false;
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
 
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1507,29 +1610,29 @@ mod tests {
         });
 
         track.process();
-        assert_eq!(track.playing_session_clips.len(), 1);
-        assert_eq!(track.playing_session_clips[0].play_position_samples, 8);
+        assert_eq!(track.rt.playing_session_clips.len(), 1);
+        assert_eq!(track.rt.playing_session_clips[0].play_position_samples, 8);
 
-        track.transport_sample = 8;
+        track.rt.transport_sample = 8;
         track.schedule_session_stop(0, 8);
         track.process();
 
-        assert!(track.playing_session_clips.is_empty());
+        assert!(track.rt.playing_session_clips.is_empty());
     }
 
     #[test]
     fn session_audio_loop_repeats_clip_content() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
         clip.id = "clip-1".to_string();
         clip.fade_enabled = false;
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
 
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1563,16 +1666,16 @@ mod tests {
     #[test]
     fn session_audio_loop_with_zero_end_loops_full_clip() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
         clip.id = "clip-1".to_string();
         clip.fade_enabled = false;
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
 
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1606,28 +1709,28 @@ mod tests {
     #[test]
     fn session_multiple_clips_mix_together() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         let mut clip1 = AudioClip::new("clip1".to_string(), 1000, 1004);
         clip1.id = "id1".to_string();
         clip1.fade_enabled = false;
-        track.audio.clips.push(clip1);
+        track.audio.push_clip(clip1);
 
         let mut clip2 = AudioClip::new("clip2".to_string(), 1000, 1004);
         clip2.id = "id2".to_string();
         clip2.fade_enabled = false;
-        track.audio.clips.push(clip2);
+        track.audio.push_clip(clip2);
 
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "clip1".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
                 samples: vec![0.5, 0.0, 0.0, 0.0],
             }),
         );
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "clip2".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1663,14 +1766,14 @@ mod tests {
     #[test]
     fn session_midi_launch_plays_referenced_clip() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         let mut clip = crate::midi::clip::MIDIClip::new("session_clip".to_string(), 0, 8);
         clip.id = "clip-1".to_string();
-        track.midi.clips.push(clip);
+        track.midi.push_clip(clip);
 
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "session_clip".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100])]),
         );
@@ -1689,6 +1792,7 @@ mod tests {
 
         assert!(
             track
+                .rt
                 .pending_hw_midi_out_events
                 .iter()
                 .any(|e| e.event.data == vec![0x90, 60, 100])
@@ -1698,14 +1802,14 @@ mod tests {
     #[test]
     fn session_midi_stop_emits_note_off_for_active_notes() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         let mut clip = crate::midi::clip::MIDIClip::new("session_clip".to_string(), 0, 16);
         clip.id = "clip-1".to_string();
-        track.midi.clips.push(clip);
+        track.midi.push_clip(clip);
 
-        track.midi_clip_cache.insert(
+        track.rt.midi_clip_cache.insert(
             "session_clip".to_string(),
             Arc::new(vec![(0, vec![0x90, 60, 100])]),
         );
@@ -1723,17 +1827,19 @@ mod tests {
         track.process();
         assert!(
             track
+                .rt
                 .pending_hw_midi_out_events
                 .iter()
                 .any(|e| e.event.data == vec![0x90, 60, 100])
         );
 
-        track.transport_sample = 8;
+        track.rt.transport_sample = 8;
         track.schedule_session_stop(0, 8);
         track.process();
 
         assert!(
             track
+                .rt
                 .pending_hw_midi_out_events
                 .iter()
                 .any(|e| e.event.data == vec![0x80, 60, 64])
@@ -1743,9 +1849,9 @@ mod tests {
     #[test]
     fn session_launch_with_missing_clip_is_ignored() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         track.schedule_session_launch(super::PendingSessionLaunch {
             scene_index: 0,
@@ -1759,7 +1865,7 @@ mod tests {
 
         track.process();
 
-        assert!(track.playing_session_clips.is_empty());
+        assert!(track.rt.playing_session_clips.is_empty());
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.0);
     }
@@ -1767,28 +1873,28 @@ mod tests {
     #[test]
     fn session_launch_same_scene_replaces_playing_clip() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        track.input_monitor = vec![false];
-        track.disk_monitor = vec![true];
-        track.clip_playback_enabled = true;
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
 
         let mut clip1 = AudioClip::new("clip1".to_string(), 1000, 1008);
         clip1.id = "id1".to_string();
         clip1.fade_enabled = false;
-        track.audio.clips.push(clip1);
+        track.audio.push_clip(clip1);
 
         let mut clip2 = AudioClip::new("clip2".to_string(), 1000, 1008);
         clip2.id = "id2".to_string();
         clip2.fade_enabled = false;
-        track.audio.clips.push(clip2);
+        track.audio.push_clip(clip2);
 
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "clip1".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
                 samples: vec![0.1; 8],
             }),
         );
-        track.audio_clip_cache.insert(
+        track.rt.audio_clip_cache.insert(
             "clip2".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1796,18 +1902,21 @@ mod tests {
             }),
         );
 
-        track.playing_session_clips.push(super::PlayingSessionClip {
-            scene_index: 0,
-            clip_id: "id1".to_string(),
-            kind: Kind::Audio,
-            play_position_samples: 4,
-            elapsed_samples: 4,
-            loop_enabled: false,
-            loop_start_samples: 0,
-            loop_end_samples: 0,
-            stop_at_sample: None,
-            active_midi_notes: std::collections::HashSet::new(),
-        });
+        track
+            .rt
+            .playing_session_clips
+            .push(super::PlayingSessionClip {
+                scene_index: 0,
+                clip_id: "id1".to_string(),
+                kind: Kind::Audio,
+                play_position_samples: 4,
+                elapsed_samples: 4,
+                loop_enabled: false,
+                loop_start_samples: 0,
+                loop_end_samples: 0,
+                stop_at_sample: None,
+                active_midi_notes: std::collections::HashSet::new(),
+            });
 
         track.schedule_session_launch(super::PendingSessionLaunch {
             scene_index: 0,
@@ -1821,8 +1930,8 @@ mod tests {
 
         track.process();
 
-        assert_eq!(track.playing_session_clips.len(), 1);
-        assert_eq!(track.playing_session_clips[0].clip_id, "id2");
+        assert_eq!(track.rt.playing_session_clips.len(), 1);
+        assert_eq!(track.rt.playing_session_clips[0].clip_id, "id2");
         let out = track.audio.outs[0].buffer.lock().to_vec();
         assert_eq!(out[0], 0.7);
     }
@@ -1830,16 +1939,16 @@ mod tests {
     #[test]
     fn folder_output_passes_child_session_clip_audio() {
         let mut child = Track::new("child".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        child.input_monitor = vec![false];
-        child.disk_monitor = vec![true];
-        child.clip_playback_enabled = false;
-        child.session_clip_playback_enabled = true;
+        child.set_input_monitor(vec![false]);
+        child.set_disk_monitor(vec![true]);
+        child.rt.clip_playback_enabled = false;
+        child.rt.session_clip_playback_enabled = true;
 
         let mut clip = AudioClip::new("session_clip".to_string(), 1000, 1004);
         clip.id = "clip-1".to_string();
         clip.fade_enabled = false;
-        child.audio.clips.push(clip);
-        child.audio_clip_cache.insert(
+        child.audio.push_clip(clip);
+        child.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
             Arc::new(AudioClipBuffer {
                 channels: 1,
@@ -1860,9 +1969,9 @@ mod tests {
         assert_eq!(child.audio.outs[0].buffer.lock()[0], 0.1);
 
         let mut folder = Track::new_folder("folder".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        folder.clip_playback_enabled = false;
-        folder.session_clip_playback_enabled = true;
-        let child_arc = Arc::new(UnsafeMutex::new(Box::new(child)));
+        folder.rt.clip_playback_enabled = false;
+        folder.rt.session_clip_playback_enabled = true;
+        let child_arc = Arc::new(child);
         {
             let child_lock = child_arc.lock();
             AudioIO::connect(&child_lock.audio.outs[0], &folder.audio.outs[0]);

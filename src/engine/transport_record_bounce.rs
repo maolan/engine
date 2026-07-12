@@ -25,7 +25,6 @@ use crate::{
         SessionAction,
     },
     midi::clip::MIDIClip,
-    mutex::UnsafeMutex,
     track::{SessionSlot, Track},
 };
 use midly::{
@@ -47,18 +46,16 @@ impl Engine {
             return;
         }
         let (cycle_samples, sample_rate_hz, output_channels): (usize, f64, usize) =
-            if let Some(hw) = &self.hw_driver {
-                let hw = hw.lock();
+            if let Some(info) = self.hw_driver_info {
                 (
-                    hw.cycle_samples(),
-                    hw.sample_rate() as f64,
-                    hw.output_channels(),
+                    info.cycle_samples,
+                    info.sample_rate as f64,
+                    info.output_channels,
                 )
             } else {
                 #[cfg(unix)]
                 {
                     if let Some(jack) = &self.jack_runtime {
-                        let jack = jack.lock();
                         (
                             jack.buffer_size,
                             jack.sample_rate as f64,
@@ -78,7 +75,7 @@ impl Engine {
         }
         self.state.lock().tracks.insert(
             Self::METRONOME_TRACK.to_string(),
-            Arc::new(UnsafeMutex::new(Box::new(Track::new(
+            Arc::new(Track::new(
                 Self::METRONOME_TRACK.to_string(),
                 0,
                 1,
@@ -86,7 +83,7 @@ impl Engine {
                 0,
                 cycle_samples.max(1),
                 sample_rate_hz.max(1.0),
-            )))),
+            )),
         );
         if let Some(track) = self.state.lock().tracks.get(Self::METRONOME_TRACK).cloned() {
             track.lock().set_level(Self::METRONOME_DEFAULT_LEVEL_DB);
@@ -146,11 +143,12 @@ impl Engine {
         }
         for (name, track_handle) in &self.state.lock().tracks {
             let track = track_handle.lock();
-            if !track.armed {
+            if !track.armed() {
                 continue;
             }
-            let audio_channels = track.record_tap_outs.len();
+            let audio_channels = track.rt.record_tap_outs.len();
             let audio_frames = track
+                .rt
                 .record_tap_outs
                 .first()
                 .map(|ch| ch.len())
@@ -188,7 +186,7 @@ impl Engine {
                             let is_new_stripe =
                                 entry.current_stripe_frames % RECORDING_STRIPE_FRAMES == 0;
                             for ch in 0..audio_channels {
-                                let sample = track.record_tap_outs[ch][frame].clamp(-1.0, 1.0);
+                                let sample = track.rt.record_tap_outs[ch][frame].clamp(-1.0, 1.0);
                                 if is_new_stripe {
                                     entry.stripe_peaks[ch].push([sample, sample]);
                                 } else {
@@ -198,7 +196,7 @@ impl Engine {
                                     entry.stripe_peaks[ch][idx][1] =
                                         entry.stripe_peaks[ch][idx][1].max(sample);
                                 }
-                                entry.samples.push(track.record_tap_outs[ch][frame]);
+                                entry.samples.push(track.rt.record_tap_outs[ch][frame]);
                             }
                             entry.current_stripe_frames += 1;
                         }
@@ -214,7 +212,7 @@ impl Engine {
                 });
                 let from = frame_offset;
                 let to = frame_offset.saturating_add(segment_len);
-                for event in &track.record_tap_midi_in {
+                for event in &track.rt.record_tap_midi_in {
                     let frame = event.frame as usize;
                     if frame < from || frame >= to {
                         continue;
@@ -270,9 +268,8 @@ impl Engine {
             return;
         }
         let rate = self
-            .hw_driver
-            .as_ref()
-            .map(|o| o.lock().sample_rate())
+            .hw_driver_info
+            .map(|info| info.sample_rate)
             .unwrap_or(48_000);
         let completed_audio = std::mem::take(&mut self.completed_audio_recordings);
         for (track_name, rec) in completed_audio {
@@ -329,9 +326,8 @@ impl Engine {
             return;
         }
         let rate = self
-            .hw_driver
-            .as_ref()
-            .map(|o| o.lock().sample_rate())
+            .hw_driver_info
+            .map(|info| info.sample_rate)
             .unwrap_or(48_000);
         let completed_audio = std::mem::take(&mut self.completed_audio_recordings);
         for (track_name, rec) in completed_audio {
@@ -459,7 +455,7 @@ impl Engine {
             let track = track.lock();
             let audio_ins = track.audio.ins.len();
             let audio_outs = track.audio.outs.len();
-            track.audio.clips.push(clip.clone());
+            track.audio.push_clip(clip.clone());
             (audio_ins, audio_outs)
         } else {
             tracing::warn!(
@@ -528,9 +524,8 @@ impl Engine {
             return;
         }
         let rate = self
-            .hw_driver
-            .as_ref()
-            .map(|o| o.lock().sample_rate())
+            .hw_driver_info
+            .map(|info| info.sample_rate)
             .unwrap_or(48_000);
         let mut i = 0;
         while i < self.completed_audio_recordings.len() {
@@ -613,7 +608,7 @@ impl Engine {
         let clip_id = crate::message::generate_clip_id();
         clip.id.clone_from(&clip_id);
         if let Some(track) = self.state.lock().tracks.get(&track_name) {
-            track.lock().midi.clips.push(clip);
+            track.lock().midi.push_clip(clip);
         }
         self.notify_clients(Ok(Action::AddClip {
             clip_id,
@@ -733,9 +728,10 @@ impl Engine {
                     tracing::warn!("Session launch for unknown track '{}'", track_name);
                     return;
                 };
-                let track = track.lock();
+                let mut track = track.lock();
                 let clip_id = if clip_id.is_empty() {
                     track
+                        .rt
                         .session_slots
                         .get(&scene_index)
                         .map(|slot| slot.clip_id.clone())
@@ -743,9 +739,9 @@ impl Engine {
                 } else {
                     clip_id
                 };
-                let kind = if track.audio.clips.iter().any(|c| c.id == clip_id) {
+                let kind = if track.audio.clips().iter().any(|c| c.id == clip_id) {
                     Kind::Audio
-                } else if track.midi.clips.iter().any(|c| c.id == clip_id) {
+                } else if track.midi.clips().iter().any(|c| c.id == clip_id) {
                     Kind::MIDI
                 } else {
                     tracing::warn!(
@@ -795,17 +791,17 @@ impl Engine {
                 let launch_at_sample = quantize(quantize_reference_sample, launch_quantization);
                 let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
                 for track in tracks {
-                    let track_lock = track.lock();
-                    let Some(slot) = track_lock.session_slots.get(&scene_index) else {
+                    let mut track_lock = track.lock();
+                    let Some(slot) = track_lock.rt.session_slots.get(&scene_index) else {
                         continue;
                     };
                     if !slot.play_enabled {
                         continue;
                     }
                     let clip_id = slot.clip_id.clone();
-                    let kind = if track_lock.audio.clips.iter().any(|c| c.id == clip_id) {
+                    let kind = if track_lock.audio.clips().iter().any(|c| c.id == clip_id) {
                         Kind::Audio
-                    } else if track_lock.midi.clips.iter().any(|c| c.id == clip_id) {
+                    } else if track_lock.midi.clips().iter().any(|c| c.id == clip_id) {
                         Kind::MIDI
                     } else {
                         continue;
@@ -837,8 +833,8 @@ impl Engine {
                 let stop_at_sample = quantize(quantize_reference_sample, LaunchQuantization::Bar);
                 let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
                 for track in tracks {
-                    let track = track.lock();
-                    for clip in &mut track.playing_session_clips {
+                    let mut track = track.lock();
+                    for clip in &mut track.rt.playing_session_clips {
                         if clip.stop_at_sample.is_none() {
                             clip.stop_at_sample = Some(stop_at_sample);
                         }
@@ -872,11 +868,11 @@ impl Engine {
             for track in tracks.values() {
                 let t = track.lock();
                 track_count += 1;
-                if t.frozen {
+                if t.frozen() {
                     frozen_track_count += 1;
                 }
-                audio_clip_count += t.audio.clips.len();
-                midi_clip_count += t.midi.clips.len();
+                audio_clip_count += t.audio.clips().len();
+                midi_clip_count += t.midi.clips().len();
                 #[cfg(all(unix, not(target_os = "macos")))]
                 {
                     lv2_instance_count += t.lv2_plugins.len();
@@ -902,14 +898,14 @@ impl Engine {
                 .values()
                 .map(std::vec::Vec::len)
                 .sum::<usize>();
-        let sample_rate_hz = if let Some(hw) = &self.hw_driver {
-            hw.lock().sample_rate() as usize
+        let sample_rate_hz = if let Some(info) = self.hw_driver_info {
+            info.sample_rate as usize
         } else {
             #[cfg(unix)]
             {
                 self.jack_runtime
                     .as_ref()
-                    .map(|j| j.lock().sample_rate)
+                    .map(|j| j.sample_rate)
                     .unwrap_or(0)
             }
             #[cfg(not(unix))]
@@ -990,10 +986,8 @@ impl Engine {
                 cancel: cancel.clone(),
             },
         );
-        let track_name_clone = track_name.clone();
-        let worker = &self.workers[worker_index];
         let job = crate::message::OfflineBounceWork {
-            state: self.state.clone(),
+            state: self.state_snapshot.load_full(),
             track_name,
             output_path,
             start_sample,
@@ -1005,10 +999,14 @@ impl Engine {
             cancel,
             apply_fader,
         };
-        if let Err(e) = worker.tx.send(Message::ProcessOfflineBounce(job)).await {
-            self.offline_bounce_jobs.remove(&track_name_clone);
-            self.notify_clients(Err(format!("Failed to schedule offline bounce: {e}")))
-                .await;
+        if self.executor.cycle_complete() {
+            self.send_bounce_job(worker_index, job).await;
+        } else {
+            // A plan cycle is in flight; starting the bounce now would race
+            // its workers on the live track bodies. The job is registered,
+            // so new cycles are suspended from now on, and the work is
+            // handed over when the cycle completes (on_all_tracks_finished).
+            self.pending_bounce_starts.push((worker_index, job));
         }
     }
 
@@ -1025,12 +1023,10 @@ impl Engine {
         self.transport_running = true;
         self.transport_restart_pending = true;
         self.notified_loop_wrap_sample = None;
-        if let Some(driver) = self.hw_driver.as_mut() {
-            driver.lock().set_playing(true);
-        }
+        self.set_hw_playing(true).await;
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
-            && let Err(e) = jack.lock().transport_start()
+            && let Err(e) = jack.transport_start()
         {
             self.notify_clients(Err(e)).await;
         }
@@ -1061,7 +1057,7 @@ impl Engine {
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = false;
         for track in self.state.lock().tracks.values() {
-            let t = track.lock();
+            let mut t = track.lock();
             t.set_clip_playback_enabled(false);
             t.set_session_clip_playback_enabled(false);
         }
@@ -1070,12 +1066,10 @@ impl Engine {
             self.playing = true;
             self.transport_restart_pending = true;
             self.notified_loop_wrap_sample = None;
-            if let Some(driver) = self.hw_driver.as_mut() {
-                driver.lock().set_playing(true);
-            }
+            self.set_hw_playing(true).await;
             #[cfg(unix)]
             if let Some(jack) = &self.jack_runtime
-                && let Err(e) = jack.lock().transport_start()
+                && let Err(e) = jack.transport_start()
             {
                 self.notify_clients(Err(e)).await;
             }
@@ -1108,16 +1102,14 @@ impl Engine {
         self.session_clip_playback_enabled = false;
         self.session_transport_sample = 0;
         for track in self.state.lock().tracks.values() {
-            let t = track.lock();
+            let mut t = track.lock();
             t.set_clip_playback_enabled(true);
             t.set_session_clip_playback_enabled(false);
         }
-        if let Some(driver) = self.hw_driver.as_mut() {
-            driver.lock().set_playing(false);
-        }
+        self.set_hw_playing(false).await;
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
-            && let Err(e) = jack.lock().transport_stop()
+            && let Err(e) = jack.transport_stop()
         {
             self.notify_clients(Err(e)).await;
         }
@@ -1160,12 +1152,10 @@ impl Engine {
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = true;
         self.session_transport_sample = 0;
-        if let Some(driver) = self.hw_driver.as_mut() {
-            driver.lock().set_playing(true);
-        }
+        self.set_hw_playing(true).await;
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
-            && let Err(e) = jack.lock().transport_start()
+            && let Err(e) = jack.transport_start()
         {
             self.notify_clients(Err(e)).await;
         }
@@ -1203,7 +1193,7 @@ impl Engine {
         }
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
-            && let Err(e) = jack.lock().transport_locate(self.transport_sample)
+            && let Err(e) = jack.transport_locate(self.transport_sample)
         {
             self.notify_clients(Err(e)).await;
         }
@@ -1237,7 +1227,7 @@ impl Engine {
         };
 
         if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-            let track = track.lock();
+            let mut track = track.lock();
             let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
             let lane = match lanes.iter_mut().find(|lane| lane.target == *target) {
                 Some(lane) => lane,
@@ -1279,15 +1269,16 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
+        let mut track = track.lock();
         match clip_id {
             Some(id) => {
                 let play_enabled = track
+                    .rt
                     .session_slots
                     .get(&scene_index)
                     .map(|slot| slot.play_enabled)
                     .unwrap_or(true);
-                track.session_slots.insert(
+                track.rt.session_slots.insert(
                     scene_index,
                     SessionSlot {
                         clip_id: id.clone(),
@@ -1296,7 +1287,7 @@ impl Engine {
                 );
             }
             None => {
-                track.session_slots.remove(&scene_index);
+                track.rt.session_slots.remove(&scene_index);
             }
         }
 
@@ -1339,7 +1330,7 @@ impl Engine {
         };
 
         if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-            let track = track.lock();
+            let mut track = track.lock();
             let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
             if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == *target) {
                 lane.visible = !lane.visible;
@@ -1388,7 +1379,7 @@ impl Engine {
         };
 
         if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-            let track = track.lock();
+            let mut track = track.lock();
             let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
             if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == *target) {
                 lane.points.retain(|point| point.sample != sample);
@@ -1416,8 +1407,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if let Some(slot) = track.session_slots.get_mut(&scene_index) {
+        let mut track = track.lock();
+        if let Some(slot) = track.rt.session_slots.get_mut(&scene_index) {
             slot.play_enabled = enabled;
         }
 

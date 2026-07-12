@@ -214,6 +214,18 @@ impl HwWorkerDriver for HwDriver {
         self.sample_rate()
     }
 
+    fn close_fds(&mut self) {
+        self.close_fds()
+    }
+
+    fn set_playing(&mut self, playing: bool) {
+        self.set_playing(playing)
+    }
+
+    fn set_output_gain_balance(&mut self, gain: f32, balance: f32) {
+        self.set_output_gain_balance(gain, balance)
+    }
+
     fn run_cycle_for_worker(&mut self) -> Result<(), String> {
         self.run_cycle_with_assist().or_else(|e| {
             if e.kind() == std::io::ErrorKind::Interrupted {

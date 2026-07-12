@@ -30,8 +30,8 @@ pub fn fill_ports_from_interleaved_buffer(
             let copy_frames = left_len.min(right_len).min(total / 2);
             unsafe {
                 if std::arch::is_x86_feature_detected!("sse") {
-                    let left_lock = ports[0].buffer.lock();
-                    let right_lock = ports[1].buffer.lock();
+                    let mut left_lock = ports[0].buffer.lock();
+                    let mut right_lock = ports[1].buffer.lock();
                     let left_dst = &mut left_lock[..left_len];
                     let right_dst = &mut right_lock[..right_len];
                     let n = copy_frames / 4;
@@ -66,8 +66,8 @@ pub fn fill_ports_from_interleaved_buffer(
                                 .store(true, std::sync::atomic::Ordering::Release);
                             continue;
                         }
-                        let channel_buf_lock = io_port.buffer.lock();
-                        let channel_samples: &mut [f32] = &mut *channel_buf_lock;
+                        let mut channel_buf_lock = io_port.buffer.lock();
+                        let channel_samples: &mut [f32] = &mut channel_buf_lock;
                         let end = frames.min(channel_samples.len());
                         let dst = &mut channel_samples[..end];
                         let mut i = ch_idx;
@@ -95,8 +95,8 @@ pub fn fill_ports_from_interleaved_buffer(
                 .store(true, std::sync::atomic::Ordering::Release);
             continue;
         }
-        let channel_buf_lock = io_port.buffer.lock();
-        let channel_samples: &mut [f32] = &mut *channel_buf_lock;
+        let mut channel_buf_lock = io_port.buffer.lock();
+        let channel_samples: &mut [f32] = &mut channel_buf_lock;
         let end = frames.min(channel_samples.len());
         let dst = &mut channel_samples[..end];
         let mut i = ch_idx;
@@ -196,7 +196,7 @@ pub fn write_interleaved_from_ports(
         }
         io_port.process();
         let channel_buf_lock = io_port.buffer.lock();
-        let channel_samples: &[f32] = &*channel_buf_lock;
+        let channel_samples: &[f32] = &channel_buf_lock;
         let balance_gain = crate::hw::common::channel_balance_gain(ch_count, ch_idx, balance);
         let total_gain = gain * balance_gain;
         let mut offset = 0;
@@ -236,8 +236,8 @@ mod tests {
                     .store(true, std::sync::atomic::Ordering::Release);
                 continue;
             }
-            let channel_buf_lock = io_port.buffer.lock();
-            let channel_samples: &mut [f32] = &mut *channel_buf_lock;
+            let mut channel_buf_lock = io_port.buffer.lock();
+            let channel_samples: &mut [f32] = &mut channel_buf_lock;
             for (frame, sample) in channel_samples.iter_mut().enumerate().take(frames) {
                 *sample = sample_at(ch_idx, frame);
             }
@@ -280,7 +280,7 @@ mod tests {
     fn fill_arena_from_interleaved_writes_hw_in_map_buffers() {
         let hw_in = Arc::new(AudioIO::new(4));
         let plan = crate::render_plan::RenderPlan::compile(
-            &crate::state::State::default(),
+            &crate::state::State::default().snapshot(),
             &[hw_in],
             &[],
             4,
@@ -300,7 +300,7 @@ mod tests {
     fn write_interleaved_from_arena_applies_gain_and_balance() {
         let hw_out = Arc::new(AudioIO::new(3));
         let plan = crate::render_plan::RenderPlan::compile(
-            &crate::state::State::default(),
+            &crate::state::State::default().snapshot(),
             &[],
             &[hw_out],
             3,

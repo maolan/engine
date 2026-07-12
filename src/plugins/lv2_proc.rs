@@ -1,16 +1,17 @@
 use crate::audio::io::AudioIO;
 use crate::midi::io::{MIDIIO, MidiEvent};
-use crate::mutex::UnsafeMutex;
 use crate::plugins::ipc;
+use arc_swap::ArcSwapOption;
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, atomic::AtomicU32};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn wait_for_host_request_complete(
@@ -47,20 +48,35 @@ pub struct Lv2Processor {
     main_audio_outputs: usize,
     midi_input_ports: Vec<Arc<MIDIIO>>,
     midi_output_ports: Vec<Arc<MIDIIO>>,
-    param_values: UnsafeMutex<HashMap<u32, f64>>,
+    /// Current value of every known parameter, keyed by parameter id and
+    /// stored as `f64` bits. Only ever touched through atomic loads/stores.
+    param_values: HashMap<u32, AtomicU64>,
     bypassed: Arc<AtomicBool>,
 
-    child: UnsafeMutex<Option<Child>>,
-    stderr: UnsafeMutex<Option<ChildStderr>>,
+    /// Host child process handle. Interior-mutable so `process_with_midi`
+    /// (which takes `&self`) can poll it with `try_wait`.
+    ///
+    /// Invariant: at any moment there is at most one accessor — either the
+    /// audio thread running this plugin's own plan task node (exactly one per
+    /// cycle), or control code running after the last `Arc` reference to this
+    /// processor is gone (`Drop`).
+    child: UnsafeCell<Option<Child>>,
+    /// Host stderr pipe; control-side only (`take_stderr`). RCU-published so
+    /// no blocking primitive is involved.
+    stderr: ArcSwapOption<ChildStderr>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
 
     crash_count: AtomicU32,
-    last_process_time: UnsafeMutex<Instant>,
 }
 
-pub type SharedLv2Processor = Arc<UnsafeMutex<Lv2Processor>>;
+// Safety: see the invariants on `child` and `stderr` above. Every other field
+// is either immutable after construction or synchronized on its own
+// (atomics / RCU).
+unsafe impl Sync for Lv2Processor {}
+
+pub type SharedLv2Processor = Arc<Lv2Processor>;
 
 impl Lv2Processor {
     pub fn new(
@@ -123,6 +139,8 @@ impl Lv2Processor {
             .map(|_| Arc::new(MIDIIO::new()))
             .collect();
 
+        let param_values: HashMap<u32, AtomicU64> = HashMap::new();
+
         Ok(Self {
             uri: plugin_uri.to_string(),
             name,
@@ -132,16 +150,26 @@ impl Lv2Processor {
             main_audio_outputs: output_count.max(1),
             midi_input_ports,
             midi_output_ports,
-            param_values: UnsafeMutex::new(HashMap::new()),
+            param_values,
             bypassed: Arc::new(AtomicBool::new(false)),
-            child: UnsafeMutex::new(Some(child)),
-            stderr: UnsafeMutex::new(stderr),
+            child: UnsafeCell::new(Some(child)),
+            stderr: ArcSwapOption::from_pointee(stderr),
             mapping: Some(mapping),
             events: Some(events),
             shm_name,
             crash_count: AtomicU32::new(0),
-            last_process_time: UnsafeMutex::new(Instant::now()),
         })
+    }
+
+    /// Access the host child process handle.
+    ///
+    /// # Safety
+    /// The caller must be the sole accessor of `child` at this time: either
+    /// the audio thread running this plugin's own plan task node (exactly one
+    /// per cycle), or control code running after the last `Arc` reference to
+    /// this processor is gone.
+    unsafe fn with_child<R>(&self, f: impl FnOnce(&mut Option<Child>) -> R) -> R {
+        f(unsafe { &mut *self.child.get() })
     }
 
     pub fn setup_audio_ports(&self) {
@@ -207,7 +235,10 @@ impl Lv2Processor {
     }
 
     pub fn parameter_values(&self) -> HashMap<u32, f64> {
-        self.param_values.lock().clone()
+        self.param_values
+            .iter()
+            .map(|(&id, value)| (id, f64::from_bits(value.load(Ordering::Relaxed))))
+            .collect()
     }
 
     pub fn set_parameter(&self, param_id: u32, value: f64) -> Result<(), String> {
@@ -215,7 +246,12 @@ impl Lv2Processor {
     }
 
     pub fn set_parameter_at(&self, param_id: u32, value: f64, _frame: u32) -> Result<(), String> {
-        self.param_values.lock().insert(param_id, value);
+        if let Some(slot) = self.param_values.get(&param_id) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        } else {
+            tracing::warn!("LV2 set_parameter_at: unknown parameter id {param_id}");
+        }
+
         if let Some(ref mapping) = self.mapping {
             let ring = unsafe {
                 let buf = param_ring_ptr(mapping.as_ptr());
@@ -550,20 +586,23 @@ impl Lv2Processor {
             return Vec::new();
         }
 
-        {
-            let child = self.child.lock();
-            if let Some(ref mut c) = child.as_mut() {
-                match c.try_wait() {
-                    Ok(Some(status)) if !status.success() => {
-                        self.crash_count.fetch_add(1, Ordering::Relaxed);
-                        ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
-                        return Vec::new();
-                    }
-                    Ok(Some(_status)) => {}
-                    Ok(None) => {}
-                    Err(_) => {}
+        // Safety: the sole RT accessor of `child` is this processor's own
+        // plan task node, which runs exactly once per cycle.
+        let crashed = unsafe {
+            self.with_child(|child| {
+                if let Some(c) = child.as_mut()
+                    && let Ok(Some(status)) = c.try_wait()
+                    && !status.success()
+                {
+                    self.crash_count.fetch_add(1, Ordering::Relaxed);
+                    return true;
                 }
-            }
+                false
+            })
+        };
+        if crashed {
+            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            return Vec::new();
         }
 
         let (mapping, events) = match (&self.mapping, &self.events) {
@@ -656,7 +695,6 @@ impl Lv2Processor {
                 }
                 port.mark_finished();
             }
-            *self.last_process_time.lock() = Instant::now();
             output_events
         }
     }
@@ -670,7 +708,9 @@ impl Lv2Processor {
     }
 
     pub fn take_stderr(&self) -> Option<ChildStderr> {
-        self.stderr.lock().take()
+        // Control-side only: the EC is the sole accessor, so after `swap`
+        // the `Arc` is unique and `try_unwrap` cannot fail in practice.
+        self.stderr.swap(None).and_then(|s| Arc::try_unwrap(s).ok())
     }
 
     pub fn begin_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {
@@ -769,41 +809,9 @@ impl Drop for Lv2Processor {
     fn drop(&mut self) {
         let mapping = self.mapping.take();
         let events = self.events.take();
-        let child = self.child.lock().take();
+        let child = self.child.get_mut().take();
         let shm_name = std::mem::take(&mut self.shm_name);
         ipc::drop_host(mapping, events, child, shm_name);
-    }
-}
-
-crate::impl_ipc_processor_wrapper!(Lv2Processor);
-
-impl UnsafeMutex<Lv2Processor> {
-    pub fn process_with_midi(&self, frames: usize, midi_events: &[MidiEvent]) -> Vec<MidiEvent> {
-        self.lock().process_with_midi(frames, midi_events)
-    }
-
-    pub fn snapshot_state(&self) -> Result<Vec<u8>, String> {
-        self.lock().snapshot_state()
-    }
-
-    pub fn restore_state(&self, state: &[u8]) -> Result<(), String> {
-        self.lock().restore_state(state)
-    }
-
-    pub fn drain_echoed_parameters(&self) -> Vec<ParameterEvent> {
-        self.lock().drain_echoed_parameters()
-    }
-
-    pub fn drain_midi_outputs(&self) -> Vec<crate::midi::io::MidiEvent> {
-        self.lock().drain_midi_outputs()
-    }
-
-    pub fn control_ports(&self) -> Result<Vec<crate::message::Lv2ControlPortInfo>, String> {
-        self.lock().control_ports()
-    }
-
-    pub fn note_names(&self) -> Result<HashMap<u8, String>, String> {
-        self.lock().note_names()
     }
 }
 
@@ -835,7 +843,7 @@ mod tests {
         processor.setup_audio_ports();
 
         {
-            let buf = processor.audio_inputs()[0].buffer.lock();
+            let mut buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
             processor.audio_inputs()[0]
                 .finished

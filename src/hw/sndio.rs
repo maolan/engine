@@ -285,6 +285,8 @@ impl HwDriver {
         self.channels_out * self.bps
     }
 
+    pub fn close_fds(&mut self) {}
+
     pub fn input_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
         self.audio_ins.get(idx).cloned()
     }

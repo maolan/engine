@@ -25,11 +25,11 @@ use crate::{
     message::Action,
     midi::clip::MIDIClip,
     midi::io::{MIDIIO, MidiEvent},
-    mutex::UnsafeMutex,
     routing,
     track::Track,
 };
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 impl Engine {
     pub(crate) fn is_track_frozen(&self, track_name: &str) -> bool {
@@ -77,12 +77,14 @@ impl Engine {
         let from_is_child_of_to = state
             .tracks
             .get(from_track)
-            .and_then(|t| t.lock().parent_track.as_deref())
+            .and_then(|t| t.lock().parent_track.clone())
+            .as_deref()
             == Some(to_track);
         let to_is_child_of_from = state
             .tracks
             .get(to_track)
-            .and_then(|t| t.lock().parent_track.as_deref())
+            .and_then(|t| t.lock().parent_track.clone())
+            .as_deref()
             == Some(from_track);
 
         let from_audio_io = if from_track == "hw:in" {
@@ -221,7 +223,7 @@ impl Engine {
         }
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime {
-            for (from_port, source) in jack.lock().audio_ins().into_iter().enumerate() {
+            for (from_port, source) in jack.audio_ins().into_iter().enumerate() {
                 if Self::audio_ports_connected(&source, removed_io) {
                     actions.push(Action::Disconnect {
                         from_track: "hw:in".to_string(),
@@ -244,7 +246,6 @@ impl Engine {
         let mut actions = Vec::new();
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime {
-            let jack = jack.lock();
             for from_port in (removed_port + 1)..jack.input_channels() {
                 let Some(source) = jack.input_audio_port(from_port) else {
                     continue;
@@ -304,7 +305,6 @@ impl Engine {
         let mut actions = Vec::new();
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime {
-            let jack = jack.lock();
             for to_port in (removed_port + 1)..jack.output_channels() {
                 let Some(target) = jack.output_audio_port(to_port) else {
                     continue;
@@ -400,16 +400,16 @@ impl Engine {
     pub(crate) fn is_track_in_soloed_folder(
         &self,
         track: &Track,
-        tracks: &std::collections::HashMap<String, Arc<UnsafeMutex<Box<Track>>>>,
+        tracks: &std::collections::HashMap<String, crate::state::TrackHandle>,
     ) -> bool {
-        let mut current = track.parent_track.as_deref();
+        let mut current = track.parent_track.clone();
         while let Some(parent_name) = current {
-            if let Some(parent) = tracks.get(parent_name) {
+            if let Some(parent) = tracks.get(&parent_name) {
                 let p = parent.lock();
-                if p.soloed {
+                if p.soloed() {
                     return true;
                 }
-                current = p.parent_track.as_deref();
+                current = p.parent_track.clone();
             } else {
                 break;
             }
@@ -420,20 +420,20 @@ impl Engine {
     pub(crate) fn folder_has_soloed_descendant(
         &self,
         folder_name: &str,
-        tracks: &std::collections::HashMap<String, Arc<UnsafeMutex<Box<Track>>>>,
+        tracks: &std::collections::HashMap<String, crate::state::TrackHandle>,
     ) -> bool {
         for track in tracks.values() {
             let t = track.lock();
-            if !t.soloed {
+            if !t.soloed() {
                 continue;
             }
-            let mut current = t.parent_track.as_deref();
+            let mut current = t.parent_track.clone();
             while let Some(parent_name) = current {
                 if parent_name == folder_name {
                     return true;
                 }
-                if let Some(parent) = tracks.get(parent_name) {
-                    current = parent.lock().parent_track.as_deref();
+                if let Some(parent) = tracks.get(&parent_name) {
+                    current = parent.lock().parent_track.clone();
                 } else {
                     break;
                 }
@@ -449,7 +449,7 @@ impl Engine {
             .iter()
             .filter_map(|(name, track)| {
                 let t = track.lock();
-                if t.armed && t.input_monitor.iter().any(|&m| m) {
+                if t.armed() && t.input_monitor().iter().any(|&m| m) {
                     Some(name.clone())
                 } else {
                     None
@@ -502,7 +502,7 @@ impl Engine {
 
         for (name, track) in state.tracks.iter() {
             let forced = infected.contains(name) && !live_seeds.contains(name);
-            let t = track.lock();
+            let mut t = track.lock();
             t.set_shared_realtime_mixed(mixed_nodes.contains(name));
             t.set_force_realtime_domain(forced);
         }
@@ -515,7 +515,7 @@ impl Engine {
             let soloed: std::collections::HashSet<String> = tracks
                 .iter()
                 .filter_map(|(name, t)| {
-                    if t.lock().soloed {
+                    if t.lock().soloed() {
                         Some(name.clone())
                     } else {
                         None
@@ -530,20 +530,20 @@ impl Engine {
             };
             for track in tracks.values() {
                 let t = track.lock();
-                let was_enabled = t.output_enabled;
-                let in_soloed_folder = self.is_track_in_soloed_folder(t, tracks);
+                let was_enabled = t.output_enabled();
+                let in_soloed_folder = self.is_track_in_soloed_folder(&t, tracks);
                 let folder_with_soloed_child =
                     t.is_folder && self.folder_has_soloed_descendant(&t.name, tracks);
-                let enabled = if t.is_master {
-                    !t.muted
+                let enabled = if t.is_master() {
+                    !t.muted()
                 } else if any_soloed {
-                    (t.soloed
+                    (t.soloed()
                         || upstream.contains(&t.name)
                         || in_soloed_folder
                         || folder_with_soloed_child)
-                        && !t.muted
+                        && !t.muted()
                 } else {
-                    !t.muted
+                    !t.muted()
                 };
                 t.set_output_enabled(enabled);
                 if was_enabled && !enabled {
@@ -564,22 +564,22 @@ impl Engine {
     pub(crate) fn track_handle_by_name(
         &self,
         track_name: &str,
-    ) -> Option<Arc<UnsafeMutex<Box<Track>>>> {
+    ) -> Option<crate::state::TrackHandle> {
         self.state.lock().tracks.get(track_name).cloned()
     }
 
     pub(crate) fn track_handle_or_err(
         &self,
         track_name: &str,
-    ) -> Result<Arc<UnsafeMutex<Box<Track>>>, String> {
+    ) -> Result<crate::state::TrackHandle, String> {
         self.track_handle_by_name(track_name)
             .ok_or_else(|| format!("Track not found: {track_name}"))
     }
 
     pub(crate) fn add_clip_to_track(&self, request: ClipAddRequest<'_>) {
         if let Some(track) = self.state.lock().tracks.get(request.track_name) {
-            let track = track.lock();
-            if track.is_master || track.is_folder {
+            let mut track = track.lock();
+            if track.is_master() || track.is_folder {
                 return;
             }
             match request.kind {
@@ -608,9 +608,9 @@ impl Engine {
                     clip.pitch_correction_formant_compensation =
                         request.pitch_correction_formant_compensation;
                     clip.plugin_graph_json = request.plugin_graph_json;
-                    track.audio.clips.push(clip);
+                    track.audio.push_clip(clip);
                     #[cfg(unix)]
-                    track.clip_pitch_shifters.clear();
+                    track.rt.clip_pitch_shifters.clear();
                 }
                 Kind::MIDI => {
                     let mut clip = MIDIClip::new(
@@ -623,7 +623,7 @@ impl Engine {
                     let max_lane = track.midi.ins.len().saturating_sub(1);
                     clip.input_channel = request.input_channel.min(max_lane);
                     clip.muted = request.muted;
-                    track.midi.clips.push(clip);
+                    track.midi.push_clip(clip);
                 }
             }
         }
@@ -691,8 +691,8 @@ impl Engine {
         midi_clip: Option<crate::message::MidiClipData>,
     ) {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
-            let track = track.lock();
-            if track.is_master {
+            let mut track = track.lock();
+            if track.is_master() {
                 return;
             }
             match kind {
@@ -701,16 +701,16 @@ impl Engine {
                     {
                         let max_lane = track.audio.ins.len().saturating_sub(1);
                         clip.input_channel = clip.input_channel.min(max_lane);
-                        track.audio.clips.push(clip);
+                        track.audio.push_clip(clip);
                         #[cfg(unix)]
-                        track.clip_pitch_shifters.clear();
+                        track.rt.clip_pitch_shifters.clear();
                     }
                 }
                 Kind::MIDI => {
                     if let Some(mut clip) = midi_clip.map(|clip| Self::midi_clip_from_data(&clip)) {
                         let max_lane = track.midi.ins.len().saturating_sub(1);
                         clip.input_channel = clip.input_channel.min(max_lane);
-                        track.midi.clips.push(clip);
+                        track.midi.push_clip(clip);
                     }
                 }
             }
@@ -724,24 +724,24 @@ impl Engine {
         clip_indices: &[usize],
     ) {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
-            let track = track.lock();
+            let mut track = track.lock();
             let mut indices = clip_indices.to_vec();
             indices.sort_unstable();
             indices.dedup();
             match kind {
                 Kind::Audio => {
                     for idx in indices.into_iter().rev() {
-                        if idx < track.audio.clips.len() {
-                            track.audio.clips.remove(idx);
+                        if idx < track.audio.clips().len() {
+                            track.audio.remove_clip(idx);
                         }
                     }
                     #[cfg(unix)]
-                    track.clip_pitch_shifters.clear();
+                    track.rt.clip_pitch_shifters.clear();
                 }
                 Kind::MIDI => {
                     for idx in indices.into_iter().rev() {
-                        if idx < track.midi.clips.len() {
-                            track.midi.clips.remove(idx);
+                        if idx < track.midi.clips().len() {
+                            track.midi.remove_clip(idx);
                         }
                     }
                 }
@@ -756,22 +756,22 @@ impl Engine {
         clip_index: usize,
         new_name: &str,
     ) {
-        let Some(track) = self.state.lock().tracks.get(track_name) else {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
         let track = track.lock();
         let old_name = match kind {
             Kind::Audio => {
-                if clip_index >= track.audio.clips.len() {
+                if clip_index >= track.audio.clips().len() {
                     return;
                 }
-                track.audio.clips[clip_index].name.clone()
+                track.audio.clips().get(clip_index).unwrap().name.clone()
             }
             Kind::MIDI => {
-                if clip_index >= track.midi.clips.len() {
+                if clip_index >= track.midi.clips().len() {
                     return;
                 }
-                track.midi.clips[clip_index].name.clone()
+                track.midi.clips().get(clip_index).unwrap().name.clone()
             }
         };
 
@@ -793,20 +793,28 @@ impl Engine {
             let other_track = other_track.lock();
             match kind {
                 Kind::Audio => {
-                    for clip in &mut other_track.audio.clips {
-                        if clip.name == old_name {
-                            clip.name = new_file_name.clone();
-                        }
-                        if clip.pitch_correction_source_name.as_deref() == Some(old_name.as_str()) {
-                            clip.pitch_correction_source_name = Some(new_file_name.clone());
-                        }
+                    let clips = other_track.audio.clips();
+                    for idx in 0..clips.len() {
+                        other_track.audio.update_clip(idx, |clip| {
+                            if clip.name == old_name {
+                                clip.name = new_file_name.clone();
+                            }
+                            if clip.pitch_correction_source_name.as_deref()
+                                == Some(old_name.as_str())
+                            {
+                                clip.pitch_correction_source_name = Some(new_file_name.clone());
+                            }
+                        });
                     }
                 }
                 Kind::MIDI => {
-                    for clip in &mut other_track.midi.clips {
-                        if clip.name == old_name {
-                            clip.name = new_file_name.clone();
-                        }
+                    let clips = other_track.midi.clips();
+                    for idx in 0..clips.len() {
+                        other_track.midi.update_clip(idx, |clip| {
+                            if clip.name == old_name {
+                                clip.name = new_file_name.clone();
+                            }
+                        });
                     }
                 }
             }
@@ -822,17 +830,17 @@ impl Engine {
         fade_in_samples: usize,
         fade_out_samples: usize,
     ) {
-        let Some(track) = self.state.lock().tracks.get(track_name) else {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
         let track = track.lock();
         match kind {
             Kind::Audio => {
-                if let Some(clip) = track.audio.clips.get_mut(clip_index) {
+                track.audio.update_clip(clip_index, |clip| {
                     clip.fade_enabled = fade_enabled;
                     clip.fade_in_samples = fade_in_samples;
                     clip.fade_out_samples = fade_out_samples;
-                }
+                });
             }
             Kind::MIDI => {}
         }
@@ -847,13 +855,13 @@ impl Engine {
         length: usize,
         offset: usize,
     ) {
-        let Some(track) = self.state.lock().tracks.get(track_name) else {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
-        let track = track.lock();
+        let mut track = track.lock();
         match kind {
             Kind::Audio => {
-                if let Some(clip) = track.audio.clips.get_mut(clip_index) {
+                track.audio.update_clip(clip_index, |clip| {
                     clip.start = start;
                     clip.end = start.saturating_add(length.max(1));
                     clip.offset = offset;
@@ -865,16 +873,16 @@ impl Engine {
                     clip.pitch_correction_frame_likeness = None;
                     clip.pitch_correction_inertia_ms = None;
                     clip.pitch_correction_formant_compensation = None;
-                }
+                });
                 #[cfg(unix)]
-                track.clip_pitch_shifters.clear();
+                track.rt.clip_pitch_shifters.clear();
             }
             Kind::MIDI => {
-                if let Some(clip) = track.midi.clips.get_mut(clip_index) {
+                track.midi.update_clip(clip_index, |clip| {
                     clip.start = start;
                     clip.end = start.saturating_add(length.max(1));
                     clip.offset = offset;
-                }
+                });
             }
         }
     }
@@ -886,22 +894,22 @@ impl Engine {
         kind: Kind,
         name: String,
     ) {
-        let Some(track) = self.state.lock().tracks.get(track_name) else {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
-        let track = track.lock();
+        let mut track = track.lock();
         match kind {
             Kind::Audio => {
-                if let Some(clip) = track.audio.clips.get_mut(clip_index) {
+                track.audio.update_clip(clip_index, |clip| {
                     clip.name = name;
-                }
+                });
                 #[cfg(unix)]
-                track.clip_pitch_shifters.clear();
+                track.rt.clip_pitch_shifters.clear();
             }
             Kind::MIDI => {
-                if let Some(clip) = track.midi.clips.get_mut(clip_index) {
+                track.midi.update_clip(clip_index, |clip| {
                     clip.name = name;
-                }
+                });
             }
         }
     }
@@ -913,20 +921,20 @@ impl Engine {
         kind: Kind,
         muted: bool,
     ) {
-        let Some(track) = self.state.lock().tracks.get(track_name) else {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
         let track = track.lock();
         match kind {
             Kind::Audio => {
-                if let Some(clip) = track.audio.clips.get_mut(clip_index) {
+                track.audio.update_clip(clip_index, |clip| {
                     clip.muted = muted;
-                }
+                });
             }
             Kind::MIDI => {
-                if let Some(clip) = track.midi.clips.get_mut(clip_index) {
+                track.midi.update_clip(clip_index, |clip| {
                     clip.muted = muted;
-                }
+                });
             }
         }
     }
@@ -946,8 +954,8 @@ impl Engine {
         pitch_correction_formant_compensation: Option<bool>,
     ) {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
-            let track = track.lock();
-            if let Some(clip) = track.audio.clips.get_mut(clip_index) {
+            let mut track = track.lock();
+            track.audio.update_clip(clip_index, |clip| {
                 clip.pitch_correction_preview_name = preview_name;
                 clip.pitch_correction_source_name = source_name;
                 clip.pitch_correction_source_offset = source_offset;
@@ -956,9 +964,9 @@ impl Engine {
                 clip.pitch_correction_frame_likeness = pitch_correction_frame_likeness;
                 clip.pitch_correction_inertia_ms = pitch_correction_inertia_ms;
                 clip.pitch_correction_formant_compensation = pitch_correction_formant_compensation;
-            }
+            });
             #[cfg(unix)]
-            track.clip_pitch_shifters.clear();
+            track.rt.clip_pitch_shifters.clear();
         }
     }
 
@@ -1070,7 +1078,7 @@ impl Engine {
     pub(crate) fn collect_descendant_track_names(&self, name: &str, out: &mut Vec<String>) {
         // Clone the child arcs while briefly holding the parent lock, then release it before
         // recursing so we never nest locks on the same thread.
-        let child_arcs: Vec<Arc<UnsafeMutex<Box<Track>>>> = {
+        let child_arcs: Vec<crate::state::TrackHandle> = {
             let state = self.state.lock();
             if let Some(track) = state.tracks.get(name) {
                 track.lock().child_tracks.clone()
@@ -1086,7 +1094,7 @@ impl Engine {
     }
 
     pub(crate) async fn remove_single_track(&mut self, name: &str) {
-        let children: Vec<Arc<UnsafeMutex<Box<Track>>>> = {
+        let children: Vec<crate::state::TrackHandle> = {
             let state = self.state.lock();
             if let Some(removed) = state.tracks.get(name).cloned() {
                 removed.lock().child_tracks.clone()
@@ -1105,14 +1113,14 @@ impl Engine {
         if let Some(parent_name) = parent_name {
             let state = self.state.lock();
             if let Some(parent) = state.tracks.get(&parent_name).cloned() {
-                let parent = parent.lock();
+                let mut parent = parent.lock();
                 parent.child_tracks.retain(|c| c.lock().name != *name);
             }
         }
         if let Some(removed_track) = self.state.lock().tracks.get(name).cloned() {
             for child in children {
                 let removed = removed_track.lock();
-                child.lock().disconnect_from_parent(removed);
+                child.lock().disconnect_from_parent(&removed);
                 child.lock().parent_track = None;
             }
         }
@@ -1224,7 +1232,7 @@ impl Engine {
             && !self.history_suspended
         {
             let state = self.state.lock();
-            create_inverse_actions(action_to_process, state).map(|mut actions| {
+            create_inverse_actions(action_to_process, &state).map(|mut actions| {
                 actions.extend(extra_inverse_actions);
                 actions
             })
@@ -1343,13 +1351,12 @@ impl Engine {
                 .await;
             return;
         }
-        let maybe_hw = if let Some(oss) = &self.hw_driver {
-            let hw = oss.lock();
-            Some((hw.cycle_samples(), hw.sample_rate() as f64))
+        let maybe_hw = if let Some(info) = self.hw_driver_info {
+            Some((info.cycle_samples, info.sample_rate as f64))
         } else {
             #[cfg(unix)]
             if let Some(jack) = &self.jack_runtime {
-                let j = jack.lock();
+                let j = jack;
                 Some((j.buffer_size, j.sample_rate as f64))
             } else {
                 None
@@ -1380,9 +1387,9 @@ impl Engine {
                     sample_rate,
                 )
             };
-            tracks.insert(name.clone(), Arc::new(UnsafeMutex::new(Box::new(track))));
+            tracks.insert(name.clone(), Arc::new(track));
             if let Some(track) = tracks.get(&name) {
-                let t = track.lock();
+                let mut t = track.lock();
                 t.set_clip_playback_enabled(self.clip_playback_enabled);
                 t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
                 t.set_session_base_dir(self.session_dir.clone());
@@ -1409,7 +1416,7 @@ impl Engine {
             let mut inv = Vec::new();
             for n in &names_to_remove {
                 if let Some(mut actions) =
-                    create_inverse_actions(&Action::RemoveTrack(n.clone()), state)
+                    create_inverse_actions(&Action::RemoveTrack(n.clone()), &state)
                 {
                     inv.append(&mut actions);
                 }
@@ -1604,7 +1611,7 @@ impl Engine {
                         (Some(f_t), Some(t_t)) => {
                             let to_in_res = t_t.lock().midi.ins.get(to_port).cloned();
                             if let Some(to_in) = to_in_res {
-                                let from_track = f_t.lock();
+                                let mut from_track = f_t.lock();
                                 if let Err(e) = from_track.midi.connect_out(from_port, to_in) {
                                     self.notify_clients(Err(e)).await;
                                     return;
@@ -1706,7 +1713,7 @@ impl Engine {
                 (state.tracks.get(from_track), state.tracks.get(to_track))
                 && let Some(to_in) = t_t.lock().midi.ins.get(to_port).cloned()
             {
-                let from_track = f_t.lock();
+                let mut from_track = f_t.lock();
                 if let Err(e) = from_track.midi.disconnect_out(from_port, &to_in) {
                     self.notify_clients(Err(e)).await;
                 } else {
@@ -1770,13 +1777,13 @@ impl Engine {
                     state.tracks.get(track_name).cloned(),
                 ) {
                     {
-                        let parent = parent_arc.lock();
+                        let mut parent = parent_arc.lock();
                         parent.child_tracks.retain(|c| c.lock().name != *track_name);
                     }
                     {
-                        let child = child_arc.lock();
+                        let mut child = child_arc.lock();
                         let parent = parent_arc.lock();
-                        child.disconnect_from_parent(parent);
+                        child.disconnect_from_parent(&parent);
                     }
                 }
             }
@@ -1795,7 +1802,7 @@ impl Engine {
                     let sources = inp.connections.lock().clone();
                     for src in sources {
                         let _ = AudioIO::disconnect(&src, inp);
-                        if let Some((src_name, src_port)) = self.find_audio_io_owner(state, &src) {
+                        if let Some((src_name, src_port)) = self.find_audio_io_owner(&state, &src) {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: src_name,
                                 from_port: src_port,
@@ -1821,7 +1828,7 @@ impl Engine {
                     let targets = out.connections.lock().clone();
                     for tgt in targets {
                         let _ = AudioIO::disconnect(out, &tgt);
-                        if let Some((tgt_name, tgt_port)) = self.find_audio_io_owner(state, &tgt) {
+                        if let Some((tgt_name, tgt_port)) = self.find_audio_io_owner(&state, &tgt) {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: track_name.to_string(),
                                 from_port: port_idx,
@@ -1880,7 +1887,7 @@ impl Engine {
                 for (port_idx, out) in child.midi.outs.iter().enumerate() {
                     let targets = out.connections();
                     for tgt in targets {
-                        if let Some((tgt_name, tgt_port, _)) = self.find_midi_io_owner(state, &tgt)
+                        if let Some((tgt_name, tgt_port, _)) = self.find_midi_io_owner(&state, &tgt)
                         {
                             let _ = MIDIIO::disconnect(out, &tgt);
                             disconnect_actions.push(Action::Disconnect {
@@ -1942,12 +1949,12 @@ impl Engine {
                 state.tracks.get(track_name).cloned(),
             ) {
                 {
-                    let parent = parent_arc.lock();
+                    let mut parent = parent_arc.lock();
                     parent.child_tracks.push(child_arc.clone());
                 }
                 {
-                    let child = child_arc.lock();
-                    let parent = parent_arc.lock();
+                    let mut child = child_arc.lock();
+                    let mut parent = parent_arc.lock();
                     // Folder input -> child input (one-to-one when counts match).
                     if parent.audio.ins.len() == child.audio.ins.len() {
                         for (parent_in, child_in) in
@@ -1993,7 +2000,7 @@ impl Engine {
         {
             let state = self.state.lock();
             if let Some(child_arc) = state.tracks.get(track_name).cloned() {
-                let child = child_arc.lock();
+                let mut child = child_arc.lock();
                 child.ensure_default_audio_passthrough();
                 child.ensure_default_midi_passthrough();
             }
@@ -2027,12 +2034,12 @@ impl Engine {
             let to_track = to_track_handle.lock();
             match kind {
                 Kind::Audio => {
-                    if from.clip_index >= from_track.audio.clips.len() {
+                    if from.clip_index >= from_track.audio.clips().len() {
                         self.notify_clients(Err(format!(
                             "Clip index {} is too high, as track {} has only {} clips!",
                             from.clip_index,
                             from_track.name.clone(),
-                            from_track.audio.clips.len(),
+                            from_track.audio.clips().len(),
                         )))
                         .await;
                         return;
@@ -2048,36 +2055,42 @@ impl Engine {
                         .await;
                         return;
                     }
-                    let clip_copy = from_track.audio.clips[from.clip_index].clone();
+                    let Some(clip_copy) = from_track.audio.clips().get(from.clip_index).cloned()
+                    else {
+                        return;
+                    };
                     if !copy {
-                        from_track.audio.clips.remove(from.clip_index);
+                        from_track.audio.remove_clip(from.clip_index);
                     }
-                    let mut clip_copy = clip_copy;
+                    let mut clip_copy = (*clip_copy).clone();
                     clip_copy.start = to.sample_offset;
                     let max_lane = to_track.audio.ins.len().saturating_sub(1);
                     clip_copy.input_channel = to.input_channel.min(max_lane);
-                    to_track.audio.clips.push(clip_copy);
+                    to_track.audio.push_clip(clip_copy);
                 }
                 Kind::MIDI => {
-                    if from.clip_index >= from_track.midi.clips.len() {
+                    if from.clip_index >= from_track.midi.clips().len() {
                         self.notify_clients(Err(format!(
                             "Clip index {} is too high, as track {} has only {} clips!",
                             from.clip_index,
                             from_track.name.clone(),
-                            from_track.midi.clips.len(),
+                            from_track.midi.clips().len(),
                         )))
                         .await;
                         return;
                     }
-                    let clip_copy = from_track.midi.clips[from.clip_index].clone();
+                    let Some(clip_copy) = from_track.midi.clips().get(from.clip_index).cloned()
+                    else {
+                        return;
+                    };
                     if !copy {
-                        from_track.midi.clips.remove(from.clip_index);
+                        from_track.midi.remove_clip(from.clip_index);
                     }
-                    let mut clip_copy = clip_copy;
+                    let mut clip_copy = (*clip_copy).clone();
                     clip_copy.start = to.sample_offset;
                     let max_lane = to_track.midi.ins.len().saturating_sub(1);
                     clip_copy.input_channel = to.input_channel.min(max_lane);
-                    to_track.midi.clips.push(clip_copy);
+                    to_track.midi.push_clip(clip_copy);
                 }
             }
         }
@@ -2107,7 +2120,7 @@ impl Engine {
         track.lock().name = new_name.clone();
         self.state.lock().tracks.insert(new_name.clone(), track);
         for other in self.state.lock().tracks.values() {
-            let other = other.lock();
+            let mut other = other.lock();
             if other.parent_track.as_deref() == Some(old_name.as_str()) {
                 other.parent_track = Some(new_name.clone());
             }
@@ -2226,7 +2239,7 @@ impl Engine {
             }
         };
         if is_folder {
-            let is_master = track.lock().is_master;
+            let is_master = track.lock().is_master();
             if is_master {
                 self.notify_clients(Err(format!(
                     "Track '{}' is the master track and cannot be made a folder",
@@ -2237,7 +2250,7 @@ impl Engine {
             }
         }
         {
-            let track = track.lock();
+            let mut track = track.lock();
             track.is_folder = is_folder;
             track.ensure_default_audio_passthrough();
             track.ensure_default_midi_passthrough();
@@ -2477,7 +2490,7 @@ impl Engine {
         };
         {
             let t = track.lock();
-            t.folder_open = !t.folder_open;
+            t.folder_open.fetch_not(Ordering::Relaxed);
         }
         self.notify_clients(Ok(Action::TrackToggleFolder {
             track_name: track_name.clone(),
@@ -2593,6 +2606,7 @@ impl Engine {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
             track
                 .lock()
+                .rt
                 .pending_automation_midi_events
                 .push(MidiEvent::new(
                     0,
@@ -2613,7 +2627,7 @@ impl Engine {
         }
         if let Some(track) = self.state.lock().tracks.get(name).cloned() {
             track.lock().arm();
-            let armed = track.lock().armed;
+            let armed = track.lock().armed();
             if !armed && self.audio_recordings.contains_key(name) {
                 self.flush_track_recording(name).await;
             }

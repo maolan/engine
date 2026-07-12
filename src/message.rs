@@ -3,8 +3,9 @@ pub use crate::connectable::{ConnectableConnection, ConnectableRef};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::lv2::Lv2PluginInfo;
 use crate::midi::io::MidiEvent;
+use crate::state::TrackHandle;
 use crate::vst3::Vst3PluginInfo;
-use crate::{kind::Kind, modulator::Modulator, mutex::UnsafeMutex, track::Track};
+use crate::{kind::Kind, modulator::Modulator};
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc::Sender;
@@ -89,7 +90,7 @@ pub struct OfflineAutomationLane {
 
 #[derive(Clone, Debug)]
 pub struct OfflineBounceWork {
-    pub state: Arc<UnsafeMutex<crate::state::State>>,
+    pub state: Arc<crate::state::StateSnapshot>,
     pub track_name: String,
     pub output_path: String,
     pub start_sample: usize,
@@ -263,11 +264,11 @@ pub enum PluginKind {
 
 #[derive(Clone, Debug)]
 pub enum ProcessTask {
-    Track(Arc<UnsafeMutex<Box<Track>>>),
-    FolderInput(Arc<UnsafeMutex<Box<Track>>>),
-    FolderOutput(Arc<UnsafeMutex<Box<Track>>>),
+    Track(TrackHandle),
+    FolderInput(TrackHandle),
+    FolderOutput(TrackHandle),
     Plugin {
-        track: Arc<UnsafeMutex<Box<Track>>>,
+        track: TrackHandle,
         kind: PluginKind,
         index: usize,
     },
@@ -406,6 +407,26 @@ pub enum TrackAutomationMode {
     Touch,
     Latch,
     Write,
+}
+
+impl TrackAutomationMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Read => 0,
+            Self::Touch => 1,
+            Self::Latch => 2,
+            Self::Write => 3,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Touch,
+            2 => Self::Latch,
+            3 => Self::Write,
+            _ => Self::Read,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1353,6 +1374,14 @@ pub enum Message {
     HWMidiEvents(Vec<HwMidiEvent>),
     HWMidiOutEvents(Vec<HwMidiEvent>),
     ClearHWMidiOutEvents,
+    HWSetPlaying(bool),
+    HWSetOutputGainBalance {
+        gain: f32,
+        balance: f32,
+    },
+    HWOpenMidiInputDevice(String),
+    HWOpenMidiOutputDevice(String),
+    HWCloseMidiDevices,
     HWFinished,
     OfflineBounceFinished {
         result: Result<Action, String>,

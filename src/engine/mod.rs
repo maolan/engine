@@ -59,9 +59,8 @@ use crate::{
     kind::Kind,
     message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, SessionSlotState},
     midi::io::MidiEvent,
-    mutex::UnsafeMutex,
     osc::OscServer,
-    state::State,
+    state::{State, StateSlot},
 };
 
 #[derive(Debug)]
@@ -74,6 +73,16 @@ impl WorkerData {
     pub fn new(tx: Sender<Message>, handle: JoinHandle<()>) -> Self {
         Self { tx, handle }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HwDriverInfo {
+    pub cycle_samples: usize,
+    pub sample_rate: i32,
+    pub input_channels: usize,
+    pub output_channels: usize,
+    pub sample_bits: i32,
+    pub frame_size_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -183,13 +192,17 @@ pub(crate) enum MidiLearnSlot {
 pub struct Engine {
     clients: Vec<Sender<Message>>,
     rx: Receiver<Message>,
-    state: Arc<UnsafeMutex<State>>,
+    state: Arc<State>,
+    state_snapshot: Arc<StateSlot>,
     tx: Sender<Message>,
     workers: Vec<WorkerData>,
-    hw_driver: Option<Arc<UnsafeMutex<HwDriver>>>,
+    hw_driver: Option<HwDriver>,
+    hw_driver_info: Option<HwDriverInfo>,
+    hw_input_ports: Vec<Arc<crate::audio::io::AudioIO>>,
+    hw_output_ports: Vec<Arc<crate::audio::io::AudioIO>>,
     #[cfg(unix)]
-    jack_runtime: Option<Arc<UnsafeMutex<JackRuntime>>>,
-    midi_hub: Arc<UnsafeMutex<MidiHub>>,
+    jack_runtime: Option<JackRuntime>,
+    midi_hub: Option<MidiHub>,
     hw_worker: Option<WorkerData>,
     osc_server: Option<OscServer>,
     osc_reply_socket: Option<UdpSocket>,
@@ -257,7 +270,7 @@ pub struct Engine {
     executor: crate::executor::CycleExecutor,
     plan_builder: crate::plan_builder::PlanBuilder,
     plan_slot: Arc<crate::render_plan::PlanSlot>,
-    hw_ports: Arc<std::sync::Mutex<crate::plan_builder::HwPorts>>,
+    hw_ports: Arc<arc_swap::ArcSwap<crate::plan_builder::HwPorts>>,
     pending_node_jobs: VecDeque<crate::executor::NodeJob>,
     latest_hw_out_meter_db: Arc<Vec<f32>>,
     latest_track_meter_snapshot: Arc<Vec<(String, Vec<f32>)>>,
@@ -265,6 +278,14 @@ pub struct Engine {
     history_group: Option<UndoEntry>,
     history_suspended: bool,
     offline_bounce_jobs: HashMap<String, OfflineBounceJob>,
+    /// Bounce jobs registered while a plan cycle was still in flight; the
+    /// work is handed to the reserved worker when the cycle completes
+    /// (`on_all_tracks_finished`), so the bounce never races RT workers.
+    pending_bounce_starts: Vec<(usize, crate::message::OfflineBounceWork)>,
+    /// Worker index → track name for in-flight bounce jobs; the worker's
+    /// terminal `Ready(id)` removes the job even on error/cancel paths
+    /// whose `OfflineBounceFinished` payload carries no track name.
+    bounce_worker_tracks: HashMap<usize, String>,
     pending_midi_learn: Option<(String, crate::message::TrackMidiLearnTarget, Option<String>)>,
     pending_global_midi_learn: Option<crate::message::GlobalMidiLearnTarget>,
     pending_session_midi_learn: Option<crate::message::SessionMidiLearnTarget>,
@@ -291,9 +312,9 @@ mod tests {
     use super::*;
     use crate::audio::clip::AudioClip;
     use crate::message::PluginKind;
-    use crate::mutex::UnsafeMutex;
     use crate::track::Track;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::sync::mpsc::channel;
     use tokio::time::{Duration as TokioDuration, timeout};
@@ -352,10 +373,13 @@ mod tests {
     }
 
     fn insert_track(engine: &mut Engine, track: Track) {
-        engine.state.lock().tracks.insert(
-            track.name.clone(),
-            Arc::new(UnsafeMutex::new(Box::new(track))),
-        );
+        engine
+            .state
+            .lock()
+            .tracks
+            .insert(track.name.clone(), Arc::new(track));
+        engine.publish_state_snapshot();
+        engine.plan_builder.mark_dirty();
     }
 
     fn osc_packet(address: &str) -> Vec<u8> {
@@ -541,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn reject_if_track_frozen_sends_error_and_blocks_operation() {
         let (mut engine, mut client_rx) = make_engine_with_client();
-        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track.set_frozen(true);
         insert_track(&mut engine, track);
 
@@ -559,14 +583,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatcher_track_mutations_publish_state_snapshot() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("snap".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        engine.publish_state_snapshot();
+
+        let snapshot = engine.state_snapshot.load_full();
+        assert!(snapshot.tracks.contains_key("snap"));
+
+        engine
+            .handle_request(Action::TrackToggleArm("snap".to_string()))
+            .await;
+
+        let snapshot = engine.state_snapshot.load_full();
+        assert!(snapshot.tracks.get("snap").unwrap().lock().armed());
+
+        engine
+            .handle_request(Action::RemoveTrack("snap".to_string()))
+            .await;
+
+        let snapshot = engine.state_snapshot.load_full();
+        assert!(!snapshot.tracks.contains_key("snap"));
+    }
+
+    #[tokio::test]
     async fn undo_restores_original_clip_bounds_after_stretch_style_group() {
         let (mut engine, _client_rx) = make_engine_with_client();
-        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         let mut clip = AudioClip::new("audio/original.wav".to_string(), 100, 220);
         clip.offset = 12;
         clip.fade_in_samples = 20;
         clip.fade_out_samples = 30;
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
         insert_track(&mut engine, track);
 
         engine.handle_request(Action::BeginHistoryGroup).await;
@@ -604,7 +655,8 @@ mod tests {
 
         let state = engine.state.lock();
         let track = state.tracks.get("track").expect("track exists").lock();
-        let clip = track.audio.clips.first().expect("clip exists");
+        let clips = track.audio.clips();
+        let clip = clips.first().expect("clip exists");
         assert_eq!(clip.name, "audio/original.wav");
         assert_eq!(clip.start, 100);
         assert_eq!(clip.end, 220);
@@ -724,7 +776,7 @@ mod tests {
         let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 1024, sample_rate as f64);
         let mut clip = AudioClip::new(wav_path.to_string_lossy().to_string(), 0, clip_samples);
         clip.fade_enabled = false;
-        track.audio.clips.push(clip);
+        track.audio.push_clip(clip);
         track.session_base_dir = Some(tmp_dir.clone());
         insert_track(&mut engine, track);
 
@@ -747,7 +799,7 @@ mod tests {
 
         async fn wait_for_track_processed(
             client_rx: &mut tokio::sync::mpsc::Receiver<Message>,
-            state: &Arc<UnsafeMutex<State>>,
+            state: &State,
         ) -> bool {
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
@@ -762,7 +814,7 @@ mod tests {
                             .lock()
                             .tracks
                             .get("track")
-                            .map(|t| t.lock().audio.finished)
+                            .map(|t| t.lock().audio.finished())
                             .unwrap_or(false)
                         {
                             return true;
@@ -786,7 +838,7 @@ mod tests {
             let state = state.lock();
             let track = state.tracks.get("track").expect("track").lock();
             let input = track.audio.ins[0].buffer.lock();
-            crate::simd::peak_abs(input)
+            crate::simd::peak_abs(&input)
         };
         assert!(
             first_peak > 0.001,
@@ -811,7 +863,7 @@ mod tests {
             let state = state.lock();
             let track = state.tracks.get("track").expect("track").lock();
             let input = track.audio.ins[0].buffer.lock();
-            crate::simd::peak_abs(input)
+            crate::simd::peak_abs(&input)
         };
         assert!(
             second_peak > 0.001,
@@ -883,9 +935,9 @@ mod tests {
         let echoes = engine.apply_modulators(12_000);
         let track = engine.state.lock().tracks["pan-track"].lock();
         assert!(
-            (track.balance - 1.0).abs() < 0.01,
+            (track.balance() - 1.0).abs() < 0.01,
             "expected balance 1.0, got {}",
-            track.balance
+            track.balance()
         );
         assert!(
             echoes.iter().any(
@@ -1144,7 +1196,7 @@ mod tests {
 
         let plan = {
             let state = engine.state.lock();
-            crate::render_plan::RenderPlan::compile(state, &[], &[], 64)
+            crate::render_plan::RenderPlan::compile(&state.snapshot(), &[], &[], 64)
         };
         plan.verify().expect("plan invariants");
 
@@ -1203,7 +1255,7 @@ mod tests {
                 None,
             )
             .expect("should load CLAP plugin on folder");
-        folder.clap_plugins[0].processor.lock().setup_audio_ports();
+        folder.clap_plugins[0].processor.setup_audio_ports();
         let plugin_id = folder.clap_plugins[0].id;
 
         insert_track(&mut engine, folder);
@@ -1256,7 +1308,7 @@ mod tests {
 
         let plan = {
             let state = engine.state.lock();
-            crate::render_plan::RenderPlan::compile(state, &[], &[], 64)
+            crate::render_plan::RenderPlan::compile(&state.snapshot(), &[], &[], 64)
         };
         plan.verify().expect("plan invariants");
 
@@ -1378,8 +1430,8 @@ mod tests {
             let folder = state.tracks.get("folder").unwrap().clone();
             let child = state.tracks.get("child").unwrap().clone();
 
-            folder.lock().input_monitor = vec![true];
-            child.lock().input_monitor = vec![true];
+            folder.lock().set_input_monitor(vec![true]);
+            child.lock().set_input_monitor(vec![true]);
 
             // Feed a signal into the folder input from an external source.
             let source = Arc::new(crate::audio::io::AudioIO::new(64));
@@ -1392,7 +1444,8 @@ mod tests {
             child.lock().process();
             folder.lock().process_folder_output();
 
-            let output = folder.lock().audio.outs[0].buffer.lock();
+            let folder_lock = folder.lock();
+            let output = folder_lock.audio.outs[0].buffer.lock();
             assert!(
                 output.iter().any(|s| (*s - 0.75).abs() < 1e-5),
                 "folder output should contain the child-processed folder input signal, got {:?}",
@@ -1466,8 +1519,8 @@ mod tests {
     #[tokio::test]
     async fn track_set_folder_rejects_master_track() {
         let (mut engine, mut client_rx) = make_engine_with_client();
-        let mut track = Track::new("master".to_string(), 2, 2, 0, 0, 64, 48_000.0);
-        track.is_master = true;
+        let track = Track::new("master".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.is_master.store(true, Ordering::Relaxed);
         insert_track(&mut engine, track);
 
         engine
@@ -1504,7 +1557,7 @@ mod tests {
 
         {
             let state = engine.state.lock();
-            assert!(!state.tracks.get("folder").unwrap().lock().is_master);
+            assert!(!state.tracks.get("folder").unwrap().lock().is_master());
         }
 
         let msg = tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;

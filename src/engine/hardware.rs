@@ -27,12 +27,12 @@ use crate::workers::sndio_worker::HwWorker;
 use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     audio::io::AudioIO,
+    engine::HwDriverInfo,
     hw::{
         config,
         traits::{HwDevice, HwWorkerDriver},
     },
     message::{Action, Message},
-    mutex::UnsafeMutex,
 };
 #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
 use std::fs::read_dir;
@@ -133,8 +133,8 @@ impl Engine {
     #[cfg(target_os = "freebsd")]
     pub(crate) fn maybe_start_freebsd_sync_group(&self) {
         if let Some(oss) = &self.hw_driver {
-            let in_fd = oss.lock().input_fd();
-            let out_fd = oss.lock().output_fd();
+            let in_fd = oss.input_fd();
+            let out_fd = oss.output_fd();
             let mut group = 0;
             let in_group = hw::add_to_sync_group(in_fd, group, true);
             if in_group > 0 {
@@ -150,8 +150,8 @@ impl Engine {
                 false
             };
             if !sync_started {
-                let _ = oss.lock().start_input_trigger();
-                let _ = oss.lock().start_output_trigger();
+                let _ = oss.start_input_trigger();
+                let _ = oss.start_output_trigger();
             }
         }
     }
@@ -161,20 +161,37 @@ impl Engine {
 
     pub(crate) async fn open_discovered_midi_hw_devices(&mut self) {
         for device in Self::discover_midi_hw_devices() {
-            let (opened_in, opened_out) = {
-                let midi_hub = self.midi_hub.lock();
-                let opened_in = midi_hub.open_input(&device).is_ok();
-                let opened_out = midi_hub.open_output(&device).is_ok();
-                (opened_in, opened_out)
-            };
-
-            if opened_in {
-                self.notify_clients(Ok(Action::OpenMidiInputDevice(device.clone())))
+            if let Some(worker) = &self.hw_worker {
+                // The worker performs the actual open and responds with the
+                // real result via Message::Response, which is forwarded to
+                // clients; notifying an optimistic Ok here would produce a
+                // spurious success followed by a contradictory Err when the
+                // open fails in the worker.
+                let _ = worker
+                    .tx
+                    .send(Message::HWOpenMidiInputDevice(device.clone()))
                     .await;
-            }
-            if opened_out {
-                self.notify_clients(Ok(Action::OpenMidiOutputDevice(device.clone())))
+                let _ = worker
+                    .tx
+                    .send(Message::HWOpenMidiOutputDevice(device.clone()))
                     .await;
+            } else {
+                let (opened_in, opened_out) = if let Some(midi_hub) = self.midi_hub.as_mut() {
+                    (
+                        midi_hub.open_input(&device).is_ok(),
+                        midi_hub.open_output(&device).is_ok(),
+                    )
+                } else {
+                    (false, false)
+                };
+                if opened_in {
+                    self.notify_clients(Ok(Action::OpenMidiInputDevice(device.clone())))
+                        .await;
+                }
+                if opened_out {
+                    self.notify_clients(Ok(Action::OpenMidiOutputDevice(device.clone())))
+                        .await;
+                }
             }
         }
     }
@@ -200,14 +217,20 @@ impl Engine {
                 let midi_outputs = runtime.midi_output_devices();
                 let rate = runtime.sample_rate;
                 if let Some(worker) = self.hw_worker.take() {
-                    if let Some(hw) = &self.hw_driver {
-                        hw.lock().request_stop();
+                    if let Some(hw) = self.hw_driver.as_mut() {
+                        hw.request_stop();
                     }
                     let _ = worker.tx.send(Message::Request(Action::Quit)).await;
                     let _ = worker.handle.await;
                 }
                 self.hw_driver = None;
-                self.jack_runtime = Some(Arc::new(UnsafeMutex::new(runtime)));
+                self.hw_driver_info = None;
+                self.hw_input_ports.clear();
+                self.hw_output_ports.clear();
+                if self.midi_hub.is_none() {
+                    self.midi_hub = Some(MidiHub::default());
+                }
+                self.jack_runtime = Some(runtime);
                 self.publish_hw_ports();
                 self.publish_hw_infos(input_channels, output_channels, rate)
                     .await;
@@ -245,22 +268,18 @@ impl Engine {
     }
 
     pub(crate) fn hw_driver_input_audio_port(&self, from_port: usize) -> Option<Arc<AudioIO>> {
-        self.hw_driver
-            .as_ref()
-            .and_then(|h| h.lock().input_port(from_port))
+        self.hw_input_ports.get(from_port).cloned()
     }
 
     pub(crate) fn hw_driver_output_audio_port(&self, to_port: usize) -> Option<Arc<AudioIO>> {
-        self.hw_driver
-            .as_ref()
-            .and_then(|h| h.lock().output_port(to_port))
+        self.hw_output_ports.get(to_port).cloned()
     }
 
     #[cfg(unix)]
     pub(crate) fn jack_input_audio_port(&self, from_port: usize) -> Option<Arc<AudioIO>> {
         self.jack_runtime
             .as_ref()
-            .and_then(|j| j.lock().input_audio_port(from_port))
+            .and_then(|j| j.input_audio_port(from_port))
     }
 
     #[cfg(not(unix))]
@@ -272,7 +291,7 @@ impl Engine {
     pub(crate) fn jack_output_audio_port(&self, to_port: usize) -> Option<Arc<AudioIO>> {
         self.jack_runtime
             .as_ref()
-            .and_then(|j| j.lock().output_audio_port(to_port))
+            .and_then(|j| j.output_audio_port(to_port))
     }
 
     #[cfg(not(unix))]
@@ -306,10 +325,10 @@ impl Engine {
 
     #[cfg(unix)]
     pub(crate) async fn sync_from_jack_transport(&mut self) {
-        let Some(jack) = self.jack_runtime.clone() else {
+        let Some(jack) = self.jack_runtime.as_ref() else {
             return;
         };
-        let Ok((jack_state, jack_frame)) = jack.lock().transport_state_and_frame() else {
+        let Ok((jack_state, jack_frame)) = jack.transport_state_and_frame() else {
             return;
         };
 
@@ -399,8 +418,8 @@ impl Engine {
             return;
         }
         let (tx, rx) = channel::<Message>(32);
-        let hw = self.hw_driver.clone().unwrap();
-        let midi_hub = self.midi_hub.clone();
+        let hw = self.hw_driver.take().unwrap();
+        let midi_hub = self.midi_hub.take().unwrap_or_default();
         let tx_engine = self.tx.clone();
         let handler = tokio::spawn(async move {
             let worker = HwWorker::new(hw, midi_hub, rx, tx_engine);
@@ -454,11 +473,25 @@ impl Engine {
         }
         self.hw_input_latency_frames = in_lat.0;
         self.hw_output_latency_frames = out_lat.0;
+        self.hw_input_ports = (0..in_channels)
+            .filter_map(|idx| d.input_port(idx))
+            .collect();
+        self.hw_output_ports = (0..out_channels)
+            .filter_map(|idx| d.output_port(idx))
+            .collect();
+        self.hw_driver_info = Some(HwDriverInfo {
+            cycle_samples: d.cycle_samples(),
+            sample_rate: d.sample_rate(),
+            input_channels: in_channels,
+            output_channels: out_channels,
+            sample_bits: d.sample_bits(),
+            frame_size_bytes: d.frame_size_bytes(),
+        });
         #[cfg(unix)]
         {
             self.jack_runtime = None;
         }
-        self.hw_driver = Some(Arc::new(UnsafeMutex::new(d)));
+        self.hw_driver = Some(d);
         self.publish_hw_ports();
         self.publish_hw_infos(in_channels, out_channels, rate).await;
         Ok(())
@@ -473,7 +506,7 @@ impl Engine {
             outs: self.all_hw_output_audio_ports(),
             buffer_size: self.current_cycle_samples(),
         };
-        *self.hw_ports.lock().expect("hw ports mutex poisoned") = ports;
+        self.hw_ports.store(Arc::new(ports));
         self.plan_builder.mark_dirty();
     }
 
@@ -482,7 +515,7 @@ impl Engine {
         if self.metronome_enabled {
             self.ensure_metronome_track().await;
         }
-        if self.hw_worker.is_none() && self.hw_driver.is_some() {
+        if self.hw_worker.is_none() && (self.hw_driver.is_some() || self.hw_driver_info.is_some()) {
             self.ensure_hw_worker_running().await;
             self.request_hw_cycle().await;
         }
@@ -500,29 +533,23 @@ impl Engine {
     }
 
     pub(crate) fn all_hw_output_audio_ports(&self) -> Vec<Arc<AudioIO>> {
-        if let Some(driver) = &self.hw_driver {
-            let count = driver.lock().output_channels();
-            return (0..count)
-                .filter_map(|idx| self.hw_driver_output_audio_port(idx))
-                .collect();
+        if !self.hw_output_ports.is_empty() {
+            return self.hw_output_ports.clone();
         }
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime {
-            return jack.lock().audio_outs();
+            return jack.audio_outs();
         }
         Vec::new()
     }
 
     pub(crate) fn all_hw_input_audio_ports(&self) -> Vec<Arc<AudioIO>> {
-        if let Some(driver) = &self.hw_driver {
-            let count = driver.lock().input_channels();
-            return (0..count)
-                .filter_map(|idx| self.hw_driver_input_audio_port(idx))
-                .collect();
+        if !self.hw_input_ports.is_empty() {
+            return self.hw_input_ports.clone();
         }
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime {
-            return jack.lock().audio_ins();
+            return jack.audio_ins();
         }
         Vec::new()
     }
@@ -580,23 +607,20 @@ impl Engine {
             }
         }
         self.finalize_open_audio_device().await;
-        if let Some(hw) = &self.hw_driver {
-            let effective_action = {
-                let hw = hw.lock();
-                Action::OpenAudioDevice {
-                    device: device.clone(),
-                    input_device: input_device.clone(),
-                    sample_rate_hz: hw.sample_rate(),
-                    bits: hw.sample_bits(),
-                    exclusive,
-                    period_frames,
-                    nperiods,
-                    sync_mode,
-                    actual_period_frames: hw.cycle_samples(),
-                    input_channels: hw.input_channels(),
-                    output_channels: hw.output_channels(),
-                    bytes_per_frame: hw.frame_size_bytes(),
-                }
+        if let Some(info) = self.hw_driver_info {
+            let effective_action = Action::OpenAudioDevice {
+                device: device.clone(),
+                input_device: input_device.clone(),
+                sample_rate_hz: info.sample_rate,
+                bits: info.sample_bits,
+                exclusive,
+                period_frames,
+                nperiods,
+                sync_mode,
+                actual_period_frames: info.cycle_samples,
+                input_channels: info.input_channels,
+                output_channels: info.output_channels,
+                bytes_per_frame: info.frame_size_bytes,
             };
             return (false, Some(effective_action));
         }
@@ -606,29 +630,31 @@ impl Engine {
     pub(crate) async fn handle_jack_add_audio_input_port(&mut self, a: Action) -> bool {
         #[cfg(unix)]
         {
-            if let Some(jack) = self.jack_runtime.clone() {
-                let (input_channels, output_channels, rate) = {
-                    let jack = jack.lock();
-                    if let Err(e) = jack.add_audio_input_port() {
-                        self.notify_clients(Err(e)).await;
-                        return true;
-                    }
-                    (
-                        jack.input_channels(),
-                        jack.output_channels(),
-                        jack.sample_rate,
-                    )
-                };
-                self.publish_hw_ports();
-                self.publish_hw_infos(input_channels, output_channels, rate)
-                    .await;
-                self.notify_clients(Ok(a.clone())).await;
-            } else {
+            let Some(jack) = self.jack_runtime.as_mut() else {
                 self.notify_clients(Err(
                     "JACK runtime is not active; open the JACK backend first".to_string(),
                 ))
                 .await;
-            }
+                return false;
+            };
+            let result = jack.add_audio_input_port().map(|_| {
+                (
+                    jack.input_channels(),
+                    jack.output_channels(),
+                    jack.sample_rate,
+                )
+            });
+            let (input_channels, output_channels, rate) = match result {
+                Ok(info) => info,
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+            };
+            self.publish_hw_ports();
+            self.publish_hw_infos(input_channels, output_channels, rate)
+                .await;
+            self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]
         {
@@ -648,57 +674,58 @@ impl Engine {
         #[cfg(unix)]
         {
             let removed_port = _removed_port;
-            if let Some(jack) = self.jack_runtime.clone() {
-                let (removed_port, removed_io) = {
-                    let jack = jack.lock();
-                    let removed_port = Some(removed_port);
-                    let removed_io = removed_port.and_then(|port| jack.input_audio_port(port));
-                    match (removed_port, removed_io) {
-                        (Some(port), Some(io)) => (port, io),
-                        _ => {
-                            self.notify_clients(Err(
-                                "JACK audio input port index is out of range".to_string()
-                            ))
-                            .await;
-                            return true;
-                        }
-                    }
-                };
-                let reindex_notifications =
-                    self.reindex_notifications_for_removed_hw_input(removed_port);
-                for disconnect in
-                    self.disconnect_actions_for_removed_hw_input(removed_port, &removed_io)
-                {
-                    if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await {
-                        self.notify_clients(Err(e)).await;
-                        return true;
-                    }
-                }
-                let (input_channels, output_channels, rate) = {
-                    let jack = jack.lock();
-                    if let Err(e) = jack.remove_audio_input_port(removed_port) {
-                        self.notify_clients(Err(e)).await;
-                        return true;
-                    }
-                    (
-                        jack.input_channels(),
-                        jack.output_channels(),
-                        jack.sample_rate,
-                    )
-                };
-                self.publish_hw_ports();
-                for action in reindex_notifications {
-                    self.notify_clients(Ok(action)).await;
-                }
-                self.publish_hw_infos(input_channels, output_channels, rate)
-                    .await;
-                self.notify_clients(Ok(a.clone())).await;
-            } else {
+            if self.jack_runtime.is_none() {
                 self.notify_clients(Err(
                     "JACK runtime is not active; open the JACK backend first".to_string(),
                 ))
                 .await;
+                return false;
             }
+            let Some(removed_io) = self
+                .jack_runtime
+                .as_ref()
+                .and_then(|jack| jack.input_audio_port(removed_port))
+            else {
+                self.notify_clients(Err(
+                    "JACK audio input port index is out of range".to_string()
+                ))
+                .await;
+                return true;
+            };
+            let reindex_notifications =
+                self.reindex_notifications_for_removed_hw_input(removed_port);
+            for disconnect in
+                self.disconnect_actions_for_removed_hw_input(removed_port, &removed_io)
+            {
+                if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+            }
+            let result = self
+                .jack_runtime
+                .as_mut()
+                .expect("checked jack runtime")
+                .remove_audio_input_port(removed_port);
+            if let Err(e) = result {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+            let (input_channels, output_channels, rate) = {
+                let jack = self.jack_runtime.as_ref().expect("checked jack runtime");
+                (
+                    jack.input_channels(),
+                    jack.output_channels(),
+                    jack.sample_rate,
+                )
+            };
+            self.publish_hw_ports();
+            for action in reindex_notifications {
+                self.notify_clients(Ok(action)).await;
+            }
+            self.publish_hw_infos(input_channels, output_channels, rate)
+                .await;
+            self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]
         {
@@ -713,29 +740,31 @@ impl Engine {
     pub(crate) async fn handle_jack_add_audio_output_port(&mut self, a: Action) -> bool {
         #[cfg(unix)]
         {
-            if let Some(jack) = self.jack_runtime.clone() {
-                let (input_channels, output_channels, rate) = {
-                    let jack = jack.lock();
-                    if let Err(e) = jack.add_audio_output_port() {
-                        self.notify_clients(Err(e)).await;
-                        return true;
-                    }
-                    (
-                        jack.input_channels(),
-                        jack.output_channels(),
-                        jack.sample_rate,
-                    )
-                };
-                self.publish_hw_ports();
-                self.publish_hw_infos(input_channels, output_channels, rate)
-                    .await;
-                self.notify_clients(Ok(a.clone())).await;
-            } else {
+            let Some(jack) = self.jack_runtime.as_mut() else {
                 self.notify_clients(Err(
                     "JACK runtime is not active; open the JACK backend first".to_string(),
                 ))
                 .await;
-            }
+                return false;
+            };
+            let result = jack.add_audio_output_port().map(|_| {
+                (
+                    jack.input_channels(),
+                    jack.output_channels(),
+                    jack.sample_rate,
+                )
+            });
+            let (input_channels, output_channels, rate) = match result {
+                Ok(info) => info,
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+            };
+            self.publish_hw_ports();
+            self.publish_hw_infos(input_channels, output_channels, rate)
+                .await;
+            self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]
         {
@@ -755,57 +784,58 @@ impl Engine {
         #[cfg(unix)]
         {
             let removed_port = _removed_port;
-            if let Some(jack) = self.jack_runtime.clone() {
-                let (removed_port, removed_io) = {
-                    let jack = jack.lock();
-                    let removed_port = Some(removed_port);
-                    let removed_io = removed_port.and_then(|port| jack.output_audio_port(port));
-                    match (removed_port, removed_io) {
-                        (Some(port), Some(io)) => (port, io),
-                        _ => {
-                            self.notify_clients(Err(
-                                "JACK audio output port index is out of range".to_string(),
-                            ))
-                            .await;
-                            return true;
-                        }
-                    }
-                };
-                let reindex_notifications =
-                    self.reindex_notifications_for_removed_hw_output(removed_port);
-                for disconnect in
-                    self.disconnect_actions_for_removed_hw_output(removed_port, &removed_io)
-                {
-                    if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await {
-                        self.notify_clients(Err(e)).await;
-                        return true;
-                    }
-                }
-                let (input_channels, output_channels, rate) = {
-                    let jack = jack.lock();
-                    if let Err(e) = jack.remove_audio_output_port(removed_port) {
-                        self.notify_clients(Err(e)).await;
-                        return true;
-                    }
-                    (
-                        jack.input_channels(),
-                        jack.output_channels(),
-                        jack.sample_rate,
-                    )
-                };
-                self.publish_hw_ports();
-                for action in reindex_notifications {
-                    self.notify_clients(Ok(action)).await;
-                }
-                self.publish_hw_infos(input_channels, output_channels, rate)
-                    .await;
-                self.notify_clients(Ok(a.clone())).await;
-            } else {
+            if self.jack_runtime.is_none() {
                 self.notify_clients(Err(
                     "JACK runtime is not active; open the JACK backend first".to_string(),
                 ))
                 .await;
+                return false;
             }
+            let Some(removed_io) = self
+                .jack_runtime
+                .as_ref()
+                .and_then(|jack| jack.output_audio_port(removed_port))
+            else {
+                self.notify_clients(Err(
+                    "JACK audio output port index is out of range".to_string()
+                ))
+                .await;
+                return true;
+            };
+            let reindex_notifications =
+                self.reindex_notifications_for_removed_hw_output(removed_port);
+            for disconnect in
+                self.disconnect_actions_for_removed_hw_output(removed_port, &removed_io)
+            {
+                if let Err(e) = self.disconnect_audio_route_and_notify(disconnect).await {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+            }
+            let result = self
+                .jack_runtime
+                .as_mut()
+                .expect("checked jack runtime")
+                .remove_audio_output_port(removed_port);
+            if let Err(e) = result {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+            let (input_channels, output_channels, rate) = {
+                let jack = self.jack_runtime.as_ref().expect("checked jack runtime");
+                (
+                    jack.input_channels(),
+                    jack.output_channels(),
+                    jack.sample_rate,
+                )
+            };
+            self.publish_hw_ports();
+            for action in reindex_notifications {
+                self.notify_clients(Ok(action)).await;
+            }
+            self.publish_hw_infos(input_channels, output_channels, rate)
+                .await;
+            self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]
         {

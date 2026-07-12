@@ -96,7 +96,7 @@ pub fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
 pub fn bypass_copy_inputs_to_outputs(inputs: &[Arc<AudioIO>], outputs: &[Arc<AudioIO>]) {
     for (input, output) in inputs.iter().zip(outputs.iter()) {
         let src = input.buffer.lock();
-        let dst = output.buffer.lock();
+        let mut dst = output.buffer.lock();
         dst.fill(0.0);
         for (d, s) in dst.iter_mut().zip(src.iter()) {
             *d = *s;
@@ -104,7 +104,7 @@ pub fn bypass_copy_inputs_to_outputs(inputs: &[Arc<AudioIO>], outputs: &[Arc<Aud
         output.finished.store(true, Ordering::Release);
     }
     for output in outputs.iter().skip(inputs.len()) {
-        let dst = output.buffer.lock();
+        let mut dst = output.buffer.lock();
         dst.fill(0.0);
         output.finished.store(true, Ordering::Release);
     }
@@ -246,7 +246,7 @@ pub unsafe fn copy_inputs_to_shm(inputs: &[Arc<AudioIO>], ptr: *mut u8, frames: 
 /// Each output buffer must be writable and at least `frames` elements long.
 pub unsafe fn copy_outputs_from_shm(outputs: &[Arc<AudioIO>], ptr: *mut u8, frames: usize) {
     for (ch, output) in outputs.iter().enumerate() {
-        let dst = output.buffer.lock();
+        let mut dst = output.buffer.lock();
         let src = unsafe { audio_channel_ptr(ptr, ch, 1) };
         let len = frames.min(dst.len());
         unsafe {
@@ -279,55 +279,4 @@ pub unsafe fn configure_shm_header(
         h.midi_out_port_count
             .store(midi_out as u32, Ordering::Release);
     }
-}
-
-#[macro_export]
-macro_rules! impl_ipc_processor_wrapper {
-    ($processor:ty) => {
-        impl $crate::mutex::UnsafeMutex<$processor> {
-            pub fn setup_audio_ports(&self) {
-                self.lock().setup_audio_ports();
-            }
-
-            pub fn audio_inputs(&self) -> &[std::sync::Arc<$crate::audio::io::AudioIO>] {
-                self.lock().audio_inputs()
-            }
-
-            pub fn audio_outputs(&self) -> &[std::sync::Arc<$crate::audio::io::AudioIO>] {
-                self.lock().audio_outputs()
-            }
-
-            pub fn main_audio_input_count(&self) -> usize {
-                self.lock().main_audio_input_count()
-            }
-
-            pub fn main_audio_output_count(&self) -> usize {
-                self.lock().main_audio_output_count()
-            }
-
-            pub fn midi_input_count(&self) -> usize {
-                self.lock().midi_input_count()
-            }
-
-            pub fn midi_output_count(&self) -> usize {
-                self.lock().midi_output_count()
-            }
-
-            pub fn set_bypassed(&self, bypassed: bool) {
-                self.lock().set_bypassed(bypassed);
-            }
-
-            pub fn name(&self) -> String {
-                self.lock().name().to_string()
-            }
-
-            pub fn run_host_callbacks_main_thread(&self) {
-                self.lock().run_host_callbacks_main_thread();
-            }
-
-            pub fn reconfigure_ports_if_needed(&self) -> Result<bool, String> {
-                self.lock().reconfigure_ports_if_needed()
-            }
-        }
-    };
 }

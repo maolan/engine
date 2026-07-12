@@ -1,29 +1,90 @@
-use crate::mutex::UnsafeMutex;
 use crate::simd;
+use std::cell::UnsafeCell;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[derive(Debug)]
+pub struct AudioCell<T> {
+    value: UnsafeCell<T>,
+}
+
+impl<T> AudioCell<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    pub fn lock(&self) -> AudioCellGuard<'_, T> {
+        AudioCellGuard {
+            value: self.value.get(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+// Safety: audio graph execution gives each buffer one writer per render step,
+// and connection edits are control-side operations outside RT processing.
+unsafe impl<T: Send> Send for AudioCell<T> {}
+unsafe impl<T: Send> Sync for AudioCell<T> {}
+
+#[derive(Debug)]
+pub struct AudioCellGuard<'a, T> {
+    value: *mut T,
+    _marker: PhantomData<&'a mut T>,
+}
+
+impl<T> Deref for AudioCellGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // Safety: callers obey the AudioCell single-writer/control-side
+        // invariant documented above.
+        unsafe { &*self.value }
+    }
+}
+
+impl<T> DerefMut for AudioCellGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Safety: callers obey the AudioCell single-writer/control-side
+        // invariant documented above.
+        unsafe { &mut *self.value }
+    }
+}
+
+impl<'a, T> IntoIterator for AudioCellGuard<'a, Vec<T>> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        // Safety: the guard carries the borrow lifetime for the cell contents.
+        unsafe { (&*self.value).iter() }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioIO {
-    pub connections: Arc<UnsafeMutex<Vec<Arc<Self>>>>,
+    pub connections: Arc<AudioCell<Vec<Arc<Self>>>>,
     pub connection_count: Arc<AtomicUsize>,
-    pub buffer: Arc<UnsafeMutex<Vec<f32>>>,
+    pub buffer: Arc<AudioCell<Vec<f32>>>,
     pub finished: Arc<AtomicBool>,
 }
 
 impl AudioIO {
     pub fn new(size: usize) -> Self {
         Self {
-            connections: Arc::new(UnsafeMutex::new(vec![])),
+            connections: Arc::new(AudioCell::new(vec![])),
             connection_count: Arc::new(AtomicUsize::new(0)),
-            buffer: Arc::new(UnsafeMutex::new(vec![0.0; size])),
+            buffer: Arc::new(AudioCell::new(vec![0.0; size])),
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn connect(from: &Arc<Self>, to: &Arc<Self>) {
         let to_len = {
-            let conns = to.connections.lock();
+            let mut conns = to.connections.lock();
             if !conns.iter().any(|conn| Arc::ptr_eq(conn, from)) {
                 conns.push(from.clone());
             }
@@ -32,7 +93,7 @@ impl AudioIO {
         to.connection_count.store(to_len, Ordering::Relaxed);
 
         let from_len = {
-            let conns = from.connections.lock();
+            let mut conns = from.connections.lock();
             if !conns.iter().any(|conn| Arc::ptr_eq(conn, to)) {
                 conns.push(to.clone());
             }
@@ -42,12 +103,12 @@ impl AudioIO {
     }
 
     pub fn disconnect(from: &Arc<Self>, to: &Arc<Self>) -> Result<(), String> {
-        let to_conns = to.connections.lock();
+        let mut to_conns = to.connections.lock();
         let to_original_len = to_conns.len();
         to_conns.retain(|conn| !Arc::ptr_eq(conn, from));
         to.connection_count.store(to_conns.len(), Ordering::Relaxed);
 
-        let from_conns = from.connections.lock();
+        let mut from_conns = from.connections.lock();
         from_conns.retain(|conn| !Arc::ptr_eq(conn, to));
         from.connection_count
             .store(from_conns.len(), Ordering::Relaxed);
@@ -60,7 +121,7 @@ impl AudioIO {
     }
 
     pub fn process(&self) {
-        let local_buf = self.buffer.lock();
+        let mut local_buf = self.buffer.lock();
         let connections = self.connections.lock();
 
         match connections.len() {
@@ -69,7 +130,7 @@ impl AudioIO {
             }
             1 => {
                 let source_buf = connections[0].buffer.lock();
-                simd::copy_sanitized_inplace(local_buf, source_buf);
+                simd::copy_sanitized_inplace(&mut local_buf, &source_buf);
                 if source_buf.len() < local_buf.len() {
                     local_buf[source_buf.len()..].fill(0.0);
                 }
@@ -78,7 +139,7 @@ impl AudioIO {
                 let mut sources = connections.iter();
                 if let Some(first_source) = sources.next() {
                     let source_buf = first_source.buffer.lock();
-                    simd::copy_sanitized_inplace(local_buf, source_buf);
+                    simd::copy_sanitized_inplace(&mut local_buf, &source_buf);
                     if source_buf.len() < local_buf.len() {
                         local_buf[source_buf.len()..].fill(0.0);
                     }
@@ -87,7 +148,7 @@ impl AudioIO {
                 }
                 for source in sources {
                     let source_buf = source.buffer.lock();
-                    simd::add_sanitized_inplace(local_buf, source_buf);
+                    simd::add_sanitized_inplace(&mut local_buf, &source_buf);
                 }
             }
         }

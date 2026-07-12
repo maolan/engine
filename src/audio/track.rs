@@ -1,24 +1,41 @@
 use super::{clip::AudioClip, io::AudioIO};
-use std::sync::{Arc, atomic::Ordering};
+use arc_swap::ArcSwap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AudioTrack {
-    pub clips: Vec<AudioClip>,
+    clips: ArcSwap<Vec<Arc<AudioClip>>>,
     pub ins: Vec<Arc<AudioIO>>,
     pub outs: Vec<Arc<AudioIO>>,
-    pub finished: bool,
-    pub processing: bool,
+    finished: AtomicBool,
+    processing: AtomicBool,
     buffer_size: usize,
+}
+
+impl Clone for AudioTrack {
+    fn clone(&self) -> Self {
+        Self {
+            clips: ArcSwap::from(self.clips()),
+            ins: self.ins.clone(),
+            outs: self.outs.clone(),
+            finished: AtomicBool::new(self.finished()),
+            processing: AtomicBool::new(self.processing()),
+            buffer_size: self.buffer_size,
+        }
+    }
 }
 
 impl AudioTrack {
     pub fn new(ins_count: usize, outs_count: usize, buffer_size: usize) -> Self {
         let mut ret = Self {
-            clips: vec![],
+            clips: ArcSwap::from_pointee(Vec::new()),
             ins: Vec::with_capacity(ins_count),
             outs: Vec::with_capacity(outs_count),
-            finished: false,
-            processing: false,
+            finished: AtomicBool::new(false),
+            processing: AtomicBool::new(false),
             buffer_size,
         };
         for _ in 0..ins_count {
@@ -32,6 +49,58 @@ impl AudioTrack {
 
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
+    }
+
+    pub fn clips(&self) -> Arc<Vec<Arc<AudioClip>>> {
+        self.clips.load_full()
+    }
+
+    pub fn set_clips(&self, clips: Vec<AudioClip>) {
+        self.clips
+            .store(Arc::new(clips.into_iter().map(Arc::new).collect()));
+    }
+
+    pub fn push_clip(&self, clip: AudioClip) {
+        let mut clips = self.clips();
+        Arc::make_mut(&mut clips).push(Arc::new(clip));
+        self.clips.store(clips);
+    }
+
+    pub fn remove_clip(&self, index: usize) -> Option<Arc<AudioClip>> {
+        let mut clips = self.clips();
+        let removed = if index < clips.len() {
+            Some(Arc::make_mut(&mut clips).remove(index))
+        } else {
+            None
+        };
+        if removed.is_some() {
+            self.clips.store(clips);
+        }
+        removed
+    }
+
+    pub fn update_clip<R>(&self, index: usize, f: impl FnOnce(&mut AudioClip) -> R) -> Option<R> {
+        let mut clips = self.clips();
+        let clip = Arc::make_mut(&mut clips).get_mut(index)?;
+        let ret = f(Arc::make_mut(clip));
+        self.clips.store(clips);
+        Some(ret)
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    pub fn set_finished(&self, finished: bool) {
+        self.finished.store(finished, Ordering::Release);
+    }
+
+    pub fn processing(&self) -> bool {
+        self.processing.load(Ordering::Acquire)
+    }
+
+    pub fn set_processing(&self, processing: bool) {
+        self.processing.store(processing, Ordering::Release);
     }
 
     pub fn connect_in(&self, index: usize, from: Arc<AudioIO>) -> Result<(), String> {
@@ -74,18 +143,18 @@ impl AudioTrack {
         }
         for (audio_in, audio_out) in self.ins.iter().zip(self.outs.iter()) {
             let in_samples = audio_in.buffer.lock();
-            let out_samples = audio_out.buffer.lock();
+            let mut out_samples = audio_out.buffer.lock();
 
-            out_samples.copy_from_slice(in_samples);
+            out_samples.copy_from_slice(&in_samples);
             audio_out.finished.store(true, Ordering::Release);
         }
-        self.finished = true;
-        self.processing = false;
+        self.set_finished(true);
+        self.set_processing(false);
     }
 
     pub fn setup(&mut self) {
-        self.finished = false;
-        self.processing = false;
+        self.set_finished(false);
+        self.set_processing(false);
         for input in &self.ins {
             input.setup();
         }

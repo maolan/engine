@@ -179,6 +179,10 @@ impl crate::hw::traits::HwWorkerDriver for HwDriver {
         self.sample_rate
     }
 
+    fn set_output_gain_balance(&mut self, gain: f32, balance: f32) {
+        self.set_output_gain_balance(gain, balance)
+    }
+
     fn run_cycle_for_worker(&mut self) -> Result<(), String> {
         self.io_state.run_cycle(
             &self.input_channels,

@@ -1,15 +1,12 @@
 use crate::{
-    hw::config,
     hw::traits::{HwMidiHub, HwWorkerDriver},
     message::{HwMidiEvent, Message},
-    mutex::UnsafeMutex,
 };
 #[cfg(unix)]
 use nix::libc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
 
@@ -28,142 +25,47 @@ pub trait Backend: Send + Sync + 'static {
 
 #[derive(Debug)]
 pub struct HwWorker<B: Backend> {
-    driver: Arc<UnsafeMutex<B::Driver>>,
-    midi_hub: Arc<UnsafeMutex<B::MidiHub>>,
+    /// Owned by the worker between cycles; shuttled to the spawn_blocking
+    /// thread for the duration of each audio cycle (`None` only while a
+    /// cycle is in flight, during which the message channel is not polled).
+    driver: Option<B::Driver>,
+    midi_hub: B::MidiHub,
     rx: Receiver<Message>,
     tx: Sender<Message>,
     cycle_frames: u32,
     pending_midi_out_events: Vec<HwMidiEvent>,
     pending_midi_out_sorted: bool,
     midi_stop: Arc<AtomicBool>,
-    assist_state: Arc<(Mutex<AssistState>, Condvar)>,
+    /// Mirrors the last `HWSetPlaying`; while stopped, MIDI-out events are
+    /// flushed on receipt (panic All-Sound-Off must not wait for a cycle)
+    /// and MIDI input is drained by a periodic timer instead of per cycle.
+    playing: bool,
 }
+
+/// How often hardware MIDI input is polled when no audio cycles are running
+/// (transport stopped). While playing, input is drained every cycle and this
+/// timer is only a harmless extra non-blocking read.
+const MIDI_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl<B: Backend> Drop for HwWorker<B> {
     fn drop(&mut self) {
-        self.driver.lock().request_stop();
-        self.midi_stop.store(true, Ordering::Release);
-        {
-            let midi_hub = self.midi_hub.lock();
-            midi_hub.wake_input_waiter();
-            midi_hub.close_input_waiter();
+        if let Some(driver) = self.driver.as_mut() {
+            driver.request_stop();
         }
-        {
-            let (lock, cvar) = &*self.assist_state;
-            if let Ok(mut st) = lock.lock() {
-                st.shutdown = true;
-                cvar.notify_one();
-            }
+        self.midi_stop.store(true, Ordering::Release);
+        self.midi_hub.wake_input_waiter();
+        self.midi_hub.close_input_waiter();
+        if let Some(driver) = self.driver.as_mut() {
+            driver.close_fds();
         }
     }
-}
-
-#[derive(Debug, Default)]
-struct AssistState {
-    shutdown: bool,
-    request_seq: u64,
-    done_seq: u64,
-    init_complete: bool,
-    last_error: Option<String>,
 }
 
 #[cfg(unix)]
 const RT_POLICY: i32 = libc::SCHED_FIFO;
 const RT_PRIORITY_WORKER: i32 = 18;
-const RT_PRIORITY_ASSIST: i32 = 12;
-const PROFILE_INTERVAL: Duration = Duration::from_secs(1);
-
-#[derive(Debug)]
-struct AssistProfiler {
-    report_at: Instant,
-    cycle_count: u64,
-    cycle_err_count: u64,
-    cycle_time_ns: u128,
-    step_count: u64,
-    step_work_count: u64,
-    step_err_count: u64,
-    step_time_ns: u128,
-    wait_count: u64,
-    wait_time_ns: u128,
-}
-
-impl AssistProfiler {
-    fn new() -> Self {
-        Self {
-            report_at: Instant::now() + PROFILE_INTERVAL,
-            cycle_count: 0,
-            cycle_err_count: 0,
-            cycle_time_ns: 0,
-            step_count: 0,
-            step_work_count: 0,
-            step_err_count: 0,
-            step_time_ns: 0,
-            wait_count: 0,
-            wait_time_ns: 0,
-        }
-    }
-
-    fn maybe_report(&mut self, cycle_samples: usize, sample_rate: i32, label: &str) {
-        let now = Instant::now();
-        if now < self.report_at {
-            return;
-        }
-        let cycle_avg_us = if self.cycle_count > 0 {
-            (self.cycle_time_ns / self.cycle_count as u128) as f64 / 1_000.0
-        } else {
-            0.0
-        };
-        let step_avg_us = if self.step_count > 0 {
-            (self.step_time_ns / self.step_count as u128) as f64 / 1_000.0
-        } else {
-            0.0
-        };
-        let wait_avg_us = if self.wait_count > 0 {
-            (self.wait_time_ns / self.wait_count as u128) as f64 / 1_000.0
-        } else {
-            0.0
-        };
-        let expected_cycles_per_sec = if cycle_samples > 0 && sample_rate > 0 {
-            sample_rate as f64 / cycle_samples as f64
-        } else {
-            0.0
-        };
-        error!(
-            "{} profile: expected_cps={:.1} cycles={} cycle_err={} cycle_avg_us={:.1} steps={} steps_work={} step_err={} step_avg_us={:.1} waits={} wait_avg_us={:.1}",
-            label,
-            expected_cycles_per_sec,
-            self.cycle_count,
-            self.cycle_err_count,
-            cycle_avg_us,
-            self.step_count,
-            self.step_work_count,
-            self.step_err_count,
-            step_avg_us,
-            self.wait_count,
-            wait_avg_us
-        );
-        self.report_at = now + PROFILE_INTERVAL;
-        self.cycle_count = 0;
-        self.cycle_err_count = 0;
-        self.cycle_time_ns = 0;
-        self.step_count = 0;
-        self.step_work_count = 0;
-        self.step_err_count = 0;
-        self.step_time_ns = 0;
-        self.wait_count = 0;
-        self.wait_time_ns = 0;
-    }
-}
 
 impl<B: Backend> HwWorker<B> {
-    fn profile_enabled() -> bool {
-        config::env_flag(config::HW_PROFILE_ENV)
-    }
-
-    fn assist_autonomous_enabled() -> bool {
-        B::ASSIST_AUTONOMOUS_DEFAULT || config::env_flag(B::ASSIST_AUTONOMOUS_ENV)
-    }
-
     fn configure_rt_thread(name: &str, priority: i32) -> Result<(), String> {
         #[cfg(unix)]
         {
@@ -239,17 +141,14 @@ impl<B: Backend> HwWorker<B> {
     }
 
     pub fn new(
-        driver: Arc<UnsafeMutex<B::Driver>>,
-        midi_hub: Arc<UnsafeMutex<B::MidiHub>>,
+        driver: B::Driver,
+        midi_hub: B::MidiHub,
         rx: Receiver<Message>,
         tx: Sender<Message>,
     ) -> Self {
-        let cycle_frames = {
-            let d = driver.lock();
-            d.cycle_samples() as u32
-        };
+        let cycle_frames = driver.cycle_samples() as u32;
         Self {
-            driver,
+            driver: Some(driver),
             midi_hub,
             rx,
             tx,
@@ -257,8 +156,34 @@ impl<B: Backend> HwWorker<B> {
             pending_midi_out_events: vec![],
             pending_midi_out_sorted: true,
             midi_stop: Arc::new(AtomicBool::new(false)),
-            assist_state: Arc::new((Mutex::new(AssistState::default()), Condvar::new())),
+            playing: false,
         }
+    }
+
+    fn driver_mut(&mut self) -> &mut B::Driver {
+        self.driver
+            .as_mut()
+            .expect("driver is only absent while a cycle runs on the blocking thread")
+    }
+
+    /// Run one audio cycle on a tokio blocking thread. The blocking pool
+    /// thread does not inherit the async worker thread's realtime priority,
+    /// so configure it for every cycle — the pool may hand each cycle to a
+    /// different thread.
+    fn run_cycle_blocking(mut driver: B::Driver) -> (B::Driver, Result<(), String>) {
+        if let Err(e) = Self::configure_rt_thread(B::WORKER_THREAD_NAME, RT_PRIORITY_WORKER) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "{} cycle thread realtime priority not enabled: {}",
+                    B::LABEL,
+                    e
+                );
+            }
+        }
+        let result = driver.run_cycle_for_worker();
+        (driver, result)
     }
 
     pub async fn work(mut self) {
@@ -276,8 +201,10 @@ impl<B: Backend> HwWorker<B> {
 
         #[cfg(unix)]
         {
-            let has_fds = self.driver.lock().capture_fd().is_some()
-                && self.driver.lock().playback_fd().is_some();
+            let has_fds = self
+                .driver
+                .as_ref()
+                .is_some_and(|d| d.capture_fd().is_some() && d.playback_fd().is_some());
             if has_fds {
                 self.work_async().await;
                 return;
@@ -289,140 +216,168 @@ impl<B: Backend> HwWorker<B> {
 
     #[cfg(unix)]
     async fn work_async(&mut self) {
-        let midi_handle = Self::start_midi_input_thread(
-            self.midi_hub.clone(),
-            self.tx.clone(),
-            self.cycle_frames,
-            self.midi_stop.clone(),
-        );
         let mut cycle_running = false;
-        let (cycle_tx, mut cycle_rx) = tokio::sync::mpsc::channel::<Result<(), String>>(1);
+        let (cycle_tx, mut cycle_rx) =
+            tokio::sync::mpsc::channel::<(B::Driver, Result<(), String>)>(1);
+        let mut midi_input_poll = tokio::time::interval(MIDI_INPUT_POLL_INTERVAL);
         loop {
             tokio::select! {
-                msg = self.rx.recv() => {
+                // While a cycle is in flight the driver lives on the blocking
+                // thread, so the message channel is not polled; queued
+                // messages (including Quit) are handled once the cycle
+                // returns — bounded by one audio period.
+                msg = self.rx.recv(), if !cycle_running => {
                     let msg = match msg {
                         Some(m) => m,
                         None => {
-                            self.driver.lock().request_stop();
-                            if cycle_running {
-                                let _ = cycle_rx.recv().await;
-                            }
-                            self.shutdown_channel_closed(midi_handle);
+                            self.driver_mut().request_stop();
+                            self.shutdown_channel_closed();
                             return;
                         }
                     };
                     match msg {
                         Message::Request(crate::message::Action::Quit) => {
-                            self.driver.lock().request_stop();
-                            if cycle_running {
-                                // Wait for the in-flight cycle to finish so the
-                                // spawn_blocking task releases the driver before
-                                // exit(0) closes the fds.
-                                let _ = cycle_rx.recv().await;
-                            }
-                            self.shutdown_quit(midi_handle);
+                            self.driver_mut().request_stop();
+                            self.shutdown_quit();
                             return;
                         }
                         Message::TracksFinished => {
                             self.flush_pending_midi_out();
+                            self.drain_midi_input().await;
                             if !cycle_running {
                                 cycle_running = true;
-                                let driver = self.driver.clone();
                                 let tx = cycle_tx.clone();
+                                let driver = self.driver.take().expect(
+                                    "driver is only absent while a cycle is running",
+                                );
                                 tokio::task::spawn_blocking(move || {
-                                    // The tokio blocking thread that executes the audio cycle
-                                    // does not inherit the async worker thread's realtime
-                                    // priority. Configure it here so OSS/ALSA cycles run with
-                                    // the same SCHED_FIFO priority as the legacy assist thread.
-                                    if let Err(e) = Self::configure_rt_thread(
-                                        B::WORKER_THREAD_NAME,
-                                        RT_PRIORITY_WORKER,
-                                    ) {
-                                        static WARNED: std::sync::atomic::AtomicBool =
-                                            std::sync::atomic::AtomicBool::new(false);
-                                        if !WARNED
-                                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                                        {
-                                            tracing::warn!(
-                                                "{} cycle thread realtime priority not enabled: {}",
-                                                B::LABEL,
-                                                e
-                                            );
-                                        }
-                                    }
-                                    let result = driver.lock().run_cycle_for_worker();
-                                    let _ = tx.blocking_send(result);
+                                    let _ = tx.blocking_send(Self::run_cycle_blocking(driver));
                                 });
                             }
                         }
                         Message::HWMidiOutEvents(mut events) => {
                             self.pending_midi_out_events.append(&mut events);
                             self.pending_midi_out_sorted = false;
+                            // Stopped transport means no cycles and no
+                            // TracksFinished to flush on; write immediately so
+                            // e.g. panic All-Sound-Off reaches the device.
+                            if !self.playing {
+                                self.flush_pending_midi_out();
+                            }
                         }
                         Message::ClearHWMidiOutEvents => {
                             self.pending_midi_out_events.clear();
                             self.pending_midi_out_sorted = true;
+                        }
+                        Message::HWSetPlaying(playing) => {
+                            self.playing = playing;
+                            self.driver_mut().set_playing(playing);
+                        }
+                        Message::HWSetOutputGainBalance { gain, balance } => {
+                            self.driver_mut().set_output_gain_balance(gain, balance);
+                        }
+                        Message::HWOpenMidiInputDevice(device) => {
+                            let result = self.midi_hub.open_input(&device);
+                            let action = crate::message::Action::OpenMidiInputDevice(device);
+                            let _ = self.tx.send(Message::Response(result.map(|_| action))).await;
+                        }
+                        Message::HWOpenMidiOutputDevice(device) => {
+                            let result = self.midi_hub.open_output(&device);
+                            let action = crate::message::Action::OpenMidiOutputDevice(device);
+                            let _ = self.tx.send(Message::Response(result.map(|_| action))).await;
+                        }
+                        Message::HWCloseMidiDevices => {
+                            self.midi_hub.close_all();
                         }
                         _ => {}
                     }
                 }
                 result = cycle_rx.recv(), if cycle_running => {
                     cycle_running = false;
-                    if let Some(Err(e)) = result {
-                        error!("{} cycle error: {}", B::LABEL, e);
-                        let _ = self.tx.send(Message::Response(Err(format!(
-                            "{} cycle error: {}", B::LABEL, e
-                        )))).await;
+                    if let Some((driver, result)) = result {
+                        self.driver = Some(driver);
+                        if let Err(e) = result {
+                            error!("{} cycle error: {}", B::LABEL, e);
+                            let _ = self.tx.send(Message::Response(Err(format!(
+                                "{} cycle error: {}", B::LABEL, e
+                            )))).await;
+                        }
                     }
                     if let Err(e) = self.tx.send(Message::HWFinished).await {
                         error!("{} worker failed to send HWFinished: {}", B::LABEL, e);
                     }
+                }
+                // Hardware MIDI input must flow even while the transport is
+                // stopped (MIDI learn, monitoring, external controllers);
+                // while playing, input is drained every cycle on
+                // TracksFinished and this is an extra non-blocking read.
+                _ = midi_input_poll.tick(), if !cycle_running => {
+                    self.drain_midi_input().await;
                 }
             }
         }
     }
 
     async fn work_legacy(&mut self) {
-        let assist_handle =
-            Self::start_assist_thread(self.driver.clone(), self.assist_state.clone());
-        let midi_handle = Self::start_midi_input_thread(
-            self.midi_hub.clone(),
-            self.tx.clone(),
-            self.cycle_frames,
-            self.midi_stop.clone(),
-        );
+        let mut midi_input_poll = tokio::time::interval(MIDI_INPUT_POLL_INTERVAL);
         loop {
-            let msg = match self.rx.recv().await {
-                Some(msg) => msg,
-                None => {
-                    self.driver.lock().request_stop();
-                    self.shutdown_midi(midi_handle);
-                    Self::stop_assist_thread(&self.assist_state, assist_handle);
-                    self.driver.lock().request_stop();
-                    return;
+            let msg = tokio::select! {
+                msg = self.rx.recv() => match msg {
+                    Some(msg) => msg,
+                    None => {
+                        self.driver_mut().request_stop();
+                        self.shutdown_midi();
+                        self.driver_mut().close_fds();
+                        return;
+                    }
+                },
+                // Keep hardware MIDI input flowing while the transport is
+                // stopped; see work_async.
+                _ = midi_input_poll.tick() => {
+                    self.drain_midi_input().await;
+                    continue;
                 }
             };
             match msg {
                 Message::Request(crate::message::Action::Quit) => {
-                    self.driver.lock().request_stop();
+                    self.driver_mut().request_stop();
                     self.flush_pending_midi_out();
-                    self.shutdown_midi(midi_handle);
-                    Self::stop_assist_thread(&self.assist_state, assist_handle);
-                    self.driver.lock().request_stop();
+                    self.shutdown_midi();
+                    self.driver_mut().close_fds();
+                    self.driver_mut().request_stop();
                     return;
                 }
                 Message::TracksFinished => {
                     self.flush_pending_midi_out();
-                    if let Err(e) = Self::run_assist_cycle(&self.driver, &self.assist_state) {
-                        error!("{} assist cycle error: {}", B::LABEL, e);
-                        let _ = self
-                            .tx
-                            .send(Message::Response(Err(format!(
-                                "{} assist cycle error: {}",
-                                B::LABEL,
-                                e
-                            ))))
-                            .await;
+                    self.drain_midi_input().await;
+                    // The cycle blocks for a full audio period; run it on a
+                    // blocking thread with per-cycle RT priority instead of
+                    // stalling the async worker task (see work_async).
+                    let driver = self
+                        .driver
+                        .take()
+                        .expect("driver is only absent while a cycle is running");
+                    let cycle =
+                        tokio::task::spawn_blocking(move || Self::run_cycle_blocking(driver));
+                    match cycle.await {
+                        Ok((driver, result)) => {
+                            self.driver = Some(driver);
+                            if let Err(e) = result {
+                                error!("{} assist cycle error: {}", B::LABEL, e);
+                                let _ = self
+                                    .tx
+                                    .send(Message::Response(Err(format!(
+                                        "{} assist cycle error: {}",
+                                        B::LABEL,
+                                        e
+                                    ))))
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            error!("{} cycle task failed: {}", B::LABEL, e);
+                            return;
+                        }
                     }
                     if let Err(e) = self.tx.send(Message::HWFinished).await {
                         error!(
@@ -435,10 +390,41 @@ impl<B: Backend> HwWorker<B> {
                 Message::HWMidiOutEvents(mut events) => {
                     self.pending_midi_out_events.append(&mut events);
                     self.pending_midi_out_sorted = false;
+                    // Stopped transport means no cycles and no TracksFinished
+                    // to flush on; write immediately (panic All-Sound-Off).
+                    if !self.playing {
+                        self.flush_pending_midi_out();
+                    }
                 }
                 Message::ClearHWMidiOutEvents => {
                     self.pending_midi_out_events.clear();
                     self.pending_midi_out_sorted = true;
+                }
+                Message::HWSetPlaying(playing) => {
+                    self.playing = playing;
+                    self.driver_mut().set_playing(playing);
+                }
+                Message::HWSetOutputGainBalance { gain, balance } => {
+                    self.driver_mut().set_output_gain_balance(gain, balance);
+                }
+                Message::HWOpenMidiInputDevice(device) => {
+                    let result = self.midi_hub.open_input(&device);
+                    let action = crate::message::Action::OpenMidiInputDevice(device);
+                    let _ = self
+                        .tx
+                        .send(Message::Response(result.map(|_| action)))
+                        .await;
+                }
+                Message::HWOpenMidiOutputDevice(device) => {
+                    let result = self.midi_hub.open_output(&device);
+                    let action = crate::message::Action::OpenMidiOutputDevice(device);
+                    let _ = self
+                        .tx
+                        .send(Message::Response(result.map(|_| action)))
+                        .await;
+                }
+                Message::HWCloseMidiDevices => {
+                    self.midi_hub.close_all();
                 }
                 _ => {}
             }
@@ -458,285 +444,41 @@ impl<B: Backend> HwWorker<B> {
             });
             self.pending_midi_out_sorted = true;
         }
-        let midi_hub = self.midi_hub.lock();
-        midi_hub.write_events(&self.pending_midi_out_events);
+        self.midi_hub.write_events(&self.pending_midi_out_events);
         self.pending_midi_out_events.clear();
     }
 
-    fn shutdown_midi(&mut self, midi_handle: JoinHandle<()>) {
+    async fn drain_midi_input(&mut self) {
+        let mut midi_in_events = Vec::with_capacity(64);
+        self.midi_hub.read_events_into(&mut midi_in_events);
+        if midi_in_events.is_empty() {
+            return;
+        }
+        spread_hw_event_frames(&mut midi_in_events, self.cycle_frames);
+        let _ = self.tx.send(Message::HWMidiEvents(midi_in_events)).await;
+    }
+
+    fn shutdown_midi(&mut self) {
         self.midi_stop.store(true, Ordering::Release);
-        {
-            let midi_hub = self.midi_hub.lock();
-            midi_hub.wake_input_waiter();
-        }
-        let _ = midi_handle.join();
-        {
-            let midi_hub = self.midi_hub.lock();
-            midi_hub.close_input_waiter();
-        }
+        self.midi_hub.wake_input_waiter();
+        self.midi_hub.close_input_waiter();
     }
 
     #[cfg(unix)]
-    fn shutdown_quit(&mut self, midi_handle: JoinHandle<()>) {
-        self.driver.lock().request_stop();
+    fn shutdown_quit(&mut self) {
+        self.driver_mut().request_stop();
         self.flush_pending_midi_out();
-        self.shutdown_midi(midi_handle);
-        self.driver.lock().request_stop();
+        self.shutdown_midi();
+        self.driver_mut().close_fds();
+        self.driver_mut().request_stop();
     }
 
     #[cfg(unix)]
-    fn shutdown_channel_closed(&mut self, midi_handle: JoinHandle<()>) {
-        self.driver.lock().request_stop();
-        self.shutdown_midi(midi_handle);
-        self.driver.lock().request_stop();
-    }
-
-    fn start_midi_input_thread(
-        midi_hub: Arc<UnsafeMutex<B::MidiHub>>,
-        tx: Sender<Message>,
-        cycle_frames: u32,
-        stop: Arc<AtomicBool>,
-    ) -> JoinHandle<()> {
-        std::thread::spawn(move || {
-            crate::enable_flush_denormals_to_zero();
-            let mut midi_in_events = Vec::with_capacity(64);
-            while !stop.load(Ordering::Acquire) {
-                let ready_fds = {
-                    let hub = midi_hub.lock();
-                    hub.wait_ready_blocking()
-                };
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                {
-                    let hub = midi_hub.lock();
-                    hub.read_events_for_fds(
-                        ready_fds.as_deref().unwrap_or(&[]),
-                        &mut midi_in_events,
-                    );
-                }
-                if midi_in_events.is_empty() {
-                    continue;
-                }
-                spread_hw_event_frames(&mut midi_in_events, cycle_frames);
-                let cap = midi_in_events.capacity();
-                let out = std::mem::replace(&mut midi_in_events, Vec::with_capacity(cap.max(64)));
-                if tx.blocking_send(Message::HWMidiEvents(out)).is_err() {
-                    break;
-                }
-            }
-        })
-    }
-
-    fn start_assist_thread(
-        driver: Arc<UnsafeMutex<B::Driver>>,
-        assist_state: Arc<(Mutex<AssistState>, Condvar)>,
-    ) -> JoinHandle<()> {
-        let profile = Self::profile_enabled();
-        let autonomous = Self::assist_autonomous_enabled();
-        std::thread::spawn(move || {
-            crate::enable_flush_denormals_to_zero();
-            if let Err(e) = Self::configure_rt_thread(B::ASSIST_THREAD_NAME, RT_PRIORITY_ASSIST) {
-                error!("{} assist realtime priority not enabled: {}", B::LABEL, e);
-            }
-            #[cfg(target_os = "macos")]
-            unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
-            }
-            let mut profiler = if profile {
-                let (cycle_samples, sample_rate) = {
-                    let d = driver.lock();
-                    (d.cycle_samples(), d.sample_rate())
-                };
-                error!(
-                    "{} profile enabled: cycle_samples={} sample_rate={} expected_cps={:.1}",
-                    B::LABEL,
-                    cycle_samples,
-                    sample_rate,
-                    if cycle_samples > 0 {
-                        sample_rate as f64 / cycle_samples as f64
-                    } else {
-                        0.0
-                    }
-                );
-                Some(AssistProfiler::new())
-            } else {
-                None
-            };
-            let (lock, cvar) = &*assist_state;
-            loop {
-                let (shutdown, has_request, target, init_complete) = {
-                    let st = lock.lock().expect("assist mutex poisoned");
-                    (
-                        st.shutdown,
-                        st.request_seq > st.done_seq,
-                        st.request_seq,
-                        st.init_complete,
-                    )
-                };
-                if shutdown {
-                    break;
-                }
-                if has_request {
-                    let started = Instant::now();
-                    let run_error = {
-                        let d = driver.lock();
-                        d.run_cycle_for_worker().err().map(|e| e.to_string())
-                    };
-                    if let Some(p) = profiler.as_mut() {
-                        p.cycle_count += 1;
-                        if run_error.is_some() {
-                            p.cycle_err_count += 1;
-                        }
-                        p.cycle_time_ns += started.elapsed().as_nanos();
-                        let (cycle_samples, sample_rate) = {
-                            let d = driver.lock();
-                            (d.cycle_samples(), d.sample_rate())
-                        };
-                        p.maybe_report(cycle_samples, sample_rate, B::LABEL);
-                    }
-                    let mut st = lock.lock().expect("assist mutex poisoned");
-                    st.done_seq = st.done_seq.max(target);
-                    if run_error.is_none() {
-                        st.init_complete = true;
-                    }
-                    st.last_error = run_error;
-                    cvar.notify_all();
-                    continue;
-                }
-
-                if B::ASSIST_STEP_REQUIRES_REQUEST_CYCLE && !init_complete {
-                    let st = lock.lock().expect("assist mutex poisoned");
-                    if st.shutdown {
-                        break;
-                    }
-                    let wait_started = Instant::now();
-                    let _guard = cvar.wait(st).expect("assist condvar failed");
-                    if let Some(p) = profiler.as_mut() {
-                        p.wait_count += 1;
-                        p.wait_time_ns += wait_started.elapsed().as_nanos();
-                    }
-                    continue;
-                }
-
-                if !autonomous {
-                    let st = lock.lock().expect("assist mutex poisoned");
-                    if st.shutdown {
-                        break;
-                    }
-                    let wait_started = Instant::now();
-                    let _guard = cvar.wait(st).expect("assist condvar failed");
-                    if let Some(p) = profiler.as_mut() {
-                        p.wait_count += 1;
-                        p.wait_time_ns += wait_started.elapsed().as_nanos();
-                    }
-                    continue;
-                }
-
-                let started = Instant::now();
-                let did_work = {
-                    let d = driver.lock();
-                    match d.run_assist_step_for_worker() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            if let Some(p) = profiler.as_mut() {
-                                p.step_err_count += 1;
-                            }
-                            let mut st = lock.lock().expect("assist mutex poisoned");
-                            st.last_error = Some(e.to_string());
-                            cvar.notify_all();
-                            false
-                        }
-                    }
-                };
-                if let Some(p) = profiler.as_mut() {
-                    p.step_count += 1;
-                    if did_work {
-                        p.step_work_count += 1;
-                    }
-                    p.step_time_ns += started.elapsed().as_nanos();
-                    let (cycle_samples, sample_rate) = {
-                        let d = driver.lock();
-                        (d.cycle_samples(), d.sample_rate())
-                    };
-                    p.maybe_report(cycle_samples, sample_rate, B::LABEL);
-                }
-                if !did_work {
-                    let st = lock.lock().expect("assist mutex poisoned");
-                    if st.shutdown {
-                        break;
-                    }
-                    let wait_started = Instant::now();
-                    let _guard = if autonomous {
-                        cvar.wait_timeout(st, Duration::from_micros(100))
-                            .expect("assist condvar failed")
-                            .0
-                    } else {
-                        cvar.wait(st).expect("assist condvar failed")
-                    };
-                    if let Some(p) = profiler.as_mut() {
-                        p.wait_count += 1;
-                        p.wait_time_ns += wait_started.elapsed().as_nanos();
-                    }
-                }
-            }
-        })
-    }
-
-    fn run_assist_cycle(
-        driver: &Arc<UnsafeMutex<B::Driver>>,
-        assist_state: &Arc<(Mutex<AssistState>, Condvar)>,
-    ) -> Result<(), String> {
-        let autonomous =
-            Self::assist_autonomous_enabled() && B::CYCLE_ON_WORKER_WHEN_ASSIST_AUTONOMOUS;
-        if autonomous {
-            let (lock, cvar) = &**assist_state;
-            {
-                let mut st = lock
-                    .lock()
-                    .map_err(|_| "assist mutex poisoned".to_string())?;
-                st.init_complete = true;
-                cvar.notify_one();
-            }
-            let result = driver.lock().run_cycle_for_worker();
-            {
-                let mut st = lock
-                    .lock()
-                    .map_err(|_| "assist mutex poisoned".to_string())?;
-                st.last_error = result.as_ref().err().map(|e| e.to_string());
-                cvar.notify_one();
-            }
-            return result;
-        }
-
-        let (lock, cvar) = &**assist_state;
-        let mut st = lock
-            .lock()
-            .map_err(|_| "assist mutex poisoned".to_string())?;
-        st.request_seq = st.request_seq.saturating_add(1);
-        let target = st.request_seq;
-        cvar.notify_one();
-        while st.done_seq < target && !st.shutdown {
-            st = cvar
-                .wait(st)
-                .map_err(|_| "assist condvar wait failed".to_string())?;
-        }
-        if let Some(err) = st.last_error.take() {
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    fn stop_assist_thread(
-        assist_state: &Arc<(Mutex<AssistState>, Condvar)>,
-        assist_handle: JoinHandle<()>,
-    ) {
-        let (lock, cvar) = &**assist_state;
-        if let Ok(mut st) = lock.lock() {
-            st.shutdown = true;
-            cvar.notify_all();
-        }
-        let _ = assist_handle.join();
+    fn shutdown_channel_closed(&mut self) {
+        self.driver_mut().request_stop();
+        self.shutdown_midi();
+        self.driver_mut().close_fds();
+        self.driver_mut().request_stop();
     }
 }
 

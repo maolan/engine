@@ -108,9 +108,9 @@ impl Engine {
     ) {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
             let track = track.lock();
-            if let Some(clip) = track.audio.clips.get_mut(clip_index) {
+            track.audio.update_clip(clip_index, |clip| {
                 clip.plugin_graph_json = plugin_graph_json;
-            }
+            });
         }
     }
 
@@ -141,8 +141,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before loading CLAP plugins",
                 track_name
@@ -160,7 +160,7 @@ impl Engine {
         }))
         .await;
         if let Some(instance) = track.clap_plugins.last()
-            && let Some(stderr) = instance.processor.lock().take_stderr()
+            && let Some(stderr) = instance.processor.take_stderr()
         {
             let source = format!("clap:{resolved_plugin_path}");
             self.spawn_plugin_host_stderr_reader(stderr, source);
@@ -191,8 +191,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
                 track_name
@@ -225,8 +225,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before unloading CLAP plugins",
                 track_name
@@ -268,8 +268,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before loading VST3 plugins",
                 track_name
@@ -282,7 +282,7 @@ impl Engine {
             return true;
         }
         if let Some(instance) = track.vst3_plugins.last()
-            && let Some(stderr) = instance.processor.lock().take_stderr()
+            && let Some(stderr) = instance.processor.take_stderr()
         {
             let source = format!("vst3:{resolved_plugin_path}");
             self.spawn_plugin_host_stderr_reader(stderr, source);
@@ -308,8 +308,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
                 track_name
@@ -342,8 +342,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before unloading VST3 plugins",
                 track_name
@@ -386,8 +386,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before loading LV2 plugins",
                 track_name
@@ -400,7 +400,7 @@ impl Engine {
             return true;
         }
         if let Some(instance) = track.lv2_plugins.last()
-            && let Some(stderr) = instance.processor.lock().take_stderr()
+            && let Some(stderr) = instance.processor.take_stderr()
         {
             let source = format!("lv2:{resolved_plugin_uri}");
             self.spawn_plugin_host_stderr_reader(stderr, source);
@@ -435,8 +435,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
                 track_name
@@ -471,8 +471,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                 "Track '{}' is currently processing audio; stop playback before unloading LV2 plugins",
                 track_name
@@ -757,7 +757,7 @@ impl Engine {
             }
         };
         let dir = std::path::Path::new(directory);
-        let track = track.lock();
+        let mut track = track.lock();
         let result = if format.eq_ignore_ascii_case("CLAP") {
             track.clip_set_clap_plugin_resource_dir(clip_idx, instance_id, dir)
         } else if format.eq_ignore_ascii_case("LV2") {
@@ -792,7 +792,7 @@ impl Engine {
         };
         match self.track_handle_or_err(track_name) {
             Ok(track) => {
-                let track = track.lock();
+                let mut track = track.lock();
                 let refs = track
                     .clip_clap_file_references(clip_idx, instance_id)
                     .unwrap_or_else(|e| {
@@ -1019,7 +1019,7 @@ impl Engine {
                     .clap_plugins
                     .iter()
                     .find(|instance| instance.id == instance_id)
-                    .map(|instance| instance.processor.lock().plugin_id().to_string())
+                    .map(|instance| instance.processor.plugin_id().to_string())
                     .unwrap_or_default();
                 match track.lock().clap_snapshot_state(instance_id) {
                     Ok(state) => {
@@ -1067,7 +1067,7 @@ impl Engine {
             }
         };
         let track = track.lock();
-        if track.audio.processing {
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                             "Track '{}' is currently processing audio; stop playback before restoring CLAP state",
                             track_name
@@ -1107,8 +1107,8 @@ impl Engine {
                 return true;
             }
         };
-        let track = track.lock();
-        if track.audio.processing {
+        let mut track = track.lock();
+        if track.audio.processing() {
             self.notify_clients(Err(format!(
                             "Track '{}' is currently processing audio; stop playback before restoring CLAP state",
                             track_name
@@ -1141,7 +1141,7 @@ impl Engine {
             locked
                 .clap_plugins
                 .iter()
-                .map(|i| (i.id, i.processor.lock().plugin_id().to_string()))
+                .map(|i| (i.id, i.processor.plugin_id().to_string()))
                 .collect()
         };
         for (instance_id, plugin_id) in instances {

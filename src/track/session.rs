@@ -43,11 +43,12 @@ impl Track {
     }
 
     pub fn schedule_session_launch(&mut self, launch: PendingSessionLaunch) {
-        self.pending_session_launches.push(launch);
+        self.rt.pending_session_launches.push(launch);
     }
 
     pub fn schedule_session_stop(&mut self, scene_index: usize, stop_at_sample: usize) {
         if let Some(clip) = self
+            .rt
             .playing_session_clips
             .iter_mut()
             .find(|c| c.scene_index == scene_index && c.stop_at_sample.is_none())
@@ -59,7 +60,7 @@ impl Track {
     pub fn process_session_clips(&mut self, cycle_start: usize, cycle_end: usize, _frames: usize) {
         let _ = cycle_end;
         let mut activated = Vec::new();
-        self.pending_session_launches.retain(|launch| {
+        self.rt.pending_session_launches.retain(|launch| {
             if launch.launch_at_sample <= cycle_start {
                 activated.push(launch.clone());
                 false
@@ -77,8 +78,8 @@ impl Track {
         }
         for launch in activated {
             let exists = match launch.kind {
-                Kind::Audio => self.audio.clips.iter().any(|c| c.id == launch.clip_id),
-                Kind::MIDI => self.midi.clips.iter().any(|c| c.id == launch.clip_id),
+                Kind::Audio => self.audio.clips().iter().any(|c| c.id == launch.clip_id),
+                Kind::MIDI => self.midi.clips().iter().any(|c| c.id == launch.clip_id),
             };
             if !exists {
                 tracing::warn!(
@@ -88,9 +89,10 @@ impl Track {
                 );
                 continue;
             }
-            self.playing_session_clips
+            self.rt
+                .playing_session_clips
                 .retain(|c| c.scene_index != launch.scene_index);
-            self.playing_session_clips.push(PlayingSessionClip {
+            self.rt.playing_session_clips.push(PlayingSessionClip {
                 scene_index: launch.scene_index,
                 clip_id: launch.clip_id,
                 kind: launch.kind,
@@ -106,7 +108,7 @@ impl Track {
 
         let mut note_offs = Vec::new();
         let mut remove_indices = Vec::new();
-        for (i, clip) in self.playing_session_clips.iter().enumerate() {
+        for (i, clip) in self.rt.playing_session_clips.iter().enumerate() {
             let should_stop = if let Some(stop_at) = clip.stop_at_sample {
                 stop_at <= cycle_start
             } else {
@@ -125,9 +127,9 @@ impl Track {
             }
         }
         for i in remove_indices.into_iter().rev() {
-            self.playing_session_clips.remove(i);
+            self.rt.playing_session_clips.remove(i);
         }
-        self.pending_session_midi_note_offs.extend(note_offs);
+        self.rt.pending_session_midi_note_offs.extend(note_offs);
     }
 
     pub(crate) fn mix_session_audio_into_inputs(&mut self) {
@@ -142,40 +144,41 @@ impl Track {
         }
         let mut active_clip_plugin_keys = HashSet::new();
         let channel_count = self.audio.ins.len();
-        let clip_count = self.playing_session_clips.len();
+        let clip_count = self.rt.playing_session_clips.len();
         let mut position_updates = Vec::new();
         let mut remove_indices = Vec::new();
 
         for i in 0..clip_count {
-            if self.playing_session_clips[i].kind != Kind::Audio {
+            if self.rt.playing_session_clips[i].kind != Kind::Audio {
                 continue;
             }
-            let clip_id = self.playing_session_clips[i].clip_id.clone();
-            let arrangement_clip = match self.audio.clips.iter().find(|c| c.id == clip_id).cloned()
-            {
-                Some(c) => c,
-                None => {
-                    remove_indices.push(i);
-                    continue;
-                }
-            };
+            let clip_id = self.rt.playing_session_clips[i].clip_id.clone();
+            let arrangement_clip =
+                match self.audio.clips().iter().find(|c| c.id == clip_id).cloned() {
+                    Some(c) => c,
+                    None => {
+                        remove_indices.push(i);
+                        continue;
+                    }
+                };
             let clip_length = arrangement_clip.end.saturating_sub(arrangement_clip.start);
             if clip_length == 0 {
                 remove_indices.push(i);
                 continue;
             }
-            let loop_enabled = self.playing_session_clips[i].loop_enabled;
-            let loop_start = self.playing_session_clips[i].loop_start_samples;
-            let loop_end = if self.playing_session_clips[i].loop_end_samples == 0 && loop_enabled {
+            let loop_enabled = self.rt.playing_session_clips[i].loop_enabled;
+            let loop_start = self.rt.playing_session_clips[i].loop_start_samples;
+            let loop_end = if self.rt.playing_session_clips[i].loop_end_samples == 0 && loop_enabled
+            {
                 clip_length
             } else {
-                self.playing_session_clips[i]
+                self.rt.playing_session_clips[i]
                     .loop_end_samples
                     .max(loop_start.saturating_add(1))
                     .min(clip_length)
             };
-            let mut play_position = self.playing_session_clips[i].play_position_samples;
-            let mut elapsed_samples = self.playing_session_clips[i].elapsed_samples;
+            let mut play_position = self.rt.playing_session_clips[i].play_position_samples;
+            let mut elapsed_samples = self.rt.playing_session_clips[i].elapsed_samples;
             let mut out_offset = 0usize;
             let mut rendered_any = false;
 
@@ -194,7 +197,7 @@ impl Track {
                     break;
                 }
                 let segment_len = (frames - out_offset).min(remaining_segment);
-                let mut session_clip = arrangement_clip.clone();
+                let mut session_clip = (*arrangement_clip).clone();
                 session_clip.start = 0;
                 session_clip.end = clip_length;
 
@@ -209,7 +212,7 @@ impl Track {
                     None => break,
                 };
                 for ch in 0..channel_count {
-                    let in_samples = self.audio.ins[ch].buffer.lock();
+                    let mut in_samples = self.audio.ins[ch].buffer.lock();
                     let src = processed.get(ch).or_else(|| processed.first());
                     if let Some(src) = src {
                         let len = src
@@ -238,13 +241,14 @@ impl Track {
         }
 
         for (idx, pos, elapsed) in position_updates {
-            self.playing_session_clips[idx].play_position_samples = pos;
-            self.playing_session_clips[idx].elapsed_samples = elapsed;
+            self.rt.playing_session_clips[idx].play_position_samples = pos;
+            self.rt.playing_session_clips[idx].elapsed_samples = elapsed;
         }
         for idx in remove_indices.into_iter().rev() {
-            self.playing_session_clips.remove(idx);
+            self.rt.playing_session_clips.remove(idx);
         }
-        self.clip_plugin_tracks
+        self.rt
+            .clip_plugin_tracks
             .retain(|key, _| active_clip_plugin_keys.contains(key));
         let peak = self
             .audio
@@ -261,7 +265,7 @@ impl Track {
         tracing::debug!(
             "mix_session_audio_into_inputs track={} playing_clips={} input_peak={}",
             self.name,
-            self.playing_session_clips.len(),
+            self.rt.playing_session_clips.len(),
             peak
         );
     }
@@ -274,22 +278,23 @@ impl Track {
         if frames == 0 || input_events.is_empty() {
             return;
         }
-        for event in self.pending_session_midi_note_offs.drain(..) {
+        for event in self.rt.pending_session_midi_note_offs.drain(..) {
             for lane in input_events.iter_mut() {
                 lane.push(event.clone());
             }
         }
 
-        let clip_count = self.playing_session_clips.len();
+        let clip_count = self.rt.playing_session_clips.len();
         let mut position_updates = Vec::new();
         let mut remove_indices = Vec::new();
 
         for i in 0..clip_count {
-            if self.playing_session_clips[i].kind != Kind::MIDI {
+            if self.rt.playing_session_clips[i].kind != Kind::MIDI {
                 continue;
             }
-            let clip_id = self.playing_session_clips[i].clip_id.clone();
-            let arrangement_clip = match self.midi.clips.iter().find(|c| c.id == clip_id).cloned() {
+            let clip_id = self.rt.playing_session_clips[i].clip_id.clone();
+            let arrangement_clip = match self.midi.clips().iter().find(|c| c.id == clip_id).cloned()
+            {
                 Some(c) => c,
                 None => {
                     remove_indices.push(i);
@@ -301,22 +306,23 @@ impl Track {
                 remove_indices.push(i);
                 continue;
             }
-            let loop_enabled = self.playing_session_clips[i].loop_enabled;
-            let loop_start = self.playing_session_clips[i].loop_start_samples;
-            let loop_end = if self.playing_session_clips[i].loop_end_samples == 0 && loop_enabled {
+            let loop_enabled = self.rt.playing_session_clips[i].loop_enabled;
+            let loop_start = self.rt.playing_session_clips[i].loop_start_samples;
+            let loop_end = if self.rt.playing_session_clips[i].loop_end_samples == 0 && loop_enabled
+            {
                 clip_length
             } else {
-                self.playing_session_clips[i]
+                self.rt.playing_session_clips[i]
                     .loop_end_samples
                     .max(loop_start.saturating_add(1))
                     .min(clip_length)
             };
-            let mut play_position = self.playing_session_clips[i].play_position_samples;
-            let mut elapsed_samples = self.playing_session_clips[i].elapsed_samples;
+            let mut play_position = self.rt.playing_session_clips[i].play_position_samples;
+            let mut elapsed_samples = self.rt.playing_session_clips[i].elapsed_samples;
             let input_lane = arrangement_clip
                 .input_channel
                 .min(input_events.len().saturating_sub(1));
-            let events = match self.midi_clip_cache.get(&arrangement_clip.name).cloned() {
+            let events = match self.rt.midi_clip_cache.get(&arrangement_clip.name).cloned() {
                 Some(e) => e,
                 None => {
                     remove_indices.push(i);
@@ -330,13 +336,13 @@ impl Track {
             while out_offset < frames {
                 if play_position >= clip_length {
                     if loop_enabled && loop_end > loop_start {
-                        for (channel, note) in &self.playing_session_clips[i].active_midi_notes {
+                        for (channel, note) in &self.rt.playing_session_clips[i].active_midi_notes {
                             input_events[input_lane].push(MidiEvent::new(
                                 out_offset as u32,
                                 vec![0x80 | (*channel).min(15), (*note).min(127), 64],
                             ));
                         }
-                        self.playing_session_clips[i].active_midi_notes.clear();
+                        self.rt.playing_session_clips[i].active_midi_notes.clear();
                         play_position =
                             loop_start + ((play_position - loop_start) % (loop_end - loop_start));
                     } else {
@@ -366,14 +372,14 @@ impl Track {
                             let channel = status & 0x0F;
                             if let Some(&note) = data.get(1) {
                                 if status & 0xF0 == 0x90 && data.get(2).copied().unwrap_or(0) > 0 {
-                                    self.playing_session_clips[i]
+                                    self.rt.playing_session_clips[i]
                                         .active_midi_notes
                                         .insert((channel, note));
                                 } else if status & 0xF0 == 0x80
                                     || (status & 0xF0 == 0x90
                                         && data.get(2).copied().unwrap_or(0) == 0)
                                 {
-                                    self.playing_session_clips[i]
+                                    self.rt.playing_session_clips[i]
                                         .active_midi_notes
                                         .remove(&(channel, note));
                                 }
@@ -390,7 +396,7 @@ impl Track {
             if emitted_any {
                 position_updates.push((i, play_position, elapsed_samples));
             } else if play_position >= clip_length && !loop_enabled {
-                for (channel, note) in &self.playing_session_clips[i].active_midi_notes {
+                for (channel, note) in &self.rt.playing_session_clips[i].active_midi_notes {
                     input_events[input_lane].push(MidiEvent::new(
                         frames.saturating_sub(1) as u32,
                         vec![0x80 | (*channel).min(15), (*note).min(127), 64],
@@ -403,11 +409,11 @@ impl Track {
         }
 
         for (idx, pos, elapsed) in position_updates {
-            self.playing_session_clips[idx].play_position_samples = pos;
-            self.playing_session_clips[idx].elapsed_samples = elapsed;
+            self.rt.playing_session_clips[idx].play_position_samples = pos;
+            self.rt.playing_session_clips[idx].elapsed_samples = elapsed;
         }
         for idx in remove_indices.into_iter().rev() {
-            self.playing_session_clips.remove(idx);
+            self.rt.playing_session_clips.remove(idx);
         }
         for events in input_events.iter_mut() {
             events.sort_by_key(|event| event.frame);

@@ -21,13 +21,10 @@ use crate::workers::sndio_worker::HwWorker;
 use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     history::{History, UndoEntry},
-    hw::traits::HwWorkerDriver,
     message::{Action, HwMidiEvent, Message, ProcessTask, SessionSlotState},
     midi::io::MidiEvent,
-    mutex::UnsafeMutex,
     osc::{OscArg, OscServer, build_error_packet, build_osc_packet},
     state::State,
-    track::Track,
     workers::worker::Worker,
 };
 use std::{
@@ -41,7 +38,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::error;
 
 impl Engine {
-    pub fn state(&self) -> Arc<UnsafeMutex<State>> {
+    pub fn state(&self) -> Arc<State> {
         self.state.clone()
     }
 
@@ -112,23 +109,27 @@ impl Engine {
     }
 
     pub fn new(rx: Receiver<Message>, tx: Sender<Message>) -> Self {
-        let state = Arc::new(UnsafeMutex::new(State::default()));
+        let state = Arc::new(State::default());
+        let initial_state_snapshot = state.lock().snapshot();
+        let state_snapshot = Arc::new(crate::state::StateSlot::from_pointee(
+            initial_state_snapshot.clone(),
+        ));
         // Phase 2 render-plan machinery: an initial (empty-session) plan is
         // built synchronously; the builder thread republishes on demand.
         let collector = basedrop::Collector::new();
-        let hw_ports = Arc::new(std::sync::Mutex::new(crate::plan_builder::HwPorts {
-            buffer_size: 1024,
-            ..Default::default()
-        }));
-        let initial_plan = {
-            let state_guard = state.lock();
-            crate::render_plan::RenderPlan::compile(state_guard, &[], &[], 1024)
-        };
+        let hw_ports = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::plan_builder::HwPorts {
+                buffer_size: 1024,
+                ..Default::default()
+            },
+        ));
+        let initial_plan =
+            { crate::render_plan::RenderPlan::compile(&initial_state_snapshot, &[], &[], 1024) };
         let plan_slot = Arc::new(crate::render_plan::PlanSlot::from_pointee(
             basedrop::Owned::new(&collector.handle(), initial_plan),
         ));
         let plan_builder = crate::plan_builder::PlanBuilder::spawn(
-            state.clone(),
+            state_snapshot.clone(),
             hw_ports.clone(),
             plan_slot.clone(),
             collector,
@@ -139,11 +140,15 @@ impl Engine {
             tx,
             clients: vec![],
             state,
+            state_snapshot,
             workers: vec![],
             hw_driver: None,
+            hw_driver_info: None,
+            hw_input_ports: Vec::new(),
+            hw_output_ports: Vec::new(),
             #[cfg(unix)]
             jack_runtime: None,
-            midi_hub: Arc::new(UnsafeMutex::new(MidiHub::default())),
+            midi_hub: Some(MidiHub::default()),
             hw_worker: None,
             osc_server: None,
             osc_reply_socket: None,
@@ -220,6 +225,8 @@ impl Engine {
             history_group: None,
             history_suspended: false,
             offline_bounce_jobs: HashMap::new(),
+            pending_bounce_starts: Vec::new(),
+            bounce_worker_tracks: HashMap::new(),
             pending_midi_learn: None,
             pending_global_midi_learn: None,
             pending_session_midi_learn: None,
@@ -236,13 +243,18 @@ impl Engine {
         }
     }
 
+    pub(crate) fn publish_state_snapshot(&self) {
+        let snapshot = self.state.lock().snapshot();
+        self.state_snapshot.store(Arc::new(snapshot));
+    }
+
     pub(crate) fn hw_driver_cycle_samples(&self) -> Option<usize> {
-        self.hw_driver.as_ref().map(|o| o.lock().cycle_samples())
+        self.hw_driver_info.map(|info| info.cycle_samples)
     }
 
     #[cfg(unix)]
     pub(crate) fn jack_cycle_samples(&self) -> Option<usize> {
-        self.jack_runtime.as_ref().map(|j| j.lock().buffer_size)
+        self.jack_runtime.as_ref().map(|j| j.buffer_size)
     }
 
     #[cfg(not(unix))]
@@ -257,20 +269,30 @@ impl Engine {
     }
 
     pub(crate) fn sample_rate(&self) -> f64 {
-        if let Some(hw) = &self.hw_driver {
-            hw.lock().sample_rate() as f64
+        if let Some(info) = self.hw_driver_info {
+            info.sample_rate as f64
         } else {
             #[cfg(unix)]
             {
                 self.jack_runtime
                     .as_ref()
-                    .map(|j| j.lock().sample_rate as f64)
+                    .map(|j| j.sample_rate as f64)
                     .unwrap_or(48_000.0)
             }
             #[cfg(not(unix))]
             {
                 48_000.0
             }
+        }
+    }
+
+    pub(crate) async fn set_hw_playing(&mut self, playing: bool) {
+        if let Some(worker) = &self.hw_worker {
+            // Await instead of try_send: a dropped HWSetPlaying(false) would
+            // leave the device playing after transport stop.
+            let _ = worker.tx.send(Message::HWSetPlaying(playing)).await;
+        } else if let Some(driver) = self.hw_driver.as_mut() {
+            driver.set_playing(playing);
         }
     }
 
@@ -426,7 +448,7 @@ impl Engine {
             {
                 let t = track.lock();
                 let next = balance.clamp(-1.0, 1.0);
-                if (t.balance - next).abs() > f32::EPSILON {
+                if (t.balance() - next).abs() > f32::EPSILON {
                     t.set_balance(next);
                     echoes.push(Action::TrackAutomationBalance(track_name.clone(), next));
                 }
@@ -435,7 +457,7 @@ impl Engine {
 
         for (track_name, events) in midi_cc_events {
             if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
-                track.lock().pending_modulator_midi_events.extend(events);
+                track.lock().rt.pending_modulator_midi_events.extend(events);
             }
         }
 
@@ -499,14 +521,14 @@ impl Engine {
                 let track = track.lock();
                 let audio_end = track
                     .audio
-                    .clips
+                    .clips()
                     .iter()
                     .map(|clip| clip.end)
                     .max()
                     .unwrap_or(0);
                 let midi_end = track
                     .midi
-                    .clips
+                    .clips()
                     .iter()
                     .map(|clip| clip.end)
                     .max()
@@ -1143,7 +1165,7 @@ impl Engine {
 
     pub(crate) fn collect_changed_track_meters(
         &mut self,
-        _tracks: &[(String, Arc<UnsafeMutex<Box<Track>>>)],
+        _tracks: &[(String, crate::state::TrackHandle)],
     ) -> Vec<(String, Vec<f32>)> {
         Vec::new()
     }
@@ -1155,18 +1177,23 @@ impl Engine {
             10.0_f32.powf(self.hw_out_level_db / 20.0)
         };
         let should_notify_interval = self.should_publish_hw_out_meters();
-        if let Some(oss) = self.hw_driver.clone() {
-            let hw = oss.lock();
-            hw.set_output_gain_balance(gain, self.hw_out_balance);
+        if let Some(worker) = &self.hw_worker {
+            let _ = worker
+                .tx
+                .send(Message::HWSetOutputGainBalance {
+                    gain,
+                    balance: self.hw_out_balance,
+                })
+                .await;
             if !should_notify_interval {
                 return;
             }
         } else {
             #[cfg(unix)]
             {
-                if let Some(jack) = self.jack_runtime.clone() {
-                    jack.lock().set_output_gain_linear(gain);
-                    jack.lock().set_output_balance(self.hw_out_balance);
+                if let Some(jack) = self.jack_runtime.as_ref() {
+                    jack.set_output_gain_linear(gain);
+                    jack.set_output_balance(self.hw_out_balance);
                     if !should_notify_interval {
                         return;
                     }
@@ -1179,8 +1206,9 @@ impl Engine {
                 return;
             }
         }
-        let peaks_linear = if let Some(oss) = self.hw_driver.clone() {
-            oss.lock().output_meter_linear(gain, self.hw_out_balance)
+        let peaks_linear = if self.hw_worker.is_some() {
+            let plan = self.executor.plan().clone();
+            crate::hw::common::output_meter_linear_from_plan(&plan, gain, self.hw_out_balance)
         } else {
             #[cfg(unix)]
             {
@@ -1228,8 +1256,22 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn preload_track_clips(&self) {
+    /// Preload all track clips and wait for completion. Used on transport
+    /// play paths: the audio cycle must not start until clip caches are
+    /// populated, otherwise the preload tasks' `&mut Track` access races the
+    /// RT worker and cold-cache reads do disk I/O on the audio path.
+    ///
+    /// Returns an owned future rather than borrowing `self`: `Engine` is not
+    /// `Sync` (it owns JackRuntime/MidiHub directly since Phase 6), so an
+    /// `async fn(&self)` future would be non-`Send`.
+    pub(crate) fn preload_track_clips(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+        Self::preload_track_handles(tracks)
+    }
+
+    async fn preload_track_handles(tracks: Vec<crate::state::TrackHandle>) {
         if tracks.is_empty() {
             return;
         }
@@ -1260,7 +1302,7 @@ impl Engine {
             ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => t,
             ProcessTask::Plugin { track, .. } => track,
         };
-        let t = track.lock();
+        let mut t = track.lock();
         let transport_sample = if self.session_clip_playback_enabled && self.playing {
             self.session_transport_sample
         } else {
@@ -1272,7 +1314,7 @@ impl Engine {
         t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
         t.set_session_clip_playback_enabled(self.session_clip_playback_enabled && self.playing);
         t.set_record_tap_enabled(self.playing && self.record_enabled);
-        t.audio.processing = true;
+        t.audio.set_processing(true);
     }
 
     /// Copy this cycle's hardware input from the plan arena into the bridge
@@ -1289,7 +1331,7 @@ impl Engine {
             // buffers before signalling cycle end, and no node of the new
             // cycle has been dispatched yet.
             let src = unsafe { plan.buffer(buf) };
-            let dst = port.buffer.lock();
+            let mut dst = port.buffer.lock();
             let n = src.len().min(dst.len());
             dst[..n].copy_from_slice(&src[..n]);
             if n < dst.len() {
@@ -1332,12 +1374,32 @@ impl Engine {
     /// Start the next audio cycle: pull any published plan, copy hardware
     /// inputs, and dispatch the seed jobs. Returns true when the cycle
     /// completed instantly (empty plan) and `on_all_tracks_finished` ran.
+    /// Ensure the metronome track's source port and output wiring exist
+    /// before tasks are dispatched. Runs on the dispatcher at cycle top so
+    /// `AudioIO.connections` is never mutated from a worker thread; marks
+    /// the plan dirty when the wiring changed.
+    fn ensure_metronome_wiring(&mut self) {
+        let Some(track) = self.state.lock().tracks.get(Self::METRONOME_TRACK).cloned() else {
+            return;
+        };
+        let frames = self.current_cycle_samples();
+        let (_, changed) = track.lock().ensure_metronome_source(frames);
+        if changed {
+            self.plan_builder.mark_dirty();
+        }
+    }
+
     pub(crate) async fn start_plan_cycle(&mut self) -> bool {
-        if !self.playing || !self.executor.cycle_complete() {
+        // While a bounce job exists, plan cycles are suspended: the bounce
+        // worker renders through live track bodies and must be their only
+        // mutator (LOCKLESS.md Phase 5, 5b-iii).
+        if !self.playing || !self.executor.cycle_complete() || !self.offline_bounce_jobs.is_empty()
+        {
             return false;
         }
         self.refresh_realtime_infection();
         self.copy_hw_inputs_to_ports();
+        self.ensure_metronome_wiring();
         let jobs = self.executor.start_cycle(Instant::now());
         if self.dispatch_node_jobs(jobs).await {
             self.on_all_tracks_finished().await;
@@ -1425,7 +1487,43 @@ impl Engine {
         }
     }
 
+    /// Hand a bounce job to its reserved worker, recording the worker→track
+    /// mapping so the terminal `Ready(id)` cleans the job up on any path.
+    pub(crate) async fn send_bounce_job(
+        &mut self,
+        worker_index: usize,
+        job: crate::message::OfflineBounceWork,
+    ) {
+        let track_name = job.track_name.clone();
+        self.bounce_worker_tracks
+            .insert(worker_index, track_name.clone());
+        let worker = &self.workers[worker_index];
+        if let Err(e) = worker.tx.send(Message::ProcessOfflineBounce(job)).await {
+            self.bounce_worker_tracks.remove(&worker_index);
+            self.offline_bounce_jobs.remove(&track_name);
+            self.push_ready_worker(worker_index);
+            self.notify_clients(Err(format!("Failed to schedule offline bounce: {e}")))
+                .await;
+        }
+    }
+
+    /// Requests queued while a bounce was running are replayed once the last
+    /// bounce job is gone (and plan cycles resume).
+    async fn drain_pending_requests_if_idle(&mut self) {
+        if self.offline_bounce_jobs.is_empty() {
+            while let Some(next) = self.pending_requests.pop_front() {
+                self.handle_request(next).await;
+            }
+        }
+    }
+
     pub(crate) async fn on_all_tracks_finished(&mut self) {
+        // Hand deferred bounce jobs to their workers now that no plan cycle
+        // is in flight (see handle_track_offline_bounce).
+        let pending = std::mem::take(&mut self.pending_bounce_starts);
+        for (worker_index, job) in pending {
+            self.send_bounce_job(worker_index, job).await;
+        }
         if self.transport_restart_pending {
             let state = self.state.lock();
             for track in state.tracks.values() {
@@ -1482,7 +1580,7 @@ impl Engine {
         if !self.should_publish_track_meters() {
             return;
         }
-        let tracks: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = self
+        let tracks: Vec<(String, crate::state::TrackHandle)> = self
             .state
             .lock()
             .tracks
@@ -1527,13 +1625,13 @@ impl Engine {
             let state = self.state.lock();
             for (track_name, track) in &state.tracks {
                 let track = track.lock();
-                for launch in &track.pending_session_launches {
+                for launch in &track.rt.pending_session_launches {
                     current.insert(
                         (track_name.clone(), launch.scene_index),
                         (SessionSlotState::Queued, 0, 0),
                     );
                 }
-                for clip in &track.playing_session_clips {
+                for clip in &track.rt.playing_session_clips {
                     current.insert(
                         (track_name.clone(), clip.scene_index),
                         (
@@ -1580,7 +1678,7 @@ impl Engine {
     }
 
     pub(crate) async fn publish_clap_state_dirty(&mut self) {
-        let tracks: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = self
+        let tracks: Vec<(String, crate::state::TrackHandle)> = self
             .state
             .lock()
             .tracks
@@ -1610,7 +1708,7 @@ impl Engine {
         let hw_channels = self.latest_hw_out_meter_db.len();
         self.latest_hw_out_meter_db = Arc::new(vec![-90.0; hw_channels]);
 
-        let tracks: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = self
+        let tracks: Vec<(String, crate::state::TrackHandle)> = self
             .state
             .lock()
             .tracks
@@ -1620,7 +1718,7 @@ impl Engine {
         self.track_meter_linear_by_track.clear();
         let mut snapshot = Vec::with_capacity(tracks.len());
         for (name, track) in tracks {
-            let t = track.lock();
+            let mut t = track.lock();
             t.clear_output_meters();
             let width = t.output_meter_linear().len();
             let zero_linear = vec![0.0; width];
@@ -1703,6 +1801,7 @@ impl Engine {
                 self.handle_request_inner(other, true).await;
             }
         }
+        self.publish_state_snapshot();
     }
 
     pub(crate) async fn handle_quit(&mut self, a: Action) {
@@ -1715,9 +1814,6 @@ impl Engine {
         // drains pending audio buffers for up to CHN_TIMEOUT
         // (5s) during process teardown.
         if let Some(worker) = self.hw_worker.take() {
-            if let Some(hw) = &self.hw_driver {
-                hw.lock().request_stop();
-            }
             // Send MIDI panic (All Sound Off) for any active
             // notes before stopping the worker.
             let panic_events = self.panic_events_for_all_hw_midi_outputs();
@@ -1739,11 +1835,16 @@ impl Engine {
         // receiving it, which skips destructors — any
         // still-open device fd would trigger the kernel's
         // 5-second drain during process teardown.
-        if let Some(hw) = &self.hw_driver {
-            hw.lock().close_fds();
+        if let Some(hw) = self.hw_driver.as_mut() {
+            hw.close_fds();
         }
-        self.midi_hub.lock().close_all();
+        if let Some(midi_hub) = self.midi_hub.as_mut() {
+            midi_hub.close_all();
+        }
         self.hw_driver = None;
+        self.hw_driver_info = None;
+        self.hw_input_ports.clear();
+        self.hw_output_ports.clear();
         self.notify_clients(Ok(Action::Quit)).await;
         self.ready_workers.clear();
         while !self.workers.is_empty() {
@@ -1912,9 +2013,9 @@ impl Engine {
                 mode,
             } => {
                 if let Some(track) = self.state.lock().tracks.get(track_name) {
-                    let track = track.lock();
+                    let mut track = track.lock();
                     track.automation_lanes = lanes.clone();
-                    track.automation_mode = mode;
+                    track.set_automation_mode(mode);
                 }
             }
             Action::TrackAutomationToggleLane { .. } => {
@@ -1937,7 +2038,7 @@ impl Engine {
                 mode,
             } => {
                 if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-                    track.lock().automation_mode = mode;
+                    track.lock().set_automation_mode(mode);
                 }
             }
             Action::RequestTrackList => {
@@ -2828,14 +2929,44 @@ impl Engine {
                 }
             }
             Action::OpenMidiInputDevice(ref device) => {
-                let midi_hub = self.midi_hub.lock();
+                if let Some(worker) = &self.hw_worker {
+                    if let Err(e) = worker
+                        .tx
+                        .send(Message::HWOpenMidiInputDevice(device.clone()))
+                        .await
+                    {
+                        self.notify_clients(Err(format!("Failed to send MIDI input open: {e}")))
+                            .await;
+                    }
+                    return;
+                }
+                let Some(midi_hub) = self.midi_hub.as_mut() else {
+                    self.notify_clients(Err("Hardware MIDI hub is not available".to_string()))
+                        .await;
+                    return;
+                };
                 if let Err(e) = midi_hub.open_input(device) {
                     self.notify_clients(Err(e)).await;
                     return;
                 }
             }
             Action::OpenMidiOutputDevice(ref device) => {
-                let midi_hub = self.midi_hub.lock();
+                if let Some(worker) = &self.hw_worker {
+                    if let Err(e) = worker
+                        .tx
+                        .send(Message::HWOpenMidiOutputDevice(device.clone()))
+                        .await
+                    {
+                        self.notify_clients(Err(format!("Failed to send MIDI output open: {e}")))
+                            .await;
+                    }
+                    return;
+                }
+                let Some(midi_hub) = self.midi_hub.as_mut() else {
+                    self.notify_clients(Err("Hardware MIDI hub is not available".to_string()))
+                        .await;
+                    return;
+                };
                 if let Err(e) = midi_hub.open_output(device) {
                     self.notify_clients(Err(e)).await;
                     return;
@@ -2907,10 +3038,17 @@ impl Engine {
             };
             match message {
                 Message::Ready(id) => {
+                    // A bounce worker's terminal Ready cleans up its job even
+                    // when the OfflineBounceFinished payload was an Err
+                    // without a track name.
+                    if let Some(track_name) = self.bounce_worker_tracks.remove(&id) {
+                        self.offline_bounce_jobs.remove(&track_name);
+                    }
                     self.push_ready_worker(id);
                     if self.dispatch_node_jobs(Vec::new()).await {
                         self.on_all_tracks_finished().await;
                     }
+                    self.drain_pending_requests_if_idle().await;
                 }
                 Message::NodeDone {
                     worker_id,
@@ -2924,6 +3062,9 @@ impl Engine {
                 }
                 Message::Channel(s) => {
                     self.clients.push(s);
+                }
+                Message::Response(result) => {
+                    self.notify_clients(result).await;
                 }
 
                 Message::Request(a) => {
@@ -2939,15 +3080,13 @@ impl Engine {
                     self.plan_builder.mark_dirty();
                 }
                 Message::OfflineBounceFinished { result } => {
-                    if let Ok(Action::TrackOfflineBounce { track_name, .. }) = &result {
+                    if let Ok(Action::TrackOfflineBounce { track_name, .. })
+                    | Ok(Action::TrackOfflineBounceCanceled { track_name, .. }) = &result
+                    {
                         self.offline_bounce_jobs.remove(track_name);
                     }
                     self.notify_clients(result).await;
-                    if self.offline_bounce_jobs.is_empty() {
-                        while let Some(next) = self.pending_requests.pop_front() {
-                            self.handle_request(next).await;
-                        }
-                    }
+                    self.drain_pending_requests_if_idle().await;
                 }
                 Message::HWFinished => {
                     if !self.awaiting_hwfinished {
@@ -2959,18 +3098,18 @@ impl Engine {
                     self.awaiting_hwfinished = false;
                     #[cfg(unix)]
                     {
-                        if let Some(jack) = &self.jack_runtime {
+                        if let Some(jack) = self.jack_runtime.as_mut() {
                             if !self.pending_hw_midi_out_events.is_empty() {
                                 let out_events =
                                     std::mem::take(&mut self.pending_hw_midi_out_events);
-                                jack.lock().write_events(&out_events);
+                                jack.write_events(&out_events);
                             }
                             let mut in_events = vec![];
-                            jack.lock().read_events_into(&mut in_events);
+                            jack.read_events_into(&mut in_events);
                             if !in_events.is_empty() {
                                 self.pending_hw_midi_events.extend(in_events);
                             }
-                            let dropped = jack.lock().take_midi_events_dropped();
+                            let dropped = jack.take_midi_events_dropped();
                             if dropped > 0 {
                                 tracing::warn!(
                                     "JACK MIDI ring full; {dropped} events dropped since last cycle"
@@ -2992,7 +3131,7 @@ impl Engine {
                     let pending_hw_in_by_device = self.pending_hw_midi_events_by_device.clone();
                     let mut reconfigured_tracks = Vec::new();
                     for (track_name, track) in self.state.lock().tracks.iter() {
-                        let track_lock = track.lock();
+                        let mut track_lock = track.lock();
                         if self.jack_runtime_is_some() {
                             if !self.pending_hw_midi_events.is_empty() {
                                 track_lock.push_hw_midi_events(&self.pending_hw_midi_events);

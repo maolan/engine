@@ -1,19 +1,20 @@
 use crate::audio::io::AudioIO;
 use crate::midi::io::{MIDIIO, MidiEvent};
-use crate::mutex::UnsafeMutex;
 use crate::plugins::ipc;
 use crate::plugins::types::ParameterInfo;
 use crate::plugins::types::Vst3PluginState;
+use arc_swap::ArcSwapOption;
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, atomic::AtomicU32};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 pub struct Vst3Processor {
     path: String,
@@ -26,20 +27,36 @@ pub struct Vst3Processor {
     midi_input_ports: Vec<Arc<MIDIIO>>,
     midi_output_ports: Vec<Arc<MIDIIO>>,
     param_infos: Vec<ParameterInfo>,
-    param_values: UnsafeMutex<HashMap<u32, f64>>,
+    /// Current value of every known parameter, keyed by parameter id and
+    /// stored as `f64` bits. Pre-populated from `param_infos` at construction
+    /// and only ever touched through atomic loads/stores.
+    param_values: HashMap<u32, AtomicU64>,
     bypassed: Arc<AtomicBool>,
 
-    child: UnsafeMutex<Option<Child>>,
-    stderr: UnsafeMutex<Option<ChildStderr>>,
+    /// Host child process handle. Interior-mutable so `process_with_midi`
+    /// (which takes `&self`) can poll it with `try_wait`.
+    ///
+    /// Invariant: at any moment there is at most one accessor — either the
+    /// audio thread running this plugin's own plan task node (exactly one per
+    /// cycle), or control code running after the last `Arc` reference to this
+    /// processor is gone (`Drop`).
+    child: UnsafeCell<Option<Child>>,
+    /// Host stderr pipe; control-side only (`take_stderr`). RCU-published so
+    /// no blocking primitive is involved.
+    stderr: ArcSwapOption<ChildStderr>,
     mapping: Option<ShmMapping>,
     events: Option<EventPair>,
     shm_name: String,
 
     crash_count: AtomicU32,
-    last_process_time: UnsafeMutex<Instant>,
 }
 
-pub type SharedVst3Processor = Arc<UnsafeMutex<Vst3Processor>>;
+// Safety: see the invariants on `child` and `stderr` above. Every other field
+// is either immutable after construction or synchronized on its own
+// (atomics / RCU).
+unsafe impl Sync for Vst3Processor {}
+
+pub type SharedVst3Processor = Arc<Vst3Processor>;
 
 impl Vst3Processor {
     pub fn new(
@@ -91,7 +108,11 @@ impl Vst3Processor {
                 })
         };
 
-        let param_infos = Vec::new();
+        let param_infos: Vec<ParameterInfo> = Vec::new();
+        let param_values = param_infos
+            .iter()
+            .map(|info| (info.id, AtomicU64::new(info.default_value.to_bits())))
+            .collect();
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
         let midi_in_count = header.midi_in_port_count.load(Ordering::Acquire) as usize;
@@ -114,16 +135,26 @@ impl Vst3Processor {
             midi_input_ports,
             midi_output_ports,
             param_infos,
-            param_values: UnsafeMutex::new(HashMap::new()),
+            param_values,
             bypassed: Arc::new(AtomicBool::new(false)),
-            child: UnsafeMutex::new(Some(child)),
-            stderr: UnsafeMutex::new(stderr),
+            child: UnsafeCell::new(Some(child)),
+            stderr: ArcSwapOption::from_pointee(stderr),
             mapping: Some(mapping),
             events: Some(events),
             shm_name,
             crash_count: AtomicU32::new(0),
-            last_process_time: UnsafeMutex::new(Instant::now()),
         })
+    }
+
+    /// Access the host child process handle.
+    ///
+    /// # Safety
+    /// The caller must be the sole accessor of `child` at this time: either
+    /// the audio thread running this plugin's own plan task node (exactly one
+    /// per cycle), or control code running after the last `Arc` reference to
+    /// this processor is gone.
+    unsafe fn with_child<R>(&self, f: impl FnOnce(&mut Option<Child>) -> R) -> R {
+        f(unsafe { &mut *self.child.get() })
     }
 
     pub fn setup_audio_ports(&self) {
@@ -193,7 +224,10 @@ impl Vst3Processor {
     }
 
     pub fn parameter_values(&self) -> HashMap<u32, f64> {
-        self.param_values.lock().clone()
+        self.param_values
+            .iter()
+            .map(|(&id, value)| (id, f64::from_bits(value.load(Ordering::Relaxed))))
+            .collect()
     }
 
     pub fn set_parameter(&self, param_id: u32, value: f64) -> Result<(), String> {
@@ -201,7 +235,12 @@ impl Vst3Processor {
     }
 
     pub fn set_parameter_at(&self, param_id: u32, value: f64, _frame: u32) -> Result<(), String> {
-        self.param_values.lock().insert(param_id, value);
+        if let Some(slot) = self.param_values.get(&param_id) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        } else {
+            tracing::warn!("VST3 set_parameter_at: unknown parameter id {param_id}");
+        }
+
         if let Some(ref mapping) = self.mapping {
             let ring = unsafe {
                 let buf = param_ring_ptr(mapping.as_ptr());
@@ -306,20 +345,23 @@ impl Vst3Processor {
             return Vec::new();
         }
 
-        {
-            let child = self.child.lock();
-            if let Some(ref mut c) = child.as_mut() {
-                match c.try_wait() {
-                    Ok(Some(status)) if !status.success() => {
-                        self.crash_count.fetch_add(1, Ordering::Relaxed);
-                        ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
-                        return Vec::new();
-                    }
-                    Ok(None) => {}
-                    Ok(Some(_status)) => {}
-                    Err(_) => {}
+        // Safety: the sole RT accessor of `child` is this processor's own
+        // plan task node, which runs exactly once per cycle.
+        let crashed = unsafe {
+            self.with_child(|child| {
+                if let Some(c) = child.as_mut()
+                    && let Ok(Some(status)) = c.try_wait()
+                    && !status.success()
+                {
+                    self.crash_count.fetch_add(1, Ordering::Relaxed);
+                    return true;
                 }
-            }
+                false
+            })
+        };
+        if crashed {
+            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            return Vec::new();
         }
 
         let (mapping, events) = match (&self.mapping, &self.events) {
@@ -412,7 +454,6 @@ impl Vst3Processor {
                 }
                 port.mark_finished();
             }
-            *self.last_process_time.lock() = Instant::now();
             output_events
         }
     }
@@ -430,7 +471,9 @@ impl Vst3Processor {
     }
 
     pub fn take_stderr(&self) -> Option<ChildStderr> {
-        self.stderr.lock().take()
+        // Control-side only: the EC is the sole accessor, so after `swap`
+        // the `Arc` is unique and `try_unwrap` cannot fail in practice.
+        self.stderr.swap(None).and_then(|s| Arc::try_unwrap(s).ok())
     }
 
     pub fn begin_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {
@@ -547,167 +590,9 @@ impl Drop for Vst3Processor {
     fn drop(&mut self) {
         let mapping = self.mapping.take();
         let events = self.events.take();
-        let child = self.child.lock().take();
+        let child = self.child.get_mut().take();
         let shm_name = std::mem::take(&mut self.shm_name);
         ipc::drop_host(mapping, events, child, shm_name);
-    }
-}
-
-impl UnsafeMutex<Vst3Processor> {
-    pub fn setup_audio_ports(&self) {
-        self.lock().setup_audio_ports();
-    }
-
-    pub fn process_with_midi(&self, frames: usize, midi_events: &[MidiEvent]) -> Vec<MidiEvent> {
-        self.lock().process_with_midi(frames, midi_events)
-    }
-
-    pub fn set_bypassed(&self, bypassed: bool) {
-        self.lock().set_bypassed(bypassed);
-    }
-
-    pub fn is_bypassed(&self) -> bool {
-        self.lock().is_bypassed()
-    }
-
-    pub fn parameter_infos(&self) -> Vec<ParameterInfo> {
-        self.lock().parameter_infos()
-    }
-
-    pub fn set_parameter(&self, param_id: u32, value: f64) -> Result<(), String> {
-        self.lock().set_parameter(param_id, value)
-    }
-
-    pub fn set_parameter_at(&self, param_id: u32, value: f64, frame: u32) -> Result<(), String> {
-        self.lock().set_parameter_at(param_id, value, frame)
-    }
-
-    pub fn begin_parameter_edit_at(&self, param_id: u32, frame: u32) -> Result<(), String> {
-        self.lock().begin_parameter_edit_at(param_id, frame)
-    }
-
-    pub fn end_parameter_edit_at(&self, param_id: u32, frame: u32) -> Result<(), String> {
-        self.lock().end_parameter_edit_at(param_id, frame)
-    }
-
-    pub fn snapshot_state(&self) -> Result<Vst3PluginState, String> {
-        self.lock().snapshot_state()
-    }
-
-    pub fn restore_state(&self, state: &Vst3PluginState) -> Result<(), String> {
-        self.lock().restore_state(state)
-    }
-
-    pub fn audio_inputs(&self) -> &[Arc<AudioIO>] {
-        self.lock().audio_inputs()
-    }
-
-    pub fn audio_outputs(&self) -> &[Arc<AudioIO>] {
-        self.lock().audio_outputs()
-    }
-
-    pub fn main_audio_input_count(&self) -> usize {
-        self.lock().main_audio_input_count()
-    }
-
-    pub fn main_audio_output_count(&self) -> usize {
-        self.lock().main_audio_output_count()
-    }
-
-    pub fn midi_input_count(&self) -> usize {
-        self.lock().midi_input_count()
-    }
-
-    pub fn midi_output_count(&self) -> usize {
-        self.lock().midi_output_count()
-    }
-
-    pub fn path(&self) -> String {
-        self.lock().path().to_string()
-    }
-
-    pub fn name(&self) -> String {
-        self.lock().name().to_string()
-    }
-
-    pub fn run_host_callbacks_main_thread(&self) {
-        self.lock().run_host_callbacks_main_thread();
-    }
-
-    pub fn reconfigure_ports_if_needed(&self) -> Result<bool, String> {
-        self.lock().reconfigure_ports_if_needed()
-    }
-
-    pub fn ui_begin_session(&self) {
-        self.lock().ui_begin_session();
-    }
-
-    pub fn ui_end_session(&self) {
-        self.lock().ui_end_session();
-    }
-
-    pub fn ui_should_close(&self) -> bool {
-        self.lock().ui_should_close()
-    }
-
-    pub fn ui_take_due_timers(&self) -> Vec<u32> {
-        self.lock().ui_take_due_timers()
-    }
-
-    pub fn ui_take_param_updates(&self) -> Vec<(u32, f64)> {
-        self.lock().ui_take_param_updates()
-    }
-
-    pub fn ui_take_state_update(&self) -> Option<Vst3PluginState> {
-        self.lock().ui_take_state_update()
-    }
-
-    pub fn gui_info(&self) -> Result<crate::plugins::types::Vst3GuiInfo, String> {
-        self.lock().gui_info()
-    }
-
-    pub fn gui_create(&self, platform_type: &str) -> Result<(), String> {
-        self.lock().gui_create(platform_type)
-    }
-
-    pub fn gui_get_size(&self) -> Result<(i32, i32), String> {
-        self.lock().gui_get_size()
-    }
-
-    pub fn gui_set_parent(&self, window: usize, platform_type: &str) -> Result<(), String> {
-        self.lock().gui_set_parent(window, platform_type)
-    }
-
-    pub fn gui_set_floating_mode(&self, floating: bool) -> Result<(), String> {
-        self.lock().gui_set_floating_mode(floating)
-    }
-
-    pub fn gui_on_size(&self, width: i32, height: i32) -> Result<(), String> {
-        self.lock().gui_on_size(width, height)
-    }
-
-    pub fn gui_show(&self) -> Result<(), String> {
-        self.lock().gui_show()
-    }
-
-    pub fn gui_hide(&self) {
-        self.lock().gui_hide();
-    }
-
-    pub fn gui_destroy(&self) {
-        self.lock().gui_destroy();
-    }
-
-    pub fn gui_on_main_thread(&self) {
-        self.lock().gui_on_main_thread();
-    }
-
-    pub fn gui_on_timer(&self, timer_id: u32) {
-        self.lock().gui_on_timer(timer_id);
-    }
-
-    pub fn gui_check_resize(&self) -> Option<(i32, i32)> {
-        self.lock().gui_check_resize()
     }
 }
 
@@ -894,7 +779,7 @@ mod tests {
         processor.setup_audio_ports();
 
         {
-            let buf = processor.audio_inputs()[0].buffer.lock();
+            let mut buf = processor.audio_inputs()[0].buffer.lock();
             buf.fill(1.0);
             processor.audio_inputs()[0]
                 .finished

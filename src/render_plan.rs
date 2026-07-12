@@ -23,8 +23,7 @@
 use crate::audio::io::AudioIO;
 use crate::connectable::{ConnectableConnection, ConnectableRef};
 use crate::message::{PluginKind, ProcessTask};
-use crate::mutex::UnsafeMutex;
-use crate::state::State;
+use crate::state::{StateSnapshot, TrackHandle};
 use crate::track::Track;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -59,8 +58,9 @@ pub enum Op {
         output: BufferId,
     },
     /// Engine task: track / folder section / plugin processing. Keeps the
-    /// `Arc<UnsafeMutex<Box<Track>>>` handle until Phase 5; `ins`/`outs` are
-    /// the arena buffers this task reads (post-`Sum`) and produces.
+    /// transitional `TrackHandle` until Phase 5's `TrackRt` split lands;
+    /// `ins`/`outs` are the arena buffers this task reads (post-`Sum`) and
+    /// produces.
     Task {
         task: ProcessTask,
         ins: Vec<BufferId>,
@@ -78,7 +78,7 @@ pub struct RenderPlan {
     /// Samples per port buffer (the driver block size at compile time).
     pub buffer_size: usize,
     /// The arena: one buffer per `AudioIO` port, owned by the plan. Replaces
-    /// `Arc<UnsafeMutex<Vec<f32>>>` on the real-time path.
+    /// shared mutable buffer wrappers on the real-time path.
     ///
     /// Interior mutability is required because workers execute disjoint nodes
     /// of the same plan concurrently. Soundness rests on the
@@ -98,7 +98,7 @@ pub struct RenderPlan {
     /// `(hw channel, buffer)` — the driver fills these before dispatch.
     pub hw_in_map: Vec<(usize, BufferId)>,
     /// The bridge port for each `hw_in_map` entry, same order. The driver
-    /// writes the arena buffer (no `UnsafeMutex` on the RT path); the
+    /// writes the arena buffer (no shared mutable wrapper on the RT path); the
     /// dispatcher copies arena → port buffer at cycle start so task bodies,
     /// which still read `port.buffer`, see this cycle's hardware input.
     pub hw_in_ports: Vec<Arc<AudioIO>>,
@@ -164,7 +164,7 @@ impl RenderPlan {
     /// Track visit order is sorted by name so plans are deterministic — the
     /// legacy scheduler iterated `State.tracks` in HashMap order.
     pub fn compile(
-        state: &State,
+        state: &StateSnapshot,
         hw_inputs: &[Arc<AudioIO>],
         hw_outputs: &[Arc<AudioIO>],
         buffer_size: usize,
@@ -172,7 +172,7 @@ impl RenderPlan {
         let mut b = Builder::new(buffer_size);
         b.add_hw(hw_inputs, hw_outputs);
 
-        let mut ordered: Vec<(String, Arc<UnsafeMutex<Box<Track>>>)> = state
+        let mut ordered: Vec<(String, TrackHandle)> = state
             .tracks
             .iter()
             .map(|(name, track)| (name.clone(), track.clone()))
@@ -364,14 +364,14 @@ impl Builder {
             Vec<Arc<crate::midi::io::MIDIIO>>,
         ) = match kind {
             PluginKind::Clap => {
-                let proc = t.clap_plugins[index].processor.lock();
+                let proc = t.clap_plugins[index].processor.clone();
                 (
                     proc.midi_input_ports().to_vec(),
                     proc.midi_output_ports().to_vec(),
                 )
             }
             PluginKind::Vst3 => {
-                let proc = t.vst3_plugins[index].processor.lock();
+                let proc = t.vst3_plugins[index].processor.clone();
                 (
                     proc.midi_input_ports().to_vec(),
                     proc.midi_output_ports().to_vec(),
@@ -379,7 +379,7 @@ impl Builder {
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             PluginKind::Lv2 => {
-                let proc = t.lv2_plugins[index].processor.lock();
+                let proc = t.lv2_plugins[index].processor.clone();
                 (
                     proc.midi_input_ports().to_vec(),
                     proc.midi_output_ports().to_vec(),
@@ -437,7 +437,7 @@ impl Builder {
     /// last node of the track's subgraph, for chaining by the caller.
     fn append_track(
         &mut self,
-        track: Arc<UnsafeMutex<Box<Track>>>,
+        track: TrackHandle,
         predecessor: Option<NodeId>,
     ) -> (NodeId, NodeId) {
         let t = track.lock();
@@ -465,14 +465,14 @@ impl Builder {
 
             let mut plugin_nodes: Vec<NodeId> = Vec::new();
             for idx in 0..t.clap_plugins.len() {
-                let node = self.push_plugin(&track, t, PluginKind::Clap, idx, folder_input);
+                let node = self.push_plugin(&track, &t, PluginKind::Clap, idx, folder_input);
                 let id = t.clap_plugins[idx].id;
                 source_keys.insert(ConnectableRef::ClapPlugin(id), node);
                 target_keys.insert(ConnectableRef::ClapPlugin(id), node);
                 plugin_nodes.push(node);
             }
             for idx in 0..t.vst3_plugins.len() {
-                let node = self.push_plugin(&track, t, PluginKind::Vst3, idx, folder_input);
+                let node = self.push_plugin(&track, &t, PluginKind::Vst3, idx, folder_input);
                 let id = t.vst3_plugins[idx].id;
                 source_keys.insert(ConnectableRef::Vst3Plugin(id), node);
                 target_keys.insert(ConnectableRef::Vst3Plugin(id), node);
@@ -480,7 +480,7 @@ impl Builder {
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             for idx in 0..t.lv2_plugins.len() {
-                let node = self.push_plugin(&track, t, PluginKind::Lv2, idx, folder_input);
+                let node = self.push_plugin(&track, &t, PluginKind::Lv2, idx, folder_input);
                 let id = t.lv2_plugins[idx].id;
                 source_keys.insert(ConnectableRef::Lv2Plugin(id), node);
                 target_keys.insert(ConnectableRef::Lv2Plugin(id), node);
@@ -512,7 +512,7 @@ impl Builder {
             for &out in &outs {
                 self.producer.insert(out, folder_output);
             }
-            self.register_midi_track_ports(t, folder_input, folder_output);
+            self.register_midi_track_ports(&t, folder_input, folder_output);
 
             // Cross-connectable edges within this folder's routing graph,
             // exactly as the legacy builder derived them.
@@ -541,17 +541,17 @@ impl Builder {
             for &out in &outs {
                 self.producer.insert(out, task);
             }
-            self.register_midi_track_ports(t, task, task);
+            self.register_midi_track_ports(&t, task, task);
             // Inline plugins are processed inside the track task body.
             for idx in 0..t.clap_plugins.len() {
-                self.register_plugin_midi_ports(t, PluginKind::Clap, idx, task);
+                self.register_plugin_midi_ports(&t, PluginKind::Clap, idx, task);
             }
             for idx in 0..t.vst3_plugins.len() {
-                self.register_plugin_midi_ports(t, PluginKind::Vst3, idx, task);
+                self.register_plugin_midi_ports(&t, PluginKind::Vst3, idx, task);
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             for idx in 0..t.lv2_plugins.len() {
-                self.register_plugin_midi_ports(t, PluginKind::Lv2, idx, task);
+                self.register_plugin_midi_ports(&t, PluginKind::Lv2, idx, task);
             }
             (task, task)
         }
@@ -559,7 +559,7 @@ impl Builder {
 
     fn push_plugin(
         &mut self,
-        track: &Arc<UnsafeMutex<Box<Track>>>,
+        track: &TrackHandle,
         t: &Track,
         kind: PluginKind,
         index: usize,
@@ -567,16 +567,16 @@ impl Builder {
     ) -> NodeId {
         let (input_ports, output_ports): (Vec<Arc<AudioIO>>, Vec<Arc<AudioIO>>) = match kind {
             PluginKind::Clap => {
-                let proc = t.clap_plugins[index].processor.lock();
+                let proc = t.clap_plugins[index].processor.clone();
                 (proc.audio_inputs().to_vec(), proc.audio_outputs().to_vec())
             }
             PluginKind::Vst3 => {
-                let proc = t.vst3_plugins[index].processor.lock();
+                let proc = t.vst3_plugins[index].processor.clone();
                 (proc.audio_inputs().to_vec(), proc.audio_outputs().to_vec())
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             PluginKind::Lv2 => {
-                let proc = t.lv2_plugins[index].processor.lock();
+                let proc = t.lv2_plugins[index].processor.clone();
                 (proc.audio_inputs().to_vec(), proc.audio_outputs().to_vec())
             }
         };
@@ -758,37 +758,25 @@ fn topo_sort(n: usize, edges: &HashSet<(NodeId, NodeId)>) -> (Vec<NodeId>, Vec<N
 mod tests {
     use super::*;
     use crate::connectable::connect_audio;
+    use crate::state::State;
 
-    fn make_track(name: &str, ins: usize, outs: usize) -> Arc<UnsafeMutex<Box<Track>>> {
-        Arc::new(UnsafeMutex::new(Box::new(Track::new(
-            name.to_string(),
-            ins,
-            outs,
-            0,
-            0,
-            64,
-            48_000.0,
-        ))))
+    fn make_track(name: &str, ins: usize, outs: usize) -> TrackHandle {
+        Arc::new(Track::new(name.to_string(), ins, outs, 0, 0, 64, 48_000.0))
     }
 
-    fn state_with(tracks: Vec<Arc<UnsafeMutex<Box<Track>>>>) -> State {
+    fn state_with(tracks: Vec<TrackHandle>) -> StateSnapshot {
         let mut state = State::default();
         for t in tracks {
             state.tracks.insert(t.lock().name.clone(), t);
         }
-        state
+        state.snapshot()
     }
 
     /// Connect `a`'s output `a_port` to `b`'s input `b_port`.
-    fn connect(
-        a: &Arc<UnsafeMutex<Box<Track>>>,
-        a_port: usize,
-        b: &Arc<UnsafeMutex<Box<Track>>>,
-        b_port: usize,
-    ) {
+    fn connect(a: &TrackHandle, a_port: usize, b: &TrackHandle, b_port: usize) {
         let src = a.lock();
         let dst = b.lock();
-        connect_audio(&**src, a_port, &**dst, b_port).expect("connect");
+        connect_audio(&*src, a_port, &*dst, b_port).expect("connect");
     }
 
     fn task_nodes(plan: &RenderPlan, name: &str) -> Vec<usize> {
@@ -942,24 +930,8 @@ mod tests {
     #[test]
     fn midi_only_connection_inserts_ordering_edge() {
         // Two tracks with no audio at all, linked only by a MIDI connection.
-        let a = Arc::new(UnsafeMutex::new(Box::new(Track::new(
-            "a".to_string(),
-            0,
-            0,
-            0,
-            1,
-            64,
-            48_000.0,
-        ))));
-        let b = Arc::new(UnsafeMutex::new(Box::new(Track::new(
-            "b".to_string(),
-            0,
-            0,
-            1,
-            0,
-            64,
-            48_000.0,
-        ))));
+        let a = Arc::new(Track::new("a".to_string(), 0, 0, 0, 1, 64, 48_000.0));
+        let b = Arc::new(Track::new("b".to_string(), 0, 0, 1, 0, 64, 48_000.0));
         let a_out = a.lock().midi.outs[0].clone();
         let b_in = b.lock().midi.ins[0].clone();
         crate::midi::io::MIDIIO::connect(&a_out, &b_in);

@@ -27,7 +27,7 @@ impl Track {
             .first()
             .map(|io| io.buffer.lock().len())
             .or_else(|| self.audio.outs.first().map(|io| io.buffer.lock().len()))
-            .unwrap_or(self.process_block_size)
+            .unwrap_or(self.process_block_size())
     }
 
     pub fn set_force_realtime_domain(&mut self, forced: bool) {
@@ -39,9 +39,9 @@ impl Track {
     }
 
     pub fn is_realtime_domain(&self) -> bool {
-        (self.armed
-            && (self.input_monitor.iter().any(|&m| m)
-                || self.midi_input_monitor.iter().any(|&m| m)))
+        (self.armed()
+            && (self.input_monitor().iter().any(|&m| m)
+                || self.midi_input_monitor().iter().any(|&m| m)))
             || self.force_realtime_domain
     }
 
@@ -61,9 +61,9 @@ impl Track {
             return Err(format!("Track '{}' has no audio buffer size", self.name));
         }
         let _ = self.audio.add_output(buffer_size);
-        self.record_tap_outs.push(vec![0.0; buffer_size]);
-        self.output_meter_linear_cache.push(0.0);
-        self.meter_peak_hold_linear.push(0.0);
+        self.rt.record_tap_outs.push(vec![0.0; buffer_size]);
+        self.rt.output_meter_linear_cache.push(0.0);
+        self.rt.meter_peak_hold_linear.push(0.0);
         self.invalidate_audio_route_cache();
         Ok(())
     }
@@ -78,7 +78,7 @@ impl Track {
         if let Some(input) = self.audio.ins.pop() {
             Self::disconnect_all(&input);
             for output in &self.audio.outs {
-                let conns = output.connections.lock();
+                let mut conns = output.connections.lock();
                 conns.retain(|source| !Arc::ptr_eq(source, &input));
             }
             self.invalidate_audio_route_cache();
@@ -105,10 +105,13 @@ impl Track {
         for target in hw_outputs.iter().chain(track_inputs.iter()) {
             let _ = AudioIO::disconnect(&output, target);
         }
-        self.record_tap_outs.truncate(self.audio.outs.len());
-        self.output_meter_linear_cache
+        self.rt.record_tap_outs.truncate(self.audio.outs.len());
+        self.rt
+            .output_meter_linear_cache
             .truncate(self.audio.outs.len());
-        self.meter_peak_hold_linear.truncate(self.audio.outs.len());
+        self.rt
+            .meter_peak_hold_linear
+            .truncate(self.audio.outs.len());
         self.invalidate_audio_route_cache();
         Ok(())
     }
@@ -123,56 +126,38 @@ impl Track {
             .collect();
         #[cfg(all(unix, not(target_os = "macos")))]
         for instance in &self.lv2_plugins {
-            source_ports.extend(
-                instance
-                    .processor
-                    .lock()
-                    .audio_outputs()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, io)| {
-                        (
-                            #[cfg(all(unix, not(target_os = "macos")))]
-                            PluginGraphNode::Lv2PluginInstance(instance.id),
-                            idx,
-                            io.clone(),
-                        )
-                    }),
-            );
+            source_ports.extend(instance.processor.audio_outputs().iter().enumerate().map(
+                |(idx, io)| {
+                    (
+                        #[cfg(all(unix, not(target_os = "macos")))]
+                        PluginGraphNode::Lv2PluginInstance(instance.id),
+                        idx,
+                        io.clone(),
+                    )
+                },
+            ));
         }
         for instance in &self.vst3_plugins {
-            source_ports.extend(
-                instance
-                    .processor
-                    .lock()
-                    .audio_outputs()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, io)| {
-                        (
-                            PluginGraphNode::Vst3PluginInstance(instance.id),
-                            idx,
-                            io.clone(),
-                        )
-                    }),
-            );
+            source_ports.extend(instance.processor.audio_outputs().iter().enumerate().map(
+                |(idx, io)| {
+                    (
+                        PluginGraphNode::Vst3PluginInstance(instance.id),
+                        idx,
+                        io.clone(),
+                    )
+                },
+            ));
         }
         for instance in &self.clap_plugins {
-            source_ports.extend(
-                instance
-                    .processor
-                    .lock()
-                    .audio_outputs()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, io)| {
-                        (
-                            PluginGraphNode::ClapPluginInstance(instance.id),
-                            idx,
-                            io.clone(),
-                        )
-                    }),
-            );
+            source_ports.extend(instance.processor.audio_outputs().iter().enumerate().map(
+                |(idx, io)| {
+                    (
+                        PluginGraphNode::ClapPluginInstance(instance.id),
+                        idx,
+                        io.clone(),
+                    )
+                },
+            ));
         }
 
         let mut connections = vec![];
@@ -194,7 +179,7 @@ impl Track {
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         for instance in &self.lv2_plugins {
-            for (to_port, to_io) in instance.processor.lock().audio_inputs().iter().enumerate() {
+            for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
                 for conn in to_io.connections.lock().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
                         .iter()
@@ -213,7 +198,7 @@ impl Track {
             }
         }
         for instance in &self.vst3_plugins {
-            for (to_port, to_io) in instance.processor.lock().audio_inputs().iter().enumerate() {
+            for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
                 for conn in to_io.connections.lock().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
                         .iter()
@@ -231,7 +216,7 @@ impl Track {
             }
         }
         for instance in &self.clap_plugins {
-            for (to_port, to_io) in instance.processor.lock().audio_inputs().iter().enumerate() {
+            for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
                 for conn in to_io.connections.lock().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
                         .iter()
@@ -707,7 +692,7 @@ impl Track {
         for (out_idx, audio_out) in self.audio.outs.iter().enumerate() {
             let source_idx = out_idx.min(self.audio.ins.len().saturating_sub(1));
             let audio_in = &self.audio.ins[source_idx];
-            let conns = audio_out.connections.lock();
+            let mut conns = audio_out.connections.lock();
             conns.retain(|conn| !self.audio.ins.iter().any(|input| Arc::ptr_eq(input, conn)));
             if !conns.iter().any(|conn| Arc::ptr_eq(conn, audio_in)) {
                 conns.push(audio_in.clone());
@@ -812,18 +797,18 @@ impl Track {
         } else {
             self.audio.ins.clone()
         };
-        if let Some(src) = &self.metronome_source {
-            sources.push(src.clone());
+        if let Some(src) = self.metronome_source.load_full() {
+            sources.push(src);
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         for instance in &self.lv2_plugins {
-            sources.extend(instance.processor.lock().audio_outputs().iter().cloned());
+            sources.extend(instance.processor.audio_outputs().iter().cloned());
         }
         for instance in &self.vst3_plugins {
-            sources.extend(instance.processor.lock().audio_outputs().iter().cloned());
+            sources.extend(instance.processor.audio_outputs().iter().cloned());
         }
         for instance in &self.clap_plugins {
-            sources.extend(instance.processor.lock().audio_outputs().iter().cloned());
+            sources.extend(instance.processor.audio_outputs().iter().cloned());
         }
         for child in &self.child_tracks {
             let child = child.lock();

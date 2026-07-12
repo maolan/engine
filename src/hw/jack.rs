@@ -1,15 +1,32 @@
-use crate::{audio::io::AudioIO, midi::io::MidiEvent, mutex::UnsafeMutex};
+use crate::{audio::io::AudioIO, midi::io::MidiEvent};
 use jack::{
     AudioIn, AudioOut, Client, ClientOptions, Control, MidiIn, MidiOut, NotificationHandler, Port,
     ProcessHandler, ProcessScope, RawMidi, TransportPosition, TransportState,
 };
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
 /// Capacity of the SPSC MIDI rings between the JACK callback and the engine
 /// thread, in events. One ring-full covers ~85 note-ons per 12 ms cycle.
 const MIDI_RING_CAPACITY: usize = 1024;
+const JACK_PORT_COMMAND_CAPACITY: usize = 64;
+const JACK_PORT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
+enum JackPortCommand {
+    AddAudioInput(Port<AudioIn>),
+    AddAudioOutput(Port<AudioOut>),
+    RemoveAudioInput(usize),
+    RemoveAudioOutput(usize),
+}
+
+#[derive(Debug)]
+enum JackPortResponse {
+    RemovedAudioInput(usize, Port<AudioIn>),
+    RemovedAudioOutput(usize, Port<AudioOut>),
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -36,8 +53,8 @@ struct Notifications;
 impl NotificationHandler for Notifications {}
 
 struct Process {
-    audio_in_ports: Arc<UnsafeMutex<Vec<Port<AudioIn>>>>,
-    audio_out_ports: Arc<UnsafeMutex<Vec<Port<AudioOut>>>>,
+    audio_in_ports: Vec<Port<AudioIn>>,
+    audio_out_ports: Vec<Port<AudioOut>>,
     midi_in_ports: Vec<Port<MidiIn>>,
     midi_out_ports: Vec<Port<MidiOut>>,
     plan_slot: Arc<crate::render_plan::PlanSlot>,
@@ -51,14 +68,40 @@ struct Process {
     midi_in_dropped: Arc<AtomicU64>,
     output_gain_linear: Arc<AtomicU32>,
     output_balance: Arc<AtomicU32>,
+    port_command_consumer: rtrb::Consumer<JackPortCommand>,
+    port_response_producer: rtrb::Producer<JackPortResponse>,
     tx_engine: Sender<crate::message::Message>,
 }
 
 impl Process {
+    fn drain_port_commands(&mut self) {
+        while let Ok(command) = self.port_command_consumer.pop() {
+            match command {
+                JackPortCommand::AddAudioInput(port) => self.audio_in_ports.push(port),
+                JackPortCommand::AddAudioOutput(port) => self.audio_out_ports.push(port),
+                JackPortCommand::RemoveAudioInput(idx) => {
+                    if idx < self.audio_in_ports.len() {
+                        let port = self.audio_in_ports.remove(idx);
+                        let _ = self
+                            .port_response_producer
+                            .push(JackPortResponse::RemovedAudioInput(idx, port));
+                    }
+                }
+                JackPortCommand::RemoveAudioOutput(idx) => {
+                    if idx < self.audio_out_ports.len() {
+                        let port = self.audio_out_ports.remove(idx);
+                        let _ = self
+                            .port_response_producer
+                            .push(JackPortResponse::RemovedAudioOutput(idx, port));
+                    }
+                }
+            }
+        }
+    }
+
     fn copy_audio_inputs(&mut self, ps: &ProcessScope) {
-        let audio_in_ports = self.audio_in_ports.lock();
         let plan = self.plan_slot.load();
-        for (idx, port) in audio_in_ports.iter().enumerate() {
+        for (idx, port) in self.audio_in_ports.iter().enumerate() {
             let Some(&(_channel, buf)) = plan.hw_in_map.get(idx) else {
                 continue;
             };
@@ -78,9 +121,8 @@ impl Process {
     fn copy_audio_outputs(&mut self, ps: &ProcessScope) {
         let gain = f32::from_bits(self.output_gain_linear.load(Ordering::Relaxed));
         let balance = f32::from_bits(self.output_balance.load(Ordering::Relaxed)).clamp(-1.0, 1.0);
-        let audio_out_ports = self.audio_out_ports.lock();
         let plan = self.plan_slot.load();
-        let stereo = audio_out_ports.len() == 2;
+        let stereo = self.audio_out_ports.len() == 2;
         let left_gain = if stereo {
             (1.0 - balance).clamp(0.0, 1.0)
         } else {
@@ -92,7 +134,7 @@ impl Process {
             1.0
         };
 
-        for (idx, port) in audio_out_ports.iter_mut().enumerate() {
+        for (idx, port) in self.audio_out_ports.iter_mut().enumerate() {
             let dst = port.as_mut_slice(ps);
             let Some(&(buf, _channel)) = plan.hw_out_map.get(idx) else {
                 dst.fill(0.0);
@@ -154,6 +196,7 @@ impl Process {
 impl ProcessHandler for Process {
     fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
         crate::enable_flush_denormals_to_zero();
+        self.drain_port_commands();
         self.copy_audio_inputs(ps);
         self.collect_midi_input(ps);
         self.copy_audio_outputs(ps);
@@ -165,17 +208,17 @@ impl ProcessHandler for Process {
 
 pub struct JackRuntime {
     client: Option<jack::AsyncClient<Notifications, Process>>,
-    audio_in_ports: Arc<UnsafeMutex<Vec<Port<AudioIn>>>>,
-    audio_out_ports: Arc<UnsafeMutex<Vec<Port<AudioOut>>>>,
-    audio_ins: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
-    audio_outs: Arc<UnsafeMutex<Vec<Arc<AudioIO>>>>,
-    /// Engine-thread ends of the MIDI rings. Mutexes are control-side only;
-    /// the JACK callback holds the bare ring ends.
-    midi_in_consumer: Mutex<rtrb::Consumer<MidiEvent>>,
-    midi_out_producer: Mutex<rtrb::Producer<MidiEvent>>,
+    audio_ins: Vec<Arc<AudioIO>>,
+    audio_outs: Vec<Arc<AudioIO>>,
+    /// Engine-thread ends of the MIDI rings; the JACK callback holds the
+    /// opposite bare ring ends.
+    midi_in_consumer: rtrb::Consumer<MidiEvent>,
+    midi_out_producer: rtrb::Producer<MidiEvent>,
     midi_in_dropped: Arc<AtomicU64>,
     output_gain_linear: Arc<AtomicU32>,
     output_balance: Arc<AtomicU32>,
+    port_command_producer: rtrb::Producer<JackPortCommand>,
+    port_response_consumer: rtrb::Consumer<JackPortResponse>,
     midi_input_count: usize,
     midi_output_count: usize,
     pub sample_rate: usize,
@@ -183,6 +226,50 @@ pub struct JackRuntime {
 }
 
 impl JackRuntime {
+    /// Push a port command to the JACK callback ring. On failure the command
+    /// is handed back so the caller can undo any registration it holds.
+    fn send_port_command(&mut self, command: JackPortCommand) -> Result<(), JackPortCommand> {
+        self.port_command_producer
+            .push(command)
+            .map_err(|e| match e {
+                rtrb::PushError::Full(command) => command,
+            })
+    }
+
+    fn wait_for_removed_audio_input_port(&mut self, idx: usize) -> Result<Port<AudioIn>, String> {
+        let deadline = Instant::now() + JACK_PORT_RESPONSE_TIMEOUT;
+        loop {
+            while let Ok(response) = self.port_response_consumer.pop() {
+                if let JackPortResponse::RemovedAudioInput(response_idx, port) = response
+                    && response_idx == idx
+                {
+                    return Ok(port);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("Timed out waiting for JACK audio input port removal".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_removed_audio_output_port(&mut self, idx: usize) -> Result<Port<AudioOut>, String> {
+        let deadline = Instant::now() + JACK_PORT_RESPONSE_TIMEOUT;
+        loop {
+            while let Ok(response) = self.port_response_consumer.pop() {
+                if let JackPortResponse::RemovedAudioOutput(response_idx, port) = response
+                    && response_idx == idx
+                {
+                    return Ok(port);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("Timed out waiting for JACK audio output port removal".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub fn new(
         client_name: &str,
         config: Config,
@@ -200,9 +287,6 @@ impl JackRuntime {
         let audio_outs: Vec<Arc<AudioIO>> = (0..config.audio_outputs)
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect();
-        let audio_in_bridges = Arc::new(UnsafeMutex::new(audio_ins));
-        let audio_out_bridges = Arc::new(UnsafeMutex::new(audio_outs));
-
         let mut audio_in_ports = Vec::with_capacity(config.audio_inputs);
         for i in 0..config.audio_inputs {
             let p = client
@@ -218,9 +302,6 @@ impl JackRuntime {
                 .map_err(|e| format!("Failed to register JACK audio output port {}: {e}", i + 1))?;
             audio_out_ports.push(p);
         }
-        let audio_in_ports = Arc::new(UnsafeMutex::new(audio_in_ports));
-        let audio_out_ports = Arc::new(UnsafeMutex::new(audio_out_ports));
-
         let mut midi_in_ports = Vec::with_capacity(config.midi_inputs);
         for i in 0..config.midi_inputs {
             let p = client
@@ -239,13 +320,17 @@ impl JackRuntime {
 
         let (midi_in_producer, midi_in_consumer) = rtrb::RingBuffer::new(MIDI_RING_CAPACITY);
         let (midi_out_producer, midi_out_consumer) = rtrb::RingBuffer::new(MIDI_RING_CAPACITY);
+        let (port_command_producer, port_command_consumer) =
+            rtrb::RingBuffer::new(JACK_PORT_COMMAND_CAPACITY);
+        let (port_response_producer, port_response_consumer) =
+            rtrb::RingBuffer::new(JACK_PORT_COMMAND_CAPACITY);
         let midi_in_dropped = Arc::new(AtomicU64::new(0));
         let output_gain_linear = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let output_balance = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
 
         let process = Process {
-            audio_in_ports: audio_in_ports.clone(),
-            audio_out_ports: audio_out_ports.clone(),
+            audio_in_ports,
+            audio_out_ports,
             midi_in_ports,
             midi_out_ports,
             plan_slot,
@@ -254,6 +339,8 @@ impl JackRuntime {
             midi_in_dropped: midi_in_dropped.clone(),
             output_gain_linear: output_gain_linear.clone(),
             output_balance: output_balance.clone(),
+            port_command_consumer,
+            port_response_producer,
             tx_engine,
         };
 
@@ -263,15 +350,15 @@ impl JackRuntime {
 
         Ok(Self {
             client: Some(client),
-            audio_in_ports,
-            audio_out_ports,
-            audio_ins: audio_in_bridges,
-            audio_outs: audio_out_bridges,
-            midi_in_consumer: Mutex::new(midi_in_consumer),
-            midi_out_producer: Mutex::new(midi_out_producer),
+            audio_ins,
+            audio_outs,
+            midi_in_consumer,
+            midi_out_producer,
             midi_in_dropped,
             output_gain_linear,
             output_balance,
+            port_command_producer,
+            port_response_consumer,
             midi_input_count: config.midi_inputs,
             midi_output_count: config.midi_outputs,
             sample_rate,
@@ -279,18 +366,16 @@ impl JackRuntime {
         })
     }
 
-    pub fn read_events_into(&self, out: &mut Vec<MidiEvent>) {
+    pub fn read_events_into(&mut self, out: &mut Vec<MidiEvent>) {
         out.clear();
-        let mut consumer = self.midi_in_consumer.lock().expect("midi ring poisoned");
-        while let Ok(event) = consumer.pop() {
+        while let Ok(event) = self.midi_in_consumer.pop() {
             out.push(event);
         }
     }
 
-    pub fn write_events(&self, events: &[MidiEvent]) {
-        let mut producer = self.midi_out_producer.lock().expect("midi ring poisoned");
+    pub fn write_events(&mut self, events: &[MidiEvent]) {
         for event in events {
-            if producer.push(event.clone()).is_err() {
+            if self.midi_out_producer.push(event.clone()).is_err() {
                 self.midi_in_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -313,27 +398,27 @@ impl JackRuntime {
     }
 
     pub fn input_channels(&self) -> usize {
-        self.audio_ins.lock().len()
+        self.audio_ins.len()
     }
 
     pub fn output_channels(&self) -> usize {
-        self.audio_outs.lock().len()
+        self.audio_outs.len()
     }
 
     pub fn audio_ins(&self) -> Vec<Arc<AudioIO>> {
-        self.audio_ins.lock().clone()
+        self.audio_ins.clone()
     }
 
     pub fn audio_outs(&self) -> Vec<Arc<AudioIO>> {
-        self.audio_outs.lock().clone()
+        self.audio_outs.clone()
     }
 
     pub fn input_audio_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
-        self.audio_ins.lock().get(idx).cloned()
+        self.audio_ins.get(idx).cloned()
     }
 
     pub fn output_audio_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
-        self.audio_outs.lock().get(idx).cloned()
+        self.audio_outs.get(idx).cloned()
     }
 
     pub fn transport_start(&self) -> Result<(), String> {
@@ -392,7 +477,7 @@ impl JackRuntime {
             .client
             .as_ref()
             .ok_or("JACK client is not active".to_string())?;
-        let next_index = self.audio_in_ports.lock().len();
+        let next_index = self.audio_ins.len();
         let port = client
             .as_client()
             .register_port(&format!("in_{}", next_index + 1), AudioIn::default())
@@ -402,9 +487,19 @@ impl JackRuntime {
                     next_index + 1
                 )
             })?;
-        self.audio_in_ports.lock().push(port);
+        if let Err(command) = self.send_port_command(JackPortCommand::AddAudioInput(port)) {
+            // The callback never took ownership of the port; unregister it
+            // so it does not leak into the JACK graph (jack-rs does not
+            // unregister on drop).
+            let JackPortCommand::AddAudioInput(port) = command else {
+                unreachable!("command was just constructed above")
+            };
+            if let Some(client) = self.client.as_ref() {
+                let _ = client.as_client().unregister_port(port);
+            }
+            return Err("JACK port command ring is full".to_string());
+        }
         self.audio_ins
-            .lock()
             .push(Arc::new(AudioIO::new(self.buffer_size)));
         Ok(next_index + 1)
     }
@@ -414,7 +509,7 @@ impl JackRuntime {
             .client
             .as_ref()
             .ok_or("JACK client is not active".to_string())?;
-        let next_index = self.audio_out_ports.lock().len();
+        let next_index = self.audio_outs.len();
         let port = client
             .as_client()
             .register_port(&format!("out_{}", next_index + 1), AudioOut::default())
@@ -424,24 +519,37 @@ impl JackRuntime {
                     next_index + 1
                 )
             })?;
-        self.audio_out_ports.lock().push(port);
+        if let Err(command) = self.send_port_command(JackPortCommand::AddAudioOutput(port)) {
+            // The callback never took ownership of the port; unregister it
+            // so it does not leak into the JACK graph (jack-rs does not
+            // unregister on drop).
+            let JackPortCommand::AddAudioOutput(port) = command else {
+                unreachable!("command was just constructed above")
+            };
+            if let Some(client) = self.client.as_ref() {
+                let _ = client.as_client().unregister_port(port);
+            }
+            return Err("JACK port command ring is full".to_string());
+        }
         self.audio_outs
-            .lock()
             .push(Arc::new(AudioIO::new(self.buffer_size)));
         Ok(next_index + 1)
     }
 
     pub fn remove_audio_input_port(&mut self, idx: usize) -> Result<Arc<AudioIO>, String> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or("JACK client is not active".to_string())?;
-        if idx >= self.audio_in_ports.lock().len() || idx >= self.audio_ins.lock().len() {
+        if self.client.is_none() {
+            return Err("JACK client is not active".to_string());
+        }
+        if idx >= self.audio_ins.len() {
             return Err("JACK audio input port index is out of range".to_string());
         }
-        let port = self.audio_in_ports.lock().remove(idx);
-        let bridge = self.audio_ins.lock().remove(idx);
-        client
+        self.send_port_command(JackPortCommand::RemoveAudioInput(idx))
+            .map_err(|_| "JACK port command ring is full".to_string())?;
+        let port = self.wait_for_removed_audio_input_port(idx)?;
+        let bridge = self.audio_ins.remove(idx);
+        self.client
+            .as_ref()
+            .ok_or("JACK client is not active".to_string())?
             .as_client()
             .unregister_port(port)
             .map_err(|e| format!("Failed to unregister JACK audio input port: {e}"))?;
@@ -449,16 +557,19 @@ impl JackRuntime {
     }
 
     pub fn remove_audio_output_port(&mut self, idx: usize) -> Result<Arc<AudioIO>, String> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or("JACK client is not active".to_string())?;
-        if idx >= self.audio_out_ports.lock().len() || idx >= self.audio_outs.lock().len() {
+        if self.client.is_none() {
+            return Err("JACK client is not active".to_string());
+        }
+        if idx >= self.audio_outs.len() {
             return Err("JACK audio output port index is out of range".to_string());
         }
-        let port = self.audio_out_ports.lock().remove(idx);
-        let bridge = self.audio_outs.lock().remove(idx);
-        client
+        self.send_port_command(JackPortCommand::RemoveAudioOutput(idx))
+            .map_err(|_| "JACK port command ring is full".to_string())?;
+        let port = self.wait_for_removed_audio_output_port(idx)?;
+        let bridge = self.audio_outs.remove(idx);
+        self.client
+            .as_ref()
+            .ok_or("JACK client is not active".to_string())?
             .as_client()
             .unregister_port(port)
             .map_err(|e| format!("Failed to unregister JACK audio output port: {e}"))?;

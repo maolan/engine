@@ -68,62 +68,62 @@ impl Lv2Instance {
 
 impl crate::connectable::AudioPorts for ClapInstance {
     fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
-        self.processor.lock().audio_inputs().to_vec()
+        self.processor.audio_inputs().to_vec()
     }
 
     fn audio_outputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
-        self.processor.lock().audio_outputs().to_vec()
+        self.processor.audio_outputs().to_vec()
     }
 }
 
 impl crate::connectable::MidiPorts for ClapInstance {
     fn midi_inputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
-        self.processor.lock().midi_input_ports().to_vec()
+        self.processor.midi_input_ports().to_vec()
     }
 
     fn midi_outputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
-        self.processor.lock().midi_output_ports().to_vec()
+        self.processor.midi_output_ports().to_vec()
     }
 }
 
 impl crate::connectable::AudioPorts for Vst3Instance {
     fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
-        self.processor.lock().audio_inputs().to_vec()
+        self.processor.audio_inputs().to_vec()
     }
 
     fn audio_outputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
-        self.processor.lock().audio_outputs().to_vec()
+        self.processor.audio_outputs().to_vec()
     }
 }
 
 impl crate::connectable::MidiPorts for Vst3Instance {
     fn midi_inputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
-        self.processor.lock().midi_input_ports().to_vec()
+        self.processor.midi_input_ports().to_vec()
     }
 
     fn midi_outputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
-        self.processor.lock().midi_output_ports().to_vec()
+        self.processor.midi_output_ports().to_vec()
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 impl crate::connectable::AudioPorts for Lv2Instance {
     fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
-        self.processor.lock().audio_inputs().to_vec()
+        self.processor.audio_inputs().to_vec()
     }
 
     fn audio_outputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
-        self.processor.lock().audio_outputs().to_vec()
+        self.processor.audio_outputs().to_vec()
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 impl crate::connectable::MidiPorts for Lv2Instance {
     fn midi_inputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
-        self.processor.lock().midi_input_ports().to_vec()
+        self.processor.midi_input_ports().to_vec()
     }
 
     fn midi_outputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
-        self.processor.lock().midi_output_ports().to_vec()
+        self.processor.midi_output_ports().to_vec()
     }
 }

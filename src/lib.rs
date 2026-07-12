@@ -11,7 +11,6 @@ pub mod kind;
 pub mod message;
 mod midi;
 pub mod modulator;
-pub mod mutex;
 mod osc;
 mod plan_builder;
 pub mod plugins;

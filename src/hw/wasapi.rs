@@ -667,6 +667,18 @@ impl traits::HwWorkerDriver for HwDriver {
         self.sample_rate()
     }
 
+    fn close_fds(&mut self) {
+        self.close_fds()
+    }
+
+    fn set_playing(&mut self, playing: bool) {
+        self.set_playing(playing)
+    }
+
+    fn set_output_gain_balance(&mut self, gain: f32, balance: f32) {
+        self.set_output_gain_balance(gain, balance)
+    }
+
     fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         let _ = self.output_stream.pause();
