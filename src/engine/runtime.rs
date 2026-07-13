@@ -733,7 +733,7 @@ impl Engine {
                                 }
                             }
                             Err(rtrb::PopError::Empty) => {
-                                std::thread::park_timeout(Duration::from_micros(100));
+                                std::thread::park();
                             }
                         }
                     }
@@ -1405,30 +1405,6 @@ impl Engine {
         t.audio.set_processing(true);
     }
 
-    /// Copy this cycle's hardware input from the plan arena into the bridge
-    /// port buffers, so task bodies (which still read `port.buffer`) see the
-    /// current hardware input. Runs on the dispatcher at cycle start; the
-    /// driver itself only touches arena buffers.
-    pub(crate) fn copy_hw_inputs_to_ports(&self) {
-        let plan = self.executor.plan();
-        for (idx, port) in plan.hw_in_ports.iter().enumerate() {
-            let Some(&(_, buf)) = plan.hw_in_map.get(idx) else {
-                continue;
-            };
-            // Safety: cycle boundary — the driver finished writing these
-            // buffers before signalling cycle end, and no node of the new
-            // cycle has been dispatched yet.
-            let src = unsafe { plan.buffer(buf) };
-            let mut dst = port.buffer.lock();
-            let n = src.len().min(dst.len());
-            dst[..n].copy_from_slice(&src[..n]);
-            if n < dst.len() {
-                dst[n..].fill(0.0);
-            }
-            port.finished.store(true, Ordering::Release);
-        }
-    }
-
     /// Dispatch queued node jobs to ready workers, buffering the rest until
     /// a worker reports `Ready`. Returns true if the cycle completed while
     /// dispatching (only possible via abandoned nodes).
@@ -1506,7 +1482,6 @@ impl Engine {
             return false;
         }
         self.refresh_realtime_infection();
-        self.copy_hw_inputs_to_ports();
         self.ensure_metronome_wiring();
         let jobs = self.executor.start_cycle(Instant::now());
         if self.dispatch_node_jobs(jobs).await {

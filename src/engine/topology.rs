@@ -60,8 +60,7 @@ impl Engine {
     #[cfg(unix)]
     pub(crate) fn audio_ports_connected(source: &Arc<AudioIO>, target: &Arc<AudioIO>) -> bool {
         source
-            .connections
-            .lock()
+            .connections()
             .iter()
             .any(|conn| Arc::ptr_eq(conn, target))
     }
@@ -381,7 +380,7 @@ impl Engine {
             if let Some(target_track) = state.tracks.get(&target_name) {
                 let tt = target_track.lock();
                 for input in &tt.audio.ins {
-                    for conn in input.connections.lock().iter() {
+                    for conn in input.connections().iter() {
                         let conn_ptr = std::sync::Arc::as_ptr(conn);
                         if let Some(source_name) = output_to_track.get(&conn_ptr)
                             && source_name != &target_name
@@ -473,7 +472,7 @@ impl Engine {
                 let t = track.lock();
                 let mut upstream_owners = std::collections::HashSet::new();
                 for input in &t.audio.ins {
-                    for conn in input.connections.lock().iter() {
+                    for conn in input.connections().iter() {
                         if let Some(owner) = output_owner.get(&std::sync::Arc::as_ptr(conn)) {
                             upstream_owners.insert(owner.clone());
                         }
@@ -993,14 +992,15 @@ impl Engine {
             match kind {
                 Kind::Audio => {
                     for out_port in &current_track.audio.outs {
-                        let conns = out_port.connections.lock();
+                        let conns = out_port.connections();
                         for conn in conns.iter() {
                             for (name, next_track_handle) in &state.tracks {
                                 let next_track = next_track_handle.lock();
-                                let is_connected =
-                                    next_track.audio.ins.iter().any(|ins_port| {
-                                        Arc::ptr_eq(&ins_port.buffer, &conn.buffer)
-                                    });
+                                let is_connected = next_track
+                                    .audio
+                                    .ins
+                                    .iter()
+                                    .any(|ins_port| Arc::ptr_eq(ins_port, conn));
 
                                 if is_connected {
                                     found_neighbors.push(name.clone());
@@ -1799,10 +1799,10 @@ impl Engine {
             if let Some(child_arc) = state.tracks.get(track_name).cloned() {
                 let child = child_arc.lock();
                 for (port_idx, inp) in child.audio.ins.iter().enumerate() {
-                    let sources = inp.connections.lock().clone();
-                    for src in sources {
-                        let _ = AudioIO::disconnect(&src, inp);
-                        if let Some((src_name, src_port)) = self.find_audio_io_owner(&state, &src) {
+                    let sources = inp.connections();
+                    for src in sources.iter() {
+                        let _ = AudioIO::disconnect(src, inp);
+                        if let Some((src_name, src_port)) = self.find_audio_io_owner(&state, src) {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: src_name,
                                 from_port: src_port,
@@ -1812,7 +1812,7 @@ impl Engine {
                             });
                         } else if let Some(src_port) = hw_inputs
                             .iter()
-                            .position(|hw_in| std::sync::Arc::ptr_eq(hw_in, &src))
+                            .position(|hw_in| std::sync::Arc::ptr_eq(hw_in, src))
                         {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: "hw:in".to_string(),
@@ -1825,10 +1825,10 @@ impl Engine {
                     }
                 }
                 for (port_idx, out) in child.audio.outs.iter().enumerate() {
-                    let targets = out.connections.lock().clone();
-                    for tgt in targets {
-                        let _ = AudioIO::disconnect(out, &tgt);
-                        if let Some((tgt_name, tgt_port)) = self.find_audio_io_owner(&state, &tgt) {
+                    let targets = out.connections();
+                    for tgt in targets.iter() {
+                        let _ = AudioIO::disconnect(out, tgt);
+                        if let Some((tgt_name, tgt_port)) = self.find_audio_io_owner(&state, tgt) {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: track_name.to_string(),
                                 from_port: port_idx,
@@ -1838,7 +1838,7 @@ impl Engine {
                             });
                         } else if let Some(tgt_port) = hw_outputs
                             .iter()
-                            .position(|hw_out| std::sync::Arc::ptr_eq(hw_out, &tgt))
+                            .position(|hw_out| std::sync::Arc::ptr_eq(hw_out, tgt))
                         {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: track_name.to_string(),

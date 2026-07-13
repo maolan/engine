@@ -25,8 +25,8 @@ impl Track {
         self.audio
             .ins
             .first()
-            .map(|io| io.buffer.lock().len())
-            .or_else(|| self.audio.outs.first().map(|io| io.buffer.lock().len()))
+            .map(|io| io.buffer_size())
+            .or_else(|| self.audio.outs.first().map(|io| io.buffer_size()))
             .unwrap_or(self.process_block_size())
     }
 
@@ -78,8 +78,9 @@ impl Track {
         if let Some(input) = self.audio.ins.pop() {
             Self::disconnect_all(&input);
             for output in &self.audio.outs {
-                let mut conns = output.connections.lock();
-                conns.retain(|source| !Arc::ptr_eq(source, &input));
+                output.update_connections(|conns| {
+                    conns.retain(|source| !Arc::ptr_eq(source, &input));
+                });
             }
             self.invalidate_audio_route_cache();
             Ok(())
@@ -162,7 +163,7 @@ impl Track {
 
         let mut connections = vec![];
         for (to_port, to_io) in self.audio.outs.iter().enumerate() {
-            for conn in to_io.connections.lock().iter() {
+            for conn in to_io.connections().iter() {
                 if let Some((from_node, from_port, _)) = source_ports
                     .iter()
                     .find(|(_, _, source_io)| Arc::ptr_eq(source_io, conn))
@@ -180,7 +181,7 @@ impl Track {
         #[cfg(all(unix, not(target_os = "macos")))]
         for instance in &self.lv2_plugins {
             for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
-                for conn in to_io.connections.lock().iter() {
+                for conn in to_io.connections().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
                         .iter()
                         .find(|(_, _, source_io)| Arc::ptr_eq(source_io, conn))
@@ -199,7 +200,7 @@ impl Track {
         }
         for instance in &self.vst3_plugins {
             for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
-                for conn in to_io.connections.lock().iter() {
+                for conn in to_io.connections().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
                         .iter()
                         .find(|(_, _, source_io)| Arc::ptr_eq(source_io, conn))
@@ -217,7 +218,7 @@ impl Track {
         }
         for instance in &self.clap_plugins {
             for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
-                for conn in to_io.connections.lock().iter() {
+                for conn in to_io.connections().iter() {
                     if let Some((from_node, from_port, _)) = source_ports
                         .iter()
                         .find(|(_, _, source_io)| Arc::ptr_eq(source_io, conn))
@@ -301,9 +302,9 @@ impl Track {
 
         let mut report_audio_targets = |targets: Vec<Arc<AudioIO>>, target_ref: ConnectableRef| {
             for (port, target) in targets.iter().enumerate() {
-                let source_list = target.connections.lock().clone();
-                for source in source_list {
-                    if let Some((from_ref, from_port)) = find_audio_source(&source) {
+                let source_list = target.connections();
+                for source in source_list.iter() {
+                    if let Some((from_ref, from_port)) = find_audio_source(source) {
                         connections.push(ConnectableConnection {
                             from: from_ref,
                             from_port,
@@ -683,36 +684,34 @@ impl Track {
         }
 
         for audio_in in &self.audio.ins {
-            audio_in
-                .connections
-                .lock()
-                .retain(|conn| !self.audio.outs.iter().any(|out| Arc::ptr_eq(out, conn)));
+            audio_in.update_connections(|conns| {
+                conns.retain(|conn| !self.audio.outs.iter().any(|out| Arc::ptr_eq(out, conn)));
+            });
         }
 
         for (out_idx, audio_out) in self.audio.outs.iter().enumerate() {
             let source_idx = out_idx.min(self.audio.ins.len().saturating_sub(1));
             let audio_in = &self.audio.ins[source_idx];
-            let mut conns = audio_out.connections.lock();
-            conns.retain(|conn| !self.audio.ins.iter().any(|input| Arc::ptr_eq(input, conn)));
-            if !conns.iter().any(|conn| Arc::ptr_eq(conn, audio_in)) {
-                conns.push(audio_in.clone());
-            }
+            audio_out.update_connections(|conns| {
+                conns.retain(|conn| !self.audio.ins.iter().any(|input| Arc::ptr_eq(input, conn)));
+                if !conns.iter().any(|conn| Arc::ptr_eq(conn, audio_in)) {
+                    conns.push(audio_in.clone());
+                }
+            });
         }
         self.invalidate_audio_route_cache();
     }
 
     pub(crate) fn disconnect_audio_inputs_from_outputs(&mut self) {
         for audio_in in &self.audio.ins {
-            audio_in
-                .connections
-                .lock()
-                .retain(|conn| !self.audio.outs.iter().any(|out| Arc::ptr_eq(out, conn)));
+            audio_in.update_connections(|conns| {
+                conns.retain(|conn| !self.audio.outs.iter().any(|out| Arc::ptr_eq(out, conn)));
+            });
         }
         for audio_out in &self.audio.outs {
-            audio_out
-                .connections
-                .lock()
-                .retain(|conn| !self.audio.ins.iter().any(|input| Arc::ptr_eq(input, conn)));
+            audio_out.update_connections(|conns| {
+                conns.retain(|conn| !self.audio.ins.iter().any(|input| Arc::ptr_eq(input, conn)));
+            });
         }
         self.invalidate_audio_route_cache();
     }
@@ -749,8 +748,7 @@ impl Track {
         for (out_idx, child_out) in self.audio.outs.iter().enumerate() {
             if let Some(parent_in) = parent.audio.ins.get(out_idx) {
                 let already_connected = child_out
-                    .connections
-                    .lock()
+                    .connections()
                     .iter()
                     .any(|conn| Arc::ptr_eq(conn, parent_in));
                 if !already_connected {
@@ -825,9 +823,9 @@ impl Track {
     }
 
     pub(crate) fn disconnect_all(port: &Arc<AudioIO>) {
-        let connections = port.connections.lock().clone();
-        for other in connections {
-            let _ = AudioIO::disconnect(&other, port);
+        let connections = port.connections();
+        for other in connections.iter() {
+            let _ = AudioIO::disconnect(other, port);
         }
     }
 }

@@ -200,11 +200,9 @@ impl HwDriver {
         self.playback_buffer_i16.fill(0);
         self.playback_buffer_i32.fill(0);
         self.playback_f32_buffer.fill(0.0);
-        for ch in &self.audio_ins {
-            ch.buffer.lock().fill(0.0);
-        }
-        for ch in &self.audio_outs {
-            ch.buffer.lock().fill(0.0);
+        if let Some(slot) = &self.plan_slot {
+            let plan = slot.load();
+            ports::clear_hw_arena_buffers(&plan);
         }
     }
 
@@ -281,7 +279,7 @@ impl HwDriver {
             let plan = slot.load();
             common::output_meter_linear_from_plan(&plan, gain, balance)
         } else {
-            common::output_meter_linear(&self.audio_outs, gain, balance)
+            common::output_meter_linear(self.audio_outs.len(), gain, balance)
         }
     }
 

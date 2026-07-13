@@ -523,8 +523,9 @@ impl Audio {
             return;
         }
         self.buffer.fill(0);
-        for ch in &self.channels {
-            ch.buffer.lock().fill(0.0);
+        if let Some(slot) = &self.plan_slot {
+            let plan = slot.load();
+            crate::hw::ports::clear_hw_arena_buffers(&plan);
         }
         self.stop_fade_remaining_frames = 0;
         self.stop_fade_total_frames = 0;

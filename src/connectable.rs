@@ -194,8 +194,7 @@ mod tests {
 
         assert!(
             target.audio_ins[0]
-                .connections
-                .lock()
+                .connections()
                 .iter()
                 .any(|c| Arc::ptr_eq(c, &source.audio_outs[0]))
         );
@@ -209,8 +208,8 @@ mod tests {
 
         disconnect_audio(&source, 0, &target, 0).unwrap();
 
-        assert!(target.audio_ins[0].connections.lock().is_empty());
-        assert!(source.audio_outs[0].connections.lock().is_empty());
+        assert!(target.audio_ins[0].connections().is_empty());
+        assert!(source.audio_outs[0].connections().is_empty());
     }
 
     #[test]

@@ -193,46 +193,120 @@ impl ClipPluginRuntime {
         _context: ClipRuntimeProcessContext,
     ) -> Vec<Vec<f32>> {
         self.setup_ports();
-        for (source, samples) in self.input_sources.iter().zip(input_blocks.iter()) {
-            let mut buffer = source.buffer.lock();
-            let len = buffer.len().min(request_len);
-            buffer.fill(0.0);
-            buffer[..len].copy_from_slice(&samples[..len]);
-            source.finished.store(true, Ordering::Release);
-        }
-        for source in self.input_sources.iter().skip(input_blocks.len()) {
-            source.buffer.lock().fill(0.0);
-            source.finished.store(true, Ordering::Release);
-        }
+        let mut midi_node_events = HashMap::new();
+        let plugin_outputs =
+            self.process_plugins_in_graph_order(request_len, input_blocks, &mut midi_node_events);
 
-        self.process_plugins_in_graph_order(request_len, &[], &mut HashMap::new());
+        self.outputs
+            .iter()
+            .map(|output| {
+                Self::sum_clip_audio_port(
+                    output,
+                    request_len,
+                    &self.input_sources,
+                    input_blocks,
+                    &plugin_outputs,
+                )
+            })
+            .collect()
+    }
 
-        let mut outputs = Vec::with_capacity(self.outputs.len());
-        for output in &self.outputs {
-            if output.ready() {
-                output.process();
+    fn clip_source_slice<'a>(
+        source: &Arc<AudioIO>,
+        input_sources: &'a [Arc<AudioIO>],
+        input_blocks: &'a [Vec<f32>],
+        output_buffers: &'a HashMap<usize, Vec<f32>>,
+    ) -> Option<&'a [f32]> {
+        let key = Arc::as_ptr(source) as usize;
+        if let Some((idx, _)) = input_sources
+            .iter()
+            .enumerate()
+            .find(|(_, input)| Arc::as_ptr(input) as usize == key)
+        {
+            return input_blocks.get(idx).map(Vec::as_slice);
+        }
+        output_buffers.get(&key).map(Vec::as_slice)
+    }
+
+    fn sum_clip_audio_port(
+        port: &Arc<AudioIO>,
+        frames: usize,
+        input_sources: &[Arc<AudioIO>],
+        input_blocks: &[Vec<f32>],
+        output_buffers: &HashMap<usize, Vec<f32>>,
+    ) -> Vec<f32> {
+        let mut dst = vec![0.0; frames];
+        let mut seeded = false;
+        for source in port.connections().iter() {
+            let Some(src) =
+                Self::clip_source_slice(source, input_sources, input_blocks, output_buffers)
+            else {
+                continue;
+            };
+            if !seeded {
+                crate::simd::copy_sanitized_inplace(&mut dst, src);
+                seeded = true;
             } else {
-                output.buffer.lock().fill(0.0);
-                output.finished.store(true, Ordering::Release);
+                crate::simd::add_sanitized_inplace(&mut dst, src);
             }
-            let buffer = output.buffer.lock();
-            outputs.push(
-                buffer
+        }
+        dst
+    }
+
+    fn clip_audio_inputs_ready(
+        input_ports: &[Arc<AudioIO>],
+        plugin_output_keys: &HashSet<usize>,
+        output_buffers: &HashMap<usize, Vec<f32>>,
+    ) -> bool {
+        input_ports.iter().all(|input| {
+            input.connections().iter().all(|source| {
+                let key = Arc::as_ptr(source) as usize;
+                !plugin_output_keys.contains(&key) || output_buffers.contains_key(&key)
+            })
+        })
+    }
+
+    fn clip_plugin_output_keys(&self) -> HashSet<usize> {
+        let mut keys = HashSet::new();
+        for instance in &self.clap_plugins {
+            keys.extend(
+                instance
+                    .processor
+                    .audio_outputs()
                     .iter()
-                    .take(request_len)
-                    .copied()
-                    .collect::<Vec<f32>>(),
+                    .map(|port| Arc::as_ptr(port) as usize),
             );
         }
-        outputs
+        for instance in &self.vst3_plugins {
+            keys.extend(
+                instance
+                    .processor
+                    .audio_outputs()
+                    .iter()
+                    .map(|port| Arc::as_ptr(port) as usize),
+            );
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for instance in &self.lv2_plugins {
+            keys.extend(
+                instance
+                    .processor
+                    .audio_outputs()
+                    .iter()
+                    .map(|port| Arc::as_ptr(port) as usize),
+            );
+        }
+        keys
     }
 
     fn process_plugins_in_graph_order(
         &self,
         frames: usize,
-        _track_input_events: &[Vec<MidiEvent>],
+        input_blocks: &[Vec<f32>],
         midi_node_events: &mut HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
-    ) {
+    ) -> HashMap<usize, Vec<f32>> {
+        let mut output_buffers = HashMap::<usize, Vec<f32>>::new();
+        let plugin_output_keys = self.clip_plugin_output_keys();
         let mut clap_processed = vec![false; self.clap_plugins.len()];
         let mut vst3_processed = vec![false; self.vst3_plugins.len()];
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -250,22 +324,53 @@ impl ClipPluginRuntime {
                     continue;
                 }
                 let processor = self.clap_plugins[idx].processor.clone();
-                let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
-                if !audio_ready || !midi_ready {
+                if !midi_ready
+                    || !Self::clip_audio_inputs_ready(
+                        processor.audio_inputs(),
+                        &plugin_output_keys,
+                        &output_buffers,
+                    )
+                {
                     continue;
                 }
-                for input in processor.audio_inputs() {
-                    input.process();
-                }
                 let _midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
-                let outputs = processor.process_with_midi(
+                let input_buffers = processor
+                    .audio_inputs()
+                    .iter()
+                    .map(|input| {
+                        Self::sum_clip_audio_port(
+                            input,
+                            frames,
+                            &self.input_sources,
+                            input_blocks,
+                            &output_buffers,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut output_buffers_for_plugin =
+                    vec![vec![0.0; frames]; processor.audio_outputs().len()];
+                let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let mut outputs = output_buffers_for_plugin
+                    .iter_mut()
+                    .map(Vec::as_mut_slice)
+                    .collect::<Vec<_>>();
+                let midi_outputs = processor.process_with_audio_buffers(
                     frames,
                     &[],
                     crate::plugins::types::ClapTransportInfo::default(),
+                    &inputs,
+                    &mut outputs,
                 );
-                for evt in outputs {
+                for (port, buffer) in processor
+                    .audio_outputs()
+                    .iter()
+                    .zip(output_buffers_for_plugin)
+                {
+                    output_buffers.insert(Arc::as_ptr(port) as usize, buffer);
+                }
+                for evt in midi_outputs {
                     midi_node_events
                         .entry((node.clone(), evt.port))
                         .or_default()
@@ -281,20 +386,49 @@ impl ClipPluginRuntime {
                     continue;
                 }
                 let processor = self.vst3_plugins[idx].processor.clone();
-                let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
-                if !audio_ready || !midi_ready {
+                if !midi_ready
+                    || !Self::clip_audio_inputs_ready(
+                        processor.audio_inputs(),
+                        &plugin_output_keys,
+                        &output_buffers,
+                    )
+                {
                     continue;
                 }
-                for input in processor.audio_inputs() {
-                    input.process();
+                let _midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
+                let input_buffers = processor
+                    .audio_inputs()
+                    .iter()
+                    .map(|input| {
+                        Self::sum_clip_audio_port(
+                            input,
+                            frames,
+                            &self.input_sources,
+                            input_blocks,
+                            &output_buffers,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut output_buffers_for_plugin =
+                    vec![vec![0.0; frames]; processor.audio_outputs().len()];
+                let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let mut outputs = output_buffers_for_plugin
+                    .iter_mut()
+                    .map(Vec::as_mut_slice)
+                    .collect::<Vec<_>>();
+                let midi_outputs =
+                    processor.process_with_audio_buffers(frames, &inputs, &mut outputs);
+                for (port, buffer) in processor
+                    .audio_outputs()
+                    .iter()
+                    .zip(output_buffers_for_plugin)
+                {
+                    output_buffers.insert(Arc::as_ptr(port) as usize, buffer);
                 }
-                let midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
-                let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs = processor.process_with_midi(frames, &vst3_input);
-                if !outputs.is_empty() {
-                    midi_node_events.insert((node.clone(), 0), outputs);
+                if !midi_outputs.is_empty() {
+                    midi_node_events.insert((node.clone(), 0), midi_outputs);
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
@@ -307,20 +441,49 @@ impl ClipPluginRuntime {
                     continue;
                 }
                 let processor = self.lv2_plugins[idx].processor.clone();
-                let audio_ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
-                if !audio_ready || !midi_ready {
+                if !midi_ready
+                    || !Self::clip_audio_inputs_ready(
+                        processor.audio_inputs(),
+                        &plugin_output_keys,
+                        &output_buffers,
+                    )
+                {
                     continue;
                 }
-                for input in processor.audio_inputs() {
-                    input.process();
+                let _midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
+                let input_buffers = processor
+                    .audio_inputs()
+                    .iter()
+                    .map(|input| {
+                        Self::sum_clip_audio_port(
+                            input,
+                            frames,
+                            &self.input_sources,
+                            input_blocks,
+                            &output_buffers,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut output_buffers_for_plugin =
+                    vec![vec![0.0; frames]; processor.audio_outputs().len()];
+                let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let mut outputs = output_buffers_for_plugin
+                    .iter_mut()
+                    .map(Vec::as_mut_slice)
+                    .collect::<Vec<_>>();
+                let midi_outputs =
+                    processor.process_with_audio_buffers(frames, &inputs, &mut outputs);
+                for (port, buffer) in processor
+                    .audio_outputs()
+                    .iter()
+                    .zip(output_buffers_for_plugin)
+                {
+                    output_buffers.insert(Arc::as_ptr(port) as usize, buffer);
                 }
-                let midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
-                let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs = processor.process_with_midi(frames, &lv2_input);
-                if !outputs.is_empty() {
-                    midi_node_events.insert((node.clone(), 0), outputs);
+                if !midi_outputs.is_empty() {
+                    midi_node_events.insert((node.clone(), 0), midi_outputs);
                 }
                 *done = true;
                 remaining = remaining.saturating_sub(1);
@@ -331,6 +494,8 @@ impl ClipPluginRuntime {
                 break;
             }
         }
+
+        output_buffers
     }
 
     fn plugin_midi_inputs_ready(ports: &[Arc<MIDIIO>]) -> bool {
@@ -402,6 +567,7 @@ pub struct TrackRt {
     session_clip_playback_enabled: bool,
     output_meter_linear_cache: Vec<f32>,
     meter_peak_hold_linear: Vec<f32>,
+    last_audio_outputs: Vec<Vec<f32>>,
     pub record_tap_outs: Vec<Vec<f32>>,
     pub record_tap_midi_in: Vec<MidiEvent>,
     record_tap_enabled: bool,
@@ -445,6 +611,7 @@ impl TrackRt {
             session_clip_playback_enabled: false,
             output_meter_linear_cache: vec![0.0; audio_outs],
             meter_peak_hold_linear: vec![0.0; audio_outs],
+            last_audio_outputs: vec![vec![0.0; buffer_size]; audio_outs],
             record_tap_outs: vec![vec![0.0; buffer_size]; audio_outs],
             record_tap_midi_in: vec![],
             record_tap_enabled: false,
@@ -637,15 +804,13 @@ mod tests {
         assert_eq!(track.audio.outs.len(), 2);
         assert!(
             track.audio.outs[0]
-                .connections
-                .lock()
+                .connections()
                 .iter()
                 .any(|conn| Arc::ptr_eq(conn, &track.audio.ins[0]))
         );
         assert!(
             track.audio.outs[1]
-                .connections
-                .lock()
+                .connections()
                 .iter()
                 .any(|conn| Arc::ptr_eq(conn, &track.audio.ins[0]))
         );
@@ -695,20 +860,17 @@ mod tests {
     #[test]
     fn track_input_passthrough_respects_input_monitor() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
-        let source = Arc::new(AudioIO::new(8));
-        source.buffer.lock()[0] = 0.5;
-        source.buffer.lock()[1] = -0.25;
-        AudioIO::connect(&source, &track.audio.ins[0]);
+        let input = [0.5, -0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
         track.set_input_monitor(vec![false]);
-        track.process();
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        track.process_with_audio_input_blocks(&[&input]);
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.0);
         assert_eq!(out[1], 0.0);
 
         track.set_input_monitor(vec![true]);
-        track.process();
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        track.process_with_audio_input_blocks(&[&input]);
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.5);
         assert_eq!(out[1], -0.25);
     }
@@ -730,7 +892,7 @@ mod tests {
         );
 
         track.process();
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.8);
     }
 
@@ -741,12 +903,9 @@ mod tests {
         track.set_disk_monitor(vec![true]);
         track.armed.store(true, Ordering::Relaxed);
         track.rt.record_tap_enabled = true;
-        let source = Arc::new(AudioIO::new(8));
-        source.buffer.lock()[0] = 0.5;
-        source.buffer.lock()[1] = -0.25;
-        AudioIO::connect(&source, &track.audio.ins[0]);
+        let input = [0.5, -0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-        track.process();
+        track.process_with_audio_input_blocks(&[&input]);
 
         assert_eq!(track.rt.record_tap_outs[0][0], 0.5);
         assert_eq!(track.rt.record_tap_outs[0][1], -0.25);
@@ -760,12 +919,9 @@ mod tests {
         track.armed.store(true, Ordering::Relaxed);
         track.rt.record_tap_enabled = true;
         track.clear_default_passthrough();
-        let source = Arc::new(AudioIO::new(8));
-        source.buffer.lock()[0] = 0.25;
-        source.buffer.lock()[1] = -0.5;
-        AudioIO::connect(&source, &track.audio.ins[0]);
+        let input = [0.25, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-        track.process();
+        track.process_with_audio_input_blocks(&[&input]);
 
         assert_eq!(track.rt.record_tap_outs[0][0], 0.25);
         assert_eq!(track.rt.record_tap_outs[0][1], -0.5);
@@ -789,30 +945,26 @@ mod tests {
         );
 
         track.process();
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.0);
 
         track.rt.clip_playback_enabled = true;
         track.process();
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.8);
     }
 
     #[test]
     fn disconnecting_one_stereo_internal_channel_mutes_only_that_channel() {
         let mut track = Track::new("t".to_string(), 2, 2, 0, 0, 8, 48_000.0);
-        let left = Arc::new(AudioIO::new(8));
-        let right = Arc::new(AudioIO::new(8));
-        left.buffer.lock()[0] = 0.25;
-        right.buffer.lock()[0] = 0.75;
-        AudioIO::connect(&left, &track.audio.ins[0]);
-        AudioIO::connect(&right, &track.audio.ins[1]);
+        let left = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let right = [0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         track.set_input_monitor(vec![true; 2]);
         track.set_disk_monitor(vec![false; 2]);
 
-        track.process();
-        let out_l = track.audio.outs[0].buffer.lock().to_vec();
-        let out_r = track.audio.outs[1].buffer.lock().to_vec();
+        track.process_with_audio_input_blocks(&[&left, &right]);
+        let out_l = track.last_audio_outputs()[0].clone();
+        let out_r = track.last_audio_outputs()[1].clone();
         assert_eq!(out_l[0], 0.25);
         assert_eq!(out_r[0], 0.75);
 
@@ -824,9 +976,9 @@ mod tests {
                 1,
             )
             .unwrap();
-        track.process();
-        let out_l = track.audio.outs[0].buffer.lock().to_vec();
-        let out_r = track.audio.outs[1].buffer.lock().to_vec();
+        track.process_with_audio_input_blocks(&[&left, &right]);
+        let out_l = track.last_audio_outputs()[0].clone();
+        let out_r = track.last_audio_outputs()[1].clone();
         assert_eq!(out_l[0], 0.25);
         assert_eq!(out_r[0], 0.0);
     }
@@ -1296,7 +1448,7 @@ mod tests {
 
         track.process();
 
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 1.5);
     }
 
@@ -1371,8 +1523,7 @@ mod tests {
         let child_out = track.child_tracks[0].lock().audio.outs[0].clone();
         assert!(
             track.audio.ins[0]
-                .connections
-                .lock()
+                .connections()
                 .iter()
                 .any(|c| Arc::ptr_eq(c, &child_out))
         );
@@ -1575,7 +1726,7 @@ mod tests {
 
         track.process();
 
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.8);
     }
 
@@ -1652,7 +1803,7 @@ mod tests {
 
         track.process();
 
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.1);
         assert_eq!(out[1], 0.2);
         assert_eq!(out[2], 0.3);
@@ -1695,7 +1846,7 @@ mod tests {
 
         track.process();
 
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.1);
         assert_eq!(out[1], 0.2);
         assert_eq!(out[2], 0.3);
@@ -1759,7 +1910,7 @@ mod tests {
 
         track.process();
 
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.8);
     }
 
@@ -1866,7 +2017,7 @@ mod tests {
         track.process();
 
         assert!(track.rt.playing_session_clips.is_empty());
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.0);
     }
 
@@ -1932,7 +2083,7 @@ mod tests {
 
         assert_eq!(track.rt.playing_session_clips.len(), 1);
         assert_eq!(track.rt.playing_session_clips[0].clip_id, "id2");
-        let out = track.audio.outs[0].buffer.lock().to_vec();
+        let out = track.last_audio_outputs()[0].clone();
         assert_eq!(out[0], 0.7);
     }
 
@@ -1966,20 +2117,30 @@ mod tests {
         });
 
         child.process();
-        assert_eq!(child.audio.outs[0].buffer.lock()[0], 0.1);
+        assert_eq!(child.last_audio_outputs()[0][0], 0.1);
+        let child_source = child.last_audio_outputs()[0].clone();
 
         let mut folder = Track::new_folder("folder".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         folder.rt.clip_playback_enabled = false;
         folder.rt.session_clip_playback_enabled = true;
         let child_arc = Arc::new(child);
-        {
+        let child_out_key = {
             let child_lock = child_arc.lock();
             AudioIO::connect(&child_lock.audio.outs[0], &folder.audio.outs[0]);
-        }
+            Arc::as_ptr(&child_lock.audio.outs[0]) as usize
+        };
         folder.child_tracks.push(child_arc);
-        folder.process();
+        let mut folder_output_buffers = [vec![0.0_f32; 8]];
+        let mut folder_outputs = folder_output_buffers
+            .iter_mut()
+            .map(|buffer| buffer.as_mut_slice())
+            .collect::<Vec<_>>();
+        folder.process_folder_output_with_audio_buffers(
+            &mut folder_outputs,
+            &[(child_out_key, child_source.as_slice())],
+        );
 
-        let folder_out = folder.audio.outs[0].buffer.lock().to_vec();
+        let folder_out = folder.last_audio_outputs()[0].clone();
         assert!(
             folder_out.iter().any(|&s| s > 0.0),
             "folder output should carry child session clip audio, got {:?}",

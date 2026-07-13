@@ -238,7 +238,7 @@ impl HwDriver {
     }
 
     pub fn output_meter_db(&self, gain: f32, balance: f32) -> Vec<f32> {
-        common::output_meter_db(&self.audio_outs, gain, balance)
+        common::output_meter_db(self.audio_outs.len(), gain, balance)
     }
 
     pub fn output_meter_linear(&self, gain: f32, balance: f32) -> Vec<f32> {
@@ -246,7 +246,7 @@ impl HwDriver {
             let plan = slot.load();
             common::output_meter_linear_from_plan(&plan, gain, balance)
         } else {
-            common::output_meter_linear(&self.audio_outs, gain, balance)
+            common::output_meter_linear(self.audio_outs.len(), gain, balance)
         }
     }
 
@@ -297,17 +297,7 @@ impl HwDriver {
                 input_channels,
             );
         } else {
-            for (ch_idx, io_port) in self.audio_ins.iter().enumerate() {
-                let dst = io_port.buffer.lock();
-                for frame in 0..input_frames.min(dst.len()) {
-                    let src_idx = frame * input_channels + ch_idx;
-                    let sample = if src_idx < consume_samples {
-                        self.input_queue[src_idx]
-                    } else {
-                        0.0
-                    };
-                    dst[frame] = sample;
-                }
+            for io_port in &self.audio_ins {
                 io_port.finished.store(true, Ordering::Release);
             }
         }
@@ -337,15 +327,7 @@ impl HwDriver {
                     },
                 );
             } else {
-                for (ch_idx, io_port) in self.audio_outs.iter().enumerate() {
-                    io_port.process();
-                    let src = io_port.buffer.lock();
-                    let b = common::channel_balance_gain(channels, ch_idx, balance);
-                    for (frame, src_sample) in src.iter().enumerate().take(frames) {
-                        let idx = frame * channels + ch_idx;
-                        interleaved[idx] = *src_sample * gain * b;
-                    }
-                }
+                let _ = (gain, balance);
             }
         }
 

@@ -137,21 +137,6 @@ impl AudioTrack {
         }
     }
 
-    pub fn process(&mut self) {
-        for audio_in in &self.ins {
-            audio_in.process();
-        }
-        for (audio_in, audio_out) in self.ins.iter().zip(self.outs.iter()) {
-            let in_samples = audio_in.buffer.lock();
-            let mut out_samples = audio_out.buffer.lock();
-
-            out_samples.copy_from_slice(&in_samples);
-            audio_out.finished.store(true, Ordering::Release);
-        }
-        self.set_finished(true);
-        self.set_processing(false);
-    }
-
     pub fn setup(&mut self) {
         self.set_finished(false);
         self.set_processing(false);

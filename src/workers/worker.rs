@@ -1,17 +1,14 @@
 use crate::{
-    audio::io::AudioIO,
     executor::NodeJob,
     message::{
         Action, Message, OfflineAutomationLane, OfflineAutomationPoint, OfflineAutomationTarget,
-        OfflineBounceWork, PluginKind, ProcessTask,
+        OfflineBounceWork, ProcessTask,
     },
     midi::io::MidiEvent,
     render_plan::Op,
-    track::Track,
 };
 #[cfg(unix)]
 use nix::libc;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -152,8 +149,8 @@ impl Worker {
                 .audio
                 .outs
                 .first()
-                .map(|io| io.buffer.lock().len())
-                .or_else(|| t.audio.ins.first().map(|io| io.buffer.lock().len()))
+                .map(|io| io.buffer_size())
+                .or_else(|| t.audio.ins.first().map(|io| io.buffer_size()))
                 .unwrap_or(0)
                 .max(1);
             (
@@ -170,37 +167,9 @@ impl Worker {
         };
 
         let all_tracks: Vec<_> = job.state.tracks.values().cloned().collect();
-        let mut output_to_track: std::collections::HashMap<usize, String> =
-            std::collections::HashMap::new();
-        for handle in &all_tracks {
-            let t = handle.lock();
-            for out in &t.audio.outs {
-                output_to_track.insert(Arc::as_ptr(out) as usize, t.name.clone());
-            }
-        }
-        let mut relevant_names = HashSet::new();
-        let mut queue = vec![job.track_name.clone()];
-        while let Some(name) = queue.pop() {
-            if !relevant_names.insert(name.clone()) {
-                continue;
-            }
-            if let Some(handle) = all_tracks.iter().find(|h| h.lock().name == name) {
-                let t = handle.lock();
-                for input in &t.audio.ins {
-                    for conn in input.connections.lock().iter() {
-                        if let Some(source_name) =
-                            output_to_track.get(&(Arc::as_ptr(conn) as usize))
-                        {
-                            queue.push(source_name.clone());
-                        }
-                    }
-                }
-            }
-        }
-        let relevant_tracks: Vec<_> = all_tracks
-            .into_iter()
-            .filter(|h| relevant_names.contains(&h.lock().name))
-            .collect();
+        let plan_collector = basedrop::Collector::new();
+        let render_plan = crate::render_plan::RenderPlan::compile(&job.state, &[], &[], block_size);
+        let render_plan = Arc::new(basedrop::Owned::new(&plan_collector.handle(), render_plan));
 
         let mut output_samples =
             Vec::<f32>::with_capacity(job.length_samples.saturating_mul(channels.max(1)));
@@ -233,7 +202,7 @@ impl Worker {
             }
 
             let step = (job.length_samples - cursor).min(block_size);
-            for handle in &relevant_tracks {
+            for handle in &all_tracks {
                 let mut t = handle.lock();
                 t.audio.set_finished(false);
                 t.audio.set_processing(false);
@@ -243,67 +212,39 @@ impl Worker {
                 t.set_clip_playback_enabled(true);
                 t.set_record_tap_enabled(false);
             }
-
-            loop {
-                let mut all_finished = true;
-                let mut progressed = false;
-                for handle in &relevant_tracks {
-                    let mut t = handle.lock();
-                    if t.audio.finished() {
-                        continue;
-                    }
-                    all_finished = false;
-                    if !t.audio.processing() && t.audio.ready() {
-                        if t.name == job.track_name {
-                            Self::apply_freeze_automation_at_sample(
-                                &mut t,
-                                job.start_sample.saturating_add(cursor),
-                                &job.automation_lanes,
-                            );
-                        }
-                        t.audio.set_processing(true);
-                        let p_start = Instant::now();
-                        t.process();
-                        total_process_time += p_start.elapsed();
-                        t.audio.set_processing(false);
-                        progressed = true;
-                    }
-                }
-                if all_finished {
-                    break;
-                }
-                if !progressed {
-                    for handle in &relevant_tracks {
-                        let mut t = handle.lock();
-                        if t.audio.finished() {
-                            continue;
-                        }
-                        if t.name == job.track_name {
-                            Self::apply_freeze_automation_at_sample(
-                                &mut t,
-                                job.start_sample.saturating_add(cursor),
-                                &job.automation_lanes,
-                            );
-                        }
-                        t.audio.set_processing(true);
-                        let p_start = Instant::now();
-                        t.process();
-                        total_process_time += p_start.elapsed();
-                        t.audio.set_processing(false);
-                    }
-                    break;
-                }
+            {
+                let mut t = target_track.lock();
+                Self::apply_freeze_automation_at_sample(
+                    &mut t,
+                    job.start_sample.saturating_add(cursor),
+                    &job.automation_lanes,
+                );
             }
+
+            let p_start = Instant::now();
+            for node in 0..render_plan.nodes.len() as crate::render_plan::NodeId {
+                let _ = Self::process_node_job_result(
+                    self.id,
+                    NodeJob {
+                        epoch: 0,
+                        plan: render_plan.clone(),
+                        node,
+                    },
+                );
+            }
+            total_process_time += p_start.elapsed();
 
             let write_start = Instant::now();
             {
                 let t = target_track.lock();
-                let outs: Vec<_> = (0..channels)
-                    .map(|ch| t.audio.outs[ch].buffer.lock())
-                    .collect();
+                let outs = t.last_audio_outputs();
                 for i in 0..step {
-                    for out in outs.iter().take(channels) {
-                        let sample = out.get(i).copied().unwrap_or(0.0);
+                    for ch in 0..channels {
+                        let sample = outs
+                            .get(ch)
+                            .and_then(|out| out.get(i))
+                            .copied()
+                            .unwrap_or(0.0);
                         output_samples.push(sample);
                     }
                 }
@@ -418,31 +359,47 @@ impl Worker {
             .expect("Failed to send message from worker");
     }
 
-    /// The output ports a plan task writes, in the same order the plan
-    /// compiler used for the node's `outs` buffers.
-    fn task_output_ports(t: &Track, task: &ProcessTask) -> Vec<Arc<AudioIO>> {
-        match task {
-            ProcessTask::Track(_) | ProcessTask::FolderOutput(_) => t.audio.outs.clone(),
-            ProcessTask::FolderInput(_) => Vec::new(),
-            ProcessTask::Plugin { kind, index, .. } => match kind {
-                PluginKind::Clap => t
-                    .clap_plugins
-                    .get(*index)
-                    .map(|p| p.processor.audio_outputs().to_vec())
-                    .unwrap_or_default(),
-                PluginKind::Vst3 => t
-                    .vst3_plugins
-                    .get(*index)
-                    .map(|p| p.processor.audio_outputs().to_vec())
-                    .unwrap_or_default(),
-                #[cfg(all(unix, not(target_os = "macos")))]
-                PluginKind::Lv2 => t
-                    .lv2_plugins
-                    .get(*index)
-                    .map(|p| p.processor.audio_outputs().to_vec())
-                    .unwrap_or_default(),
-            },
-        }
+    fn arena_input_slices<'a>(
+        plan: &'a crate::render_plan::RenderPlan,
+        ins: &[crate::render_plan::BufferId],
+    ) -> Vec<&'a [f32]> {
+        ins.iter()
+            .map(|&buf| {
+                // Safety: the plan dispatched this task only after every
+                // producer of the input buffer completed.
+                unsafe { plan.buffer(buf) }
+            })
+            .collect()
+    }
+
+    fn arena_source_slices<'a>(
+        plan: &'a crate::render_plan::RenderPlan,
+        writable: &[crate::render_plan::BufferId],
+    ) -> Vec<(usize, &'a [f32])> {
+        plan.port_map
+            .iter()
+            .filter_map(|(&key, &buf)| {
+                if writable.contains(&buf) {
+                    return None;
+                }
+                // Safety: every returned buffer is excluded from this node's
+                // writable outputs. Its producer completed before this task
+                // because the plan routes folder-output dependencies from
+                // child and plugin producer nodes.
+                Some((key, unsafe { plan.buffer(buf) }))
+            })
+            .collect()
+    }
+
+    fn metronome_output_buffer(
+        plan: &crate::render_plan::RenderPlan,
+        t: &crate::track::Track,
+        outs: &[crate::render_plan::BufferId],
+    ) -> Option<crate::render_plan::BufferId> {
+        let source = t.metronome_source()?;
+        let key = Arc::as_ptr(&source) as usize;
+        let &buf = plan.port_map.get(&key)?;
+        outs.contains(&buf).then_some(buf)
     }
 
     /// Execute one node of a render plan (Phase 2, see `LOCKLESS.md`).
@@ -485,7 +442,7 @@ impl Worker {
                 // started; nothing to do.
                 (Vec::new(), Vec::new())
             }
-            Op::Task { task, outs, .. } => {
+            Op::Task { task, ins, outs } => {
                 let track = match task {
                     ProcessTask::Track(t)
                     | ProcessTask::FolderInput(t)
@@ -494,27 +451,137 @@ impl Worker {
                 };
                 let mut t = track.lock();
                 match task {
-                    ProcessTask::Track(_) => t.process(),
-                    ProcessTask::FolderInput(_) => t.process_folder_input(),
-                    ProcessTask::FolderOutput(_) => t.process_folder_output(),
-                    ProcessTask::Plugin { kind, index, .. } => t.process_plugin(*kind, *index),
+                    ProcessTask::Track(_) => {
+                        let audio_out_count = t.audio.outs.len();
+                        let metronome_output = Self::metronome_output_buffer(&plan, &t, outs);
+                        let input_ptrs = ins
+                            .iter()
+                            .map(|&buf| {
+                                // Safety: track tasks are registered as
+                                // in-place writers for their input buffers.
+                                unsafe { plan.buffer_ptr(buf) }
+                            })
+                            .collect::<Vec<_>>();
+                        let mut inputs = input_ptrs
+                            .iter()
+                            .map(|&ptr| {
+                                // Safety: each pointer came from a task input
+                                // buffer this node owns in-place.
+                                unsafe { (&mut *ptr).as_mut_slice() }
+                            })
+                            .collect::<Vec<_>>();
+                        let source_buffers = Self::arena_source_slices(&plan, outs);
+                        let output_ptrs = outs
+                            .iter()
+                            .take(audio_out_count)
+                            .map(|&buf| {
+                                // Safety: this worker executes the unique
+                                // producer node for each output buffer.
+                                unsafe { plan.buffer_ptr(buf) }
+                            })
+                            .collect::<Vec<_>>();
+                        let mut outputs = output_ptrs
+                            .iter()
+                            .map(|&ptr| {
+                                // Safety: each pointer came from a distinct
+                                // task output buffer owned by this node.
+                                unsafe { (&mut *ptr).as_mut_slice() }
+                            })
+                            .collect::<Vec<_>>();
+                        let metronome_output_ptr = metronome_output.map(|buf| {
+                            // Safety: the track task is the registered
+                            // producer of the metronome side-output buffer.
+                            unsafe { plan.buffer_ptr(buf) }
+                        });
+                        let metronome_output = metronome_output_ptr.map(|ptr| {
+                            // Safety: the side-output buffer is excluded from
+                            // the normal audio output slice above.
+                            unsafe { (&mut *ptr).as_mut_slice() }
+                        });
+                        t.process_render_block_with_audio_buffers_and_metronome(
+                            &mut inputs,
+                            &mut outputs,
+                            &source_buffers,
+                            metronome_output,
+                        );
+                    }
+                    ProcessTask::FolderInput(_) => {
+                        let metronome_output = Self::metronome_output_buffer(&plan, &t, outs);
+                        let input_ptrs = ins
+                            .iter()
+                            .map(|&buf| {
+                                // Safety: folder-input tasks are registered
+                                // as in-place writers for their input buffers.
+                                unsafe { plan.buffer_ptr(buf) }
+                            })
+                            .collect::<Vec<_>>();
+                        let mut inputs = input_ptrs
+                            .iter()
+                            .map(|&ptr| {
+                                // Safety: each pointer came from a task input
+                                // buffer this node owns in-place.
+                                unsafe { (&mut *ptr).as_mut_slice() }
+                            })
+                            .collect::<Vec<_>>();
+                        let metronome_output_ptr = metronome_output.map(|buf| {
+                            // Safety: the folder-input task is the registered
+                            // producer of the metronome side-output buffer.
+                            unsafe { plan.buffer_ptr(buf) }
+                        });
+                        let metronome_output = metronome_output_ptr.map(|ptr| {
+                            // Safety: this buffer is a side output, distinct
+                            // from the folder input buffers.
+                            unsafe { (&mut *ptr).as_mut_slice() }
+                        });
+                        t.process_folder_input_with_audio_buffers_and_metronome(
+                            &mut inputs,
+                            metronome_output,
+                        );
+                    }
+                    ProcessTask::FolderOutput(_) => {
+                        let source_buffers = Self::arena_source_slices(&plan, outs);
+                        let output_ptrs = outs
+                            .iter()
+                            .map(|&buf| {
+                                // Safety: this worker executes the unique
+                                // producer node for each output buffer.
+                                unsafe { plan.buffer_ptr(buf) }
+                            })
+                            .collect::<Vec<_>>();
+                        let mut outputs = output_ptrs
+                            .iter()
+                            .map(|&ptr| {
+                                // Safety: each pointer came from a distinct
+                                // task output buffer owned by this node.
+                                unsafe { (&mut *ptr).as_mut_slice() }
+                            })
+                            .collect::<Vec<_>>();
+                        t.process_folder_output_with_audio_buffers(&mut outputs, &source_buffers);
+                    }
+                    ProcessTask::Plugin { kind, index, .. } => {
+                        let inputs = Self::arena_input_slices(&plan, ins);
+                        let output_ptrs = outs
+                            .iter()
+                            .map(|&buf| {
+                                // Safety: this worker executes the unique
+                                // producer node for each output buffer.
+                                unsafe { plan.buffer_ptr(buf) }
+                            })
+                            .collect::<Vec<_>>();
+                        let mut outputs = output_ptrs
+                            .iter()
+                            .map(|&ptr| {
+                                // Safety: each pointer came from a distinct
+                                // task output buffer owned by this node.
+                                unsafe { (&mut *ptr).as_mut_slice() }
+                            })
+                            .collect::<Vec<_>>();
+                        t.process_plugin_with_audio_buffers(*kind, *index, &inputs, &mut outputs);
+                    }
                 }
                 t.audio.set_processing(false);
                 let updates = std::mem::take(&mut t.rt.echoed_parameter_updates);
                 let meter = t.output_meter_linear();
-                // Copy task outputs port -> arena for downstream Sum nodes
-                // and the hardware output drain.
-                for (port, &buf) in Self::task_output_ports(&t, task).iter().zip(outs.iter()) {
-                    let src = port.buffer.lock();
-                    // Safety: this worker executes this node, the unique
-                    // producer of `buf` (see `Op::Zero`).
-                    let dst = unsafe { &mut *plan.buffer_ptr(buf) };
-                    let n = src.len().min(dst.len());
-                    dst[..n].copy_from_slice(&src[..n]);
-                    if n < dst.len() {
-                        dst[n..].fill(0.0);
-                    }
-                }
                 (meter, updates)
             }
         };
@@ -732,7 +799,6 @@ mod tests {
             dependents: vec![vec![]],
             sources: vec![0],
             hw_in_map: vec![],
-            hw_in_ports: vec![],
             hw_out_map: vec![],
             port_map: HashMap::new(),
             midi_edges: vec![],

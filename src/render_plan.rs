@@ -48,11 +48,9 @@ pub type NodeId = u32;
 /// What a plan node does when executed.
 #[derive(Debug)]
 pub enum Op {
-    /// Fill `output` with silence — an unconnected consumer port
-    /// (`AudioIO::process()` with zero connections fills its buffer today).
+    /// Fill `output` with silence for an unconnected consumer port.
     Zero { output: BufferId },
-    /// Sum all `inputs` into `output` — the compiled form of
-    /// `AudioIO::process()` for a connected consumer port.
+    /// Sum all `inputs` into `output` for a connected consumer port.
     Sum {
         inputs: Vec<BufferId>,
         output: BufferId,
@@ -97,11 +95,6 @@ pub struct RenderPlan {
     pub sources: Vec<NodeId>,
     /// `(hw channel, buffer)` — the driver fills these before dispatch.
     pub hw_in_map: Vec<(usize, BufferId)>,
-    /// The bridge port for each `hw_in_map` entry, same order. The driver
-    /// writes the arena buffer (no shared mutable wrapper on the RT path); the
-    /// dispatcher copies arena → port buffer at cycle start so task bodies,
-    /// which still read `port.buffer`, see this cycle's hardware input.
-    pub hw_in_ports: Vec<Arc<AudioIO>>,
     /// `(buffer, hw channel)` — the driver drains these after the cycle.
     pub hw_out_map: Vec<(BufferId, usize)>,
     /// `Arc` pointer identity of each `AudioIO` port → its arena buffer.
@@ -298,7 +291,6 @@ struct Builder {
     /// Producer node per buffer, filled as producer nodes are created.
     producer: HashMap<BufferId, NodeId>,
     hw_in_map: Vec<(usize, BufferId)>,
-    hw_in_ports: Vec<Arc<AudioIO>>,
     hw_out_map: Vec<(BufferId, usize)>,
     /// `Arc` pointer identity of a MIDI port → the task that writes its
     /// event buffer this cycle.
@@ -323,7 +315,6 @@ impl Builder {
             port_inplace_writers: HashMap::new(),
             producer: HashMap::new(),
             hw_in_map: Vec::new(),
-            hw_in_ports: Vec::new(),
             hw_out_map: Vec::new(),
             midi_writers: HashMap::new(),
             midi_readers: HashMap::new(),
@@ -423,7 +414,6 @@ impl Builder {
             let node = self.push_node(Op::HwInput { channel, output });
             self.producer.insert(output, node);
             self.hw_in_map.push((channel, output));
-            self.hw_in_ports.push(port.clone());
         }
         for (channel, port) in hw_outputs.iter().enumerate() {
             let buffer = self.buffer_for(port);
@@ -443,20 +433,29 @@ impl Builder {
         let t = track.lock();
         let ins: Vec<BufferId> = t.audio.ins.iter().map(|p| self.buffer_for(p)).collect();
         let outs: Vec<BufferId> = t.audio.outs.iter().map(|p| self.buffer_for(p)).collect();
+        let metronome_source = t.metronome_source();
+        let metronome_out = metronome_source.as_ref().map(|p| self.buffer_for(p));
         for p in &t.audio.ins {
             self.consumer_ports.push(p.clone());
         }
 
         if t.is_folder {
+            let mut folder_input_outs = Vec::new();
+            if let Some(out) = metronome_out {
+                folder_input_outs.push(out);
+            }
             let folder_input = self.push_node(Op::Task {
                 task: ProcessTask::FolderInput(track.clone()),
                 ins: ins.clone(),
-                outs: Vec::new(),
+                outs: folder_input_outs,
             });
             if let Some(pred) = predecessor {
                 self.edges.insert((pred, folder_input));
             }
             self.register_task_ports(folder_input, &ins, true);
+            if let Some(out) = metronome_out {
+                self.producer.insert(out, folder_input);
+            }
 
             let mut source_keys: HashMap<ConnectableRef, NodeId> = HashMap::new();
             let mut target_keys: HashMap<ConnectableRef, NodeId> = HashMap::new();
@@ -529,16 +528,23 @@ impl Builder {
 
             (folder_input, folder_output)
         } else {
+            let mut task_outs = outs.clone();
+            if let Some(out) = metronome_out {
+                task_outs.push(out);
+            }
             let task = self.push_node(Op::Task {
                 task: ProcessTask::Track(track.clone()),
                 ins: ins.clone(),
-                outs: outs.clone(),
+                outs: task_outs,
             });
             if let Some(pred) = predecessor {
                 self.edges.insert((pred, task));
             }
             self.register_task_ports(task, &ins, true);
             for &out in &outs {
+                self.producer.insert(out, task);
+            }
+            if let Some(out) = metronome_out {
                 self.producer.insert(out, task);
             }
             self.register_midi_track_ports(&t, task, task);
@@ -609,6 +615,7 @@ impl Builder {
             self.port_readers.entry(b).or_default().push(node);
             if in_place {
                 self.port_inplace_writers.entry(b).or_default().push(node);
+                self.producer.insert(b, node);
             }
         }
     }
@@ -619,7 +626,7 @@ impl Builder {
         for port in self.consumer_ports.clone() {
             let output = self.buffer_for(&port);
             let sources: Vec<BufferId> = {
-                let conns = port.connections.lock();
+                let conns = port.connections();
                 conns.iter().map(|p| self.buffer_for(p)).collect()
             };
             let node = if sources.is_empty() {
@@ -712,7 +719,6 @@ impl Builder {
             dependents,
             sources,
             hw_in_map: self.hw_in_map,
-            hw_in_ports: self.hw_in_ports,
             hw_out_map: self.hw_out_map,
             port_map: self.port_map,
             midi_edges,
@@ -907,6 +913,28 @@ mod tests {
     }
 
     #[test]
+    fn metronome_source_is_produced_by_track_task() {
+        let metronome = make_track("metronome", 0, 1);
+        let source = {
+            let mut track = metronome.lock();
+            let (source, changed) = track.ensure_metronome_source(64);
+            assert!(changed);
+            source.expect("metronome source")
+        };
+        let plan = RenderPlan::compile(&state_with(vec![metronome]), &[], &[], 64);
+        plan.verify().expect("invariants");
+
+        let source_key = Arc::as_ptr(&source) as usize;
+        let source_buffer = *plan.port_map.get(&source_key).expect("source buffer");
+        let task = task_node(&plan, "metronome", is_track);
+
+        match &plan.nodes[task] {
+            Op::Task { outs, .. } => assert!(outs.contains(&source_buffer)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
     fn folder_track_emits_input_child_output_chain() {
         let folder = make_track("folder", 1, 1);
         let child = make_track("child", 1, 1);
@@ -1023,7 +1051,6 @@ mod tests {
             dependents,
             sources,
             hw_in_map: vec![],
-            hw_in_ports: vec![],
             hw_out_map: vec![],
             port_map: HashMap::new(),
             midi_edges: vec![],

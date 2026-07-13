@@ -1,10 +1,8 @@
-use crate::audio::io::AudioIO;
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::shm::ShmMapping;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -93,20 +91,15 @@ pub fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
     false
 }
 
-pub fn bypass_copy_inputs_to_outputs(inputs: &[Arc<AudioIO>], outputs: &[Arc<AudioIO>]) {
-    for (input, output) in inputs.iter().zip(outputs.iter()) {
-        let src = input.buffer.lock();
-        let mut dst = output.buffer.lock();
-        dst.fill(0.0);
-        for (d, s) in dst.iter_mut().zip(src.iter()) {
+pub fn bypass_copy_input_slices_to_outputs(inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+    for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
+        output.fill(0.0);
+        for (d, s) in output.iter_mut().zip(input.iter()) {
             *d = *s;
         }
-        output.finished.store(true, Ordering::Release);
     }
-    for output in outputs.iter().skip(inputs.len()) {
-        let mut dst = output.buffer.lock();
-        dst.fill(0.0);
-        output.finished.store(true, Ordering::Release);
+    for output in outputs.iter_mut().skip(inputs.len()) {
+        output.fill(0.0);
     }
 }
 
@@ -228,9 +221,8 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
 /// `ptr` must point to a valid, initialized shared-memory layout with enough
 /// space for the configured number of input channels and `frames` samples.
 /// `frames` must not exceed the block size reserved in that layout.
-pub unsafe fn copy_inputs_to_shm(inputs: &[Arc<AudioIO>], ptr: *mut u8, frames: usize) {
-    for (ch, input) in inputs.iter().enumerate() {
-        let src = input.buffer.lock();
+pub unsafe fn copy_input_slices_to_shm(inputs: &[&[f32]], ptr: *mut u8, frames: usize) {
+    for (ch, src) in inputs.iter().enumerate() {
         let dst = unsafe { audio_channel_ptr(ptr, ch, 0) };
         let len = frames.min(src.len());
         unsafe {
@@ -244,15 +236,17 @@ pub unsafe fn copy_inputs_to_shm(inputs: &[Arc<AudioIO>], ptr: *mut u8, frames: 
 /// `ptr` must point to a valid, initialized shared-memory layout with enough
 /// space for the configured number of output channels and `frames` samples.
 /// Each output buffer must be writable and at least `frames` elements long.
-pub unsafe fn copy_outputs_from_shm(outputs: &[Arc<AudioIO>], ptr: *mut u8, frames: usize) {
-    for (ch, output) in outputs.iter().enumerate() {
-        let mut dst = output.buffer.lock();
+pub unsafe fn copy_outputs_from_shm_to_slices(
+    outputs: &mut [&mut [f32]],
+    ptr: *mut u8,
+    frames: usize,
+) {
+    for (ch, dst) in outputs.iter_mut().enumerate() {
         let src = unsafe { audio_channel_ptr(ptr, ch, 1) };
         let len = frames.min(dst.len());
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), len);
         }
-        output.finished.store(true, Ordering::Release);
     }
 }
 

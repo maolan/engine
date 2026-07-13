@@ -150,7 +150,7 @@ impl HwDriver {
     }
 
     pub fn output_meter_db(&self, gain: f32, balance: f32) -> Vec<f32> {
-        common::output_meter_db(&self.output_channels, gain, balance)
+        common::output_meter_db(self.output_channels.len(), gain, balance)
     }
 
     pub fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {

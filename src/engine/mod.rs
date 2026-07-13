@@ -870,52 +870,45 @@ mod tests {
             }
         }
 
-        async fn wait_for_track_processed(
+        async fn wait_for_audible_track(
             client_rx: &mut tokio::sync::mpsc::Receiver<Message>,
             state: &State,
-        ) -> bool {
+        ) -> Option<f32> {
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                let msg =
-                    tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;
-                if let Ok(Some(Message::Response(Ok(Action::TransportPosition(_)))))
-                | Ok(Some(Message::Response(Ok(Action::Play)))) = msg
                 {
-                    let track_deadline = Instant::now() + Duration::from_secs(5);
-                    while Instant::now() < track_deadline {
-                        if state
-                            .lock()
-                            .tracks
-                            .get("track")
-                            .map(|t| t.lock().audio.finished())
-                            .unwrap_or(false)
-                        {
-                            return true;
-                        }
-                        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+                    let state = state.lock();
+                    let peak = state
+                        .tracks
+                        .get("track")
+                        .map(|t| {
+                            t.lock()
+                                .output_meter_linear()
+                                .into_iter()
+                                .fold(0.0_f32, f32::max)
+                        })
+                        .unwrap_or(0.0);
+                    if peak > 0.001 {
+                        return Some(peak);
                     }
                 }
+                let _ =
+                    tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await;
+                tokio::time::sleep(TokioDuration::from_millis(10)).await;
             }
-            false
+            None
         }
 
         tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
             .await
             .unwrap();
         tx.send(Message::Request(Action::Play)).await.unwrap();
-        assert!(
-            wait_for_track_processed(&mut client_rx, &state).await,
-            "track did not process on first play"
-        );
-        let first_peak = {
-            let state = state.lock();
-            let track = state.tracks.get("track").expect("track").lock();
-            let input = track.audio.ins[0].buffer.lock();
-            crate::simd::peak_abs(&input)
-        };
+        let first_peak = wait_for_audible_track(&mut client_rx, &state)
+            .await
+            .unwrap_or(0.0);
         assert!(
             first_peak > 0.001,
-            "expected audible input on first play, got {first_peak}"
+            "expected audible output on first play, got {first_peak}"
         );
 
         tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
@@ -928,19 +921,12 @@ mod tests {
             .await
             .unwrap();
         tx.send(Message::Request(Action::Play)).await.unwrap();
-        assert!(
-            wait_for_track_processed(&mut client_rx, &state).await,
-            "track did not process on second play"
-        );
-        let second_peak = {
-            let state = state.lock();
-            let track = state.tracks.get("track").expect("track").lock();
-            let input = track.audio.ins[0].buffer.lock();
-            crate::simd::peak_abs(&input)
-        };
+        let second_peak = wait_for_audible_track(&mut client_rx, &state)
+            .await
+            .unwrap_or(0.0);
         assert!(
             second_peak > 0.001,
-            "expected audible input on second play after stop, got {second_peak}"
+            "expected audible output on second play after stop, got {second_peak}"
         );
 
         let _ = tx.send(Message::Request(Action::Quit)).await;
@@ -1055,16 +1041,14 @@ mod tests {
         {
             assert!(
                 child_in
-                    .connections
-                    .lock()
+                    .connections()
                     .iter()
                     .any(|c| Arc::ptr_eq(c, parent_in)),
                 "folder input {i} is not routed to child input {i}"
             );
             assert!(
                 !parent_in
-                    .connections
-                    .lock()
+                    .connections()
                     .iter()
                     .any(|c| Arc::ptr_eq(c, child_in)),
                 "folder input {i} should not read from child input {i}"
@@ -1077,8 +1061,7 @@ mod tests {
         {
             assert!(
                 parent_out
-                    .connections
-                    .lock()
+                    .connections()
                     .iter()
                     .any(|c| Arc::ptr_eq(c, child_out)),
                 "child output {i} is not routed to folder output {i}"
@@ -1088,7 +1071,7 @@ mod tests {
         // Child passthrough is restored so audio can flow through.
         for (i, child_out) in child.audio.outs.iter().enumerate() {
             assert!(
-                child_out.connections.lock().iter().any(|c| {
+                child_out.connections().iter().any(|c| {
                     child
                         .audio
                         .ins
@@ -1140,7 +1123,7 @@ mod tests {
 
         for (i, child_out) in child.audio.outs.iter().enumerate() {
             assert!(
-                child_out.connections.lock().iter().any(|c| {
+                child_out.connections().iter().any(|c| {
                     child
                         .audio
                         .ins
@@ -1454,8 +1437,7 @@ mod tests {
         {
             assert!(
                 child_in
-                    .connections
-                    .lock()
+                    .connections()
                     .iter()
                     .any(|c| Arc::ptr_eq(c, parent_in)),
                 "folder input {i} is not routed to child input {i}"
@@ -1468,8 +1450,7 @@ mod tests {
         {
             assert!(
                 parent_out
-                    .connections
-                    .lock()
+                    .connections()
                     .iter()
                     .any(|c| Arc::ptr_eq(c, child_out)),
                 "child output {i} is not routed to folder output {i}"
@@ -1506,19 +1487,32 @@ mod tests {
             folder.lock().set_input_monitor(vec![true]);
             child.lock().set_input_monitor(vec![true]);
 
-            // Feed a signal into the folder input from an external source.
+            // Feed a signal into the folder input from a fake hardware source
+            // and execute the compiled render plan once.
             let source = Arc::new(crate::audio::io::AudioIO::new(64));
-            for sample in source.buffer.lock().iter_mut() {
-                *sample = 0.75;
-            }
             crate::audio::io::AudioIO::connect(&source, &folder.lock().audio.ins[0]);
-
-            folder.lock().process_folder_input();
-            child.lock().process();
-            folder.lock().process_folder_output();
+            let plan =
+                crate::render_plan::RenderPlan::compile(&state.snapshot(), &[source], &[], 64);
+            plan.verify().expect("plan invariants");
+            let (_, hw_buf) = plan.hw_in_map[0];
+            // Safety: test thread, no node is running yet; the fake driver owns
+            // the hardware-input buffer before the cycle starts.
+            unsafe { (&mut *plan.buffer_ptr(hw_buf)).fill(0.75) };
+            let collector = basedrop::Collector::new();
+            let shared = Arc::new(basedrop::Owned::new(&collector.handle(), plan));
+            for node in 0..shared.nodes.len() {
+                crate::workers::worker::Worker::process_node_job_result(
+                    0,
+                    crate::executor::NodeJob {
+                        epoch: 0,
+                        plan: shared.clone(),
+                        node: node as u32,
+                    },
+                );
+            }
 
             let folder_lock = folder.lock();
-            let output = folder_lock.audio.outs[0].buffer.lock();
+            let output = folder_lock.last_audio_outputs()[0].clone();
             assert!(
                 output.iter().any(|s| (*s - 0.75).abs() < 1e-5),
                 "folder output should contain the child-processed folder input signal, got {:?}",

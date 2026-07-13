@@ -61,7 +61,7 @@ pub struct ClapProcessor {
     param_values: HashMap<u32, AtomicU64>,
     bypassed: Arc<AtomicBool>,
 
-    /// Host child process handle. Interior-mutable so `process_with_midi`
+    /// Host child process handle. Interior-mutable so `process_with_audio_buffers`
     /// (which takes `&self`) can poll it with `try_wait`.
     ///
     /// Invariant: at any moment there is at most one accessor — either the
@@ -626,18 +626,16 @@ impl ClapProcessor {
         Ok(())
     }
 
-    pub fn process_with_audio_io(&self, frames: usize) {
-        let _ = self.process_with_midi(frames, &[], ClapTransportInfo::default());
-    }
-
-    pub fn process_with_midi(
+    pub fn process_with_audio_buffers(
         &self,
         frames: usize,
         midi_in: &[MidiEvent],
         transport: ClapTransportInfo,
+        audio_inputs: &[&[f32]],
+        audio_outputs: &mut [&mut [f32]],
     ) -> Vec<ClapMidiOutputEvent> {
         if self.bypassed.load(Ordering::Relaxed) {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
@@ -658,14 +656,14 @@ impl ClapProcessor {
             })
         };
         if crashed {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
             _ => {
-                ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+                ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
                 return Vec::new();
             }
         };
@@ -675,12 +673,12 @@ impl ClapProcessor {
             ipc::configure_shm_header(
                 ptr,
                 frames,
-                self.audio_inputs.len(),
-                self.audio_outputs.len(),
+                audio_inputs.len(),
+                audio_outputs.len(),
                 self.midi_input_ports.len(),
                 self.midi_output_ports.len(),
             );
-            ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
+            ipc::copy_input_slices_to_shm(audio_inputs, ptr, frames);
 
             let t = transport_mut(ptr);
             t.playhead_sample = transport.transport_sample as u64;
@@ -728,13 +726,13 @@ impl ClapProcessor {
         }
 
         if events.signal_host().is_err() {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
         let timeout = Duration::from_millis(100);
         if events.wait_host(timeout).is_err() {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
@@ -752,12 +750,12 @@ impl ClapProcessor {
             })
         };
         if crashed {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
         unsafe {
-            ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
+            ipc::copy_outputs_from_shm_to_slices(audio_outputs, ptr, frames);
         }
 
         let mut midi_out = Vec::new();
@@ -1078,20 +1076,26 @@ mod tests {
 
         processor.setup_audio_ports();
 
-        for (i, input) in processor.audio_inputs().iter().enumerate() {
-            let mut buf = input.buffer.lock();
-            for (j, sample) in buf.iter_mut().enumerate() {
-                *sample = (i * 1000 + j) as f32;
-            }
-            input.finished.store(true, Ordering::Release);
-        }
+        let input_buffers = (0..processor.audio_inputs().len())
+            .map(|i| (0..256).map(|j| (i * 1000 + j) as f32).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut output_buffers = vec![vec![0.0; 256]; processor.audio_outputs().len()];
+        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = output_buffers
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        processor.process_with_audio_buffers(
+            256,
+            &[],
+            ClapTransportInfo::default(),
+            &inputs,
+            &mut outputs,
+        );
 
-        processor.process_with_audio_io(256);
-
-        for output in processor.audio_outputs().iter() {
-            let buf = output.buffer.lock();
+        for output in output_buffers.iter() {
             assert!(
-                buf.iter().any(|&s| s != 0.0),
+                output.iter().any(|&s| s != 0.0),
                 "output buffer should contain non-zero samples"
             );
         }
@@ -1109,22 +1113,27 @@ mod tests {
 
         processor.setup_audio_ports();
 
-        {
-            let mut buf = processor.audio_inputs()[0].buffer.lock();
-            buf.fill(1.0);
-            processor.audio_inputs()[0]
-                .finished
-                .store(true, Ordering::Release);
-        }
+        let input_buffers = [vec![1.0; 256]];
+        let mut output_buffers = [vec![0.0; 256]];
+        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = output_buffers
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
 
         // Give the aborted host a moment to be reaped so the crash is visible.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        processor.process_with_audio_io(256);
+        processor.process_with_audio_buffers(
+            256,
+            &[],
+            ClapTransportInfo::default(),
+            &inputs,
+            &mut outputs,
+        );
 
-        let out_buf = processor.audio_outputs()[0].buffer.lock();
         assert!(
-            out_buf.iter().all(|&s| s == 1.0),
+            output_buffers[0].iter().all(|&s| s == 1.0),
             "after crash, output should be bypass copy of input"
         );
     }
@@ -1164,20 +1173,26 @@ mod tests {
         let processor = track.clap_plugins[0].processor.clone();
         processor.setup_audio_ports();
 
-        for (i, input) in processor.audio_inputs().iter().enumerate() {
-            let mut buf = input.buffer.lock();
-            for (j, sample) in buf.iter_mut().enumerate() {
-                *sample = (i * 1000 + j) as f32;
-            }
-            input.finished.store(true, Ordering::Release);
-        }
+        let input_buffers = (0..processor.audio_inputs().len())
+            .map(|i| (0..256).map(|j| (i * 1000 + j) as f32).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut output_buffers = vec![vec![0.0; 256]; processor.audio_outputs().len()];
+        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = output_buffers
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        processor.process_with_audio_buffers(
+            256,
+            &[],
+            ClapTransportInfo::default(),
+            &inputs,
+            &mut outputs,
+        );
 
-        processor.process_with_audio_io(256);
-
-        for (ch, output) in processor.audio_outputs().iter().enumerate() {
-            let buf = output.buffer.lock();
+        for (ch, output) in output_buffers.iter().enumerate() {
             assert!(
-                buf.iter().any(|&s| s != 0.0),
+                output.iter().any(|&s| s != 0.0),
                 "plugin output ch={ch} should contain non-zero samples after CLAP processing"
             );
         }

@@ -313,7 +313,7 @@ impl HwDriver {
             let plan = slot.load();
             common::output_meter_linear_from_plan(&plan, gain, balance)
         } else {
-            common::output_meter_linear(&self.audio_outs, gain, balance)
+            common::output_meter_linear(self.audio_outs.len(), gain, balance)
         }
     }
 

@@ -156,14 +156,7 @@ impl Track {
     }
 
     pub fn connect_directed_audio(from: &Arc<AudioIO>, to: &Arc<AudioIO>) {
-        let new_len = {
-            let mut conns = to.connections.lock();
-            if !conns.iter().any(|conn| Arc::ptr_eq(conn, from)) {
-                conns.push(from.clone());
-            }
-            conns.len()
-        };
-        to.connection_count.store(new_len, Ordering::Relaxed);
+        AudioIO::connect_directed(from, to);
     }
 
     pub fn invalidate_audio_route_cache(&mut self) {
@@ -187,7 +180,7 @@ impl Track {
         let internal_sources = self.internal_audio_sources();
         let mut routes = Vec::with_capacity(self.audio.outs.len());
         for audio_out in &self.audio.outs {
-            let connections = audio_out.connections.lock();
+            let connections = audio_out.connections();
             let mut route_sources = Vec::new();
             for source in connections.iter() {
                 if internal_sources
@@ -289,7 +282,7 @@ impl Track {
             .metronome_source
             .load_full()
             .as_ref()
-            .is_none_or(|src| src.buffer.lock().len() < needed);
+            .is_none_or(|src| src.buffer_size() < needed);
         if needs_new {
             self.metronome_source
                 .store(Some(Arc::new(AudioIO::new(needed))));
@@ -299,12 +292,7 @@ impl Track {
             return (None, changed);
         };
         for out in &self.audio.outs {
-            if !out
-                .connections
-                .lock()
-                .iter()
-                .any(|conn| Arc::ptr_eq(conn, &src))
-            {
+            if !out.connections().iter().any(|conn| Arc::ptr_eq(conn, &src)) {
                 Self::connect_directed_audio(&src, out);
                 changed = true;
             }
@@ -315,9 +303,13 @@ impl Track {
         (Some(src), changed)
     }
 
-    pub(crate) fn synthesize_metronome_into(&mut self, dst: &Arc<AudioIO>, frames: usize) {
-        let mut buf = dst.buffer.lock();
+    pub(crate) fn metronome_source(&self) -> Option<Arc<AudioIO>> {
+        self.metronome_source.load_full()
+    }
+
+    pub(crate) fn synthesize_metronome_into_buffer(&mut self, buf: &mut [f32]) {
         buf.fill(0.0);
+        let frames = buf.len();
         if !self.metronome_enabled() || !self.rt.clip_playback_enabled || frames == 0 {
             return;
         }
@@ -367,96 +359,114 @@ impl Track {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn process_render_block(&mut self) -> usize {
-        let live_mode = self.is_realtime_domain();
-        let t0 = std::time::Instant::now();
-        self.process_folder_input();
-        let t5 = std::time::Instant::now();
-        let frames = self.compute_process_frames();
+        self.process_render_block_with_input_sum(true)
+    }
 
-        {
-            let track_name = self.name.clone();
-            let track_input_events = self.rt.folder_input_midi_events.clone();
-            let can_skip_plugins = !live_mode
-                && self.rt.last_render_block_silent
-                && track_input_events.is_empty()
-                && self.audio.ins.iter().all(|audio_in| {
-                    let buf = audio_in.buffer.lock();
-                    buf.iter().all(|&s| s == 0.0)
-                });
-            if can_skip_plugins {
-                for instance in &self.clap_plugins {
-                    for output in instance.processor.audio_outputs() {
-                        output.buffer.lock().fill(0.0);
-                    }
-                }
-                for instance in &self.vst3_plugins {
-                    for output in instance.processor.audio_outputs() {
-                        output.buffer.lock().fill(0.0);
-                    }
-                }
-                #[cfg(all(unix, not(target_os = "macos")))]
-                for instance in &self.lv2_plugins {
-                    for output in instance.processor.audio_outputs() {
-                        output.buffer.lock().fill(0.0);
-                    }
-                }
-                self.rt.echoed_parameter_updates.clear();
-                self.rt.folder_plugin_midi_node_events.clear();
-                self.rt.folder_processed_midi_plugins.clear();
-            } else {
-                self.process_track_plugins_in_graph_order(frames);
-            }
-            let t6 = std::time::Instant::now();
-            let t9 = std::time::Instant::now();
-            let total = t9.duration_since(t0).as_secs_f64() * 1000.0;
-            if total > 20.0 {
-                let _clap_count = self.clap_plugins.len();
-                let _vst3_count = self.vst3_plugins.len();
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let _lv2_count = self.lv2_plugins.len();
-                #[cfg(not(all(unix, not(target_os = "macos"))))]
-                let _lv2_count = 0;
-                tracing::warn!(
-                    "Track '{}' process breakdown: total={:.1}ms clip_mix={:.1}ms plugins={:.1}ms midi_route={:.1}ms",
-                    track_name,
-                    total,
-                    t5.duration_since(t0).as_secs_f64() * 1000.0,
-                    t6.duration_since(t5).as_secs_f64() * 1000.0,
-                    t9.duration_since(t6).as_secs_f64() * 1000.0,
-                );
-            }
+    pub(crate) fn process_render_block_with_audio_buffers_and_metronome(
+        &mut self,
+        audio_inputs: &mut [&mut [f32]],
+        audio_outputs: &mut [&mut [f32]],
+        source_buffers: &[(usize, &[f32])],
+        metronome_output: Option<&mut [f32]>,
+    ) -> usize {
+        let frames = self.process_render_block_inputs_and_plugins_with_audio_buffers_and_metronome(
+            audio_inputs,
+            metronome_output,
+        );
+        let plugin_outputs =
+            self.process_track_plugins_in_graph_order_with_audio_buffers(frames, audio_inputs);
+        let mut sources = source_buffers.to_vec();
+        for (audio_in, buffer) in self.audio.ins.iter().zip(audio_inputs.iter()) {
+            sources.push((Arc::as_ptr(audio_in) as usize, &**buffer));
         }
-
-        self.process_folder_output();
+        for (key, buffer) in &plugin_outputs {
+            sources.push((*key, buffer.as_slice()));
+        }
+        self.process_folder_output_with_audio_buffers(audio_outputs, &sources);
         frames
     }
 
-    pub fn process(&mut self) {
-        let _ = self.process_render_block();
+    fn process_render_block_inputs_and_plugins_with_audio_buffers_and_metronome(
+        &mut self,
+        audio_inputs: &mut [&mut [f32]],
+        metronome_output: Option<&mut [f32]>,
+    ) -> usize {
+        self.process_folder_input_with_audio_buffers_and_metronome(audio_inputs, metronome_output);
+        self.compute_process_frames_from_audio_inputs(audio_inputs)
     }
-
-    pub fn process_folder_input(&mut self) {
-        for audio_in in &self.audio.ins {
-            audio_in.process();
-        }
-        let frames = self
-            .audio
-            .ins
+    fn compute_process_frames_from_audio_inputs(&self, audio_inputs: &[&mut [f32]]) -> usize {
+        audio_inputs
             .first()
-            .map(|audio_in| audio_in.buffer.lock().len())
+            .map(|input| input.len())
             .or_else(|| {
                 self.audio
                     .outs
                     .first()
-                    .map(|audio_out| audio_out.buffer.lock().len())
+                    .map(|audio_out| audio_out.buffer_size())
+            })
+            .unwrap_or(self.process_block_size())
+    }
+
+    #[cfg(test)]
+    fn process_render_block_with_input_sum(&mut self, _sum_audio_inputs: bool) -> usize {
+        self.process_with_audio_input_blocks(&[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_with_audio_input_blocks(&mut self, input_blocks: &[&[f32]]) -> usize {
+        let frames = input_blocks
+            .first()
+            .map(|buffer| buffer.len())
+            .unwrap_or_else(|| self.compute_process_frames());
+        let mut input_buffers = vec![vec![0.0_f32; frames]; self.audio.ins.len()];
+        for (dst, src) in input_buffers.iter_mut().zip(input_blocks.iter()) {
+            let len = dst.len().min(src.len());
+            dst[..len].copy_from_slice(&src[..len]);
+        }
+        let mut output_buffers = vec![vec![0.0_f32; frames]; self.audio.outs.len()];
+        let mut inputs = input_buffers
+            .iter_mut()
+            .map(|buffer| buffer.as_mut_slice())
+            .collect::<Vec<_>>();
+        let mut outputs = output_buffers
+            .iter_mut()
+            .map(|buffer| buffer.as_mut_slice())
+            .collect::<Vec<_>>();
+        self.process_render_block_with_audio_buffers_and_metronome(
+            &mut inputs,
+            &mut outputs,
+            &[],
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn process(&mut self) {
+        let _ = self.process_render_block();
+    }
+
+    pub(crate) fn process_folder_input_with_audio_buffers_and_metronome(
+        &mut self,
+        audio_inputs: &mut [&mut [f32]],
+        metronome_output: Option<&mut [f32]>,
+    ) {
+        let frames = audio_inputs
+            .first()
+            .map(|audio_in| audio_in.len())
+            .or_else(|| {
+                self.audio
+                    .outs
+                    .first()
+                    .map(|audio_out| audio_out.buffer_size())
             })
             .unwrap_or(self.process_block_size());
         // The metronome source and its wiring are ensured by the dispatcher
         // at cycle top (never from a worker — see ensure_metronome_source);
         // here we only synthesize into the existing source.
-        if let Some(source) = self.metronome_source.load_full() {
-            self.synthesize_metronome_into(&source, frames);
+        if let Some(output) = metronome_output {
+            self.synthesize_metronome_into_buffer(output);
         }
         let input_monitor = self.input_monitor();
         let disk_monitor = self.disk_monitor();
@@ -473,10 +483,9 @@ impl Track {
             self.rt.clip_playback_enabled
         );
         self.rt.folder_record_tap_input_snapshots = if self.armed() && self.rt.record_tap_enabled {
-            self.audio
-                .ins
+            audio_inputs
                 .iter()
-                .map(|audio_in| audio_in.buffer.lock().to_vec())
+                .map(|audio_in| audio_in.to_vec())
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -511,17 +520,17 @@ impl Track {
                 buffer.sort_by_key(|event| event.frame);
                 input.mark_finished();
             }
-            for (lane, audio_in) in self.audio.ins.iter().enumerate() {
+            for (lane, audio_in) in audio_inputs.iter_mut().enumerate() {
                 if !input_monitor.get(lane).copied().unwrap_or(false) {
-                    audio_in.buffer.lock().fill(0.0);
+                    audio_in.fill(0.0);
                 }
             }
             let mix_start = std::time::Instant::now();
             if arrangement_active {
-                self.mix_clip_audio_into_inputs();
+                self.mix_clip_audio_into_input_buffers(audio_inputs);
             }
             if session_active {
-                self.mix_session_audio_into_inputs();
+                self.mix_session_audio_into_input_buffers(audio_inputs);
             }
             let mix_elapsed = mix_start.elapsed().as_secs_f64() * 1000.0;
             if mix_elapsed > 1.0 {
@@ -557,17 +566,23 @@ impl Track {
         self.audio
             .ins
             .first()
-            .map(|audio_in| audio_in.buffer.lock().len())
+            .map(|audio_in| audio_in.buffer_size())
             .or_else(|| {
                 self.audio
                     .outs
                     .first()
-                    .map(|audio_out| audio_out.buffer.lock().len())
+                    .map(|audio_out| audio_out.buffer_size())
             })
             .unwrap_or(self.process_block_size())
     }
 
-    pub fn process_plugin(&mut self, kind: PluginKind, index: usize) {
+    pub fn process_plugin_with_audio_buffers(
+        &mut self,
+        kind: PluginKind,
+        index: usize,
+        audio_inputs: &[&[f32]],
+        audio_outputs: &mut [&mut [f32]],
+    ) {
         let frames = self.compute_process_frames();
         let track_input_events = self.rt.folder_input_midi_events.clone();
 
@@ -577,14 +592,9 @@ impl Track {
                     return;
                 }
                 let processor = self.clap_plugins[index].processor.clone();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[index].id);
-                if !ready || !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins)
-                {
+                if !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins) {
                     return;
-                }
-                for input in processor.audio_inputs() {
-                    input.process();
                 }
                 self.plugin_midi_input_events(
                     &node,
@@ -592,7 +602,7 @@ impl Track {
                     &track_input_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
-                let outputs = processor.process_with_midi(
+                let outputs = processor.process_with_audio_buffers(
                     frames,
                     &[],
                     crate::plugins::types::ClapTransportInfo {
@@ -606,6 +616,8 @@ impl Track {
                         tsig_num: self.rt.tsig_num,
                         tsig_denom: self.rt.tsig_denom,
                     },
+                    audio_inputs,
+                    audio_outputs,
                 );
                 let track_name = self.name.clone();
                 for ev in processor.drain_echoed_parameters() {
@@ -632,14 +644,9 @@ impl Track {
                     return;
                 }
                 let processor = self.vst3_plugins[index].processor.clone();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[index].id);
-                if !ready || !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins)
-                {
+                if !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins) {
                     return;
-                }
-                for input in processor.audio_inputs() {
-                    input.process();
                 }
                 let midi_inputs = self.plugin_midi_input_events(
                     &node,
@@ -647,8 +654,9 @@ impl Track {
                     &track_input_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
-                let vst3_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs = processor.process_with_midi(frames, &vst3_input);
+                let _vst3_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs =
+                    processor.process_with_audio_buffers(frames, audio_inputs, audio_outputs);
                 let track_name = self.name.clone();
                 for ev in processor.drain_echoed_parameters() {
                     self.rt.echoed_parameter_updates.push(
@@ -673,14 +681,9 @@ impl Track {
                     return;
                 }
                 let processor = self.lv2_plugins[index].processor.clone();
-                let ready = processor.audio_inputs().iter().all(|input| input.ready());
                 let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[index].id);
-                if !ready || !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins)
-                {
+                if !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins) {
                     return;
-                }
-                for input in processor.audio_inputs() {
-                    input.process();
                 }
                 let midi_inputs = self.plugin_midi_input_events(
                     &node,
@@ -688,8 +691,9 @@ impl Track {
                     &track_input_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
-                let lv2_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs = processor.process_with_midi(frames, &lv2_input);
+                let _lv2_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs =
+                    processor.process_with_audio_buffers(frames, audio_inputs, audio_outputs);
                 let track_name = self.name.clone();
                 for ev in processor.drain_echoed_parameters() {
                     self.rt.echoed_parameter_updates.push(
@@ -711,7 +715,29 @@ impl Track {
         }
     }
 
-    pub fn process_folder_output(&mut self) {
+    fn arena_source_slice<'a>(
+        source_buffers: &'a [(usize, &'a [f32])],
+        source: &Arc<AudioIO>,
+    ) -> Option<&'a [f32]> {
+        let key = Arc::as_ptr(source) as usize;
+        source_buffers
+            .iter()
+            .find_map(|(candidate, buffer)| (*candidate == key).then_some(*buffer))
+    }
+
+    fn with_source_buffer<R>(
+        source_buffers: &[(usize, &[f32])],
+        source: &Arc<AudioIO>,
+        f: impl FnOnce(&[f32]) -> R,
+    ) -> Option<R> {
+        Self::arena_source_slice(source_buffers, source).map(f)
+    }
+
+    pub(crate) fn process_folder_output_with_audio_buffers(
+        &mut self,
+        audio_outputs: &mut [&mut [f32]],
+        source_buffers: &[(usize, &[f32])],
+    ) {
         let track_input_events = self.rt.folder_input_midi_events.clone();
         let midi_node_events = self.rt.folder_plugin_midi_node_events.clone();
 
@@ -762,6 +788,11 @@ impl Track {
                 .meter_peak_hold_linear
                 .resize(self.audio.outs.len(), 0.0);
         }
+        if self.rt.last_audio_outputs.len() != self.audio.outs.len() {
+            self.rt
+                .last_audio_outputs
+                .resize_with(self.audio.outs.len(), Vec::new);
+        }
         let clip_playback_active = self.rt.folder_clip_playback_active;
         let session_active = self.rt.session_clip_playback_enabled
             && (!self.rt.playing_session_clips.is_empty()
@@ -776,9 +807,9 @@ impl Track {
         let record_tap_input_snapshots = self.rt.folder_record_tap_input_snapshots.clone();
         let input_monitor = self.input_monitor();
         let mut all_outputs_zero = true;
-        for out_idx in 0..self.audio.outs.len() {
+        for out_idx in 0..self.audio.outs.len().min(audio_outputs.len()) {
             let audio_out = self.audio.outs[out_idx].clone();
-            let mut out_samples = audio_out.buffer.lock();
+            let out_samples = &mut audio_outputs[out_idx];
             let capture_record_tap = self.armed() && self.rt.record_tap_enabled;
             if capture_record_tap {
                 if self.rt.record_tap_outs.len() <= out_idx {
@@ -822,23 +853,28 @@ impl Track {
                     {
                         continue;
                     }
-                    let source_buf = source.buffer.lock();
-                    if !seeded {
-                        if unity_output_gain {
-                            Self::copy_unity_with_zero_tail(&mut out_samples, &source_buf);
+                    if Self::with_source_buffer(source_buffers, source, |source_buf| {
+                        if !seeded {
+                            if unity_output_gain {
+                                Self::copy_unity_with_zero_tail(out_samples, source_buf);
+                            } else {
+                                Self::copy_scaled_with_zero_tail(
+                                    out_samples,
+                                    source_buf,
+                                    output_gain,
+                                );
+                            }
+                            seeded = true;
+                            wrote_output = true;
+                        } else if unity_output_gain {
+                            Self::add_unity(out_samples, source_buf);
                         } else {
-                            Self::copy_scaled_with_zero_tail(
-                                &mut out_samples,
-                                &source_buf,
-                                output_gain,
-                            );
+                            Self::add_scaled(out_samples, source_buf, output_gain);
                         }
-                        seeded = true;
-                        wrote_output = true;
-                    } else if unity_output_gain {
-                        Self::add_unity(&mut out_samples, &source_buf);
-                    } else {
-                        Self::add_scaled(&mut out_samples, &source_buf, output_gain);
+                    })
+                    .is_none()
+                    {
+                        continue;
                     }
                 }
             }
@@ -860,8 +896,10 @@ impl Track {
                         {
                             Self::copy_unity_with_zero_tail(tap, &record_tap_input_snapshots[idx]);
                         } else {
-                            let first = sources[0].buffer.lock();
-                            Self::copy_unity_with_zero_tail(tap, &first);
+                            let _ =
+                                Self::with_source_buffer(source_buffers, &sources[0], |first| {
+                                    Self::copy_unity_with_zero_tail(tap, first);
+                                });
                         }
                         for source in &sources[1..] {
                             if let Some(idx) = self
@@ -873,8 +911,13 @@ impl Track {
                             {
                                 Self::add_unity(tap, &record_tap_input_snapshots[idx]);
                             } else {
-                                let source_buf = source.buffer.lock();
-                                Self::add_unity(tap, &source_buf);
+                                let _ = Self::with_source_buffer(
+                                    source_buffers,
+                                    source,
+                                    |source_buf| {
+                                        Self::add_unity(tap, source_buf);
+                                    },
+                                );
                             }
                         }
                     }
@@ -886,7 +929,12 @@ impl Track {
                     tap.fill(0.0);
                 }
             }
-            let peak_now = crate::simd::peak_abs(&out_samples);
+            if self.rt.last_audio_outputs[out_idx].len() != out_samples.len() {
+                self.rt.last_audio_outputs[out_idx].resize(out_samples.len(), 0.0);
+            }
+            self.rt.last_audio_outputs[out_idx].copy_from_slice(out_samples);
+
+            let peak_now = crate::simd::peak_abs(out_samples);
             if peak_now > 0.0 {
                 all_outputs_zero = false;
             }
@@ -926,6 +974,10 @@ impl Track {
 
     pub fn output_meter_linear(&self) -> Vec<f32> {
         self.rt.output_meter_linear_cache.clone()
+    }
+
+    pub(crate) fn last_audio_outputs(&self) -> &[Vec<f32>] {
+        &self.rt.last_audio_outputs
     }
 
     pub fn clear_output_meters(&mut self) {
@@ -1148,8 +1200,8 @@ impl Track {
             .audio
             .outs
             .first()
-            .map(|io| io.buffer.lock().len())
-            .or_else(|| self.audio.ins.first().map(|io| io.buffer.lock().len()))
+            .map(|io| io.buffer_size())
+            .or_else(|| self.audio.ins.first().map(|io| io.buffer_size()))
             .unwrap_or(0)
             .max(1);
 
@@ -1181,14 +1233,35 @@ impl Track {
         self.rt.pending_hw_midi_out_events.clear();
 
         let mut rendered = vec![0.0_f32; length_samples.saturating_mul(channels)];
+        let mut input_buffers = vec![vec![0.0_f32; block_size]; self.audio.ins.len()];
+        let mut output_buffers = vec![vec![0.0_f32; block_size]; channels];
         let mut cursor = 0usize;
         while cursor < length_samples {
             self.rt.transport_sample = start_sample.saturating_add(cursor);
-            self.process();
+            for input in &mut input_buffers {
+                input.fill(0.0);
+            }
+            for output in &mut output_buffers {
+                output.fill(0.0);
+            }
+            let mut inputs = input_buffers
+                .iter_mut()
+                .map(|buffer| buffer.as_mut_slice())
+                .collect::<Vec<_>>();
+            let mut outputs = output_buffers
+                .iter_mut()
+                .map(|buffer| buffer.as_mut_slice())
+                .collect::<Vec<_>>();
+            self.process_render_block_with_audio_buffers_and_metronome(
+                &mut inputs,
+                &mut outputs,
+                &[],
+                None,
+            );
             let step = (length_samples - cursor).min(block_size);
             if channels == 2 {
-                let out_l = self.audio.outs[0].buffer.lock();
-                let out_r = self.audio.outs[1].buffer.lock();
+                let out_l = &output_buffers[0];
+                let out_r = &output_buffers[1];
                 let copy_len = step.min(out_l.len()).min(out_r.len());
                 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
                 unsafe {
@@ -1228,8 +1301,7 @@ impl Track {
                     }
                 }
             } else {
-                for ch in 0..channels {
-                    let out = self.audio.outs[ch].buffer.lock();
+                for (ch, out) in output_buffers.iter().enumerate().take(channels) {
                     let copy_len = step.min(out.len());
                     for (i, out_i) in out.iter().enumerate().take(copy_len) {
                         let dst = (cursor + i) * channels + ch;

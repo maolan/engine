@@ -53,7 +53,7 @@ pub struct Lv2Processor {
     param_values: HashMap<u32, AtomicU64>,
     bypassed: Arc<AtomicBool>,
 
-    /// Host child process handle. Interior-mutable so `process_with_midi`
+    /// Host child process handle. Interior-mutable so `process_with_audio_buffers`
     /// (which takes `&self`) can poll it with `try_wait`.
     ///
     /// Invariant: at any moment there is at most one accessor — either the
@@ -576,13 +576,14 @@ impl Lv2Processor {
         Ok(())
     }
 
-    pub fn process_with_audio_io(&self, frames: usize) {
-        let _ = self.process_with_midi(frames, &[]);
-    }
-
-    pub fn process_with_midi(&self, frames: usize, _midi_in: &[MidiEvent]) -> Vec<MidiEvent> {
+    pub fn process_with_audio_buffers(
+        &self,
+        frames: usize,
+        audio_inputs: &[&[f32]],
+        audio_outputs: &mut [&mut [f32]],
+    ) -> Vec<MidiEvent> {
         if self.bypassed.load(Ordering::Relaxed) {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
@@ -601,21 +602,21 @@ impl Lv2Processor {
             })
         };
         if crashed {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
             _ => {
-                ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+                ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
                 return Vec::new();
             }
         };
 
         let ptr = mapping.as_ptr();
-        let num_in = self.audio_inputs.len();
-        let num_out = self.audio_outputs.len();
+        let num_in = audio_inputs.len();
+        let num_out = audio_outputs.len();
         let midi_in_count = self.midi_input_ports.len();
         let midi_out_count = self.midi_output_ports.len();
         unsafe {
@@ -628,7 +629,7 @@ impl Lv2Processor {
             t.denominator = 4;
             t.flags = 1;
 
-            ipc::copy_inputs_to_shm(&self.audio_inputs, ptr, frames);
+            ipc::copy_input_slices_to_shm(audio_inputs, ptr, frames);
 
             for (port_idx, port) in self.midi_input_ports.iter().enumerate() {
                 let buf = midi_in_ring_ptr(ptr, port_idx);
@@ -660,7 +661,7 @@ impl Lv2Processor {
         }
 
         if events.signal_host().is_err() {
-            ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
 
@@ -668,13 +669,13 @@ impl Lv2Processor {
         match events.wait_host(timeout) {
             Ok(()) => {}
             Err(_) => {
-                ipc::bypass_copy_inputs_to_outputs(&self.audio_inputs, &self.audio_outputs);
+                ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
                 return Vec::new();
             }
         }
 
         unsafe {
-            ipc::copy_outputs_from_shm(&self.audio_outputs, ptr, frames);
+            ipc::copy_outputs_from_shm_to_slices(audio_outputs, ptr, frames);
 
             let mut output_events = Vec::new();
             for (port_idx, port) in self.midi_output_ports.iter().enumerate() {
@@ -842,17 +843,16 @@ mod tests {
 
         processor.setup_audio_ports();
 
-        {
-            let mut buf = processor.audio_inputs()[0].buffer.lock();
-            buf.fill(1.0);
-            processor.audio_inputs()[0]
-                .finished
-                .store(true, Ordering::Release);
-        }
+        let input_buffers = [vec![1.0; 256]];
+        let mut output_buffers = [vec![0.0; 256]];
+        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = output_buffers
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        processor.process_with_audio_buffers(256, &inputs, &mut outputs);
 
-        processor.process_with_audio_io(256);
-
-        let out_buf = processor.audio_outputs()[0].buffer.lock();
+        let out_buf = &output_buffers[0];
         let first_few: Vec<f32> = out_buf.iter().take(10).copied().collect();
         assert!(
             out_buf.iter().all(|&s| s == 1.0),

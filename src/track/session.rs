@@ -132,18 +132,13 @@ impl Track {
         self.rt.pending_session_midi_note_offs.extend(note_offs);
     }
 
-    pub(crate) fn mix_session_audio_into_inputs(&mut self) {
-        let frames = self
-            .audio
-            .ins
-            .first()
-            .map(|audio_in| audio_in.buffer.lock().len())
-            .unwrap_or(0);
-        if frames == 0 || self.audio.ins.is_empty() {
+    pub(crate) fn mix_session_audio_into_input_buffers(&mut self, inputs: &mut [&mut [f32]]) {
+        let frames = inputs.first().map(|input| input.len()).unwrap_or(0);
+        if frames == 0 || inputs.is_empty() {
             return;
         }
         let mut active_clip_plugin_keys = HashSet::new();
-        let channel_count = self.audio.ins.len();
+        let channel_count = inputs.len();
         let clip_count = self.rt.playing_session_clips.len();
         let mut position_updates = Vec::new();
         let mut remove_indices = Vec::new();
@@ -211,8 +206,7 @@ impl Track {
                     Some(p) => p,
                     None => break,
                 };
-                for ch in 0..channel_count {
-                    let mut in_samples = self.audio.ins[ch].buffer.lock();
+                for (ch, in_samples) in inputs.iter_mut().enumerate().take(channel_count) {
                     let src = processed.get(ch).or_else(|| processed.first());
                     if let Some(src) = src {
                         let len = src
@@ -250,17 +244,9 @@ impl Track {
         self.rt
             .clip_plugin_tracks
             .retain(|key, _| active_clip_plugin_keys.contains(key));
-        let peak = self
-            .audio
-            .ins
+        let peak = inputs
             .iter()
-            .map(|in_| {
-                in_.buffer
-                    .lock()
-                    .iter()
-                    .map(|&s| s.abs())
-                    .fold(0.0_f32, f32::max)
-            })
+            .map(|input| input.iter().map(|&s| s.abs()).fold(0.0_f32, f32::max))
             .fold(0.0_f32, f32::max);
         tracing::debug!(
             "mix_session_audio_into_inputs track={} playing_clips={} input_peak={}",

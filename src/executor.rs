@@ -21,7 +21,6 @@
 //! mirroring the legacy `!progressed` fallback: they run with stale input
 //! data, which is the standard feedback-loop behaviour.
 
-use crate::audio::io::AudioIO;
 use crate::message::{PluginKind, ProcessTask};
 use crate::render_plan::{NodeId, Op, PlanSlot, SharedPlan};
 use crate::state::TrackHandle;
@@ -262,9 +261,8 @@ impl CycleExecutor {
     }
 
     /// Write silence into the node's arena output buffers and, for task
-    /// nodes, into the track's port buffers, setting the legacy finished
-    /// flags so dependent task bodies (which re-sum from port buffers and
-    /// check `ready()` internally) see a completed, silent producer.
+    /// nodes, set the port finished flags so any remaining legacy readiness
+    /// checks see a completed producer.
     fn silence_node(&mut self, node: NodeId) {
         let op = &self.plan.nodes[node as usize];
         let (outs, task) = match op {
@@ -292,11 +290,11 @@ impl CycleExecutor {
     }
 }
 
-/// Mirror of the legacy `force_stalled_task_completions` port handling:
-/// silence the task's output ports and mark it finished/not-processing.
+/// Mirror of the legacy `force_stalled_task_completions` state handling:
+/// mark the task's output ports finished and clear track processing state.
 fn silence_task_ports(track: &TrackHandle, task: &ProcessTask) {
     let t = track.lock();
-    let output_ports: Vec<Arc<AudioIO>> = match task {
+    match task {
         ProcessTask::Track(_) | ProcessTask::FolderOutput(_) => t.audio.outs.clone(),
         ProcessTask::FolderInput(_) => Vec::new(),
         ProcessTask::Plugin { kind, index, .. } => match kind {
@@ -317,11 +315,11 @@ fn silence_task_ports(track: &TrackHandle, task: &ProcessTask) {
                 .map(|p| p.processor.audio_outputs().to_vec())
                 .unwrap_or_default(),
         },
-    };
-    for out in &output_ports {
-        out.buffer.lock().fill(0.0);
-        out.finished.store(true, Ordering::Release);
     }
+    .iter()
+    .for_each(|out| {
+        out.finished.store(true, Ordering::Release);
+    });
     t.audio.set_processing(false);
     t.audio.set_finished(true);
 }
@@ -377,7 +375,6 @@ mod tests {
             dependents: vec![vec![2], vec![2], vec![3], vec![]],
             sources: vec![0, 1],
             hw_in_map: vec![],
-            hw_in_ports: vec![],
             hw_out_map: vec![],
             port_map: HashMap::new(),
             midi_edges: vec![],
@@ -577,7 +574,6 @@ mod tests {
         assert!(!t.audio.processing());
         for out in &t.audio.outs {
             assert!(out.finished.load(Ordering::Acquire));
-            assert!(out.buffer.lock().iter().all(|&s| s == 0.0));
         }
         // Finish the cycle; a second timeout pass is a no-op.
         let (jobs, _) = exec.on_node_done(exec.epoch(), 2, later);

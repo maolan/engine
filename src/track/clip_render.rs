@@ -1160,20 +1160,15 @@ impl Track {
         segments
     }
 
-    pub(crate) fn mix_clip_audio_into_inputs(&mut self) {
-        let frames = self
-            .audio
-            .ins
-            .first()
-            .map(|audio_in| audio_in.buffer.lock().len())
-            .unwrap_or(0);
+    pub(crate) fn mix_clip_audio_into_input_buffers(&mut self, inputs: &mut [&mut [f32]]) {
+        let frames = inputs.first().map(|input| input.len()).unwrap_or(0);
         tracing::debug!(
             "mix_clip_audio_into_inputs for '{}' frames={} clips={}",
             self.name,
             frames,
             self.audio.clips().len()
         );
-        if frames == 0 || self.audio.ins.is_empty() {
+        if frames == 0 || inputs.is_empty() {
             return;
         }
 
@@ -1206,13 +1201,9 @@ impl Track {
                 let from = (*segment_start).max(clip_start);
                 let to = (*segment_end).min(clip_end);
                 let track_idx = out_offset + (from - *segment_start);
-                let copy_len = to.saturating_sub(from).min(
-                    self.audio
-                        .ins
-                        .first()
-                        .map(|audio_in| audio_in.buffer.lock().len().saturating_sub(track_idx))
-                        .unwrap_or(0),
-                );
+                let copy_len = to
+                    .saturating_sub(from)
+                    .min(inputs[0].len().saturating_sub(track_idx));
                 if copy_len == 0 {
                     tracing::debug!("mix_clip_audio_into_inputs clip '{}' copy_len=0", clip.name);
                     continue;
@@ -1247,7 +1238,7 @@ impl Track {
                     processed_blocks.len(),
                     processed_blocks.first().and_then(|b| b.first())
                 );
-                for in_channel in 0..self.audio.ins.len() {
+                for (in_channel, in_samples) in inputs.iter_mut().enumerate() {
                     if !self
                         .disk_monitor()
                         .get(in_channel)
@@ -1256,7 +1247,6 @@ impl Track {
                     {
                         continue;
                     }
-                    let mut in_samples = self.audio.ins[in_channel].buffer.lock();
                     let processed = processed_blocks
                         .get(in_channel)
                         .or_else(|| processed_blocks.first());

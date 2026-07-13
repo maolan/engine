@@ -5,9 +5,40 @@ use crate::hw::latency;
 use crate::hw::options::HwOptions;
 use crate::hw::traits::HwWorkerDriver;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+#[derive(Debug)]
+struct AssistGate {
+    active: AtomicBool,
+}
+
+impl AssistGate {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+        }
+    }
+
+    fn try_enter(gate: &Arc<Self>) -> Option<AssistGateGuard> {
+        gate.active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| AssistGateGuard { gate: gate.clone() })
+    }
+}
+
+#[derive(Debug)]
+struct AssistGateGuard {
+    gate: Arc<AssistGate>,
+}
+
+impl Drop for AssistGateGuard {
+    fn drop(&mut self) {
+        self.gate.active.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug)]
 pub struct HwDriver {
@@ -19,7 +50,7 @@ pub struct HwDriver {
     output_latency_frames: usize,
     playing: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
-    assist_lock: Arc<Mutex<()>>,
+    assist_gate: Arc<AssistGate>,
 }
 
 impl Default for HwOptions {
@@ -89,7 +120,7 @@ impl HwDriver {
             output_latency_frames: options.output_latency_frames,
             playing,
             stop_requested,
-            assist_lock: Arc::new(Mutex::new(())),
+            assist_gate: Arc::new(AssistGate::new()),
         })
     }
 
@@ -148,7 +179,7 @@ impl HwDriver {
             let plan = slot.load();
             common::output_meter_linear_from_plan(&plan, gain, balance)
         } else {
-            common::output_meter_linear(&self.playback.channels, gain, balance)
+            common::output_meter_linear(self.playback.channels.len(), gain, balance)
         }
     }
 
@@ -169,14 +200,22 @@ impl HwDriver {
     }
 
     fn run_cycle_with_assist(&mut self) -> std::io::Result<()> {
-        let assist_lock = self.assist_lock.clone();
-        let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
+        let assist_gate = self.assist_gate.clone();
+        let Some(_guard) = AssistGate::try_enter(&assist_gate) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "OSS assist cycle already running",
+            ));
+        };
         self.channel().run_cycle()
     }
 
     fn run_assist_step(&mut self) -> std::io::Result<bool> {
-        let assist_lock = self.assist_lock.clone();
-        self.channel().run_assist_step_with_lock(&assist_lock)
+        let assist_gate = self.assist_gate.clone();
+        let Some(_guard) = AssistGate::try_enter(&assist_gate) else {
+            return Ok(false);
+        };
+        self.channel().run_assist_step()
     }
 
     pub fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {
