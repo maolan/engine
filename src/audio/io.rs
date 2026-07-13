@@ -1,10 +1,10 @@
 use arc_swap::ArcSwap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 #[derive(Debug, Clone)]
 pub struct AudioIO {
-    pub connections: Arc<ArcSwap<Vec<Arc<Self>>>>,
+    pub connections: Arc<ArcSwap<Vec<Weak<Self>>>>,
     pub connection_count: Arc<AtomicUsize>,
     buffer_size: usize,
     pub finished: Arc<AtomicBool>,
@@ -25,17 +25,25 @@ impl AudioIO {
     }
 
     pub fn connections(&self) -> Arc<Vec<Arc<Self>>> {
-        self.connections.load_full()
+        let connections = self.connections.load_full();
+        let live = Self::live_connections(&connections);
+        if live.len() != connections.len() {
+            self.store_connections(live.clone());
+        } else {
+            self.connection_count.store(live.len(), Ordering::Relaxed);
+        }
+        Arc::new(live)
     }
 
     pub fn store_connections(&self, connections: Vec<Arc<Self>>) {
         let len = connections.len();
-        self.connections.store(Arc::new(connections));
+        self.connections
+            .store(Arc::new(connections.iter().map(Arc::downgrade).collect()));
         self.connection_count.store(len, Ordering::Relaxed);
     }
 
     pub fn update_connections(&self, update: impl FnOnce(&mut Vec<Arc<Self>>)) {
-        let mut connections = self.connections.load_full().as_ref().clone();
+        let mut connections = self.connections().as_ref().clone();
         update(&mut connections);
         self.store_connections(connections);
     }
@@ -54,12 +62,12 @@ impl AudioIO {
     }
 
     pub fn disconnect(from: &Arc<Self>, to: &Arc<Self>) -> Result<(), String> {
-        let mut to_conns = to.connections.load_full().as_ref().clone();
+        let mut to_conns = to.connections().as_ref().clone();
         let to_original_len = to_conns.len();
         to_conns.retain(|conn| !Arc::ptr_eq(conn, from));
         to.store_connections(to_conns.clone());
 
-        let mut from_conns = from.connections.load_full().as_ref().clone();
+        let mut from_conns = from.connections().as_ref().clone();
         from_conns.retain(|conn| !Arc::ptr_eq(conn, to));
         from.store_connections(from_conns);
 
@@ -81,13 +89,17 @@ impl AudioIO {
         if self.connection_count.load(Ordering::Relaxed) == 0 {
             return true;
         }
-        let connections = self.connections.load_full();
+        let connections = self.connections();
         for conn in connections.iter() {
             if !conn.finished.load(Ordering::Acquire) {
                 return false;
             }
         }
         true
+    }
+
+    fn live_connections(connections: &[Weak<Self>]) -> Vec<Arc<Self>> {
+        connections.iter().filter_map(Weak::upgrade).collect()
     }
 }
 

@@ -824,6 +824,10 @@ mod tests {
         ipc::find_plugin_host_binary().expect("maolan-plugin-host binary should be built for tests")
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
     #[test]
     fn find_host_binary_locates_binary() {
         let host_bin = find_host_binary();
@@ -834,6 +838,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
     #[test]
     fn lv2_processor_crash_bypass() {
         let host_bin = find_host_binary();

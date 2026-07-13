@@ -24,7 +24,9 @@ use crate::audio::io::AudioIO;
 use crate::connectable::{ConnectableConnection, ConnectableRef};
 use crate::message::{PluginKind, ProcessTask};
 use crate::state::{StateSnapshot, TrackHandle};
+#[cfg(test)]
 use crate::track::Track;
+use crate::track::TrackData;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -326,7 +328,7 @@ impl Builder {
     /// Register a track's own MIDI ports: inputs are written and read by the
     /// track's first task (folder input / track body), outputs by its last
     /// task (folder output / track body).
-    fn register_midi_track_ports(&mut self, t: &Track, first: NodeId, last: NodeId) {
+    fn register_midi_track_ports(&mut self, t: &TrackData, first: NodeId, last: NodeId) {
         for p in &t.midi.ins {
             let key = Arc::as_ptr(p) as usize;
             self.midi_writers.insert(key, first);
@@ -345,7 +347,7 @@ impl Builder {
     /// node for folder plugins, the track task for inline plugins).
     fn register_plugin_midi_ports(
         &mut self,
-        t: &Track,
+        t: &TrackData,
         kind: PluginKind,
         index: usize,
         node: NodeId,
@@ -566,7 +568,7 @@ impl Builder {
     fn push_plugin(
         &mut self,
         track: &TrackHandle,
-        t: &Track,
+        t: &TrackData,
         kind: PluginKind,
         index: usize,
         folder_input: NodeId,

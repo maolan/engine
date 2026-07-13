@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use std::cell::UnsafeCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidiEvent {
@@ -34,10 +34,10 @@ impl MidiEvent {
 #[allow(clippy::upper_case_acronyms)]
 pub struct MIDIIO {
     /// Ports that feed events into this port (consumers see producers here).
-    sources: ArcSwap<Vec<Arc<MIDIIO>>>,
+    sources: ArcSwap<Vec<Weak<MIDIIO>>>,
     /// Ports that this port feeds events into (producers see consumers here).
     /// Control-side only, COW-published like `sources`.
-    connections: ArcSwap<Vec<Arc<MIDIIO>>>,
+    connections: ArcSwap<Vec<Weak<MIDIIO>>>,
     buffer: UnsafeCell<Vec<MidiEvent>>,
     finished: AtomicBool,
 }
@@ -79,15 +79,15 @@ impl MIDIIO {
     /// `to.sources` contains `from` and `from.connections` contains `to`.
     /// Control-side only; publishes the new `sources` list RCU-style.
     pub fn connect(from: &Arc<MIDIIO>, to: &Arc<MIDIIO>) {
-        let mut conns = from.connections.load_full().as_ref().clone();
+        let mut conns = from.connections();
         if !conns.iter().any(|c| Arc::ptr_eq(c, to)) {
             conns.push(to.clone());
-            from.connections.store(Arc::new(conns));
+            from.store_connections(conns);
         }
-        let mut sources = to.sources.load_full().as_ref().clone();
+        let mut sources = to.sources();
         if !sources.iter().any(|s| Arc::ptr_eq(s, from)) {
             sources.push(from.clone());
-            to.sources.store(Arc::new(sources));
+            to.store_sources(sources);
         }
     }
 
@@ -95,16 +95,16 @@ impl MIDIIO {
     /// Control-side only.
     pub fn disconnect(from: &Arc<MIDIIO>, to: &Arc<MIDIIO>) -> Result<(), String> {
         let mut removed = false;
-        let mut conns = from.connections.load_full().as_ref().clone();
+        let mut conns = from.connections();
         let before = conns.len();
         conns.retain(|c| !Arc::ptr_eq(c, to));
         if conns.len() < before {
-            from.connections.store(Arc::new(conns));
+            from.store_connections(conns);
             removed = true;
         }
-        let mut sources = to.sources.load_full().as_ref().clone();
+        let mut sources = to.sources();
         sources.retain(|s| !Arc::ptr_eq(s, from));
-        to.sources.store(Arc::new(sources));
+        to.store_sources(sources);
         if removed {
             Ok(())
         } else {
@@ -117,22 +117,32 @@ impl MIDIIO {
     /// reparenting, where events flow by direct buffer writes ordered by
     /// plan edges rather than by source merging.
     pub fn add_connection(&self, to: &Arc<MIDIIO>) {
-        let mut conns = self.connections.load_full().as_ref().clone();
+        let mut conns = self.connections();
         if !conns.iter().any(|c| Arc::ptr_eq(c, to)) {
             conns.push(to.clone());
-            self.connections.store(Arc::new(conns));
+            self.store_connections(conns);
         }
     }
 
     /// Control-side snapshot of the ports this port feeds. Used by routing
     /// queries and the plan compiler; never on the RT path.
     pub fn connections(&self) -> Vec<Arc<MIDIIO>> {
-        self.connections.load_full().as_ref().clone()
+        let connections = self.connections.load_full();
+        let live = Self::live_ports(&connections);
+        if live.len() != connections.len() {
+            self.store_connections(live.clone());
+        }
+        live
     }
 
     /// Control-side snapshot of the ports feeding this port.
     pub fn sources(&self) -> Vec<Arc<MIDIIO>> {
-        self.sources.load_full().as_ref().clone()
+        let sources = self.sources.load_full();
+        let live = Self::live_ports(&sources);
+        if live.len() != sources.len() {
+            self.store_sources(live.clone());
+        }
+        live
     }
 
     /// Prepare this port for a new processing cycle.
@@ -158,7 +168,7 @@ impl MIDIIO {
         let buffer = unsafe { &mut *self.buffer.get() };
         buffer.clear();
         let sources = self.sources.load();
-        for source in sources.iter() {
+        for source in sources.iter().filter_map(Weak::upgrade) {
             // Safety: sources are read-only here; their producers completed
             // earlier in the plan (MIDI edge) or in a finished cycle.
             let src = unsafe { &*source.buffer.get() };
@@ -199,10 +209,32 @@ impl MIDIIO {
     /// producing; a port with sources is ready only when all sources have.
     pub fn ready(&self) -> bool {
         let sources = self.sources.load();
-        if sources.is_empty() {
-            return self.finished.load(Ordering::Acquire);
+        let mut has_source = false;
+        for source in sources.iter().filter_map(Weak::upgrade) {
+            has_source = true;
+            if !source.finished.load(Ordering::Acquire) {
+                return false;
+            }
         }
-        sources.iter().all(|s| s.finished.load(Ordering::Acquire))
+        if has_source {
+            true
+        } else {
+            self.finished.load(Ordering::Acquire)
+        }
+    }
+
+    fn store_connections(&self, connections: Vec<Arc<MIDIIO>>) {
+        self.connections
+            .store(Arc::new(connections.iter().map(Arc::downgrade).collect()));
+    }
+
+    fn store_sources(&self, sources: Vec<Arc<MIDIIO>>) {
+        self.sources
+            .store(Arc::new(sources.iter().map(Arc::downgrade).collect()));
+    }
+
+    fn live_ports(ports: &[Weak<MIDIIO>]) -> Vec<Arc<MIDIIO>> {
+        ports.iter().filter_map(Weak::upgrade).collect()
     }
 
     /// Mark this port as finished without processing (used by producers

@@ -1045,6 +1045,10 @@ mod tests {
             .join("maolan-plugin-host")
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
     #[test]
     fn clap_processor_processes_audio() {
         let host_bin = find_host_binary();
@@ -1101,6 +1105,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
     #[test]
     fn clap_processor_crash_bypass() {
         let host_bin = find_host_binary();
@@ -1138,6 +1146,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
     #[test]
     fn clap_track_integration() {
         use crate::track::Track;

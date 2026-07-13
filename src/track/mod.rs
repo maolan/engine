@@ -14,6 +14,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, HashSet},
+    fmt,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::{
@@ -676,8 +678,12 @@ impl DerefMut for TrackRtCell {
     }
 }
 
-#[derive(Debug)]
 pub struct Track {
+    inner: UnsafeCell<TrackData>,
+}
+
+#[derive(Debug)]
+pub struct TrackData {
     pub rt: TrackRtCell,
     pub name: String,
     // Atomic scalars (5b-iv-1): single-location control values written by the
@@ -736,38 +742,146 @@ pub struct Track {
     metronome_source: ArcSwapOption<AudioIO>,
 }
 
-pub struct TrackGuard {
-    ptr: *mut Track,
+pub struct TrackGuard<'a> {
+    ptr: *mut TrackData,
+    _marker: PhantomData<&'a mut TrackData>,
 }
 
-unsafe impl Send for TrackGuard {}
+unsafe impl Send for TrackGuard<'_> {}
 
-impl Deref for TrackGuard {
-    type Target = Track;
+impl fmt::Debug for Track {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        TrackData::fmt(self, f)
+    }
+}
+
+impl Deref for Track {
+    type Target = TrackData;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.inner.get() }
+    }
+}
+
+impl DerefMut for Track {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.get_mut()
+    }
+}
+
+impl Deref for TrackGuard<'_> {
+    type Target = TrackData;
 
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.ptr }
     }
 }
 
-impl DerefMut for TrackGuard {
+impl DerefMut for TrackGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.ptr }
     }
 }
 
 impl Track {
-    pub fn lock(&self) -> TrackGuard {
-        TrackGuard {
-            ptr: std::ptr::from_ref(self).cast_mut(),
+    pub fn new(
+        name: String,
+        audio_ins: usize,
+        audio_outs: usize,
+        midi_ins: usize,
+        midi_outs: usize,
+        buffer_size: usize,
+        sample_rate: f64,
+    ) -> Self {
+        Self {
+            inner: UnsafeCell::new(TrackData::new(
+                name,
+                audio_ins,
+                audio_outs,
+                midi_ins,
+                midi_outs,
+                buffer_size,
+                sample_rate,
+            )),
         }
+    }
+
+    pub fn new_folder(
+        name: String,
+        audio_ins: usize,
+        audio_outs: usize,
+        midi_ins: usize,
+        midi_outs: usize,
+        buffer_size: usize,
+        sample_rate: f64,
+    ) -> Self {
+        Self {
+            inner: UnsafeCell::new(TrackData::new_folder(
+                name,
+                audio_ins,
+                audio_outs,
+                midi_ins,
+                midi_outs,
+                buffer_size,
+                sample_rate,
+            )),
+        }
+    }
+
+    pub fn lock(&self) -> TrackGuard<'_> {
+        TrackGuard {
+            ptr: self.inner.get(),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn connect_directed_audio(from: &Arc<AudioIO>, to: &Arc<AudioIO>) {
+        TrackData::connect_directed_audio(from, to);
+    }
+
+    pub fn quantize_sample_to_boundary(
+        sample: usize,
+        quantization: crate::message::LaunchQuantization,
+        bpm: f64,
+        tsig_num: u16,
+        tsig_denom: u16,
+        sample_rate: f64,
+    ) -> usize {
+        TrackData::quantize_sample_to_boundary(
+            sample,
+            quantization,
+            bpm,
+            tsig_num,
+            tsig_denom,
+            sample_rate,
+        )
+    }
+
+    pub fn process_direct_clip_graph(
+        graph: &serde_json::Value,
+        track_inputs: &[Vec<f32>],
+        block_size: usize,
+    ) -> Vec<Vec<f32>> {
+        TrackData::process_direct_clip_graph(graph, track_inputs, block_size)
+    }
+
+    pub fn clip_graph_uses_plugin_runtime(graph: &serde_json::Value) -> bool {
+        TrackData::clip_graph_uses_plugin_runtime(graph)
+    }
+
+    pub fn clip_plugin_runtime_key(
+        clip: &crate::audio::clip::AudioClip,
+        input_count: usize,
+        output_count: usize,
+    ) -> String {
+        TrackData::clip_plugin_runtime_key(clip, input_count, output_count)
     }
 }
 
 unsafe impl Sync for Track {}
 unsafe impl Send for Track {}
 
-impl crate::connectable::AudioPorts for Track {
+impl crate::connectable::AudioPorts for TrackData {
     fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
         self.audio.ins.clone()
     }
@@ -777,7 +891,7 @@ impl crate::connectable::AudioPorts for Track {
     }
 }
 
-impl crate::connectable::MidiPorts for Track {
+impl crate::connectable::MidiPorts for TrackData {
     fn midi_inputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
         self.midi.ins.clone()
     }

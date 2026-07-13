@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-impl Track {
+impl TrackData {
     const METRONOME_DEFAULT_LEVEL_DB: f32 = -10.0;
 
     pub(crate) fn new_raw(
@@ -127,7 +127,7 @@ impl Track {
     pub(crate) fn alloc_plugin_instance_id(&self) -> usize {
         // Returns the pre-increment value, matching the old read-then-write.
         self.next_plugin_instance_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(1))
             })
             .expect("closure always returns Some")
@@ -981,12 +981,8 @@ impl Track {
     }
 
     pub fn clear_output_meters(&mut self) {
-        for value in &mut self.rt.output_meter_linear_cache {
-            *value = 0.0;
-        }
-        for value in &mut self.rt.meter_peak_hold_linear {
-            *value = 0.0;
-        }
+        self.rt.output_meter_linear_cache.fill(0.0);
+        self.rt.meter_peak_hold_linear.fill(0.0);
     }
 
     pub fn arm(&self) {

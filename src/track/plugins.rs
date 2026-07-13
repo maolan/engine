@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-impl Track {
+impl TrackData {
     #[cfg(all(unix, not(target_os = "macos")))]
     pub fn load_lv2_plugin(&mut self, uri: &str, instance_id: Option<usize>) -> Result<(), String> {
         let buffer_size = self

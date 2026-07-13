@@ -196,26 +196,26 @@ fn decode_wav_fallback(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
     match (audio_format, bits_per_sample) {
         (3, 32) => {
             out.reserve(data.len() / 4);
-            for b in data.chunks_exact(4) {
+            for b in data.as_chunks::<4>().0 {
                 out.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
             }
         }
         (1, 16) => {
             out.reserve(data.len() / 2);
-            for b in data.chunks_exact(2) {
+            for b in data.as_chunks::<2>().0 {
                 out.push(i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0);
             }
         }
         (1, 24) => {
             out.reserve(data.len() / 3);
-            for b in data.chunks_exact(3) {
+            for b in data.as_chunks::<3>().0 {
                 let v = ((b[2] as i32) << 24 | (b[1] as i32) << 16 | (b[0] as i32) << 8) >> 8;
                 out.push(v as f32 / 8_388_608.0);
             }
         }
         (1, 32) => {
             out.reserve(data.len() / 4);
-            for b in data.chunks_exact(4) {
+            for b in data.as_chunks::<4>().0 {
                 out.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0);
             }
         }

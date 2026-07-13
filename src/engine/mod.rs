@@ -341,10 +341,10 @@ pub struct Engine {
     /// publishes plans, `pending_node_jobs` buffers jobs when no worker is
     /// free, and `hw_ports` is the snapshot the builder compiles against.
     executor: crate::executor::CycleExecutor,
-    plan_builder: crate::plan_builder::PlanBuilder,
     plan_slot: Arc<crate::render_plan::PlanSlot>,
     hw_ports: Arc<arc_swap::ArcSwap<crate::plan_builder::HwPorts>>,
     pending_node_jobs: VecDeque<crate::executor::NodeJob>,
+    plan_builder: crate::plan_builder::PlanBuilder,
     latest_hw_out_meter_db: Arc<Vec<f32>>,
     latest_track_meter_snapshot: Arc<Vec<(String, Vec<f32>)>>,
     history: History,
@@ -455,6 +455,15 @@ mod tests {
         engine.plan_builder.mark_dirty();
     }
 
+    fn insert_track_for_modulator_test(engine: &mut Engine, track: Track) {
+        engine
+            .state
+            .lock()
+            .tracks
+            .insert(track.name.clone(), Arc::new(track));
+        engine.publish_state_snapshot();
+    }
+
     fn osc_packet(address: &str) -> Vec<u8> {
         fn push_padded_osc_string(packet: &mut Vec<u8>, value: &str) {
             packet.extend_from_slice(value.as_bytes());
@@ -470,6 +479,10 @@ mod tests {
         packet
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn set_osc_enabled_starts_and_stops_server() {
         let (mut engine, _client_rx) = make_engine_with_client();
@@ -485,6 +498,10 @@ mod tests {
         assert!(engine.osc_server.is_none());
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn set_tempo_map_is_recorded_and_undone() {
         let (mut engine, _client_rx) = make_engine_with_client();
@@ -524,6 +541,10 @@ mod tests {
         assert_eq!(engine.tsig_denom, 4);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn osc_server_forwards_transport_packets_to_engine_channel() {
         let (tx, mut rx) = channel(4);
@@ -550,6 +571,10 @@ mod tests {
         server.stop();
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_offline_bounce_rejects_zero_length_requests() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -577,6 +602,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_offline_bounce_rejects_when_same_track_is_active() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -606,6 +635,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_offline_bounce_allows_different_track_concurrently() {
         let (mut engine, _client_rx) = make_engine_with_client();
@@ -635,6 +668,10 @@ mod tests {
         assert_eq!(engine.pending_requests.len(), 1);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn reject_if_track_frozen_sends_error_and_blocks_operation() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -655,6 +692,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn dispatcher_track_mutations_publish_state_snapshot() {
         let (mut engine, _client_rx) = make_engine_with_client();
@@ -682,6 +723,10 @@ mod tests {
         assert!(!snapshot.tracks.contains_key("snap"));
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn undo_restores_original_clip_bounds_after_stretch_style_group() {
         let (mut engine, _client_rx) = make_engine_with_client();
@@ -737,6 +782,10 @@ mod tests {
         assert_eq!(clip.offset, 12);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_offline_bounce_queues_when_no_worker_is_ready() {
         let (mut engine, _client_rx) = make_engine_with_client();
@@ -765,6 +814,10 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_offline_bounce_returns_missing_track_error() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -788,6 +841,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_offline_bounce_clears_job_when_worker_send_fails() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -822,6 +879,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn play_stop_play_keeps_clip_output_audible() {
         use crate::audio::clip::AudioClip;
@@ -939,7 +1000,7 @@ mod tests {
     fn modulator_sets_track_volume() {
         let (mut engine, _client_rx) = make_engine_with_client();
         let track = Track::new("vol-track".to_string(), 0, 2, 0, 0, 128, 48_000.0);
-        insert_track(&mut engine, track);
+        insert_track_for_modulator_test(&mut engine, track);
 
         engine.modulators = vec![crate::modulator::Modulator {
             id: 1,
@@ -957,7 +1018,8 @@ mod tests {
 
         // At sample 12000 (1/4 period at 48kHz/1Hz), sine value maps to 1.0 -> max 20 dB.
         let echoes = engine.apply_modulators(12_000);
-        let track = engine.state.lock().tracks["vol-track"].lock();
+        let state_guard = engine.state.lock();
+        let track = state_guard.tracks["vol-track"].lock();
         assert!(
             (track.level() - 20.0).abs() < 0.01,
             "expected 20 dB, got {}",
@@ -974,7 +1036,7 @@ mod tests {
     fn modulator_sets_track_balance() {
         let (mut engine, _client_rx) = make_engine_with_client();
         let track = Track::new("pan-track".to_string(), 0, 2, 0, 0, 128, 48_000.0);
-        insert_track(&mut engine, track);
+        insert_track_for_modulator_test(&mut engine, track);
 
         engine.modulators = vec![crate::modulator::Modulator {
             id: 1,
@@ -992,7 +1054,8 @@ mod tests {
 
         // At sample 12000 (1/4 period), sine value maps to 1.0 -> max balance 1.0.
         let echoes = engine.apply_modulators(12_000);
-        let track = engine.state.lock().tracks["pan-track"].lock();
+        let state_guard = engine.state.lock();
+        let track = state_guard.tracks["pan-track"].lock();
         assert!(
             (track.balance() - 1.0).abs() < 0.01,
             "expected balance 1.0, got {}",
@@ -1005,6 +1068,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_set_parent_wires_folder_input_to_child_input_and_child_output_to_folder_output()
     {
@@ -1083,6 +1150,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_set_parent_to_none_restores_root_passthrough() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -1135,6 +1206,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_set_parent_wires_folder_midi_to_child_midi() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -1231,29 +1306,38 @@ mod tests {
     fn nested_folder_expands_in_render_plan() {
         use crate::message::ProcessTask;
 
-        let (mut engine, _client_rx) = make_engine_with_client();
-        let outer = Track::new_folder("outer".to_string(), 2, 2, 0, 0, 64, 48_000.0);
-        let inner = Track::new_folder("inner".to_string(), 2, 2, 0, 0, 64, 48_000.0);
-        let leaf = Track::new("leaf".to_string(), 2, 2, 0, 0, 64, 48_000.0);
-        insert_track(&mut engine, outer);
-        insert_track(&mut engine, inner);
-        insert_track(&mut engine, leaf);
-
+        let state = crate::state::State::default();
+        let outer = Arc::new(Track::new_folder(
+            "outer".to_string(),
+            2,
+            2,
+            0,
+            0,
+            64,
+            48_000.0,
+        ));
+        let inner = Arc::new(Track::new_folder(
+            "inner".to_string(),
+            2,
+            2,
+            0,
+            0,
+            64,
+            48_000.0,
+        ));
+        let leaf = Arc::new(Track::new("leaf".to_string(), 2, 2, 0, 0, 64, 48_000.0));
+        outer.lock().child_tracks.push(inner.clone());
+        inner.lock().child_tracks.push(leaf.clone());
+        inner.lock().parent_track = Some("outer".to_string());
+        leaf.lock().parent_track = Some("inner".to_string());
         {
-            let state = engine.state.lock();
-            let outer = state.tracks.get("outer").unwrap().clone();
-            let inner = state.tracks.get("inner").unwrap().clone();
-            let leaf = state.tracks.get("leaf").unwrap().clone();
-            outer.lock().child_tracks.push(inner.clone());
-            inner.lock().child_tracks.push(leaf.clone());
-            inner.lock().parent_track = Some("outer".to_string());
-            leaf.lock().parent_track = Some("inner".to_string());
+            let mut state = state.lock();
+            state.tracks.insert("outer".to_string(), outer);
+            state.tracks.insert("inner".to_string(), inner);
+            state.tracks.insert("leaf".to_string(), leaf);
         }
 
-        let plan = {
-            let state = engine.state.lock();
-            crate::render_plan::RenderPlan::compile(&state.snapshot(), &[], &[], 64)
-        };
+        let plan = crate::render_plan::RenderPlan::compile(&state.snapshot(), &[], &[], 64);
         plan.verify().expect("plan invariants");
 
         let is_fi = |t: &ProcessTask| matches!(t, ProcessTask::FolderInput(_));
@@ -1283,6 +1367,10 @@ mod tests {
         assert!(plan.forced.is_empty(), "no feedback cycle");
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "uses filesystem metadata, which Miri isolation does not support on FreeBSD"
+    )]
     #[test]
     fn child_to_plugin_to_folder_output_render_plan_has_no_cycle() {
         use crate::message::{ConnectableRef, ProcessTask};
@@ -1406,6 +1494,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_set_parent_wires_child_io_to_folder_even_after_addtrack() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -1458,6 +1550,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn folder_child_audio_passes_through() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -1521,6 +1617,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn remove_folder_track_deletes_descendants_recursively() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -1583,6 +1683,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_set_folder_rejects_master_track() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -1612,6 +1716,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn track_toggle_master_ignored_for_folder_track() {
         let (mut engine, mut client_rx) = make_engine_with_client();

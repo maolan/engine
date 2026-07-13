@@ -398,7 +398,7 @@ impl Engine {
 
     pub(crate) fn is_track_in_soloed_folder(
         &self,
-        track: &Track,
+        track: &crate::track::TrackData,
         tracks: &std::collections::HashMap<String, crate::state::TrackHandle>,
     ) -> bool {
         let mut current = track.parent_track.clone();
@@ -788,7 +788,7 @@ impl Engine {
         };
         let _ = track;
 
-        for (_, other_track) in self.state.lock().tracks.iter() {
+        for other_track in self.state.lock().tracks.values() {
             let other_track = other_track.lock();
             match kind {
                 Kind::Audio => {
@@ -1231,8 +1231,7 @@ impl Engine {
             && should_record(action_to_process)
             && !self.history_suspended
         {
-            let state = self.state.lock();
-            create_inverse_actions(action_to_process, &state).map(|mut actions| {
+            create_inverse_actions(action_to_process, self.state.as_ref()).map(|mut actions| {
                 actions.extend(extra_inverse_actions);
                 actions
             })
@@ -1412,11 +1411,10 @@ impl Engine {
             .collect();
 
         let combined_inverse = if record_history && !self.history_suspended {
-            let state = self.state.lock();
             let mut inv = Vec::new();
             for n in &names_to_remove {
                 if let Some(mut actions) =
-                    create_inverse_actions(&Action::RemoveTrack(n.clone()), &state)
+                    create_inverse_actions(&Action::RemoveTrack(n.clone()), self.state.as_ref())
                 {
                     inv.append(&mut actions);
                 }
@@ -1802,7 +1800,9 @@ impl Engine {
                     let sources = inp.connections();
                     for src in sources.iter() {
                         let _ = AudioIO::disconnect(src, inp);
-                        if let Some((src_name, src_port)) = self.find_audio_io_owner(&state, src) {
+                        if let Some((src_name, src_port)) =
+                            self.find_audio_io_owner(self.state.as_ref(), src)
+                        {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: src_name,
                                 from_port: src_port,
@@ -1828,7 +1828,9 @@ impl Engine {
                     let targets = out.connections();
                     for tgt in targets.iter() {
                         let _ = AudioIO::disconnect(out, tgt);
-                        if let Some((tgt_name, tgt_port)) = self.find_audio_io_owner(&state, tgt) {
+                        if let Some((tgt_name, tgt_port)) =
+                            self.find_audio_io_owner(self.state.as_ref(), tgt)
+                        {
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: track_name.to_string(),
                                 from_port: port_idx,
@@ -1887,7 +1889,8 @@ impl Engine {
                 for (port_idx, out) in child.midi.outs.iter().enumerate() {
                     let targets = out.connections();
                     for tgt in targets {
-                        if let Some((tgt_name, tgt_port, _)) = self.find_midi_io_owner(&state, &tgt)
+                        if let Some((tgt_name, tgt_port, _)) =
+                            self.find_midi_io_owner(self.state.as_ref(), &tgt)
                         {
                             let _ = MIDIIO::disconnect(out, &tgt);
                             disconnect_actions.push(Action::Disconnect {

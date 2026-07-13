@@ -10,7 +10,7 @@ use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
 use serde_json::Value;
 use std::{collections::HashSet, path::Path, sync::Arc};
 
-impl Track {
+impl TrackData {
     pub(crate) fn invalidate_midi_clip_cache(&mut self, clip_name: &str) {
         self.rt.midi_clip_cache.remove(clip_name);
     }

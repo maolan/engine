@@ -1009,11 +1009,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
-        Action::TrackLoadClapPlugin {
-            track_name,
-            plugin_id: _,
-            ..
-        } => {
+        Action::TrackLoadClapPlugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
             Some(Action::TrackUnloadClapPluginInstance {
@@ -1030,11 +1026,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             instance_id: None,
         }),
 
-        Action::TrackLoadVst3Plugin {
-            track_name,
-            plugin_id: _,
-            ..
-        } => {
+        Action::TrackLoadVst3Plugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
             Some(Action::TrackUnloadVst3PluginInstance {
@@ -1043,11 +1035,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
             })
         }
         #[cfg(all(unix, not(target_os = "macos")))]
-        Action::TrackLoadLv2Plugin {
-            track_name,
-            plugin_uri: _,
-            ..
-        } => {
+        Action::TrackLoadLv2Plugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
             Some(Action::TrackUnloadLv2PluginInstance {

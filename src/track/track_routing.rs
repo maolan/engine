@@ -8,7 +8,7 @@ use crate::kind::Kind;
 use crate::{audio::io::AudioIO, midi::io::MIDIIO};
 use std::sync::Arc;
 
-impl Track {
+impl TrackData {
     pub fn clear_default_passthrough(&mut self) {
         for (audio_in, audio_out) in self.audio.ins.iter().zip(self.audio.outs.iter()) {
             let _ = AudioIO::disconnect(audio_in, audio_out);
@@ -759,7 +759,7 @@ impl Track {
         self.invalidate_audio_route_cache();
     }
 
-    pub fn disconnect_from_parent(&mut self, parent: &Track) {
+    pub fn disconnect_from_parent(&mut self, parent: &TrackData) {
         // Folder input -> child input
         for (in_idx, child_in) in self.audio.ins.iter().enumerate() {
             if let Some(parent_in) = parent.audio.ins.get(in_idx) {

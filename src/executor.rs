@@ -332,15 +332,50 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    fn wrap(plan: RenderPlan) -> (basedrop::Collector, basedrop::Owned<RenderPlan>) {
-        let collector = basedrop::Collector::new();
-        let owned = basedrop::Owned::new(&collector.handle(), plan);
-        (collector, owned)
+    struct TestPlanSlot {
+        collector: Option<basedrop::Collector>,
+        slot: Option<Arc<PlanSlot>>,
     }
 
-    fn slot_with(plan: RenderPlan) -> (basedrop::Collector, Arc<PlanSlot>) {
-        let (collector, owned) = wrap(plan);
-        (collector, Arc::new(PlanSlot::from_pointee(owned)))
+    impl TestPlanSlot {
+        fn new(plan: RenderPlan) -> Self {
+            let collector = basedrop::Collector::new();
+            let owned = basedrop::Owned::new(&collector.handle(), plan);
+            Self {
+                collector: Some(collector),
+                slot: Some(Arc::new(PlanSlot::from_pointee(owned))),
+            }
+        }
+
+        fn slot(&self) -> Arc<PlanSlot> {
+            self.slot.as_ref().expect("test slot").clone()
+        }
+
+        fn store(&self, plan: RenderPlan) {
+            let owned = basedrop::Owned::new(
+                &self.collector.as_ref().expect("test collector").handle(),
+                plan,
+            );
+            self.slot
+                .as_ref()
+                .expect("test slot")
+                .store(Arc::new(owned));
+        }
+    }
+
+    impl Drop for TestPlanSlot {
+        fn drop(&mut self) {
+            self.slot.take();
+            let Some(mut collector) = self.collector.take() else {
+                return;
+            };
+            collector.collect();
+            let _ = collector.try_cleanup();
+        }
+    }
+
+    fn slot_with(plan: RenderPlan) -> TestPlanSlot {
+        TestPlanSlot::new(plan)
     }
 
     /// Chain plan: two source tasks -> sum -> sink task.
@@ -389,7 +424,8 @@ mod tests {
     #[test]
     fn counters_dispatch_in_dependency_order_exactly_once() {
         let track = make_track("t");
-        let (_collector, slot) = slot_with(chain_plan(&track));
+        let slot_guard = slot_with(chain_plan(&track));
+        let slot = slot_guard.slot();
         let mut exec = CycleExecutor::new(slot);
         let now = Instant::now();
 
@@ -433,7 +469,8 @@ mod tests {
     #[test]
     fn swap_during_cycle_keeps_old_plan_until_boundary() {
         let track = make_track("t");
-        let (_collector, slot) = slot_with(chain_plan(&track));
+        let slot_guard = slot_with(chain_plan(&track));
+        let slot = slot_guard.slot();
         let mut exec = CycleExecutor::new(slot.clone());
         let now = Instant::now();
 
@@ -442,8 +479,7 @@ mod tests {
         let epoch0 = exec.epoch();
 
         // Swap in a fresh plan mid-cycle.
-        let (_collector2, owned2) = wrap(chain_plan(&track));
-        slot.store(Arc::new(owned2));
+        slot_guard.store(chain_plan(&track));
 
         // Old-epoch completions still count; the swap is invisible mid-cycle.
         let (jobs, _) = exec.on_node_done(epoch0, 0, now);
@@ -477,15 +513,15 @@ mod tests {
     #[test]
     fn swap_during_simulated_parallel_cycle_exactly_once() {
         let track = make_track("t");
-        let (_collector, slot) = slot_with(chain_plan(&track));
+        let slot_guard = slot_with(chain_plan(&track));
+        let slot = slot_guard.slot();
         let exec = Mutex::new(CycleExecutor::new(slot.clone()));
         let now = Instant::now();
 
         let jobs = exec.lock().expect("lock").start_cycle(now);
         let epoch0 = exec.lock().expect("lock").epoch();
         // Swap immediately: the parallel cycle runs entirely on the old plan.
-        let (_collector2, owned2) = wrap(chain_plan(&track));
-        slot.store(Arc::new(owned2));
+        slot_guard.store(chain_plan(&track));
 
         // A single shared queue behind a Mutex; two threads pull jobs and
         // report done through the executor, exactly as the tokio workers do.
@@ -540,7 +576,8 @@ mod tests {
     #[test]
     fn timeout_silences_node_outputs_and_completes_by_index() {
         let track = make_track("t");
-        let (_collector, slot) = slot_with(chain_plan(&track));
+        let slot_guard = slot_with(chain_plan(&track));
+        let slot = slot_guard.slot();
         let mut exec = CycleExecutor::new(slot);
         let now = Instant::now();
         let timeout = Duration::from_millis(250);
@@ -587,7 +624,8 @@ mod tests {
     #[test]
     fn abandon_node_completes_with_silence() {
         let track = make_track("t");
-        let (_collector, slot) = slot_with(chain_plan(&track));
+        let slot_guard = slot_with(chain_plan(&track));
+        let slot = slot_guard.slot();
         let mut exec = CycleExecutor::new(slot);
         let now = Instant::now();
 
@@ -616,7 +654,8 @@ mod tests {
         // Turn the sink into an undispatchable feedback node.
         plan.indegree[3] = 2;
         plan.forced = vec![3];
-        let (_collector, slot) = slot_with(plan);
+        let slot_guard = slot_with(plan);
+        let slot = slot_guard.slot();
         let mut exec = CycleExecutor::new(slot);
         let now = Instant::now();
         let timeout = Duration::from_millis(250);
@@ -646,7 +685,8 @@ mod tests {
     #[test]
     fn stale_epoch_completions_are_dropped() {
         let track = make_track("t");
-        let (_collector, slot) = slot_with(chain_plan(&track));
+        let slot_guard = slot_with(chain_plan(&track));
+        let slot = slot_guard.slot();
         let mut exec = CycleExecutor::new(slot);
         let now = Instant::now();
 

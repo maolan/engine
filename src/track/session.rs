@@ -6,7 +6,7 @@ use crate::kind::Kind;
 use crate::midi::io::MidiEvent;
 use std::collections::HashSet;
 
-impl Track {
+impl TrackData {
     pub fn quantize_sample_to_boundary(
         sample: usize,
         quantization: crate::message::LaunchQuantization,

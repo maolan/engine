@@ -54,7 +54,7 @@ impl Worker {
     }
 
     fn apply_freeze_automation_at_sample(
-        track: &mut crate::track::Track,
+        track: &mut crate::track::TrackData,
         sample: usize,
         lanes: &[OfflineAutomationLane],
     ) {
@@ -114,7 +114,7 @@ impl Worker {
         }
     }
 
-    fn prepare_track_for_freeze_render(track: &mut crate::track::Track) -> (f32, f32) {
+    fn prepare_track_for_freeze_render(track: &mut crate::track::TrackData) -> (f32, f32) {
         let original_level = track.level();
         let original_balance = track.balance();
         track.set_level(0.0);
@@ -123,7 +123,7 @@ impl Worker {
     }
 
     fn restore_track_after_freeze_render(
-        track: &mut crate::track::Track,
+        track: &mut crate::track::TrackData,
         original_level: f32,
         original_balance: f32,
     ) {
@@ -393,7 +393,7 @@ impl Worker {
 
     fn metronome_output_buffer(
         plan: &crate::render_plan::RenderPlan,
-        t: &crate::track::Track,
+        t: &crate::track::TrackData,
         outs: &[crate::render_plan::BufferId],
     ) -> Option<crate::render_plan::BufferId> {
         let source = t.metronome_source()?;
@@ -773,6 +773,10 @@ mod tests {
         assert_eq!(track.rt.pending_automation_midi_events[0].data[2], 25);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn process_node_job_sums_arena_buffers() {
         use crate::render_plan::{Op, RenderPlan};
@@ -845,6 +849,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn process_offline_bounce_errors_when_track_is_missing() {
         let (_rx_unused_tx, rx_unused) = channel(1);
@@ -879,6 +887,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn process_offline_bounce_cancels_and_restores_track_state() {
         let (_rx_unused_tx, rx_unused) = channel(1);
@@ -916,11 +928,16 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         }
         assert!(matches!(out_rx.recv().await, Some(Message::Ready(5))));
-        let track = state.lock().tracks.get("track").expect("track").lock();
+        let state_guard = state.lock();
+        let track = state_guard.tracks.get("track").expect("track").lock();
         assert_eq!(track.level(), -9.0);
         assert_eq!(track.balance(), -0.3);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn process_offline_bounce_restores_track_state_on_write_failure() {
         let (_rx_unused_tx, rx_unused) = channel(1);
@@ -971,11 +988,16 @@ mod tests {
             }
         }
         assert!(saw_error);
-        let track = state.lock().tracks.get("track").expect("track").lock();
+        let state_guard = state.lock();
+        let track = state_guard.tracks.get("track").expect("track").lock();
         assert_eq!(track.level(), -4.0);
         assert_eq!(track.balance(), 0.25);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[tokio::test]
     async fn process_offline_bounce_emits_progress_and_completion() {
         let (_rx_unused_tx, rx_unused) = channel(1);
@@ -1049,7 +1071,8 @@ mod tests {
         assert!(saw_ready);
         assert!(output.exists());
         std::fs::remove_file(&output).expect("remove temp wav");
-        let track = state.lock().tracks.get("track").expect("track").lock();
+        let state_guard = state.lock();
+        let track = state_guard.tracks.get("track").expect("track").lock();
         assert_eq!(track.level(), -3.0);
         assert_eq!(track.balance(), 0.4);
         assert!(!track.muted());

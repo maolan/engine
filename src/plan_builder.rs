@@ -98,6 +98,9 @@ fn builder_loop(
         // unpark; builds themselves are triggered by the dirty flag.
         std::thread::park_timeout(Duration::from_millis(10));
         if quit.load(Ordering::Acquire) {
+            drop(slot);
+            collector.collect();
+            let _ = collector.try_cleanup();
             break;
         }
         if !dirty.swap(false, Ordering::AcqRel) {
