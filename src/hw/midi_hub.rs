@@ -101,7 +101,7 @@ impl MidiHub {
     }
 
     pub fn close_input_waiter(&mut self) {
-        if let Some(waiter) = self.input_waiter.as_mut() {
+        if let Some(mut waiter) = self.input_waiter.take() {
             waiter.close();
         }
     }

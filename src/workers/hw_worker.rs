@@ -54,7 +54,7 @@ impl<B: Backend> Drop for HwWorker<B> {
         }
         self.midi_stop.store(true, Ordering::Release);
         self.midi_hub.wake_input_waiter();
-        self.midi_hub.close_input_waiter();
+        self.midi_hub.close_all();
         if let Some(driver) = self.driver.as_mut() {
             driver.close_fds();
         }
@@ -461,7 +461,7 @@ impl<B: Backend> HwWorker<B> {
     fn shutdown_midi(&mut self) {
         self.midi_stop.store(true, Ordering::Release);
         self.midi_hub.wake_input_waiter();
-        self.midi_hub.close_input_waiter();
+        self.midi_hub.close_all();
     }
 
     #[cfg(unix)]
