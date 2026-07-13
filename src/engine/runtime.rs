@@ -109,6 +109,34 @@ impl Engine {
     }
 
     pub fn new(rx: Receiver<Message>, tx: Sender<Message>) -> Self {
+        let (meter_snapshot_producer, _) =
+            crate::triple_buffer::triple_buffer(crate::meter::MeterSnapshot::default());
+        let (transport_snapshot_producer, _) =
+            crate::triple_buffer::triple_buffer(crate::meter::TransportSnapshot::default());
+        let (session_runtime_snapshot_producer, _) =
+            crate::triple_buffer::triple_buffer(crate::meter::SessionRuntimeSnapshot::default());
+        Self::new_with_snapshots(
+            rx,
+            tx,
+            meter_snapshot_producer,
+            transport_snapshot_producer,
+            session_runtime_snapshot_producer,
+        )
+    }
+
+    pub fn new_with_snapshots(
+        rx: Receiver<Message>,
+        tx: Sender<Message>,
+        meter_snapshot_producer: crate::triple_buffer::TripleBufferProducer<
+            crate::meter::MeterSnapshot,
+        >,
+        transport_snapshot_producer: crate::triple_buffer::TripleBufferProducer<
+            crate::meter::TransportSnapshot,
+        >,
+        session_runtime_snapshot_producer: crate::triple_buffer::TripleBufferProducer<
+            crate::meter::SessionRuntimeSnapshot,
+        >,
+    ) -> Self {
         let state = Arc::new(State::default());
         let initial_state_snapshot = state.lock().snapshot();
         let state_snapshot = Arc::new(crate::state::StateSlot::from_pointee(
@@ -211,9 +239,12 @@ impl Engine {
             #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
             hw_out_meter_publish_phase: false,
             last_track_meter_publish: None,
+            last_meter_snapshot_publish: None,
             last_session_report_publish: None,
-            session_report_state: HashMap::new(),
             track_meter_linear_by_track: HashMap::new(),
+            meter_snapshot_producer,
+            transport_snapshot_producer,
+            session_runtime_snapshot_producer,
             executor,
             plan_builder,
             plan_slot,
@@ -1077,6 +1108,7 @@ impl Engine {
         }
         tracing::debug!("request_hw_cycle sending TracksFinished");
         self.apply_hw_out_gain_and_meter().await;
+        self.publish_meter_snapshot_if_due();
         if let Some((after_frames, loop_start, cycle_end_sample)) =
             self.scheduled_loop_wrap_for_next_cycle()
         {
@@ -1161,13 +1193,6 @@ impl Engine {
 
     pub(crate) async fn maybe_notify_hw_out_meter(&mut self, _meter_db: Vec<f32>) {
         {}
-    }
-
-    pub(crate) fn collect_changed_track_meters(
-        &mut self,
-        _tracks: &[(String, crate::state::TrackHandle)],
-    ) -> Vec<(String, Vec<f32>)> {
-        Vec::new()
     }
 
     pub(crate) async fn apply_hw_out_gain_and_meter(&mut self) {
@@ -1576,7 +1601,7 @@ impl Engine {
         self.ready_workers.push(worker_index);
     }
 
-    pub(crate) async fn publish_track_meters(&mut self) {
+    pub(crate) fn publish_track_meters(&mut self) {
         if !self.should_publish_track_meters() {
             return;
         }
@@ -1602,14 +1627,6 @@ impl Engine {
             snapshot.push((name.clone(), output_db));
         }
         self.latest_track_meter_snapshot = Arc::new(snapshot);
-        let meters = self.collect_changed_track_meters(&tracks);
-        for (track_name, output_db) in meters {
-            self.notify_clients(Ok(Action::TrackMeters {
-                track_name,
-                output_db,
-            }))
-            .await;
-        }
     }
 
     pub(crate) async fn publish_session_runtime_reports(&mut self) {
@@ -1644,36 +1661,20 @@ impl Engine {
             }
         }
 
-        let previous_keys: Vec<(String, usize)> =
-            self.session_report_state.keys().cloned().collect();
-        for key in previous_keys {
-            if current.contains_key(&key) {
-                continue;
-            }
-            let (track_name, scene_index) = key;
-            self.notify_clients(Ok(Action::SessionRuntimeReport {
-                track_name,
-                scene_index,
-                state: SessionSlotState::Stopped,
-                play_position_samples: 0,
-                elapsed_samples: 0,
-            }))
-            .await;
-        }
-
-        for ((track_name, scene_index), (state, play_position_samples, elapsed_samples)) in &current
-        {
-            self.notify_clients(Ok(Action::SessionRuntimeReport {
-                track_name: track_name.clone(),
-                scene_index: *scene_index,
-                state: *state,
-                play_position_samples: *play_position_samples,
-                elapsed_samples: *elapsed_samples,
-            }))
-            .await;
-        }
-
-        self.session_report_state = current.into_iter().map(|(k, (s, _, _))| (k, s)).collect();
+        let snapshot = self.session_runtime_snapshot_producer.write_buffer();
+        snapshot.slots.clear();
+        snapshot.slots.extend(current.iter().map(
+            |((track_name, scene_index), (state, play_position_samples, elapsed_samples))| {
+                crate::meter::SessionRuntimeSlotSnapshot {
+                    track_name: track_name.clone(),
+                    scene_index: *scene_index,
+                    state: *state,
+                    play_position_samples: *play_position_samples,
+                    elapsed_samples: *elapsed_samples,
+                }
+            },
+        ));
+        self.session_runtime_snapshot_producer.publish();
         self.last_session_report_publish = Some(Instant::now());
     }
 
@@ -1700,6 +1701,7 @@ impl Engine {
     pub(crate) fn reset_meters_after_stop(&mut self) {
         self.last_hw_out_meter_publish = None;
         self.last_track_meter_publish = None;
+        self.last_meter_snapshot_publish = None;
         self.hw_out_peak_hold_linear.fill(0.0);
         #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
         {
@@ -1727,6 +1729,43 @@ impl Engine {
             snapshot.push((name, vec![-90.0; width]));
         }
         self.latest_track_meter_snapshot = Arc::new(snapshot);
+        self.publish_meter_snapshot();
+    }
+
+    pub(crate) fn publish_meter_snapshot_if_due(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_meter_snapshot_publish
+            .is_some_and(|last| now.duration_since(last) < Self::METER_PUBLISH_INTERVAL)
+        {
+            return;
+        }
+        self.last_meter_snapshot_publish = Some(now);
+        self.publish_meter_snapshot();
+    }
+
+    pub(crate) fn publish_meter_snapshot(&mut self) {
+        let snapshot = self.meter_snapshot_producer.write_buffer();
+        snapshot.hw_out_db.clear();
+        snapshot
+            .hw_out_db
+            .extend(self.latest_hw_out_meter_db.iter().copied());
+        snapshot.track_meters.clear();
+        snapshot
+            .track_meters
+            .extend(self.latest_track_meter_snapshot.iter().cloned());
+        self.meter_snapshot_producer.publish();
+    }
+
+    pub(crate) fn publish_transport_snapshot(&mut self) {
+        let snapshot = self.transport_snapshot_producer.write_buffer();
+        snapshot.sample = self.transport_sample;
+        snapshot.tempo_bpm = self.tempo_bpm;
+        snapshot.playing = self.playing;
+        snapshot.transport_running = self.transport_running;
+        snapshot.tsig_num = self.tsig_num;
+        snapshot.tsig_denom = self.tsig_denom;
+        self.transport_snapshot_producer.publish();
     }
 
     pub(crate) async fn handle_request(&mut self, a: Action) {
@@ -1911,6 +1950,7 @@ impl Engine {
             }
             Action::JumpToEnd => {
                 self.transport_sample = self.normalize_transport_sample(self.session_end_sample());
+                self.publish_transport_snapshot();
                 self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                     .await;
             }
@@ -1974,6 +2014,7 @@ impl Engine {
             }
             Action::SetTempo(bpm) => {
                 self.tempo_bpm = bpm.max(1.0);
+                self.publish_transport_snapshot();
             }
             Action::SetTimeSignature {
                 numerator,
@@ -1981,6 +2022,7 @@ impl Engine {
             } => {
                 self.tsig_num = numerator.max(1);
                 self.tsig_denom = denominator.max(1);
+                self.publish_transport_snapshot();
             }
             Action::SetTempoMap {
                 ref tempo_points,
@@ -1989,6 +2031,7 @@ impl Engine {
                 self.tempo_points = tempo_points.clone();
                 self.time_signature_points = time_signature_points.clone();
                 self.update_global_tempo_from_map();
+                self.publish_transport_snapshot();
             }
             Action::SetOscEnabled(enabled) => {
                 if let Err(err) = self.set_osc_enabled_with(enabled, OscServer::start) {
@@ -3241,7 +3284,7 @@ impl Engine {
                             reconfigured_tracks.push(track_name.clone());
                         }
                     }
-                    self.publish_track_meters().await;
+                    self.publish_track_meters();
                     self.publish_session_runtime_reports().await;
                     self.publish_clap_state_dirty().await;
                     for track_name in reconfigured_tracks {
@@ -3278,6 +3321,7 @@ impl Engine {
                             let normalized = self.normalize_transport_sample(next);
                             let wrapped = normalized != next;
                             self.transport_sample = normalized;
+                            self.publish_transport_snapshot();
                             if wrapped {
                                 if self.notified_loop_wrap_sample == Some(self.transport_sample) {
                                     self.notified_loop_wrap_sample = None;

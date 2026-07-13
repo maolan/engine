@@ -57,7 +57,7 @@ use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     history::{History, UndoEntry},
     kind::Kind,
-    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, SessionSlotState},
+    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
     midi::io::MidiEvent,
     osc::OscServer,
     state::{State, StateSlot},
@@ -260,9 +260,15 @@ pub struct Engine {
     #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
     hw_out_meter_publish_phase: bool,
     last_track_meter_publish: Option<Instant>,
+    last_meter_snapshot_publish: Option<Instant>,
     last_session_report_publish: Option<Instant>,
-    session_report_state: HashMap<(String, usize), SessionSlotState>,
     track_meter_linear_by_track: HashMap<String, Vec<f32>>,
+    meter_snapshot_producer:
+        crate::triple_buffer::TripleBufferProducer<crate::meter::MeterSnapshot>,
+    transport_snapshot_producer:
+        crate::triple_buffer::TripleBufferProducer<crate::meter::TransportSnapshot>,
+    session_runtime_snapshot_producer:
+        crate::triple_buffer::TripleBufferProducer<crate::meter::SessionRuntimeSnapshot>,
     /// Phase 2 render-plan machinery (see `LOCKLESS.md`): the executor
     /// drives per-cycle node dispatch, the builder thread recompiles and
     /// publishes plans, `pending_node_jobs` buffers jobs when no worker is

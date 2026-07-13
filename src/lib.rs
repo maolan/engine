@@ -9,6 +9,7 @@ pub mod history;
 mod hw;
 pub mod kind;
 pub mod message;
+pub mod meter;
 mod midi;
 pub mod modulator;
 mod osc;
@@ -21,6 +22,7 @@ mod rubberband;
 pub mod simd;
 pub mod state;
 mod track;
+pub mod triple_buffer;
 pub mod workers;
 pub use workers::worker;
 
@@ -81,12 +83,38 @@ pub fn enable_flush_denormals_to_zero() {
     }
 }
 
-pub fn init() -> (Sender<message::Message>, JoinHandle<()>) {
+pub type EngineInit = (
+    Sender<message::Message>,
+    JoinHandle<()>,
+    triple_buffer::TripleBufferConsumer<meter::MeterSnapshot>,
+    triple_buffer::TripleBufferConsumer<meter::TransportSnapshot>,
+    triple_buffer::TripleBufferConsumer<meter::SessionRuntimeSnapshot>,
+);
+
+pub fn init() -> EngineInit {
     let (tx, rx) = channel::<message::Message>(32);
-    let mut engine = engine::Engine::new(rx, tx.clone());
+    let (meter_producer, meter_consumer) =
+        triple_buffer::triple_buffer(meter::MeterSnapshot::default());
+    let (transport_producer, transport_consumer) =
+        triple_buffer::triple_buffer(meter::TransportSnapshot::default());
+    let (session_runtime_producer, session_runtime_consumer) =
+        triple_buffer::triple_buffer(meter::SessionRuntimeSnapshot::default());
+    let mut engine = engine::Engine::new_with_snapshots(
+        rx,
+        tx.clone(),
+        meter_producer,
+        transport_producer,
+        session_runtime_producer,
+    );
     let handle = tokio::spawn(async move {
         engine.init().await;
         engine.work().await;
     });
-    (tx.clone(), handle)
+    (
+        tx.clone(),
+        handle,
+        meter_consumer,
+        transport_consumer,
+        session_runtime_consumer,
+    )
 }

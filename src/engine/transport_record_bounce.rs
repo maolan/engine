@@ -1023,6 +1023,7 @@ impl Engine {
         self.transport_running = true;
         self.transport_restart_pending = true;
         self.notified_loop_wrap_sample = None;
+        self.publish_transport_snapshot();
         self.set_hw_playing(true).await;
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
@@ -1062,10 +1063,12 @@ impl Engine {
             t.set_session_clip_playback_enabled(false);
         }
         self.transport_running = false;
+        self.publish_transport_snapshot();
         if !self.playing {
             self.playing = true;
             self.transport_restart_pending = true;
             self.notified_loop_wrap_sample = None;
+            self.publish_transport_snapshot();
             self.set_hw_playing(true).await;
             #[cfg(unix)]
             if let Some(jack) = &self.jack_runtime
@@ -1106,6 +1109,7 @@ impl Engine {
             t.set_clip_playback_enabled(true);
             t.set_session_clip_playback_enabled(false);
         }
+        self.publish_transport_snapshot();
         self.set_hw_playing(false).await;
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
@@ -1152,6 +1156,7 @@ impl Engine {
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = true;
         self.session_transport_sample = 0;
+        self.publish_transport_snapshot();
         self.set_hw_playing(true).await;
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
@@ -1185,6 +1190,7 @@ impl Engine {
 
         self.transport_sample = self.normalize_transport_sample(sample);
         self.notified_loop_wrap_sample = None;
+        self.publish_transport_snapshot();
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
             for action in echoes {
