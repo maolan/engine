@@ -2928,6 +2928,100 @@ impl Engine {
                     return;
                 }
             }
+            Action::JackGetGraph => {
+                #[cfg(unix)]
+                {
+                    match self
+                        .jack_runtime
+                        .as_ref()
+                        .ok_or(
+                            "JACK runtime is not active; open the JACK backend first".to_string(),
+                        )
+                        .and_then(|jack| jack.graph_info())
+                    {
+                        Ok(graph) => self.notify_clients(Ok(Action::JackGraph(graph))).await,
+                        Err(e) => self.notify_clients(Err(e)).await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    self.notify_clients(Err(
+                        "JACK backend is not available on this platform build".to_string(),
+                    ))
+                    .await;
+                }
+                return;
+            }
+            Action::JackConnect {
+                ref source,
+                ref destination,
+            } => {
+                #[cfg(unix)]
+                {
+                    match self
+                        .jack_runtime
+                        .as_ref()
+                        .ok_or(
+                            "JACK runtime is not active; open the JACK backend first".to_string(),
+                        )
+                        .and_then(|jack| jack.connect_ports_by_name(source, destination))
+                        .and_then(|_| {
+                            self.jack_runtime
+                                .as_ref()
+                                .expect("JACK runtime was checked")
+                                .graph_info()
+                        }) {
+                        Ok(graph) => {
+                            self.notify_clients(Ok(a.clone())).await;
+                            self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                        }
+                        Err(e) => self.notify_clients(Err(e)).await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    self.notify_clients(Err(
+                        "JACK backend is not available on this platform build".to_string(),
+                    ))
+                    .await;
+                }
+                return;
+            }
+            Action::JackDisconnect {
+                ref source,
+                ref destination,
+            } => {
+                #[cfg(unix)]
+                {
+                    match self
+                        .jack_runtime
+                        .as_ref()
+                        .ok_or(
+                            "JACK runtime is not active; open the JACK backend first".to_string(),
+                        )
+                        .and_then(|jack| jack.disconnect_ports_by_name(source, destination))
+                        .and_then(|_| {
+                            self.jack_runtime
+                                .as_ref()
+                                .expect("JACK runtime was checked")
+                                .graph_info()
+                        }) {
+                        Ok(graph) => {
+                            self.notify_clients(Ok(a.clone())).await;
+                            self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                        }
+                        Err(e) => self.notify_clients(Err(e)).await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    self.notify_clients(Err(
+                        "JACK backend is not available on this platform build".to_string(),
+                    ))
+                    .await;
+                }
+                return;
+            }
             Action::OpenMidiInputDevice(ref device) => {
                 if let Some(worker) = &self.hw_worker {
                     if let Err(e) = worker

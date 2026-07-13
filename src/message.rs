@@ -41,6 +41,28 @@ pub struct MidiRawEventData {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JackPortInfo {
+    pub name: String,
+    pub kind: Kind,
+    pub is_input: bool,
+    pub is_output: bool,
+    pub is_physical: bool,
+    pub is_maolan: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JackConnectionInfo {
+    pub source: String,
+    pub destination: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JackGraphInfo {
+    pub ports: Vec<JackPortInfo>,
+    pub connections: Vec<JackConnectionInfo>,
+}
+
 #[derive(Clone, Debug)]
 pub struct HwMidiEvent {
     pub device: String,
@@ -1297,6 +1319,16 @@ pub enum Action {
     JackRemoveAudioInputPort(usize),
     JackAddAudioOutputPort,
     JackRemoveAudioOutputPort(usize),
+    JackGetGraph,
+    JackGraph(JackGraphInfo),
+    JackConnect {
+        source: String,
+        destination: String,
+    },
+    JackDisconnect {
+        source: String,
+        destination: String,
+    },
     OpenMidiInputDevice(String),
     OpenMidiOutputDevice(String),
     RequestSessionDiagnostics,

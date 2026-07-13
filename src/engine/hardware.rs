@@ -654,6 +654,17 @@ impl Engine {
             self.publish_hw_ports();
             self.publish_hw_infos(input_channels, output_channels, rate)
                 .await;
+            match self
+                .jack_runtime
+                .as_ref()
+                .expect("checked jack runtime")
+                .graph_info()
+            {
+                Ok(graph) => {
+                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                }
+                Err(e) => self.notify_clients(Err(e)).await,
+            }
             self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]
@@ -725,6 +736,17 @@ impl Engine {
             }
             self.publish_hw_infos(input_channels, output_channels, rate)
                 .await;
+            match self
+                .jack_runtime
+                .as_ref()
+                .expect("checked jack runtime")
+                .graph_info()
+            {
+                Ok(graph) => {
+                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                }
+                Err(e) => self.notify_clients(Err(e)).await,
+            }
             self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]
@@ -764,6 +786,17 @@ impl Engine {
             self.publish_hw_ports();
             self.publish_hw_infos(input_channels, output_channels, rate)
                 .await;
+            match self
+                .jack_runtime
+                .as_ref()
+                .expect("checked jack runtime")
+                .graph_info()
+            {
+                Ok(graph) => {
+                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                }
+                Err(e) => self.notify_clients(Err(e)).await,
+            }
             self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]
@@ -835,6 +868,17 @@ impl Engine {
             }
             self.publish_hw_infos(input_channels, output_channels, rate)
                 .await;
+            match self
+                .jack_runtime
+                .as_ref()
+                .expect("checked jack runtime")
+                .graph_info()
+            {
+                Ok(graph) => {
+                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                }
+                Err(e) => self.notify_clients(Err(e)).await,
+            }
             self.notify_clients(Ok(a.clone())).await;
         }
         #[cfg(not(unix))]

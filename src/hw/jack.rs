@@ -1,7 +1,12 @@
-use crate::{audio::io::AudioIO, midi::io::MidiEvent};
+use crate::{
+    audio::io::AudioIO,
+    kind::Kind,
+    message::{JackConnectionInfo, JackGraphInfo, JackPortInfo},
+    midi::io::MidiEvent,
+};
 use jack::{
     AudioIn, AudioOut, Client, ClientOptions, Control, MidiIn, MidiOut, NotificationHandler, Port,
-    ProcessHandler, ProcessScope, RawMidi, TransportPosition, TransportState,
+    PortFlags, PortSpec, ProcessHandler, ProcessScope, RawMidi, TransportPosition, TransportState,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -16,8 +21,8 @@ const JACK_PORT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 enum JackPortCommand {
-    AddAudioInput(Port<AudioIn>),
-    AddAudioOutput(Port<AudioOut>),
+    AddAudioInput(usize, Port<AudioIn>),
+    AddAudioOutput(usize, Port<AudioOut>),
     RemoveAudioInput(usize),
     RemoveAudioOutput(usize),
 }
@@ -77,8 +82,20 @@ impl Process {
     fn drain_port_commands(&mut self) {
         while let Ok(command) = self.port_command_consumer.pop() {
             match command {
-                JackPortCommand::AddAudioInput(port) => self.audio_in_ports.push(port),
-                JackPortCommand::AddAudioOutput(port) => self.audio_out_ports.push(port),
+                JackPortCommand::AddAudioInput(idx, port) => {
+                    if idx <= self.audio_in_ports.len() {
+                        self.audio_in_ports.insert(idx, port);
+                    } else {
+                        self.audio_in_ports.push(port);
+                    }
+                }
+                JackPortCommand::AddAudioOutput(idx, port) => {
+                    if idx <= self.audio_out_ports.len() {
+                        self.audio_out_ports.insert(idx, port);
+                    } else {
+                        self.audio_out_ports.push(port);
+                    }
+                }
                 JackPortCommand::RemoveAudioInput(idx) => {
                     if idx < self.audio_in_ports.len() {
                         let port = self.audio_in_ports.remove(idx);
@@ -251,6 +268,22 @@ impl JackRuntime {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn next_available_port_slot(&self, prefix: &str) -> Result<usize, String> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("JACK client is not active".to_string())?
+            .as_client();
+        let client_name = client.name();
+        for idx in 0.. {
+            let name = format!("{client_name}:{prefix}_{}", idx + 1);
+            if client.port_by_name(&name).is_none() {
+                return Ok(idx);
+            }
+        }
+        unreachable!("usize iteration is unbounded")
     }
 
     fn wait_for_removed_audio_output_port(&mut self, idx: usize) -> Result<Port<AudioOut>, String> {
@@ -473,11 +506,11 @@ impl JackRuntime {
     }
 
     pub fn add_audio_input_port(&mut self) -> Result<usize, String> {
+        let next_index = self.next_available_port_slot("in")?;
         let client = self
             .client
             .as_ref()
             .ok_or("JACK client is not active".to_string())?;
-        let next_index = self.audio_ins.len();
         let port = client
             .as_client()
             .register_port(&format!("in_{}", next_index + 1), AudioIn::default())
@@ -487,11 +520,13 @@ impl JackRuntime {
                     next_index + 1
                 )
             })?;
-        if let Err(command) = self.send_port_command(JackPortCommand::AddAudioInput(port)) {
+        if let Err(command) =
+            self.send_port_command(JackPortCommand::AddAudioInput(next_index, port))
+        {
             // The callback never took ownership of the port; unregister it
             // so it does not leak into the JACK graph (jack-rs does not
             // unregister on drop).
-            let JackPortCommand::AddAudioInput(port) = command else {
+            let JackPortCommand::AddAudioInput(_, port) = command else {
                 unreachable!("command was just constructed above")
             };
             if let Some(client) = self.client.as_ref() {
@@ -499,17 +534,21 @@ impl JackRuntime {
             }
             return Err("JACK port command ring is full".to_string());
         }
-        self.audio_ins
-            .push(Arc::new(AudioIO::new(self.buffer_size)));
+        let bridge = Arc::new(AudioIO::new(self.buffer_size));
+        if next_index <= self.audio_ins.len() {
+            self.audio_ins.insert(next_index, bridge);
+        } else {
+            self.audio_ins.push(bridge);
+        }
         Ok(next_index + 1)
     }
 
     pub fn add_audio_output_port(&mut self) -> Result<usize, String> {
+        let next_index = self.next_available_port_slot("out")?;
         let client = self
             .client
             .as_ref()
             .ok_or("JACK client is not active".to_string())?;
-        let next_index = self.audio_outs.len();
         let port = client
             .as_client()
             .register_port(&format!("out_{}", next_index + 1), AudioOut::default())
@@ -519,11 +558,13 @@ impl JackRuntime {
                     next_index + 1
                 )
             })?;
-        if let Err(command) = self.send_port_command(JackPortCommand::AddAudioOutput(port)) {
+        if let Err(command) =
+            self.send_port_command(JackPortCommand::AddAudioOutput(next_index, port))
+        {
             // The callback never took ownership of the port; unregister it
             // so it does not leak into the JACK graph (jack-rs does not
             // unregister on drop).
-            let JackPortCommand::AddAudioOutput(port) = command else {
+            let JackPortCommand::AddAudioOutput(_, port) = command else {
                 unreachable!("command was just constructed above")
             };
             if let Some(client) = self.client.as_ref() {
@@ -531,8 +572,12 @@ impl JackRuntime {
             }
             return Err("JACK port command ring is full".to_string());
         }
-        self.audio_outs
-            .push(Arc::new(AudioIO::new(self.buffer_size)));
+        let bridge = Arc::new(AudioIO::new(self.buffer_size));
+        if next_index <= self.audio_outs.len() {
+            self.audio_outs.insert(next_index, bridge);
+        } else {
+            self.audio_outs.push(bridge);
+        }
         Ok(next_index + 1)
     }
 
@@ -574,6 +619,117 @@ impl JackRuntime {
             .unregister_port(port)
             .map_err(|e| format!("Failed to unregister JACK audio output port: {e}"))?;
         Ok(bridge)
+    }
+
+    pub fn graph_info(&self) -> Result<JackGraphInfo, String> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("JACK client is not active".to_string())?
+            .as_client();
+        let client_name = client.name();
+        let mut ports = Vec::new();
+        for (kind, port_type) in [
+            (Kind::Audio, AudioIn::default().jack_port_type()),
+            (Kind::MIDI, MidiIn::default().jack_port_type()),
+        ] {
+            ports.extend(
+                client
+                    .ports(None, Some(port_type), PortFlags::empty())
+                    .into_iter()
+                    .filter_map(|name| {
+                        let port = client.port_by_name(&name)?;
+                        let flags = port.flags();
+                        Some(JackPortInfo {
+                            name,
+                            kind,
+                            is_input: flags.contains(PortFlags::IS_INPUT),
+                            is_output: flags.contains(PortFlags::IS_OUTPUT),
+                            is_physical: flags.contains(PortFlags::IS_PHYSICAL),
+                            is_maolan: port
+                                .name()
+                                .is_ok_and(|name| name.starts_with(&format!("{client_name}:"))),
+                        })
+                    }),
+            );
+        }
+        ports.sort_by(|a, b| {
+            let kind_order = |kind| match kind {
+                Kind::Audio => 0,
+                Kind::MIDI => 1,
+            };
+            let trailing_number = |name: &str| {
+                let short = name
+                    .rsplit_once(':')
+                    .map(|(_, short)| short)
+                    .unwrap_or(name);
+                let digits = short
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>();
+                (!digits.is_empty())
+                    .then(|| digits.parse::<usize>().ok())
+                    .flatten()
+            };
+            a.is_maolan
+                .cmp(&b.is_maolan)
+                .reverse()
+                .then_with(|| a.is_physical.cmp(&b.is_physical).reverse())
+                .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
+                .then_with(|| trailing_number(&a.name).cmp(&trailing_number(&b.name)))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let mut connections = Vec::new();
+        for source in ports.iter().filter(|port| port.is_output) {
+            let Some(port) = client.port_by_name(&source.name) else {
+                continue;
+            };
+            for destination in port.get_connections() {
+                if ports.iter().any(|port| port.name == destination) {
+                    connections.push(JackConnectionInfo {
+                        source: source.name.clone(),
+                        destination,
+                    });
+                }
+            }
+        }
+        connections.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then_with(|| a.destination.cmp(&b.destination))
+        });
+        connections.dedup();
+
+        Ok(JackGraphInfo { ports, connections })
+    }
+
+    pub fn connect_ports_by_name(&self, source: &str, destination: &str) -> Result<(), String> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("JACK client is not active".to_string())?
+            .as_client();
+        client
+            .connect_ports_by_name(source, destination)
+            .map_err(|e| format!("Failed to connect JACK ports '{source}' -> '{destination}': {e}"))
+    }
+
+    pub fn disconnect_ports_by_name(&self, source: &str, destination: &str) -> Result<(), String> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("JACK client is not active".to_string())?
+            .as_client();
+        client
+            .disconnect_ports_by_name(source, destination)
+            .map_err(|e| {
+                format!("Failed to disconnect JACK ports '{source}' -> '{destination}': {e}")
+            })
     }
 
     pub fn midi_input_devices(&self) -> Vec<String> {
