@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 const BUFFER_COUNT: usize = 3;
@@ -32,7 +32,8 @@ pub struct TripleBufferProducer<T> {
 #[derive(Debug)]
 pub struct TripleBufferConsumer<T> {
     inner: Arc<Inner<T>>,
-    front: usize,
+    front: AtomicUsize,
+    active: AtomicBool,
 }
 
 pub fn triple_buffer<T: Clone>(initial: T) -> (TripleBufferProducer<T>, TripleBufferConsumer<T>) {
@@ -45,7 +46,11 @@ pub fn triple_buffer<T: Clone>(initial: T) -> (TripleBufferProducer<T>, TripleBu
             inner: inner.clone(),
             back: 2,
         },
-        TripleBufferConsumer { inner, front: 0 },
+        TripleBufferConsumer {
+            inner,
+            front: AtomicUsize::new(0),
+            active: AtomicBool::new(false),
+        },
     )
 }
 
@@ -79,10 +84,32 @@ impl<T> TripleBufferProducer<T> {
 
 impl<T> TripleBufferConsumer<T> {
     pub fn refresh(&mut self) -> bool {
+        self.refresh_inner().is_some()
+    }
+
+    pub fn read_buffer(&self) -> &T {
+        let front = self.front.load(Ordering::Acquire);
+        // Safety: callers using this low-level API must ensure no concurrent
+        // consumer refresh runs while the returned reference is live.
+        unsafe { &*self.inner.buffers[front].get() }
+    }
+
+    pub fn read_latest_clone(&self) -> Option<T>
+    where
+        T: Clone,
+    {
+        let _guard = self.try_enter()?;
+        let front = self.refresh_inner()?;
+        // Safety: `ConsumerAccess` serializes consumer refreshes/clones, and
+        // the producer never writes the current front buffer.
+        Some(unsafe { (&*self.inner.buffers[front].get()).clone() })
+    }
+
+    fn refresh_inner(&self) -> Option<usize> {
         let mut state = self.inner.state.load(Ordering::Acquire);
         loop {
             if !is_dirty(state) {
-                return false;
+                return None;
             }
             let front = front_index(state);
             let middle = middle_index(state);
@@ -95,17 +122,31 @@ impl<T> TripleBufferConsumer<T> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.front = middle;
-                    return true;
+                    self.front.store(middle, Ordering::Release);
+                    return Some(middle);
                 }
                 Err(current) => state = current,
             }
         }
     }
 
-    pub fn read_buffer(&self) -> &T {
-        // Safety: `self.front` is owned only by this consumer until `refresh`.
-        unsafe { &*self.inner.buffers[self.front].get() }
+    fn try_enter(&self) -> Option<ConsumerAccess<'_>> {
+        self.active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| ConsumerAccess {
+                active: &self.active,
+            })
+    }
+}
+
+struct ConsumerAccess<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for ConsumerAccess<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -160,6 +201,20 @@ mod tests {
         assert!(consumer.refresh());
         assert_eq!(*consumer.read_buffer(), 2);
         assert!(!consumer.refresh());
+    }
+
+    #[test]
+    fn shared_consumer_clones_latest_value_without_mutex() {
+        let (mut producer, consumer) = triple_buffer(0usize);
+
+        *producer.write_buffer() = 11;
+        producer.publish();
+        assert_eq!(consumer.read_latest_clone(), Some(11));
+        assert_eq!(consumer.read_latest_clone(), None);
+
+        *producer.write_buffer() = 12;
+        producer.publish();
+        assert_eq!(consumer.read_latest_clone(), Some(12));
     }
 
     #[test]

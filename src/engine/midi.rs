@@ -562,7 +562,7 @@ impl Engine {
         ignore: Option<MidiLearnSlot>,
     ) -> Vec<String> {
         let mut conflicts = Vec::<String>::new();
-        let state = self.state.lock();
+        let state = self.state_snapshot.load_full();
         let mut push_conflict = |slot: MidiLearnSlot, label: String| {
             if ignore.as_ref().is_some_and(|i| i == &slot) {
                 return;
@@ -724,7 +724,7 @@ impl Engine {
                 .await;
                 return;
             }
-            if let Some(track) = self.state.lock().tracks.get(&track_name) {
+            if let Some(track) = self.state_snapshot.load_full().tracks.get(&track_name) {
                 match target {
                     crate::message::TrackMidiLearnTarget::Volume => {
                         track.lock().midi_learn_volume = Some(binding.clone());
@@ -838,7 +838,8 @@ impl Engine {
         }
 
         let mut mapped_actions = Vec::<Action>::new();
-        for (track_name, track) in self.state.lock().tracks.iter() {
+        let state = self.state_snapshot.load_full();
+        for (track_name, track) in state.tracks.iter() {
             let t = track.lock();
             if let Some(binding) = t.midi_learn_volume.as_ref() {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
@@ -977,45 +978,46 @@ impl Engine {
                 }
             }
         }
+        let state = self.state_snapshot.load_full();
         for action in mapped_actions {
             match action {
                 Action::TrackLevel(ref track_name, level) => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().set_level(level);
                         self.notify_clients(Ok(Action::TrackLevel(track_name.clone(), level)))
                             .await;
                     }
                 }
                 Action::TrackBalance(ref track_name, balance) => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().set_balance(balance);
                         self.notify_clients(Ok(Action::TrackBalance(track_name.clone(), balance)))
                             .await;
                     }
                 }
                 Action::TrackToggleMute(ref track_name) => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().mute();
                         self.notify_clients(Ok(Action::TrackToggleMute(track_name.clone())))
                             .await;
                     }
                 }
                 Action::TrackTogglePhase(ref track_name) => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().invert_phase();
                         self.notify_clients(Ok(Action::TrackTogglePhase(track_name.clone())))
                             .await;
                     }
                 }
                 Action::TrackToggleSolo(ref track_name) => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().solo();
                         self.notify_clients(Ok(Action::TrackToggleSolo(track_name.clone())))
                             .await;
                     }
                 }
                 Action::TrackToggleMaster(ref track_name) => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         let can_toggle = {
                             let t = track.lock();
                             t.is_master() || !t.is_folder
@@ -1028,7 +1030,7 @@ impl Engine {
                     }
                 }
                 Action::TrackToggleArm(ref track_name) => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().arm();
                         self.notify_clients(Ok(Action::TrackToggleArm(track_name.clone())))
                             .await;
@@ -1038,7 +1040,7 @@ impl Engine {
                     ref track_name,
                     lane,
                 } => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().toggle_input_monitor(lane);
                         self.notify_clients(Ok(Action::TrackToggleInputMonitor {
                             track_name: track_name.clone(),
@@ -1051,7 +1053,7 @@ impl Engine {
                     ref track_name,
                     lane,
                 } => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().toggle_disk_monitor(lane);
                         self.notify_clients(Ok(Action::TrackToggleDiskMonitor {
                             track_name: track_name.clone(),
@@ -1064,7 +1066,7 @@ impl Engine {
                     ref track_name,
                     lane,
                 } => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().toggle_midi_input_monitor(lane);
                         self.notify_clients(Ok(Action::TrackToggleMidiInputMonitor {
                             track_name: track_name.clone(),
@@ -1077,7 +1079,7 @@ impl Engine {
                     ref track_name,
                     lane,
                 } => {
-                    if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    if let Some(track) = state.tracks.get(track_name) {
                         track.lock().toggle_midi_disk_monitor(lane);
                         self.notify_clients(Ok(Action::TrackToggleMidiDiskMonitor {
                             track_name: track_name.clone(),
@@ -1098,7 +1100,7 @@ impl Engine {
         self.pending_hw_midi_out_events.clear();
         self.pending_hw_midi_out_events_by_device.clear();
         {
-            let state = self.state.lock();
+            let state = self.state_snapshot.load_full();
             for track in state.tracks.values() {
                 track.lock().take_hw_midi_out_events();
             }
@@ -1140,7 +1142,8 @@ impl Engine {
         if let Some(b) = self.global_midi_learn_record_toggle.as_ref() {
             lines.push(format!("Global RecordToggle: {}", fmt_binding(b)));
         }
-        for (track_name, track) in self.state.lock().tracks.iter() {
+        let state = self.state_snapshot.load_full();
+        for (track_name, track) in state.tracks.iter() {
             let t = track.lock();
             if let Some(b) = t.midi_learn_volume.as_ref() {
                 lines.push(format!("{} Volume: {}", track_name, fmt_binding(b)));
@@ -1364,7 +1367,7 @@ impl Engine {
         self.session_midi_learn_stop_track.clear();
         self.session_midi_learn_stop_all = None;
         self.midi_cc_gate.clear();
-        for track in self.state.lock().tracks.values() {
+        for track in self.state_snapshot.load_full().tracks.values() {
             let mut t = track.lock();
             t.midi_learn_volume = None;
             t.midi_learn_balance = None;

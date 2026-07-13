@@ -464,9 +464,10 @@ impl Engine {
                 }
             }
         }
+        let state = self.state_snapshot.load_full();
         for (track_name, (level, balance)) in per_track {
             if let Some(level) = level
-                && let Some(track) = self.state.lock().tracks.get(&track_name).cloned()
+                && let Some(track) = state.tracks.get(&track_name).cloned()
             {
                 let t = track.lock();
                 if (t.level() - level).abs() > f32::EPSILON {
@@ -475,7 +476,7 @@ impl Engine {
                 }
             }
             if let Some(balance) = balance
-                && let Some(track) = self.state.lock().tracks.get(&track_name).cloned()
+                && let Some(track) = state.tracks.get(&track_name).cloned()
             {
                 let t = track.lock();
                 let next = balance.clamp(-1.0, 1.0);
@@ -487,12 +488,11 @@ impl Engine {
         }
 
         for (track_name, events) in midi_cc_events {
-            if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+            if let Some(track) = state.tracks.get(&track_name).cloned() {
                 track.lock().rt.pending_modulator_midi_events.extend(events);
             }
         }
 
-        let state = self.state.lock();
         for ((track_name, instance_id, param_id), value) in clap_params {
             if let Some(track) = state.tracks.get(&track_name).cloned()
                 && track
@@ -697,7 +697,58 @@ impl Engine {
                 let wrk = Worker::new(id, rx, tx_thread, 8);
                 wrk.await.work().await;
             });
-            self.workers.push(WorkerData::new(tx.clone(), handler));
+            let (node_job_tx, mut node_job_rx) = rtrb::RingBuffer::new(64);
+            let (mut node_result_tx, node_result_rx) = rtrb::RingBuffer::new(64);
+            let node_quit = Arc::new(AtomicBool::new(false));
+            let node_quit_thread = node_quit.clone();
+            let node_thread_handle = std::thread::Builder::new()
+                .name(format!("maolan-node-worker-{id}"))
+                .spawn(move || {
+                    crate::enable_flush_denormals_to_zero();
+                    if let Err(e) = Worker::try_enable_realtime(8) {
+                        tracing::warn!(
+                            "Node worker {} realtime priority {} not enabled: {}",
+                            id,
+                            8,
+                            e
+                        );
+                    }
+                    while !node_quit_thread.load(std::sync::atomic::Ordering::Acquire) {
+                        match node_job_rx.pop() {
+                            Ok(job) => {
+                                let mut result = Worker::process_node_job_result(id, job);
+                                loop {
+                                    match node_result_tx.push(result) {
+                                        Ok(()) => break,
+                                        Err(rtrb::PushError::Full(returned)) => {
+                                            if node_quit_thread
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                            {
+                                                break;
+                                            }
+                                            result = returned;
+                                            std::thread::yield_now();
+                                        }
+                                    }
+                                }
+                            }
+                            Err(rtrb::PopError::Empty) => {
+                                std::thread::park_timeout(Duration::from_micros(100));
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn node worker thread");
+            let node_thread = node_thread_handle.thread().clone();
+            std::mem::forget(node_thread_handle);
+            self.workers.push(WorkerData::with_node_mailbox(
+                tx.clone(),
+                handler,
+                node_job_tx,
+                node_result_rx,
+                node_thread,
+                node_quit,
+            ));
         }
     }
 
@@ -1273,7 +1324,13 @@ impl Engine {
     }
 
     pub(crate) fn preload_track_clips_spawn(&self) {
-        let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+        let tracks: Vec<_> = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .values()
+            .cloned()
+            .collect();
         for track in tracks {
             tokio::task::spawn_blocking(move || {
                 track.lock().preload_clips();
@@ -1292,7 +1349,13 @@ impl Engine {
     pub(crate) fn preload_track_clips(
         &self,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+        let tracks: Vec<_> = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .values()
+            .cloned()
+            .collect();
         Self::preload_track_handles(tracks)
     }
 
@@ -1384,10 +1447,24 @@ impl Engine {
             {
                 self.prepare_task_track(task);
             }
-            let worker = &self.workers[worker_index];
-            if let Err(e) = worker.tx.send(Message::NodeJob(job.clone())).await {
-                error!("Failed to send node job to worker: {e}");
-                let outcome = self.executor.abandon_node(job.node, Instant::now());
+            let worker = &mut self.workers[worker_index];
+            if let Some(node_job_tx) = worker.node_job_tx.as_mut() {
+                match node_job_tx.push(job) {
+                    Ok(()) => {
+                        if let Some(thread) = &worker.node_thread {
+                            thread.unpark();
+                        }
+                    }
+                    Err(rtrb::PushError::Full(job)) => {
+                        self.pending_node_jobs.push_front(job);
+                        self.push_ready_worker(worker_index);
+                        break;
+                    }
+                }
+            } else {
+                let node = job.node;
+                error!("Worker {worker_index} has no node-job mailbox");
+                let outcome = self.executor.abandon_node(node, Instant::now());
                 self.log_silenced_nodes(&outcome.silenced);
                 cycle_complete |= outcome.cycle_complete;
                 self.pending_node_jobs.extend(outcome.jobs);
@@ -1404,7 +1481,13 @@ impl Engine {
     /// `AudioIO.connections` is never mutated from a worker thread; marks
     /// the plan dirty when the wiring changed.
     fn ensure_metronome_wiring(&mut self) {
-        let Some(track) = self.state.lock().tracks.get(Self::METRONOME_TRACK).cloned() else {
+        let Some(track) = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .get(Self::METRONOME_TRACK)
+            .cloned()
+        else {
             return;
         };
         let frames = self.current_cycle_samples();
@@ -1479,6 +1562,169 @@ impl Engine {
         }
     }
 
+    pub(crate) async fn poll_node_worker_results(&mut self) {
+        let mut results = Vec::new();
+        for worker in &mut self.workers {
+            if let Some(rx) = worker.node_result_rx.as_mut() {
+                while let Ok(result) = rx.pop() {
+                    results.push(result);
+                }
+            }
+        }
+        for result in results {
+            self.on_node_done(
+                result.worker_id,
+                result.epoch,
+                result.node,
+                result.output_linear,
+                result.parameter_updates,
+            )
+            .await;
+        }
+    }
+
+    pub(crate) async fn poll_jack_hw_finished(&mut self) {
+        #[cfg(unix)]
+        {
+            let finished = self
+                .jack_runtime
+                .as_ref()
+                .map(|jack| jack.take_hw_finished_count())
+                .unwrap_or(0);
+            if finished > 0 {
+                self.handle_hw_finished().await;
+            }
+        }
+    }
+
+    pub(crate) async fn handle_hw_finished(&mut self) {
+        if !self.awaiting_hwfinished {
+            tracing::debug!("HWFinished ignored (not awaiting)");
+            return;
+        }
+        tracing::debug!("HWFinished handling; playing={}", self.playing);
+        self.handling_hwfinished = true;
+        self.awaiting_hwfinished = false;
+        #[cfg(unix)]
+        {
+            if let Some(jack) = self.jack_runtime.as_mut() {
+                if !self.pending_hw_midi_out_events.is_empty() {
+                    let out_events = std::mem::take(&mut self.pending_hw_midi_out_events);
+                    jack.write_events(&out_events);
+                }
+                let mut in_events = vec![];
+                jack.read_events_into(&mut in_events);
+                if !in_events.is_empty() {
+                    self.pending_hw_midi_events.extend(in_events);
+                }
+                let dropped = jack.take_midi_events_dropped();
+                if dropped > 0 {
+                    tracing::warn!(
+                        "JACK MIDI ring full; {dropped} events dropped since last cycle"
+                    );
+                }
+            }
+        }
+        #[cfg(unix)]
+        if self.jack_runtime.is_some() {
+            self.sync_from_jack_transport().await;
+        }
+        while let Some(a) = self.pending_requests.pop_front() {
+            self.handle_request(a).await;
+        }
+        self.apply_mute_solo_policy();
+        self.append_recorded_cycle();
+        self.flush_completed_recordings().await;
+        let hw_in_routes = self.midi_hw_in_routes.clone();
+        let pending_hw_in_by_device = self.pending_hw_midi_events_by_device.clone();
+        let mut reconfigured_tracks = Vec::new();
+        let state = self.state_snapshot.load_full();
+        for (track_name, track) in state.tracks.iter() {
+            let mut track_lock = track.lock();
+            if self.jack_runtime_is_some() {
+                if !self.pending_hw_midi_events.is_empty() {
+                    track_lock.push_hw_midi_events(&self.pending_hw_midi_events);
+                }
+            } else {
+                for route in hw_in_routes.iter().filter(|r| &r.to_track == track_name) {
+                    if let Some(events) = pending_hw_in_by_device.get(&route.device) {
+                        track_lock.push_hw_midi_events_to_port(route.to_port, events);
+                    }
+                }
+            }
+            if track_lock.setup() {
+                reconfigured_tracks.push(track_name.clone());
+            }
+        }
+        self.publish_track_meters();
+        self.publish_session_runtime_reports().await;
+        self.publish_clap_state_dirty().await;
+        for track_name in reconfigured_tracks {
+            let track = state.tracks.get(&track_name).cloned();
+            if let Some(track) = track {
+                let (plugins, connections, connectable_connections) = {
+                    let track_lock = track.lock();
+                    (
+                        track_lock.plugin_graph_plugins(false),
+                        track_lock.plugin_graph_connections(),
+                        track_lock.connectable_connections(),
+                    )
+                };
+                self.notify_clients(Ok(Action::TrackPluginGraph {
+                    track_name: track_name.clone(),
+                    plugins,
+                    connections,
+                    connectable_connections,
+                }))
+                .await;
+            }
+        }
+        self.pending_hw_midi_events.clear();
+        self.pending_hw_midi_events_by_device.clear();
+        if self.transport_running {
+            if self.transport_panic_flush_pending {
+                self.transport_panic_flush_pending = false;
+            } else if self.transport_restart_pending {
+                self.transport_restart_pending = false;
+            } else {
+                let next = self
+                    .transport_sample
+                    .saturating_add(self.current_cycle_samples());
+                let normalized = self.normalize_transport_sample(next);
+                let wrapped = normalized != next;
+                self.transport_sample = normalized;
+                self.publish_transport_snapshot();
+                if wrapped {
+                    if self.notified_loop_wrap_sample == Some(self.transport_sample) {
+                        self.notified_loop_wrap_sample = None;
+                    } else {
+                        self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+                            .await;
+                    }
+                }
+            }
+        }
+        if self.session_clip_playback_enabled && self.playing {
+            self.session_transport_sample = self
+                .session_transport_sample
+                .saturating_add(self.current_cycle_samples());
+        }
+        {
+            let echoes = self.apply_modulators(self.active_transport_sample());
+            for action in echoes {
+                self.notify_clients(Ok(action)).await;
+            }
+        }
+        self.start_plan_cycle().await;
+        #[cfg(unix)]
+        {
+            if self.jack_runtime.is_some() {
+                self.awaiting_hwfinished = true;
+            }
+        }
+        self.handling_hwfinished = false;
+    }
+
     /// Periodic tick (called from the engine loop's interval): force
     /// timed-out nodes even when no worker message arrives.
     pub(crate) async fn on_executor_tick(&mut self) {
@@ -1550,7 +1796,7 @@ impl Engine {
             self.send_bounce_job(worker_index, job).await;
         }
         if self.transport_restart_pending {
-            let state = self.state.lock();
+            let state = self.state_snapshot.load_full();
             for track in state.tracks.values() {
                 track.lock().take_hw_midi_out_events();
             }
@@ -1606,8 +1852,8 @@ impl Engine {
             return;
         }
         let tracks: Vec<(String, crate::state::TrackHandle)> = self
-            .state
-            .lock()
+            .state_snapshot
+            .load_full()
             .tracks
             .iter()
             .map(|(name, track)| (name.clone(), track.clone()))
@@ -1639,7 +1885,7 @@ impl Engine {
 
         let mut current = HashMap::<(String, usize), (SessionSlotState, usize, usize)>::new();
         {
-            let state = self.state.lock();
+            let state = self.state_snapshot.load_full();
             for (track_name, track) in &state.tracks {
                 let track = track.lock();
                 for launch in &track.rt.pending_session_launches {
@@ -1680,8 +1926,8 @@ impl Engine {
 
     pub(crate) async fn publish_clap_state_dirty(&mut self) {
         let tracks: Vec<(String, crate::state::TrackHandle)> = self
-            .state
-            .lock()
+            .state_snapshot
+            .load_full()
             .tracks
             .iter()
             .map(|(name, track)| (name.clone(), track.clone()))
@@ -1711,8 +1957,8 @@ impl Engine {
         self.latest_hw_out_meter_db = Arc::new(vec![-90.0; hw_channels]);
 
         let tracks: Vec<(String, crate::state::TrackHandle)> = self
-            .state
-            .lock()
+            .state_snapshot
+            .load_full()
             .tracks
             .iter()
             .map(|(name, track)| (name.clone(), track.clone()))
@@ -1852,7 +2098,7 @@ impl Engine {
         // destructors. Without this, the kernel's dsp_close
         // drains pending audio buffers for up to CHN_TIMEOUT
         // (5s) during process teardown.
-        if let Some(worker) = self.hw_worker.take() {
+        if let Some(mut worker) = self.hw_worker.take() {
             // Send MIDI panic (All Sound Off) for any active
             // notes before stopping the worker.
             let panic_events = self.panic_events_for_all_hw_midi_outputs();
@@ -1864,10 +2110,11 @@ impl Engine {
             if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
                 error!("Error sending quit message to HW worker: {e}");
             }
-            worker
-                .handle
-                .await
-                .unwrap_or_else(|e| error!("Error waiting for HW worker to quit: {e}"));
+            if let Some(handle) = worker.handle.take() {
+                handle
+                    .await
+                    .unwrap_or_else(|e| error!("Error waiting for HW worker to quit: {e}"));
+            }
         }
         // Explicitly close audio and MIDI fds before sending
         // the Quit response. The GUI calls exit(0) upon
@@ -1887,14 +2134,15 @@ impl Engine {
         self.notify_clients(Ok(Action::Quit)).await;
         self.ready_workers.clear();
         while !self.workers.is_empty() {
-            let worker = self.workers.remove(0);
+            let mut worker = self.workers.remove(0);
             if let Err(e) = worker.tx.send(Message::Request(a.clone())).await {
                 error!("Error sending quit message to worker: {e}");
             }
-            worker
-                .handle
-                .await
-                .unwrap_or_else(|e| error!("Error waiting for worker to quit: {e}"));
+            if let Some(handle) = worker.handle.take() {
+                handle
+                    .await
+                    .unwrap_or_else(|e| error!("Error waiting for worker to quit: {e}"));
+            }
         }
         #[cfg(unix)]
         {
@@ -1966,13 +2214,13 @@ impl Engine {
             Action::SessionMidiLearnTriggered { .. } => {}
             Action::SetClipPlaybackEnabled(enabled) => {
                 self.clip_playback_enabled = enabled;
-                for track in self.state.lock().tracks.values() {
+                for track in self.state_snapshot.load_full().tracks.values() {
                     track.lock().set_clip_playback_enabled(enabled);
                 }
             }
             Action::SetSessionClipPlaybackEnabled(enabled) => {
                 self.session_clip_playback_enabled = enabled;
-                for track in self.state.lock().tracks.values() {
+                for track in self.state_snapshot.load_full().tracks.values() {
                     track.lock().set_session_clip_playback_enabled(enabled);
                 }
             }
@@ -2008,7 +2256,13 @@ impl Engine {
                 if enabled {
                     self.ensure_metronome_track().await;
                 }
-                if let Some(track) = self.state.lock().tracks.get(Self::METRONOME_TRACK).cloned() {
+                if let Some(track) = self
+                    .state_snapshot
+                    .load_full()
+                    .tracks
+                    .get(Self::METRONOME_TRACK)
+                    .cloned()
+                {
                     track.lock().set_metronome_enabled(enabled);
                 }
             }
@@ -2055,7 +2309,7 @@ impl Engine {
                 ref lanes,
                 mode,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     let mut track = track.lock();
                     track.automation_lanes = lanes.clone();
                     track.set_automation_mode(mode);
@@ -2080,12 +2334,24 @@ impl Engine {
                 ref track_name,
                 mode,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+                if let Some(track) = self
+                    .state_snapshot
+                    .load_full()
+                    .tracks
+                    .get(track_name)
+                    .cloned()
+                {
                     track.lock().set_automation_mode(mode);
                 }
             }
             Action::RequestTrackList => {
-                let names: Vec<String> = self.state.lock().tracks.keys().cloned().collect();
+                let names: Vec<String> = self
+                    .state_snapshot
+                    .load_full()
+                    .tracks
+                    .keys()
+                    .cloned()
+                    .collect();
                 self.notify_clients(Ok(Action::TrackList(names))).await;
             }
             Action::TrackList(_) => {}
@@ -2138,7 +2404,7 @@ impl Engine {
                 self.ensure_session_subdirs();
                 #[cfg(all(unix, not(target_os = "macos")))]
                 let _lv2_dir = self.session_plugins_dir();
-                for track in self.state.lock().tracks.values() {
+                for track in self.state_snapshot.load_full().tracks.values() {
                     track.lock().set_session_base_dir(self.session_dir.clone());
                 }
             }
@@ -2216,14 +2482,14 @@ impl Engine {
             Action::TrackLevel(ref name, level) => {
                 if name == "hw:out" {
                     self.hw_out_level_db = level;
-                } else if let Some(track) = self.state.lock().tracks.get(name) {
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().set_level(level);
                 }
             }
             Action::TrackBalance(ref name, balance) => {
                 if name == "hw:out" {
                     self.hw_out_balance = balance.clamp(-1.0, 1.0);
-                } else if let Some(track) = self.state.lock().tracks.get(name) {
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().set_balance(balance);
                 }
             }
@@ -2231,14 +2497,14 @@ impl Engine {
                 tracing::debug!(%name, level, "engine received TrackAutomationLevel");
                 if name == "hw:out" {
                     self.hw_out_level_db = level;
-                } else if let Some(track) = self.state.lock().tracks.get(name) {
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().set_level(level);
                 }
             }
             Action::TrackAutomationBalance(ref name, balance) => {
                 if name == "hw:out" {
                     self.hw_out_balance = balance.clamp(-1.0, 1.0);
-                } else if let Some(track) = self.state.lock().tracks.get(name) {
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().set_balance(balance);
                 }
             }
@@ -2265,12 +2531,12 @@ impl Engine {
             Action::TrackToggleMute(ref name) => {
                 if name == "hw:out" {
                     self.hw_out_muted = !self.hw_out_muted;
-                } else if let Some(track) = self.state.lock().tracks.get(name) {
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().mute();
                 }
             }
             Action::TrackTogglePhase(ref name) => {
-                if let Some(track) = self.state.lock().tracks.get(name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().invert_phase();
                 }
             }
@@ -2278,12 +2544,12 @@ impl Engine {
                 if name == "hw:out" {
                     return;
                 }
-                if let Some(track) = self.state.lock().tracks.get(name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().solo();
                 }
             }
             Action::TrackToggleMaster(ref name) => {
-                if let Some(track) = self.state.lock().tracks.get(name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().toggle_master();
                 }
             }
@@ -2291,7 +2557,7 @@ impl Engine {
                 ref track_name,
                 lane,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     track.lock().toggle_input_monitor(lane);
                 }
             }
@@ -2299,7 +2565,7 @@ impl Engine {
                 ref track_name,
                 lane,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     track.lock().toggle_disk_monitor(lane);
                 }
             }
@@ -2307,7 +2573,7 @@ impl Engine {
                 ref track_name,
                 lane,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     track.lock().toggle_midi_input_monitor(lane);
                 }
             }
@@ -2315,7 +2581,7 @@ impl Engine {
                 ref track_name,
                 lane,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     track.lock().toggle_midi_disk_monitor(lane);
                 }
             }
@@ -2323,7 +2589,7 @@ impl Engine {
                 ref track_name,
                 color,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     track.lock().color = color;
                 }
             }
@@ -2412,7 +2678,7 @@ impl Engine {
                 velocity,
                 on,
             } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     let status = if on { 0x90 } else { 0x80 };
                     let event = MidiEvent::new(0, vec![status, note.min(127), velocity.min(127)]);
                     track.lock().push_hw_midi_events(&[event]);
@@ -3156,9 +3422,9 @@ impl Engine {
         self.notify_clients(Ok(action_to_process)).await;
     }
     pub async fn work(&mut self) {
-        // Periodic tick so timed-out nodes are force-completed even when no
-        // worker message arrives (e.g. a fully hung cycle).
-        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        // Periodic tick drains fixed-thread node-worker result rings and
+        // force-completes timed-out nodes even when no worker result arrives.
+        let mut tick = tokio::time::interval(Duration::from_millis(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let message = tokio::select! {
@@ -3169,10 +3435,14 @@ impl Engine {
                     message
                 }
                 _ = tick.tick() => {
+                    self.poll_node_worker_results().await;
+                    self.poll_jack_hw_finished().await;
                     self.on_executor_tick().await;
                     continue;
                 }
             };
+            self.poll_node_worker_results().await;
+            self.poll_jack_hw_finished().await;
             match message {
                 Message::Ready(id) => {
                     // A bounce worker's terminal Ready cleans up its job even
@@ -3267,7 +3537,8 @@ impl Engine {
                     let hw_in_routes = self.midi_hw_in_routes.clone();
                     let pending_hw_in_by_device = self.pending_hw_midi_events_by_device.clone();
                     let mut reconfigured_tracks = Vec::new();
-                    for (track_name, track) in self.state.lock().tracks.iter() {
+                    let state = self.state_snapshot.load_full();
+                    for (track_name, track) in state.tracks.iter() {
                         let mut track_lock = track.lock();
                         if self.jack_runtime_is_some() {
                             if !self.pending_hw_midi_events.is_empty() {
@@ -3288,7 +3559,7 @@ impl Engine {
                     self.publish_session_runtime_reports().await;
                     self.publish_clap_state_dirty().await;
                     for track_name in reconfigured_tracks {
-                        let track = self.state.lock().tracks.get(&track_name).cloned();
+                        let track = state.tracks.get(&track_name).cloned();
                         if let Some(track) = track {
                             let (plugins, connections, connectable_connections) = {
                                 let track_lock = track.lock();
@@ -3405,7 +3676,7 @@ impl Engine {
 
     pub(crate) fn collect_hw_midi_output_events(&self) -> Vec<MidiEvent> {
         let mut events = vec![];
-        for track in self.state.lock().tracks.values() {
+        for track in self.state_snapshot.load_full().tracks.values() {
             events.extend(
                 track
                     .lock()
@@ -3423,7 +3694,7 @@ impl Engine {
         let routes = self.midi_hw_out_routes.clone();
         let mut events_by_track = HashMap::<String, Vec<crate::track::HwMidiOutEvent>>::new();
         {
-            let state = self.state.lock();
+            let state = self.state_snapshot.load_full();
             for route in &routes {
                 if events_by_track.contains_key(&route.from_track) {
                     continue;

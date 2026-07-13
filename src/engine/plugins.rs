@@ -106,7 +106,7 @@ impl Engine {
         clip_index: usize,
         plugin_graph_json: Option<serde_json::Value>,
     ) {
-        if let Some(track) = self.state.lock().tracks.get(track_name) {
+        if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
             let track = track.lock();
             track.audio.update_clip(clip_index, |clip| {
                 clip.plugin_graph_json = plugin_graph_json;

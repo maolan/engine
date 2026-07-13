@@ -16,6 +16,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 
+pub(crate) struct NodeJobResult {
+    pub(crate) worker_id: usize,
+    pub(crate) epoch: u64,
+    pub(crate) node: u32,
+    pub(crate) output_linear: Vec<f32>,
+    pub(crate) parameter_updates: Vec<Action>,
+}
+
 #[derive(Debug)]
 pub struct Worker {
     id: usize,
@@ -366,7 +374,7 @@ impl Worker {
     }
 
     #[cfg(unix)]
-    fn try_enable_realtime(priority: i32) -> Result<(), String> {
+    pub(crate) fn try_enable_realtime(priority: i32) -> Result<(), String> {
         let thread = unsafe { libc::pthread_self() };
         let policy = libc::SCHED_FIFO;
         let param = unsafe {
@@ -383,7 +391,7 @@ impl Worker {
     }
 
     #[cfg(not(unix))]
-    fn try_enable_realtime(_priority: i32) -> Result<(), String> {
+    pub(crate) fn try_enable_realtime(_priority: i32) -> Result<(), String> {
         Err("Realtime thread priority is not supported on this platform".to_string())
     }
 
@@ -443,7 +451,7 @@ impl Worker {
     /// (it still re-sums its inputs from the port graph — identical to the
     /// plan's `Sum` result) and then copy their output ports into the arena
     /// so downstream `Sum` nodes and the hardware drain see the result.
-    async fn process_node_job(&self, job: NodeJob) {
+    pub(crate) fn process_node_job_result(worker_id: usize, job: NodeJob) -> NodeJobResult {
         let NodeJob { epoch, plan, node } = job;
         let (output_linear, parameter_updates) = match &plan.nodes[node as usize] {
             Op::Zero { output } => {
@@ -510,16 +518,18 @@ impl Worker {
                 (meter, updates)
             }
         };
-        let _ = self
-            .tx
-            .send(Message::NodeDone {
-                worker_id: self.id,
-                epoch,
-                node,
-                output_linear,
-                parameter_updates,
-            })
-            .await;
+        NodeJobResult {
+            worker_id,
+            epoch,
+            node,
+            output_linear,
+            parameter_updates,
+        }
+    }
+
+    async fn process_node_job(&self, job: NodeJob) {
+        let result = Self::process_node_job_result(self.id, job);
+        let _ = self.tx.send(result.into()).await;
     }
 
     pub async fn work(&mut self) {
@@ -545,6 +555,18 @@ impl Worker {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+impl From<NodeJobResult> for Message {
+    fn from(result: NodeJobResult) -> Self {
+        Message::NodeDone {
+            worker_id: result.worker_id,
+            epoch: result.epoch,
+            node: result.node,
+            output_linear: result.output_linear,
+            parameter_updates: result.parameter_updates,
         }
     }
 }

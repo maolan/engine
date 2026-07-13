@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use super::init;
@@ -10,9 +10,9 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 #[derive(Debug, Clone)]
 pub struct Client {
     pub sender: Sender<Message>,
-    meter_consumer: Arc<Mutex<TripleBufferConsumer<MeterSnapshot>>>,
-    transport_consumer: Arc<Mutex<TripleBufferConsumer<TransportSnapshot>>>,
-    session_runtime_consumer: Arc<Mutex<TripleBufferConsumer<SessionRuntimeSnapshot>>>,
+    meter_consumer: Arc<TripleBufferConsumer<MeterSnapshot>>,
+    transport_consumer: Arc<TripleBufferConsumer<TransportSnapshot>>,
+    session_runtime_consumer: Arc<TripleBufferConsumer<SessionRuntimeSnapshot>>,
     _handle: Arc<JoinHandle<()>>,
 }
 
@@ -21,9 +21,9 @@ impl Default for Client {
         let (sender, handle, meter_consumer, transport_consumer, session_runtime_consumer) = init();
         Self {
             sender,
-            meter_consumer: Arc::new(Mutex::new(meter_consumer)),
-            transport_consumer: Arc::new(Mutex::new(transport_consumer)),
-            session_runtime_consumer: Arc::new(Mutex::new(session_runtime_consumer)),
+            meter_consumer: Arc::new(meter_consumer),
+            transport_consumer: Arc::new(transport_consumer),
+            session_runtime_consumer: Arc::new(session_runtime_consumer),
             _handle: Arc::new(handle),
         }
     }
@@ -47,26 +47,14 @@ impl Client {
     }
 
     pub fn meter_snapshot(&self) -> Option<MeterSnapshot> {
-        let mut consumer = self
-            .meter_consumer
-            .lock()
-            .expect("meter snapshot consumer lock poisoned");
-        consumer.refresh().then(|| consumer.read_buffer().clone())
+        self.meter_consumer.read_latest_clone()
     }
 
     pub fn transport_snapshot(&self) -> Option<TransportSnapshot> {
-        let mut consumer = self
-            .transport_consumer
-            .lock()
-            .expect("transport snapshot consumer lock poisoned");
-        consumer.refresh().then(|| consumer.read_buffer().clone())
+        self.transport_consumer.read_latest_clone()
     }
 
     pub fn session_runtime_snapshot(&self) -> Option<SessionRuntimeSnapshot> {
-        let mut consumer = self
-            .session_runtime_consumer
-            .lock()
-            .expect("session runtime snapshot consumer lock poisoned");
-        consumer.refresh().then(|| consumer.read_buffer().clone())
+        self.session_runtime_consumer.read_latest_clone()
     }
 }

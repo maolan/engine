@@ -61,17 +61,84 @@ use crate::{
     midi::io::MidiEvent,
     osc::OscServer,
     state::{State, StateSlot},
+    workers::worker::NodeJobResult,
 };
 
-#[derive(Debug)]
+struct RtProducer<T>(rtrb::Producer<T>);
+
+// Safety: each producer is owned only by the engine task and is never shared
+// with the consumer thread. The `Sync` impl only permits the engine future to
+// remain `Send` across `.await`; no concurrent access is introduced.
+unsafe impl<T: Send> Send for RtProducer<T> {}
+unsafe impl<T: Send> Sync for RtProducer<T> {}
+
+impl<T> RtProducer<T> {
+    fn push(&mut self, value: T) -> Result<(), rtrb::PushError<T>> {
+        self.0.push(value)
+    }
+}
+
+struct RtConsumer<T>(rtrb::Consumer<T>);
+
+// Safety: each consumer is owned only by the engine task and is never shared
+// with the producer thread. See `RtProducer` for the `Sync` rationale.
+unsafe impl<T: Send> Send for RtConsumer<T> {}
+unsafe impl<T: Send> Sync for RtConsumer<T> {}
+
+impl<T> RtConsumer<T> {
+    fn pop(&mut self) -> Result<T, rtrb::PopError> {
+        self.0.pop()
+    }
+}
+
 struct WorkerData {
     tx: Sender<Message>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
+    node_job_tx: Option<RtProducer<crate::executor::NodeJob>>,
+    node_result_rx: Option<RtConsumer<NodeJobResult>>,
+    node_thread: Option<std::thread::Thread>,
+    node_quit: Option<Arc<AtomicBool>>,
 }
 
 impl WorkerData {
     pub fn new(tx: Sender<Message>, handle: JoinHandle<()>) -> Self {
-        Self { tx, handle }
+        Self {
+            tx,
+            handle: Some(handle),
+            node_job_tx: None,
+            node_result_rx: None,
+            node_thread: None,
+            node_quit: None,
+        }
+    }
+
+    pub fn with_node_mailbox(
+        tx: Sender<Message>,
+        handle: JoinHandle<()>,
+        node_job_tx: rtrb::Producer<crate::executor::NodeJob>,
+        node_result_rx: rtrb::Consumer<NodeJobResult>,
+        node_thread: std::thread::Thread,
+        node_quit: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            tx,
+            handle: Some(handle),
+            node_job_tx: Some(RtProducer(node_job_tx)),
+            node_result_rx: Some(RtConsumer(node_result_rx)),
+            node_thread: Some(node_thread),
+            node_quit: Some(node_quit),
+        }
+    }
+}
+
+impl Drop for WorkerData {
+    fn drop(&mut self) {
+        if let Some(quit) = &self.node_quit {
+            quit.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(thread) = &self.node_thread {
+            thread.unpark();
+        }
     }
 }
 

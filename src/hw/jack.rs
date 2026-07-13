@@ -11,7 +11,6 @@ use jack::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::Sender;
 
 /// Capacity of the SPSC MIDI rings between the JACK callback and the engine
 /// thread, in events. One ring-full covers ~85 note-ons per 12 ms cycle.
@@ -75,7 +74,7 @@ struct Process {
     output_balance: Arc<AtomicU32>,
     port_command_consumer: rtrb::Consumer<JackPortCommand>,
     port_response_producer: rtrb::Producer<JackPortResponse>,
-    tx_engine: Sender<crate::message::Message>,
+    hw_finished_count: Arc<AtomicU64>,
 }
 
 impl Process {
@@ -218,7 +217,7 @@ impl ProcessHandler for Process {
         self.collect_midi_input(ps);
         self.copy_audio_outputs(ps);
         self.emit_midi_output(ps);
-        let _ = self.tx_engine.try_send(crate::message::Message::HWFinished);
+        self.hw_finished_count.fetch_add(1, Ordering::Release);
         Control::Continue
     }
 }
@@ -234,6 +233,7 @@ pub struct JackRuntime {
     midi_in_dropped: Arc<AtomicU64>,
     output_gain_linear: Arc<AtomicU32>,
     output_balance: Arc<AtomicU32>,
+    hw_finished_count: Arc<AtomicU64>,
     port_command_producer: rtrb::Producer<JackPortCommand>,
     port_response_consumer: rtrb::Consumer<JackPortResponse>,
     midi_input_count: usize,
@@ -306,7 +306,6 @@ impl JackRuntime {
     pub fn new(
         client_name: &str,
         config: Config,
-        tx_engine: Sender<crate::message::Message>,
         plan_slot: Arc<crate::render_plan::PlanSlot>,
     ) -> Result<Self, String> {
         let (client, _status) = Client::new(client_name, ClientOptions::NO_START_SERVER)
@@ -360,6 +359,7 @@ impl JackRuntime {
         let midi_in_dropped = Arc::new(AtomicU64::new(0));
         let output_gain_linear = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let output_balance = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let hw_finished_count = Arc::new(AtomicU64::new(0));
 
         let process = Process {
             audio_in_ports,
@@ -374,7 +374,7 @@ impl JackRuntime {
             output_balance: output_balance.clone(),
             port_command_consumer,
             port_response_producer,
-            tx_engine,
+            hw_finished_count: hw_finished_count.clone(),
         };
 
         let client = client
@@ -390,6 +390,7 @@ impl JackRuntime {
             midi_in_dropped,
             output_gain_linear,
             output_balance,
+            hw_finished_count,
             port_command_producer,
             port_response_consumer,
             midi_input_count: config.midi_inputs,
@@ -418,6 +419,10 @@ impl JackRuntime {
     /// directions share the counter).
     pub fn take_midi_events_dropped(&self) -> u64 {
         self.midi_in_dropped.swap(0, Ordering::Relaxed)
+    }
+
+    pub fn take_hw_finished_count(&self) -> u64 {
+        self.hw_finished_count.swap(0, Ordering::Acquire)
     }
 
     pub fn set_output_gain_linear(&self, gain: f32) {

@@ -141,7 +141,8 @@ impl Engine {
         if !self.playing || !self.record_enabled {
             return;
         }
-        for (name, track_handle) in &self.state.lock().tracks {
+        let state = self.state_snapshot.load_full();
+        for (name, track_handle) in &state.tracks {
             let track = track_handle.lock();
             if !track.armed() {
                 continue;
@@ -450,20 +451,20 @@ impl Engine {
             start_sample,
             start_sample.saturating_add(length.max(1)),
         );
-        let (audio_ins, audio_outs) = if let Some(track) = self.state.lock().tracks.get(&track_name)
-        {
-            let track = track.lock();
-            let audio_ins = track.audio.ins.len();
-            let audio_outs = track.audio.outs.len();
-            track.audio.push_clip(clip.clone());
-            (audio_ins, audio_outs)
-        } else {
-            tracing::warn!(
-                "flush_recording_entry: track '{}' not found in engine state",
-                track_name
-            );
-            (0, 0)
-        };
+        let (audio_ins, audio_outs) =
+            if let Some(track) = self.state_snapshot.load_full().tracks.get(&track_name) {
+                let track = track.lock();
+                let audio_ins = track.audio.ins.len();
+                let audio_outs = track.audio.outs.len();
+                track.audio.push_clip(clip.clone());
+                (audio_ins, audio_outs)
+            } else {
+                tracing::warn!(
+                    "flush_recording_entry: track '{}' not found in engine state",
+                    track_name
+                );
+                (0, 0)
+            };
         let clip_id = crate::message::generate_clip_id();
         clip.id.clone_from(&clip_id);
         self.notify_clients(Ok(Action::AddClip {
@@ -491,7 +492,13 @@ impl Engine {
             plugin_graph_json: Some(Self::default_clip_plugin_graph_json(audio_ins, audio_outs)),
         }))
         .await;
-        if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+        if let Some(track) = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .get(&track_name)
+            .cloned()
+        {
             tokio::task::spawn_blocking(move || {
                 track.lock().preload_clips();
                 tracing::debug!("Preloaded clips for track '{}' after recording", track_name);
@@ -607,7 +614,7 @@ impl Engine {
         clip.offset = 0;
         let clip_id = crate::message::generate_clip_id();
         clip.id.clone_from(&clip_id);
-        if let Some(track) = self.state.lock().tracks.get(&track_name) {
+        if let Some(track) = self.state_snapshot.load_full().tracks.get(&track_name) {
             track.lock().midi.push_clip(clip);
         }
         self.notify_clients(Ok(Action::AddClip {
@@ -635,7 +642,13 @@ impl Engine {
             plugin_graph_json: None,
         }))
         .await;
-        if let Some(track) = self.state.lock().tracks.get(&track_name).cloned() {
+        if let Some(track) = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .get(&track_name)
+            .cloned()
+        {
             tokio::task::spawn_blocking(move || {
                 track.lock().preload_clips();
                 tracing::debug!(
@@ -789,7 +802,13 @@ impl Engine {
                 launch_quantization,
             } => {
                 let launch_at_sample = quantize(quantize_reference_sample, launch_quantization);
-                let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+                let tracks: Vec<_> = self
+                    .state_snapshot
+                    .load_full()
+                    .tracks
+                    .values()
+                    .cloned()
+                    .collect();
                 for track in tracks {
                     let mut track_lock = track.lock();
                     let Some(slot) = track_lock.rt.session_slots.get(&scene_index) else {
@@ -822,7 +841,13 @@ impl Engine {
                 launch_quantization,
             } => {
                 let stop_at_sample = quantize(quantize_reference_sample, launch_quantization);
-                let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+                let tracks: Vec<_> = self
+                    .state_snapshot
+                    .load_full()
+                    .tracks
+                    .values()
+                    .cloned()
+                    .collect();
                 for track in tracks {
                     track
                         .lock()
@@ -831,7 +856,13 @@ impl Engine {
             }
             SessionAction::StopAllClips => {
                 let stop_at_sample = quantize(quantize_reference_sample, LaunchQuantization::Bar);
-                let tracks: Vec<_> = self.state.lock().tracks.values().cloned().collect();
+                let tracks: Vec<_> = self
+                    .state_snapshot
+                    .load_full()
+                    .tracks
+                    .values()
+                    .cloned()
+                    .collect();
                 for track in tracks {
                     let mut track = track.lock();
                     for clip in &mut track.rt.playing_session_clips {
@@ -854,7 +885,8 @@ impl Engine {
             vst3_instance_count,
             clap_instance_count,
         ) = {
-            let tracks = &self.state.lock().tracks;
+            let state = self.state_snapshot.load_full();
+            let tracks = &state.tracks;
             let mut track_count = 0usize;
             let mut frozen_track_count = 0usize;
             let mut audio_clip_count = 0usize;
@@ -1057,7 +1089,7 @@ impl Engine {
 
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = false;
-        for track in self.state.lock().tracks.values() {
+        for track in self.state_snapshot.load_full().tracks.values() {
             let mut t = track.lock();
             t.set_clip_playback_enabled(false);
             t.set_session_clip_playback_enabled(false);
@@ -1104,7 +1136,7 @@ impl Engine {
         self.clip_playback_enabled = true;
         self.session_clip_playback_enabled = false;
         self.session_transport_sample = 0;
-        for track in self.state.lock().tracks.values() {
+        for track in self.state_snapshot.load_full().tracks.values() {
             let mut t = track.lock();
             t.set_clip_playback_enabled(true);
             t.set_session_clip_playback_enabled(false);
@@ -1232,7 +1264,13 @@ impl Engine {
             return false;
         };
 
-        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+        if let Some(track) = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .get(track_name)
+            .cloned()
+        {
             let mut track = track.lock();
             let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
             let lane = match lanes.iter_mut().find(|lane| lane.target == *target) {
@@ -1335,7 +1373,13 @@ impl Engine {
             return false;
         };
 
-        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+        if let Some(track) = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .get(track_name)
+            .cloned()
+        {
             let mut track = track.lock();
             let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
             if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == *target) {
@@ -1384,7 +1428,13 @@ impl Engine {
             return false;
         };
 
-        if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
+        if let Some(track) = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .get(track_name)
+            .cloned()
+        {
             let mut track = track.lock();
             let mut lanes = Self::parse_automation_lanes(&track.automation_lanes);
             if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == *target) {

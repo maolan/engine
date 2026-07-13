@@ -207,7 +207,6 @@ impl Engine {
         match JackRuntime::new(
             "maolan",
             crate::hw::jack::Config::default(),
-            self.tx.clone(),
             self.plan_slot.clone(),
         ) {
             Ok(runtime) => {
@@ -216,12 +215,14 @@ impl Engine {
                 let midi_inputs = runtime.midi_input_devices();
                 let midi_outputs = runtime.midi_output_devices();
                 let rate = runtime.sample_rate;
-                if let Some(worker) = self.hw_worker.take() {
+                if let Some(mut worker) = self.hw_worker.take() {
                     if let Some(hw) = self.hw_driver.as_mut() {
                         hw.request_stop();
                     }
                     let _ = worker.tx.send(Message::Request(Action::Quit)).await;
-                    let _ = worker.handle.await;
+                    if let Some(handle) = worker.handle.take() {
+                        let _ = handle.await;
+                    }
                 }
                 self.hw_driver = None;
                 self.hw_driver_info = None;
