@@ -225,7 +225,13 @@ impl Engine {
             session_clip_playback_enabled: false,
             session_transport_sample: 0,
             session_scene_queue: None,
+            session_scene_queue_length_samples: 0,
             session_current_scene: None,
+            session_current_scene_previous_scene: None,
+            session_current_scene_start_sample: 0,
+            session_current_scene_length_samples: 0,
+            session_completed_clip_passes: Vec::new(),
+            session_reported_clip_passes: std::collections::HashSet::new(),
             record_enabled: false,
             step_recording_enabled: false,
             session_dir: None,
@@ -1851,14 +1857,83 @@ impl Engine {
         self.latest_track_meter_snapshot = Arc::new(snapshot);
     }
 
-    pub(crate) async fn publish_session_runtime_reports(&mut self) {
-        if self
-            .last_session_report_publish
-            .is_some_and(|t| t.elapsed() < Self::SESSION_RUNTIME_REPORT_INTERVAL)
-        {
-            return;
+    fn record_session_completed_clip_pass(
+        &mut self,
+        track_name: String,
+        scene_index: usize,
+        clip_id: String,
+        pass_index: usize,
+        start_sample: usize,
+        length_samples: usize,
+    ) {
+        let key = (
+            track_name.clone(),
+            scene_index,
+            clip_id.clone(),
+            pass_index,
+            start_sample,
+        );
+        if self.session_reported_clip_passes.insert(key) {
+            self.session_completed_clip_passes
+                .push(crate::meter::SessionCompletedClipPass {
+                    track_name,
+                    scene_index,
+                    clip_id,
+                    pass_index,
+                    start_sample,
+                    length_samples,
+                });
         }
+    }
 
+    fn record_completed_session_scene_span(
+        &mut self,
+        tracks: &HashMap<String, crate::state::TrackHandle>,
+        scene_index: usize,
+        previous_scene: Option<usize>,
+        scene_start_sample: usize,
+        elapsed_samples: usize,
+    ) {
+        for (track_name, track) in tracks {
+            let track = track.lock();
+            let slot = track.rt.session_slots.get(&scene_index);
+            let prev_slot = previous_scene.and_then(|scene| track.rt.session_slots.get(&scene));
+            let playing_clip_id = track
+                .rt
+                .playing_session_clips
+                .last()
+                .map(|clip| clip.clip_id.as_str());
+            let clip_id = match (slot, prev_slot) {
+                (Some(slot), _) if slot.play_enabled => Some(slot.clip_id.as_str()),
+                (Some(slot), _) if slot.stop_enabled => None,
+                (_, Some(prev_slot)) if prev_slot.play_enabled => Some(prev_slot.clip_id.as_str()),
+                (_, Some(prev_slot)) if prev_slot.stop_enabled => None,
+                _ => playing_clip_id,
+            }
+            .filter(|clip_id| !clip_id.is_empty());
+            let Some(clip_id) = clip_id else { continue };
+            let clip_length = track
+                .session_clip_length(clip_id, crate::kind::Kind::Audio)
+                .or_else(|| track.session_clip_length(clip_id, crate::kind::Kind::MIDI))
+                .unwrap_or(0);
+            if clip_length == 0 {
+                continue;
+            }
+            let completed_passes = elapsed_samples / clip_length;
+            for pass_index in 0..completed_passes {
+                self.record_session_completed_clip_pass(
+                    track_name.clone(),
+                    scene_index,
+                    clip_id.to_string(),
+                    pass_index,
+                    scene_start_sample.saturating_add(pass_index * clip_length),
+                    clip_length,
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn publish_session_runtime_reports(&mut self) {
         let mut current = HashMap::<(String, usize), (SessionSlotState, usize, usize)>::new();
         {
             let state = self.state_snapshot.load_full();
@@ -1882,9 +1957,37 @@ impl Engine {
                         .any(|clip| clip.stop_at_sample == Some(queued_launch_at))
                 });
                 if !still_pending && self.session_transport_sample >= queued_launch_at {
+                    if let Some(current_scene) = self.session_current_scene {
+                        let scene_start = self.session_current_scene_start_sample;
+                        let elapsed = queued_launch_at.saturating_sub(scene_start);
+                        self.record_completed_session_scene_span(
+                            &state.tracks,
+                            current_scene,
+                            self.session_current_scene_previous_scene,
+                            scene_start,
+                            elapsed,
+                        );
+                    }
                     self.session_scene_queue = None;
+                    self.session_current_scene_previous_scene = self.session_current_scene;
                     self.session_current_scene = Some(queued_scene);
+                    self.session_current_scene_start_sample = queued_launch_at;
+                    self.session_current_scene_length_samples =
+                        self.session_scene_queue_length_samples;
+                    self.session_scene_queue_length_samples = 0;
                 }
+            }
+            if let Some(current_scene) = self.session_current_scene
+                && self.session_current_scene_length_samples > 0
+            {
+                self.record_completed_session_scene_span(
+                    &state.tracks,
+                    current_scene,
+                    self.session_current_scene_previous_scene,
+                    self.session_current_scene_start_sample,
+                    self.session_transport_sample
+                        .saturating_sub(self.session_current_scene_start_sample),
+                );
             }
             for (track_name, track) in &state.tracks {
                 let track = track.lock();
@@ -1895,6 +1998,52 @@ impl Engine {
                     );
                 }
                 for clip in &track.rt.playing_session_clips {
+                    if self.session_current_scene_length_samples == 0
+                        && let Some(clip_length) =
+                            track.session_clip_length(&clip.clip_id, clip.kind)
+                    {
+                        let scene_report = self
+                            .session_current_scene
+                            .map(|_| self.session_current_scene_length_samples)
+                            .filter(|length| *length > 0)
+                            .map(|length| {
+                                (
+                                    self.session_current_scene.unwrap_or(clip.scene_index),
+                                    self.session_current_scene_start_sample,
+                                    self.session_transport_sample
+                                        .saturating_sub(self.session_current_scene_start_sample),
+                                    length,
+                                )
+                            });
+                        let launch_sample = self
+                            .session_transport_sample
+                            .saturating_sub(clip.elapsed_samples);
+                        let (
+                            report_scene_index,
+                            report_start_sample,
+                            report_elapsed,
+                            report_length,
+                        ) = scene_report.unwrap_or((
+                            clip.scene_index,
+                            launch_sample,
+                            clip.elapsed_samples,
+                            clip_length,
+                        ));
+                        if report_length == 0 {
+                            continue;
+                        }
+                        let completed_passes = report_elapsed / report_length;
+                        for pass_index in 0..completed_passes {
+                            self.record_session_completed_clip_pass(
+                                track_name.clone(),
+                                report_scene_index,
+                                clip.clip_id.clone(),
+                                pass_index,
+                                report_start_sample.saturating_add(pass_index * report_length),
+                                report_length,
+                            );
+                        }
+                    }
                     current.insert(
                         (track_name.clone(), clip.scene_index),
                         (
@@ -1907,7 +2056,15 @@ impl Engine {
             }
         }
 
+        if self
+            .last_session_report_publish
+            .is_some_and(|t| t.elapsed() < Self::SESSION_RUNTIME_REPORT_INTERVAL)
+        {
+            return;
+        }
+
         let snapshot = self.session_runtime_snapshot_producer.write_buffer();
+        snapshot.session_sample = self.session_transport_sample;
         snapshot.slots.clear();
         snapshot.slots.extend(current.iter().map(
             |((track_name, scene_index), (state, play_position_samples, elapsed_samples))| {
@@ -1920,6 +2077,7 @@ impl Engine {
                 }
             },
         ));
+        snapshot.completed_clip_passes = self.session_completed_clip_passes.clone();
         snapshot.current_scene = self.session_current_scene;
         self.session_runtime_snapshot_producer.publish();
         self.last_session_report_publish = Some(Instant::now());

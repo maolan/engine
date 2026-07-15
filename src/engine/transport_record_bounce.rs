@@ -21,7 +21,7 @@ use crate::{
         SessionAction,
     },
     midi::clip::MIDIClip,
-    track::{SessionSlot, Track},
+    track::{SessionSlot, Track, TrackData},
 };
 use midly::{
     Arena, Format, Header, MetaMessage, Smf, Timing, TrackEvent, TrackEventKind,
@@ -35,6 +35,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::error;
+
+#[derive(Clone, Copy)]
+struct SessionSceneLengthTiming {
+    launch_quantization: LaunchQuantization,
+    bpm: f64,
+    tsig_num: u16,
+    tsig_denom: u16,
+    sample_rate: f64,
+}
 
 impl Engine {
     pub(crate) async fn ensure_metronome_track(&mut self) {
@@ -721,11 +730,66 @@ impl Engine {
         }
     }
 
+    fn session_scene_length_samples(
+        tracks: &[crate::state::TrackHandle],
+        scene_index: usize,
+        previous_scene: Option<usize>,
+        timing: SessionSceneLengthTiming,
+    ) -> usize {
+        let snap_interval = TrackData::launch_quantization_interval_samples(
+            timing.launch_quantization,
+            timing.bpm,
+            timing.tsig_num,
+            timing.tsig_denom,
+            timing.sample_rate,
+        );
+        let mut longest_scene_clip = 0usize;
+        for track in tracks {
+            let track = track.lock();
+            let slot = track.rt.session_slots.get(&scene_index);
+            let prev_scene = track
+                .rt
+                .playing_session_clips
+                .last()
+                .map(|clip| clip.scene_index)
+                .or(previous_scene);
+            let prev_slot = prev_scene.and_then(|scene| track.rt.session_slots.get(&scene));
+            let playing_clip_id = track
+                .rt
+                .playing_session_clips
+                .last()
+                .map(|clip| clip.clip_id.as_str());
+
+            let clip_id = match (slot, prev_slot) {
+                (Some(slot), _) if slot.play_enabled => Some(slot.clip_id.as_str()),
+                (Some(slot), _) if slot.stop_enabled => None,
+                (_, Some(prev_slot)) if prev_slot.play_enabled => Some(prev_slot.clip_id.as_str()),
+                (_, Some(prev_slot)) if prev_slot.stop_enabled => None,
+                _ => playing_clip_id,
+            }
+            .filter(|clip_id| !clip_id.is_empty());
+            let Some(clip_id) = clip_id else { continue };
+            let clip_length = track
+                .session_clip_length(clip_id, Kind::Audio)
+                .or_else(|| track.session_clip_length(clip_id, Kind::MIDI))
+                .unwrap_or(0);
+            longest_scene_clip = longest_scene_clip.max(clip_length);
+        }
+        snap_interval.max(longest_scene_clip).max(1)
+    }
+
     pub(crate) async fn handle_session_action(&mut self, action: SessionAction) {
         let sample_rate = self.sample_rate();
         let bpm = self.tempo_bpm;
         let tsig_num = self.tsig_num;
         let tsig_denom = self.tsig_denom;
+        let scene_length_timing = |launch_quantization| SessionSceneLengthTiming {
+            launch_quantization,
+            bpm,
+            tsig_num,
+            tsig_denom,
+            sample_rate,
+        };
         let session_active = self.session_clip_playback_enabled && self.playing;
         let quantize_reference_sample = if session_active {
             self.session_transport_sample
@@ -835,7 +899,9 @@ impl Engine {
                 launch_quantization,
             } => {
                 let launch_at_sample = quantize(quantize_reference_sample, launch_quantization);
+                self.session_current_scene_previous_scene = self.session_current_scene;
                 self.session_current_scene = Some(scene_index);
+                self.session_current_scene_start_sample = launch_at_sample;
                 let tracks: Vec<_> = self
                     .state_snapshot
                     .load_full()
@@ -843,6 +909,12 @@ impl Engine {
                     .values()
                     .cloned()
                     .collect();
+                self.session_current_scene_length_samples = Self::session_scene_length_samples(
+                    &tracks,
+                    scene_index,
+                    None,
+                    scene_length_timing(launch_quantization),
+                );
                 for track in tracks {
                     let mut track_lock = track.lock();
                     let Some(slot) = track_lock.rt.session_slots.get(&scene_index) else {
@@ -902,7 +974,10 @@ impl Engine {
                         .schedule_session_stop(scene_index, stop_at_sample);
                 }
             }
-            SessionAction::QueueScene { scene_index } => {
+            SessionAction::QueueScene {
+                scene_index,
+                launch_quantization,
+            } => {
                 let tracks: Vec<_> = self
                     .state_snapshot
                     .load_full()
@@ -913,36 +988,76 @@ impl Engine {
 
                 // A previously queued scene is replaced by the new one.
                 Self::cancel_session_scene_queue(&mut self.session_scene_queue, &tracks);
+                self.session_scene_queue_length_samples = 0;
 
-                // Fire when the longest currently playing clip finishes its
-                // current pass; immediately when nothing is playing.
+                // Fire at the next current-scene boundary. Scene length is
+                // independent per scene: at least the selected snap interval
+                // and at least the longest clip populated in that scene.
+                // Fall back to currently playing clip pass length when no
+                // current scene marker exists.
                 let mut max_remaining = 0usize;
-                for track in &tracks {
-                    let track_lock = track.lock();
-                    for clip in &track_lock.rt.playing_session_clips {
-                        let Some(clip_length) =
-                            track_lock.session_clip_length(&clip.clip_id, clip.kind)
-                        else {
-                            continue;
-                        };
-                        if clip_length == 0 {
-                            continue;
-                        }
-                        let loop_end = if clip.loop_enabled && clip.loop_end_samples > 0 {
-                            clip.loop_end_samples.min(clip_length)
-                        } else {
-                            clip_length
-                        };
-                        let position = clip.play_position_samples.min(loop_end);
-                        max_remaining = max_remaining.max(loop_end.saturating_sub(position));
-                    }
-                }
                 let base_sample = if session_active {
                     self.session_transport_sample
                 } else {
                     self.transport_sample
                 };
+
+                if let Some(current_scene) = self.session_current_scene {
+                    let scene_length = if self.session_current_scene_length_samples > 0 {
+                        self.session_current_scene_length_samples
+                    } else {
+                        Self::session_scene_length_samples(
+                            &tracks,
+                            current_scene,
+                            Some(current_scene),
+                            scene_length_timing(launch_quantization),
+                        )
+                    };
+                    let elapsed =
+                        base_sample.saturating_sub(self.session_current_scene_start_sample);
+                    let boundary_offset = if elapsed == 0 {
+                        scene_length
+                    } else {
+                        let remainder = elapsed % scene_length;
+                        if remainder == 0 {
+                            elapsed
+                        } else {
+                            elapsed.saturating_add(scene_length - remainder)
+                        }
+                    };
+                    let launch_at_sample = self
+                        .session_current_scene_start_sample
+                        .saturating_add(boundary_offset);
+                    max_remaining = launch_at_sample.saturating_sub(base_sample);
+                } else {
+                    for track in &tracks {
+                        let track_lock = track.lock();
+                        for clip in &track_lock.rt.playing_session_clips {
+                            let Some(clip_length) =
+                                track_lock.session_clip_length(&clip.clip_id, clip.kind)
+                            else {
+                                continue;
+                            };
+                            if clip_length == 0 {
+                                continue;
+                            }
+                            let loop_end = if clip.loop_enabled && clip.loop_end_samples > 0 {
+                                clip.loop_end_samples.min(clip_length)
+                            } else {
+                                clip_length
+                            };
+                            let position = clip.play_position_samples.min(loop_end);
+                            max_remaining = max_remaining.max(loop_end.saturating_sub(position));
+                        }
+                    }
+                }
                 let launch_at_sample = base_sample.saturating_add(max_remaining);
+                let queued_scene_length = Self::session_scene_length_samples(
+                    &tracks,
+                    scene_index,
+                    self.session_current_scene,
+                    scene_length_timing(launch_quantization),
+                );
 
                 /// How a track behaves when the queued scene launches.
                 enum SceneSwitch {
@@ -1083,6 +1198,7 @@ impl Engine {
                 }
                 if queue_changed_anything || max_remaining > 0 {
                     self.session_scene_queue = Some((scene_index, launch_at_sample));
+                    self.session_scene_queue_length_samples = queued_scene_length;
                 }
             }
             SessionAction::StopAllClips => {
@@ -1368,7 +1484,13 @@ impl Engine {
         self.session_clip_playback_enabled = false;
         self.session_transport_sample = 0;
         self.session_scene_queue = None;
+        self.session_scene_queue_length_samples = 0;
         self.session_current_scene = None;
+        self.session_current_scene_previous_scene = None;
+        self.session_current_scene_start_sample = 0;
+        self.session_current_scene_length_samples = 0;
+        self.session_completed_clip_passes.clear();
+        self.session_reported_clip_passes.clear();
         for track in self.state_snapshot.load_full().tracks.values() {
             let mut t = track.lock();
             t.set_clip_playback_enabled(true);
@@ -1422,6 +1544,17 @@ impl Engine {
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = true;
         self.session_transport_sample = 0;
+        self.session_scene_queue = None;
+        self.session_scene_queue_length_samples = 0;
+        self.session_current_scene = None;
+        self.session_current_scene_previous_scene = None;
+        self.session_current_scene_start_sample = 0;
+        self.session_current_scene_length_samples = 0;
+        self.session_completed_clip_passes.clear();
+        self.session_reported_clip_passes.clear();
+        for track in self.state_snapshot.load_full().tracks.values() {
+            track.lock().stop_all_session_clips_immediate();
+        }
         self.publish_transport_snapshot();
         self.set_hw_playing(true).await;
         #[cfg(unix)]

@@ -315,9 +315,15 @@ pub struct Engine {
     /// Scene queued via [`crate::message::SessionAction::QueueScene`] as
     /// (scene_index, launch_at_sample); `None` when no scene is queued.
     session_scene_queue: Option<(usize, usize)>,
+    session_scene_queue_length_samples: usize,
     /// Scene whose launch most recently fired; reported in the session
     /// runtime snapshot so clients can highlight it as the current scene.
     session_current_scene: Option<usize>,
+    session_current_scene_previous_scene: Option<usize>,
+    session_current_scene_start_sample: usize,
+    session_current_scene_length_samples: usize,
+    session_completed_clip_passes: Vec<crate::meter::SessionCompletedClipPass>,
+    session_reported_clip_passes: std::collections::HashSet<(String, usize, String, usize, usize)>,
     record_enabled: bool,
     step_recording_enabled: bool,
     session_dir: Option<PathBuf>,
@@ -389,6 +395,7 @@ mod tests {
     use super::*;
     use crate::audio::clip::AudioClip;
     use crate::message::PluginKind;
+    use crate::midi::clip::MIDIClip;
     use crate::track::Track;
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -1082,6 +1089,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1126,6 +1134,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1168,6 +1177,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1177,8 +1187,9 @@ mod tests {
         let launch = &track.rt.pending_session_launches[0];
         assert_eq!(launch.clip_id, "clip-playing");
         assert_eq!(launch.scene_index, 0);
-        // Nothing is playing, so the queued scene fires immediately.
-        assert_eq!(launch.launch_at_sample, 1_000);
+        // A current scene marker exists, so the queued scene waits until
+        // the current scene boundary even though the track is silent.
+        assert_eq!(launch.launch_at_sample, 96_000);
     }
 
     #[cfg_attr(
@@ -1214,6 +1225,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1248,6 +1260,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1279,6 +1292,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1299,6 +1313,7 @@ mod tests {
             engine
                 .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                     scene_index,
+                    launch_quantization: crate::message::LaunchQuantization::Bar,
                 }))
                 .await;
         }
@@ -1329,6 +1344,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
         assert_eq!(engine.session_current_scene, None);
@@ -1376,6 +1392,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1407,6 +1424,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
         assert_eq!(engine.session_scene_queue, Some((1, 1_050)));
@@ -1452,6 +1470,7 @@ mod tests {
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
                 scene_index: 0,
+                launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
 
@@ -1459,6 +1478,483 @@ mod tests {
         let track = state.tracks.get("track").expect("track exists").lock();
         assert_eq!(track.rt.pending_session_launches.len(), 1);
         assert_eq!(track.rt.pending_session_launches[0].launch_at_sample, 500);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_after_clipless_current_scene_waits_for_snap_length() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+
+        engine.playing = true;
+        engine.session_clip_playback_enabled = true;
+        engine.session_transport_sample = 600;
+        engine.session_current_scene = Some(0);
+        engine.session_current_scene_start_sample = 500;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Beat,
+            }))
+            .await;
+
+        let expected_launch = 500 + 24_000;
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert_eq!(track.rt.pending_session_launches.len(), 1);
+        assert_eq!(
+            track.rt.pending_session_launches[0].launch_at_sample,
+            expected_launch
+        );
+        assert_eq!(
+            engine.session_scene_queue,
+            Some((1, expected_launch)),
+            "clipless current scene should hold for the selected snap length"
+        );
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_current_scene_length_uses_longest_clip_when_longer_than_snap() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut current_clip = AudioClip::new("audio/current.wav".to_string(), 0, 36_000);
+        current_clip.id = "clip-current".to_string();
+        let mut queued_clip = AudioClip::new("audio/queued.wav".to_string(), 0, 12_000);
+        queued_clip.id = "clip-queued".to_string();
+        track.audio.push_clip(current_clip);
+        track.audio.push_clip(queued_clip);
+        insert_track(&mut engine, track);
+        for (scene_index, clip_id) in [(0, "clip-current"), (1, "clip-queued")] {
+            engine
+                .handle_request(Action::TrackSetSessionSlot {
+                    track_name: "track".to_string(),
+                    scene_index,
+                    clip_id: Some(clip_id.to_string()),
+                })
+                .await;
+        }
+
+        engine.playing = true;
+        engine.session_clip_playback_enabled = true;
+        engine.session_transport_sample = 10_000;
+        engine.session_current_scene = Some(0);
+        engine.session_current_scene_start_sample = 1_000;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Beat,
+            }))
+            .await;
+
+        let expected_launch = 1_000 + 36_000;
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert_eq!(track.rt.pending_session_launches.len(), 1);
+        assert_eq!(
+            track.rt.pending_session_launches[0].launch_at_sample,
+            expected_launch
+        );
+        assert_eq!(engine.session_scene_queue, Some((1, expected_launch)));
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queued_scene_length_includes_inherited_clip_when_longer_than_scene_clip() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let synth = Track::new("Synth".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut audio_clip = AudioClip::new("audio/synth.wav".to_string(), 0, 48_000);
+        audio_clip.id = "audio-clip".to_string();
+        synth.audio.push_clip(audio_clip);
+        insert_track(&mut engine, synth);
+
+        let midi_track = Track::new("sdfv".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let midi_clip = MIDIClip {
+            id: "midi-clip".to_string(),
+            name: "midi/sdfv.mid".to_string(),
+            start: 0,
+            end: 12_000,
+            ..MIDIClip::default()
+        };
+        midi_track.midi.push_clip(midi_clip);
+        insert_track(&mut engine, midi_track);
+
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "Synth".to_string(),
+                scene_index: 0,
+                clip_id: Some("audio-clip".to_string()),
+            })
+            .await;
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "sdfv".to_string(),
+                scene_index: 1,
+                clip_id: Some("midi-clip".to_string()),
+            })
+            .await;
+
+        engine.playing = true;
+        engine.session_clip_playback_enabled = true;
+        engine.session_transport_sample = 10_000;
+        engine.session_current_scene = Some(0);
+        engine.session_current_scene_start_sample = 0;
+        engine.session_current_scene_length_samples = 48_000;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+                launch_quantization: crate::message::LaunchQuantization::Beat,
+            }))
+            .await;
+
+        assert_eq!(engine.session_scene_queue_length_samples, 48_000);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn session_runtime_reports_completed_scene_span_not_each_short_clip_loop() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 0, 1_000);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+        engine.session_transport_sample = 1_000;
+        engine.session_current_scene = Some(0);
+        engine.session_current_scene_start_sample = 0;
+        engine.session_current_scene_length_samples = 1_000;
+        {
+            let state = engine.state.lock();
+            let mut track = state.tracks.get("track").expect("track exists").lock();
+            track
+                .rt
+                .playing_session_clips
+                .push(crate::track::PlayingSessionClip {
+                    scene_index: 0,
+                    clip_id: "clip-1".to_string(),
+                    kind: Kind::Audio,
+                    play_position_samples: 0,
+                    elapsed_samples: 1_000,
+                    loop_enabled: true,
+                    loop_start_samples: 0,
+                    loop_end_samples: 0,
+                    stop_at_sample: None,
+                    active_midi_notes: std::collections::HashSet::new(),
+                });
+        }
+
+        engine.publish_session_runtime_reports().await;
+
+        assert_eq!(engine.session_completed_clip_passes.len(), 1);
+        let pass = &engine.session_completed_clip_passes[0];
+        assert_eq!(pass.scene_index, 0);
+        assert_eq!(pass.clip_id, "clip-1");
+        assert_eq!(pass.start_sample, 0);
+        assert_eq!(pass.length_samples, 1_000);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn session_runtime_reports_repeated_scene_occurrences_as_separate_passes() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 0, 1_000);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+        {
+            let state = engine.state.lock();
+            let mut track = state.tracks.get("track").expect("track exists").lock();
+            track
+                .rt
+                .playing_session_clips
+                .push(crate::track::PlayingSessionClip {
+                    scene_index: 0,
+                    clip_id: "clip-1".to_string(),
+                    kind: Kind::Audio,
+                    play_position_samples: 0,
+                    elapsed_samples: 1_000,
+                    loop_enabled: true,
+                    loop_start_samples: 0,
+                    loop_end_samples: 0,
+                    stop_at_sample: None,
+                    active_midi_notes: std::collections::HashSet::new(),
+                });
+        }
+
+        engine.session_current_scene = Some(0);
+        engine.session_current_scene_start_sample = 0;
+        engine.session_current_scene_length_samples = 1_000;
+        engine.session_transport_sample = 1_000;
+        engine.publish_session_runtime_reports().await;
+
+        engine.session_current_scene = Some(0);
+        engine.session_current_scene_start_sample = 2_000;
+        engine.session_current_scene_length_samples = 1_000;
+        engine.session_transport_sample = 3_000;
+        engine.publish_session_runtime_reports().await;
+
+        let starts: Vec<_> = engine
+            .session_completed_clip_passes
+            .iter()
+            .map(|pass| pass.start_sample)
+            .collect();
+        assert_eq!(starts, vec![0, 2_000]);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn session_runtime_reports_scene_that_ended_at_queued_launch_boundary() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut scene_1_clip = AudioClip::new("audio/scene-1.wav".to_string(), 0, 1_000);
+        scene_1_clip.id = "clip-scene-1".to_string();
+        let mut scene_2_clip = AudioClip::new("audio/scene-2.wav".to_string(), 0, 1_000);
+        scene_2_clip.id = "clip-scene-2".to_string();
+        track.audio.push_clip(scene_1_clip);
+        track.audio.push_clip(scene_2_clip);
+        insert_track(&mut engine, track);
+        for (scene_index, clip_id) in [(0, "clip-scene-1"), (1, "clip-scene-2")] {
+            engine
+                .handle_request(Action::TrackSetSessionSlot {
+                    track_name: "track".to_string(),
+                    scene_index,
+                    clip_id: Some(clip_id.to_string()),
+                })
+                .await;
+        }
+
+        engine.session_current_scene = Some(0);
+        engine.session_current_scene_start_sample = 0;
+        engine.session_current_scene_length_samples = 1_000;
+        engine.session_scene_queue = Some((1, 1_000));
+        engine.session_scene_queue_length_samples = 1_000;
+        engine.session_transport_sample = 1_000;
+
+        engine.publish_session_runtime_reports().await;
+
+        assert_eq!(engine.session_current_scene, Some(1));
+        assert_eq!(engine.session_completed_clip_passes.len(), 1);
+        let pass = &engine.session_completed_clip_passes[0];
+        assert_eq!(pass.scene_index, 0);
+        assert_eq!(pass.clip_id, "clip-scene-1");
+        assert_eq!(pass.start_sample, 0);
+        assert_eq!(pass.length_samples, 1_000);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn session_runtime_reports_inherited_clip_and_own_length_midi_passes() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let synth = Track::new("Synth".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut audio_clip = AudioClip::new("audio/synth.wav".to_string(), 0, 48_000);
+        audio_clip.id = "audio-clip".to_string();
+        synth.audio.push_clip(audio_clip);
+        insert_track(&mut engine, synth);
+
+        let midi_track = Track::new("sdfv".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let midi_clip = MIDIClip {
+            id: "midi-clip".to_string(),
+            name: "midi/sdfv.mid".to_string(),
+            start: 0,
+            end: 24_000,
+            ..MIDIClip::default()
+        };
+        midi_track.midi.push_clip(midi_clip);
+        insert_track(&mut engine, midi_track);
+
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "Synth".to_string(),
+                scene_index: 0,
+                clip_id: Some("audio-clip".to_string()),
+            })
+            .await;
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "sdfv".to_string(),
+                scene_index: 1,
+                clip_id: Some("midi-clip".to_string()),
+            })
+            .await;
+
+        engine.session_current_scene = Some(1);
+        engine.session_current_scene_previous_scene = Some(0);
+        engine.session_current_scene_start_sample = 48_000;
+        engine.session_current_scene_length_samples = 48_000;
+        engine.session_transport_sample = 96_000;
+        engine.publish_session_runtime_reports().await;
+
+        let mut passes: Vec<_> = engine
+            .session_completed_clip_passes
+            .iter()
+            .map(|pass| {
+                (
+                    pass.track_name.as_str(),
+                    pass.clip_id.as_str(),
+                    pass.start_sample,
+                    pass.length_samples,
+                )
+            })
+            .collect();
+        passes.sort_unstable();
+        assert_eq!(
+            passes,
+            vec![
+                ("Synth", "audio-clip", 48_000, 48_000),
+                ("sdfv", "midi-clip", 48_000, 24_000),
+                ("sdfv", "midi-clip", 72_000, 24_000),
+            ]
+        );
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn session_play_clears_stale_scene_state_before_recording() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/scene-1.wav".to_string(), 0, 1_000);
+        clip.id = "clip-scene-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-scene-1".to_string()),
+            })
+            .await;
+
+        engine.session_current_scene = Some(1);
+        engine.session_current_scene_previous_scene = Some(0);
+        engine.session_current_scene_start_sample = 500;
+        engine.session_current_scene_length_samples = 1_000;
+        engine.session_scene_queue = Some((0, 1_000));
+        engine.session_scene_queue_length_samples = 1_000;
+        engine.session_transport_sample = 500;
+        engine
+            .session_completed_clip_passes
+            .push(crate::meter::SessionCompletedClipPass {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                clip_id: "stale-clip".to_string(),
+                pass_index: 0,
+                start_sample: 0,
+                length_samples: 1_000,
+            });
+        {
+            let state = engine.state.lock();
+            let mut track = state.tracks.get("track").expect("track exists").lock();
+            track
+                .rt
+                .pending_session_launches
+                .push(crate::track::PendingSessionLaunch {
+                    scene_index: 1,
+                    clip_id: "clip-scene-1".to_string(),
+                    kind: Kind::Audio,
+                    launch_at_sample: 1_000,
+                    loop_enabled: true,
+                    loop_start_samples: 0,
+                    loop_end_samples: 0,
+                });
+            track
+                .rt
+                .playing_session_clips
+                .push(crate::track::PlayingSessionClip {
+                    scene_index: 1,
+                    clip_id: "clip-scene-1".to_string(),
+                    kind: Kind::Audio,
+                    play_position_samples: 500,
+                    elapsed_samples: 500,
+                    loop_enabled: true,
+                    loop_start_samples: 0,
+                    loop_end_samples: 0,
+                    stop_at_sample: None,
+                    active_midi_notes: std::collections::HashSet::new(),
+                });
+        }
+
+        engine.handle_request(Action::SessionPlay).await;
+
+        assert_eq!(engine.session_current_scene, None);
+        assert_eq!(engine.session_scene_queue, None);
+        assert!(engine.session_completed_clip_passes.is_empty());
+        {
+            let state = engine.state.lock();
+            let track = state.tracks.get("track").expect("track exists").lock();
+            assert!(track.rt.pending_session_launches.is_empty());
+            assert!(track.rt.playing_session_clips.is_empty());
+        }
+
+        engine
+            .handle_request(Action::Session(
+                crate::message::SessionAction::LaunchScene {
+                    scene_index: 0,
+                    launch_quantization: crate::message::LaunchQuantization::None,
+                },
+            ))
+            .await;
+        engine.session_transport_sample = 1_000;
+        engine.publish_session_runtime_reports().await;
+
+        assert_eq!(engine.session_completed_clip_passes.len(), 1);
+        let pass = &engine.session_completed_clip_passes[0];
+        assert_eq!(pass.scene_index, 0);
+        assert_eq!(pass.clip_id, "clip-scene-1");
+        assert_eq!(pass.start_sample, 0);
+        assert_eq!(pass.length_samples, 1_000);
     }
 
     #[cfg_attr(

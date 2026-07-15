@@ -38,9 +38,21 @@ pub struct SessionRuntimeSlotSnapshot {
     pub elapsed_samples: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionCompletedClipPass {
+    pub track_name: String,
+    pub scene_index: usize,
+    pub clip_id: String,
+    pub pass_index: usize,
+    pub start_sample: usize,
+    pub length_samples: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SessionRuntimeSnapshot {
+    pub session_sample: usize,
     pub slots: Vec<SessionRuntimeSlotSnapshot>,
+    pub completed_clip_passes: Vec<SessionCompletedClipPass>,
     /// Scene whose launch most recently fired; `None` before any scene
     /// launch or after the session transport stopped.
     pub current_scene: Option<usize>,

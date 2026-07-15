@@ -42,6 +42,35 @@ impl TrackData {
         }
     }
 
+    pub fn launch_quantization_interval_samples(
+        quantization: crate::message::LaunchQuantization,
+        bpm: f64,
+        tsig_num: u16,
+        tsig_denom: u16,
+        sample_rate: f64,
+    ) -> usize {
+        use crate::message::LaunchQuantization;
+        let denom = tsig_denom.max(1) as f64;
+        let beats_per_bar = tsig_num.max(1) as f64;
+        let samples_per_beat = ((sample_rate * 60.0) / bpm.max(1.0)) * (4.0 / denom);
+        if !samples_per_beat.is_finite() || samples_per_beat <= 0.0 {
+            return 1;
+        }
+        let interval = match quantization {
+            LaunchQuantization::None => 1.0,
+            LaunchQuantization::Beat => samples_per_beat,
+            LaunchQuantization::Bar => samples_per_beat * beats_per_bar,
+            LaunchQuantization::TwoBars => samples_per_beat * beats_per_bar * 2.0,
+            LaunchQuantization::FourBars => samples_per_beat * beats_per_bar * 4.0,
+            LaunchQuantization::EightBars => samples_per_beat * beats_per_bar * 8.0,
+            LaunchQuantization::Eighth => samples_per_beat / 2.0,
+            LaunchQuantization::Sixteenth => samples_per_beat / 4.0,
+            LaunchQuantization::ThirtySecond => samples_per_beat / 8.0,
+            LaunchQuantization::SixtyFourth => samples_per_beat / 16.0,
+        };
+        interval.max(1.0) as usize
+    }
+
     /// Length in samples of a clip playable in a session slot, resolved from
     /// the timeline clips or the session clip pool. `None` when unknown.
     pub fn session_clip_length(&self, clip_id: &str, kind: Kind) -> Option<usize> {
@@ -309,11 +338,15 @@ impl TrackData {
         }
 
         for (idx, pos, elapsed) in position_updates {
-            self.rt.playing_session_clips[idx].play_position_samples = pos;
-            self.rt.playing_session_clips[idx].elapsed_samples = elapsed;
+            if let Some(clip) = self.rt.playing_session_clips.get_mut(idx) {
+                clip.play_position_samples = pos;
+                clip.elapsed_samples = elapsed;
+            }
         }
         for idx in remove_indices.into_iter().rev() {
-            self.rt.playing_session_clips.remove(idx);
+            if idx < self.rt.playing_session_clips.len() {
+                self.rt.playing_session_clips.remove(idx);
+            }
         }
         self.rt
             .clip_plugin_tracks
@@ -480,11 +513,15 @@ impl TrackData {
         }
 
         for (idx, pos, elapsed) in position_updates {
-            self.rt.playing_session_clips[idx].play_position_samples = pos;
-            self.rt.playing_session_clips[idx].elapsed_samples = elapsed;
+            if let Some(clip) = self.rt.playing_session_clips.get_mut(idx) {
+                clip.play_position_samples = pos;
+                clip.elapsed_samples = elapsed;
+            }
         }
         for idx in remove_indices.into_iter().rev() {
-            self.rt.playing_session_clips.remove(idx);
+            if idx < self.rt.playing_session_clips.len() {
+                self.rt.playing_session_clips.remove(idx);
+            }
         }
         for events in input_events.iter_mut() {
             events.sort_by_key(|event| event.frame);

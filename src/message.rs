@@ -476,11 +476,13 @@ pub enum SessionAction {
         launch_quantization: LaunchQuantization,
     },
     /// Queue a scene to launch when the longest currently playing clip
-    /// finishes its current pass (immediately when nothing is playing).
+    /// finishes its current pass. When the current scene has no clips, it
+    /// behaves as a clip whose length is `launch_quantization`.
     /// Queueing a different scene replaces the queue. Playing clips stop
     /// when the queued scene launches.
     QueueScene {
         scene_index: usize,
+        launch_quantization: LaunchQuantization,
     },
     StopAllClips,
 }
