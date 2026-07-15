@@ -983,6 +983,36 @@ impl Engine {
         }
     }
 
+    pub(crate) fn set_clip_identity(
+        &self,
+        track_name: &str,
+        kind: Kind,
+        clip_index: usize,
+        new_id: &str,
+        new_name: &str,
+    ) {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
+            return;
+        };
+        let mut track = track.lock();
+        match kind {
+            Kind::Audio => {
+                track.audio.update_clip(clip_index, |clip| {
+                    clip.id = new_id.to_string();
+                    clip.name = new_name.to_string();
+                });
+                #[cfg(unix)]
+                track.rt.clip_pitch_shifters.clear();
+            }
+            Kind::MIDI => {
+                track.midi.update_clip(clip_index, |clip| {
+                    clip.id = new_id.to_string();
+                    clip.name = new_name.to_string();
+                });
+            }
+        }
+    }
+
     pub(crate) fn set_clip_fade(
         &self,
         track_name: &str,

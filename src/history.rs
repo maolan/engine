@@ -174,6 +174,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::RemoveClip { .. }
         | Action::MoveClipToUnused { .. }
         | Action::RenameClip { .. }
+        | Action::SetClipIdentity { .. }
         | Action::ClipMove { .. }
         | Action::SetClipFade { .. }
         | Action::SetClipBounds { .. }
@@ -572,6 +573,33 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 track_name: track_name.clone(),
                 kind: *kind,
                 clip_index: *clip_index,
+                new_name: old_name,
+            })
+        }
+
+        Action::SetClipIdentity {
+            track_name,
+            kind,
+            clip_index,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let (old_id, old_name) = match kind {
+                Kind::Audio => {
+                    let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
+                    (clip.id.clone(), clip.name.clone())
+                }
+                Kind::MIDI => {
+                    let clip = track_lock.midi.clips().get(*clip_index).cloned()?;
+                    (clip.id.clone(), clip.name.clone())
+                }
+            };
+            Some(Action::SetClipIdentity {
+                track_name: track_name.clone(),
+                kind: *kind,
+                clip_index: *clip_index,
+                new_id: old_id,
                 new_name: old_name,
             })
         }

@@ -1071,6 +1071,7 @@ impl Engine {
             | Action::SetRecordEnabled(_)
             | Action::SetStepRecording(_)
             | Action::StepRecordMidiNote { .. }
+            | Action::SetClipIdentity { .. }
             | Action::SetSessionPath(_)
             | Action::ClearHistory
             | Action::BeginSessionRestore
@@ -3153,6 +3154,15 @@ impl Engine {
                 ref new_name,
             } => {
                 self.rename_clip_references(track_name, kind, clip_index, new_name);
+            }
+            Action::SetClipIdentity {
+                ref track_name,
+                kind,
+                clip_index,
+                ref new_id,
+                ref new_name,
+            } => {
+                self.set_clip_identity(track_name, kind, clip_index, new_id, new_name);
             }
             Action::SetClipSourceName {
                 ref track_name,

@@ -664,6 +664,13 @@ pub enum Action {
         clip_index: usize,
         new_name: String,
     },
+    SetClipIdentity {
+        track_name: String,
+        kind: Kind,
+        clip_index: usize,
+        new_id: String,
+        new_name: String,
+    },
     SetClipSourceName {
         track_name: String,
         kind: Kind,
