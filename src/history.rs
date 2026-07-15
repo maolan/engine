@@ -10,7 +10,9 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-fn audio_clip_to_data(clip: &crate::audio::clip::AudioClip) -> crate::message::AudioClipData {
+pub(crate) fn audio_clip_to_data(
+    clip: &crate::audio::clip::AudioClip,
+) -> crate::message::AudioClipData {
     crate::message::AudioClipData {
         id: clip.id.clone(),
         name: clip.name.clone(),
@@ -36,7 +38,9 @@ fn audio_clip_to_data(clip: &crate::audio::clip::AudioClip) -> crate::message::A
     }
 }
 
-fn midi_clip_to_data(clip: &crate::midi::clip::MIDIClip) -> crate::message::MidiClipData {
+pub(crate) fn midi_clip_to_data(
+    clip: &crate::midi::clip::MIDIClip,
+) -> crate::message::MidiClipData {
     crate::message::MidiClipData {
         id: clip.id.clone(),
         name: clip.name.clone(),
@@ -156,6 +160,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackSetFrozen { .. }
         | Action::TrackSetSessionSlot { .. }
         | Action::TrackSetSessionSlotPlayEnabled { .. }
+        | Action::TrackSetSessionSlotStopEnabled { .. }
         | Action::TrackSetFolder { .. }
         | Action::TrackSetParent { .. }
         | Action::TrackToggleFolder { .. }
@@ -167,6 +172,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::AddClip { .. }
         | Action::AddGroupedClip { .. }
         | Action::RemoveClip { .. }
+        | Action::MoveClipToUnused { .. }
         | Action::RenameClip { .. }
         | Action::ClipMove { .. }
         | Action::SetClipFade { .. }
@@ -357,6 +363,25 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 enabled,
             })
         }
+        Action::TrackSetSessionSlotStopEnabled {
+            track_name,
+            scene_index,
+            enabled: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let enabled = track_lock
+                .rt
+                .session_slots
+                .get(scene_index)
+                .map(|slot| slot.stop_enabled)
+                .unwrap_or(false);
+            Some(Action::TrackSetSessionSlotStopEnabled {
+                track_name: track_name.clone(),
+                scene_index: *scene_index,
+                enabled,
+            })
+        }
         Action::TrackSetFolder {
             track_name,
             is_folder: _,
@@ -423,6 +448,11 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
         }
 
         Action::RemoveClip {
+            track_name,
+            kind,
+            clip_indices,
+        }
+        | Action::MoveClipToUnused {
             track_name,
             kind,
             clip_indices,
@@ -2188,6 +2218,61 @@ mod tests {
             }
             other => panic!("unexpected inverse action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_inverse_action_for_move_clip_to_unused_restores_clip() {
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.offset = 12;
+        track.audio.push_clip(clip);
+        let state = make_state_with_track(track);
+
+        let inverse = create_inverse_action(
+            &Action::MoveClipToUnused {
+                track_name: "t".to_string(),
+                kind: Kind::Audio,
+                clip_indices: vec![0],
+            },
+            &state,
+        )
+        .expect("inverse action");
+
+        match inverse {
+            Action::AddClip {
+                name,
+                track_name,
+                start,
+                length,
+                offset,
+                kind,
+                ..
+            } => {
+                assert_eq!(name, "audio/clip.wav");
+                assert_eq!(track_name, "t");
+                assert_eq!(start, 48);
+                assert_eq!(length, 96);
+                assert_eq!(offset, 12);
+                assert_eq!(kind, Kind::Audio);
+            }
+            other => panic!("unexpected inverse action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_record_covers_unused_clip_pool_actions() {
+        assert!(should_record(&Action::MoveClipToUnused {
+            track_name: "t".to_string(),
+            kind: Kind::Audio,
+            clip_indices: vec![0],
+        }));
+        assert!(!should_record(&Action::DeleteUnusedClips {
+            clip_ids: vec!["clip-1".to_string()],
+        }));
+        assert!(!should_record(&Action::SetUnusedClips {
+            audio: vec![],
+            midi: vec![],
+        }));
     }
 
     #[test]

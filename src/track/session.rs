@@ -42,6 +42,33 @@ impl TrackData {
         }
     }
 
+    /// Length in samples of a clip playable in a session slot, resolved from
+    /// the timeline clips or the session clip pool. `None` when unknown.
+    pub fn session_clip_length(&self, clip_id: &str, kind: Kind) -> Option<usize> {
+        match kind {
+            Kind::Audio => {
+                if let Some(clip) = self.audio.clips().iter().find(|c| c.id == clip_id) {
+                    return Some(clip.end.saturating_sub(clip.start));
+                }
+                self.rt
+                    .session_clip_pool_audio
+                    .iter()
+                    .find(|c| c.id == clip_id)
+                    .map(|c| c.end.saturating_sub(c.start))
+            }
+            Kind::MIDI => {
+                if let Some(clip) = self.midi.clips().iter().find(|c| c.id == clip_id) {
+                    return Some(clip.end.saturating_sub(clip.start));
+                }
+                self.rt
+                    .session_clip_pool_midi
+                    .iter()
+                    .find(|c| c.id == clip_id)
+                    .map(|c| c.end.saturating_sub(c.start))
+            }
+        }
+    }
+
     pub fn schedule_session_launch(&mut self, launch: PendingSessionLaunch) {
         self.rt.pending_session_launches.push(launch);
     }
@@ -55,6 +82,28 @@ impl TrackData {
         {
             clip.stop_at_sample = Some(stop_at_sample);
         }
+    }
+
+    /// Immediately stops every playing session clip and drops pending
+    /// launches. Unlike [`schedule_session_stop`], which takes effect at a
+    /// quantized position on the session timeline, this removes the clips
+    /// right away so session audio cannot leak into arrangement playback
+    /// started afterwards. Note-offs for active MIDI notes are queued and
+    /// flushed on the next processed cycle.
+    pub fn stop_all_session_clips_immediate(&mut self) {
+        self.rt.pending_session_launches.clear();
+        let mut note_offs = Vec::new();
+        for clip in self.rt.playing_session_clips.drain(..) {
+            if clip.kind == Kind::MIDI {
+                for (channel, note) in &clip.active_midi_notes {
+                    note_offs.push(MidiEvent::new(
+                        0,
+                        vec![0x80 | (*channel).min(15), (*note).min(127), 64],
+                    ));
+                }
+            }
+        }
+        self.rt.pending_session_midi_note_offs.extend(note_offs);
     }
 
     pub fn process_session_clips(&mut self, cycle_start: usize, cycle_end: usize, _frames: usize) {
@@ -78,8 +127,22 @@ impl TrackData {
         }
         for launch in activated {
             let exists = match launch.kind {
-                Kind::Audio => self.audio.clips().iter().any(|c| c.id == launch.clip_id),
-                Kind::MIDI => self.midi.clips().iter().any(|c| c.id == launch.clip_id),
+                Kind::Audio => {
+                    self.audio.clips().iter().any(|c| c.id == launch.clip_id)
+                        || self
+                            .rt
+                            .session_clip_pool_audio
+                            .iter()
+                            .any(|c| c.id == launch.clip_id)
+                }
+                Kind::MIDI => {
+                    self.midi.clips().iter().any(|c| c.id == launch.clip_id)
+                        || self
+                            .rt
+                            .session_clip_pool_midi
+                            .iter()
+                            .any(|c| c.id == launch.clip_id)
+                }
             };
             if !exists {
                 tracing::warn!(
@@ -148,14 +211,25 @@ impl TrackData {
                 continue;
             }
             let clip_id = self.rt.playing_session_clips[i].clip_id.clone();
-            let arrangement_clip =
-                match self.audio.clips().iter().find(|c| c.id == clip_id).cloned() {
-                    Some(c) => c,
-                    None => {
-                        remove_indices.push(i);
-                        continue;
-                    }
-                };
+            let arrangement_clip = match self
+                .audio
+                .clips()
+                .iter()
+                .find(|c| c.id == clip_id)
+                .cloned()
+                .or_else(|| {
+                    self.rt
+                        .session_clip_pool_audio
+                        .iter()
+                        .find(|c| c.id == clip_id)
+                        .cloned()
+                }) {
+                Some(c) => c,
+                None => {
+                    remove_indices.push(i);
+                    continue;
+                }
+            };
             let clip_length = arrangement_clip.end.saturating_sub(arrangement_clip.start);
             if clip_length == 0 {
                 remove_indices.push(i);
@@ -279,8 +353,19 @@ impl TrackData {
                 continue;
             }
             let clip_id = self.rt.playing_session_clips[i].clip_id.clone();
-            let arrangement_clip = match self.midi.clips().iter().find(|c| c.id == clip_id).cloned()
-            {
+            let arrangement_clip = match self
+                .midi
+                .clips()
+                .iter()
+                .find(|c| c.id == clip_id)
+                .cloned()
+                .or_else(|| {
+                    self.rt
+                        .session_clip_pool_midi
+                        .iter()
+                        .find(|c| c.id == clip_id)
+                        .cloned()
+                }) {
                 Some(c) => c,
                 None => {
                     remove_indices.push(i);

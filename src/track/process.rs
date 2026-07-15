@@ -501,6 +501,14 @@ impl TrackData {
             && (!self.rt.playing_session_clips.is_empty()
                 || !self.rt.pending_session_launches.is_empty());
         if arrangement_active || session_active {
+            // Flush note-offs queued by an immediate session stop (transport
+            // Stop) before any new note-ons are mixed in below, so they are
+            // delivered even when no session clip is active anymore.
+            for event in self.rt.pending_session_midi_note_offs.drain(..) {
+                for lane in track_input_midi_events.iter_mut() {
+                    lane.push(event.clone());
+                }
+            }
             self.process_session_clips(cycle_start, cycle_end, frames);
             if arrangement_active {
                 self.mix_clip_midi_into_inputs(&mut track_input_midi_events, frames);

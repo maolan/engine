@@ -1,3 +1,4 @@
+use crate::message::{AudioClipData, MidiClipData};
 use crate::track::Track;
 use std::{
     cell::UnsafeCell,
@@ -18,6 +19,8 @@ pub struct State {
 #[derive(Default, Debug)]
 pub struct StateData {
     pub tracks: HashMap<String, TrackHandle>,
+    pub unused_audio_clips: Vec<AudioClipData>,
+    pub unused_midi_clips: Vec<MidiClipData>,
 }
 
 pub struct StateGuard<'a> {
@@ -67,6 +70,8 @@ impl StateData {
     pub fn snapshot(&self) -> StateSnapshot {
         StateSnapshot {
             tracks: self.tracks.clone(),
+            unused_audio_clips: self.unused_audio_clips.clone(),
+            unused_midi_clips: self.unused_midi_clips.clone(),
         }
     }
 }
@@ -88,6 +93,8 @@ impl DerefMut for StateGuard<'_> {
 #[derive(Clone, Default, Debug)]
 pub struct StateSnapshot {
     pub tracks: HashMap<String, TrackHandle>,
+    pub unused_audio_clips: Vec<AudioClipData>,
+    pub unused_midi_clips: Vec<MidiClipData>,
 }
 
 impl State {

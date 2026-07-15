@@ -16,7 +16,9 @@ use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     audio::clip::AudioClip,
     audio::io::AudioIO,
-    history::{UndoEntry, create_inverse_actions, should_record},
+    history::{
+        UndoEntry, audio_clip_to_data, create_inverse_actions, midi_clip_to_data, should_record,
+    },
     kind::Kind,
     message::Action,
     midi::clip::MIDIClip,
@@ -621,6 +623,15 @@ impl Engine {
                     track.midi.push_clip(clip);
                 }
             }
+            track
+                .rt
+                .session_clip_pool_audio
+                .retain(|clip| clip.id != request.clip_id);
+            track
+                .rt
+                .session_clip_pool_midi
+                .retain(|clip| clip.id != request.clip_id);
+            self.take_clip_from_unused(request.clip_id);
         }
     }
 
@@ -696,16 +707,28 @@ impl Engine {
                     {
                         let max_lane = track.audio.ins.len().saturating_sub(1);
                         clip.input_channel = clip.input_channel.min(max_lane);
+                        let clip_id = clip.id.clone();
                         track.audio.push_clip(clip);
                         #[cfg(unix)]
                         track.rt.clip_pitch_shifters.clear();
+                        track
+                            .rt
+                            .session_clip_pool_audio
+                            .retain(|clip| clip.id != clip_id);
+                        self.take_clip_from_unused(&clip_id);
                     }
                 }
                 Kind::MIDI => {
                     if let Some(mut clip) = midi_clip.map(|clip| Self::midi_clip_from_data(&clip)) {
                         let max_lane = track.midi.ins.len().saturating_sub(1);
                         clip.input_channel = clip.input_channel.min(max_lane);
+                        let clip_id = clip.id.clone();
                         track.midi.push_clip(clip);
+                        track
+                            .rt
+                            .session_clip_pool_midi
+                            .retain(|clip| clip.id != clip_id);
+                        self.take_clip_from_unused(&clip_id);
                     }
                 }
             }
@@ -742,6 +765,150 @@ impl Engine {
                 }
             }
         }
+    }
+
+    pub(crate) fn move_clips_to_unused(
+        &self,
+        track_name: &str,
+        kind: Kind,
+        clip_indices: &[usize],
+    ) {
+        if let Some(track) = self.state.lock().tracks.get(track_name) {
+            let mut track = track.lock();
+            let mut indices = clip_indices.to_vec();
+            indices.sort_unstable();
+            indices.dedup();
+            match kind {
+                Kind::Audio => {
+                    let mut moved = Vec::new();
+                    for idx in indices.into_iter().rev() {
+                        if idx < track.audio.clips().len()
+                            && let Some(clip) = track.audio.remove_clip(idx)
+                        {
+                            if track
+                                .rt
+                                .session_slots
+                                .values()
+                                .any(|slot| slot.clip_id == clip.id)
+                            {
+                                track.rt.session_clip_pool_audio.push(clip.clone());
+                            }
+                            moved.push(audio_clip_to_data(&clip));
+                        }
+                    }
+                    moved.reverse();
+                    self.state.lock().unused_audio_clips.extend(moved);
+                    #[cfg(unix)]
+                    track.rt.clip_pitch_shifters.clear();
+                }
+                Kind::MIDI => {
+                    let mut moved = Vec::new();
+                    for idx in indices.into_iter().rev() {
+                        if idx < track.midi.clips().len()
+                            && let Some(clip) = track.midi.remove_clip(idx)
+                        {
+                            if track
+                                .rt
+                                .session_slots
+                                .values()
+                                .any(|slot| slot.clip_id == clip.id)
+                            {
+                                track.rt.session_clip_pool_midi.push(clip.clone());
+                            }
+                            moved.push(midi_clip_to_data(&clip));
+                        }
+                    }
+                    moved.reverse();
+                    self.state.lock().unused_midi_clips.extend(moved);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn delete_unused_clips(&self, clip_ids: &[String]) {
+        let mut state = self.state.lock();
+        state
+            .unused_audio_clips
+            .retain(|clip| !clip_ids.contains(&clip.id));
+        state
+            .unused_midi_clips
+            .retain(|clip| !clip_ids.contains(&clip.id));
+        for track in state.tracks.values() {
+            let mut track = track.lock();
+            track
+                .rt
+                .session_clip_pool_audio
+                .retain(|clip| !clip_ids.contains(&clip.id));
+            track
+                .rt
+                .session_clip_pool_midi
+                .retain(|clip| !clip_ids.contains(&clip.id));
+        }
+    }
+
+    pub(crate) fn set_unused_clips(
+        &self,
+        audio: Vec<crate::message::AudioClipData>,
+        midi: Vec<crate::message::MidiClipData>,
+    ) {
+        let mut state = self.state.lock();
+        state.unused_audio_clips = audio;
+        state.unused_midi_clips = midi;
+        // Session restore assigns slots before the unused pool arrives; give
+        // each track a playback fallback for slot-referenced clips that are
+        // not on its timeline.
+        for track in state.tracks.values() {
+            let mut track = track.lock();
+            let slot_clip_ids: Vec<String> = track
+                .rt
+                .session_slots
+                .values()
+                .map(|slot| slot.clip_id.clone())
+                .collect();
+            for clip_id in slot_clip_ids {
+                let on_track = track.audio.clips().iter().any(|clip| clip.id == clip_id)
+                    || track.midi.clips().iter().any(|clip| clip.id == clip_id);
+                let in_pool = track
+                    .rt
+                    .session_clip_pool_audio
+                    .iter()
+                    .any(|clip| clip.id == clip_id)
+                    || track
+                        .rt
+                        .session_clip_pool_midi
+                        .iter()
+                        .any(|clip| clip.id == clip_id);
+                if on_track || in_pool {
+                    continue;
+                }
+                if let Some(data) = state
+                    .unused_audio_clips
+                    .iter()
+                    .find(|clip| clip.id == clip_id)
+                {
+                    track
+                        .rt
+                        .session_clip_pool_audio
+                        .push(Arc::new(Self::audio_clip_from_data(data)));
+                } else if let Some(data) = state
+                    .unused_midi_clips
+                    .iter()
+                    .find(|clip| clip.id == clip_id)
+                {
+                    track
+                        .rt
+                        .session_clip_pool_midi
+                        .push(Arc::new(Self::midi_clip_from_data(data)));
+                }
+            }
+            track.rt.prune_session_clip_pool();
+        }
+    }
+
+    pub(crate) fn take_clip_from_unused(&self, clip_id: &str) {
+        let mut state = self.state.lock();
+        state.unused_audio_clips.retain(|clip| clip.id != clip_id);
+        state.unused_midi_clips.retain(|clip| clip.id != clip_id);
     }
 
     pub(crate) fn rename_clip_references(

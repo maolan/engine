@@ -698,6 +698,29 @@ impl Engine {
         parse_automation_lanes(value)
     }
 
+    /// Drop a queued scene's pending launches and revert the stops it
+    /// scheduled. The queue marker is taken from `queue`, which ends up
+    /// `None` whether or not a queue was stored.
+    fn cancel_session_scene_queue(
+        queue: &mut Option<(usize, usize)>,
+        tracks: &[crate::state::TrackHandle],
+    ) {
+        let Some((prev_scene, prev_launch_at)) = queue.take() else {
+            return;
+        };
+        for track in tracks {
+            let mut track_lock = track.lock();
+            track_lock.rt.pending_session_launches.retain(|launch| {
+                !(launch.scene_index == prev_scene && launch.launch_at_sample == prev_launch_at)
+            });
+            for clip in &mut track_lock.rt.playing_session_clips {
+                if clip.stop_at_sample == Some(prev_launch_at) {
+                    clip.stop_at_sample = None;
+                }
+            }
+        }
+    }
+
     pub(crate) async fn handle_session_action(&mut self, action: SessionAction) {
         let sample_rate = self.sample_rate();
         let bpm = self.tempo_bpm;
@@ -752,6 +775,20 @@ impl Engine {
                     Kind::Audio
                 } else if track.midi.clips().iter().any(|c| c.id == clip_id) {
                     Kind::MIDI
+                } else if track
+                    .rt
+                    .session_clip_pool_audio
+                    .iter()
+                    .any(|c| c.id == clip_id)
+                {
+                    Kind::Audio
+                } else if track
+                    .rt
+                    .session_clip_pool_midi
+                    .iter()
+                    .any(|c| c.id == clip_id)
+                {
+                    Kind::MIDI
                 } else {
                     tracing::warn!(
                         "Session launch for unknown clip '{}' on track '{}'",
@@ -798,6 +835,7 @@ impl Engine {
                 launch_quantization,
             } => {
                 let launch_at_sample = quantize(quantize_reference_sample, launch_quantization);
+                self.session_current_scene = Some(scene_index);
                 let tracks: Vec<_> = self
                     .state_snapshot
                     .load_full()
@@ -817,6 +855,20 @@ impl Engine {
                     let kind = if track_lock.audio.clips().iter().any(|c| c.id == clip_id) {
                         Kind::Audio
                     } else if track_lock.midi.clips().iter().any(|c| c.id == clip_id) {
+                        Kind::MIDI
+                    } else if track_lock
+                        .rt
+                        .session_clip_pool_audio
+                        .iter()
+                        .any(|c| c.id == clip_id)
+                    {
+                        Kind::Audio
+                    } else if track_lock
+                        .rt
+                        .session_clip_pool_midi
+                        .iter()
+                        .any(|c| c.id == clip_id)
+                    {
                         Kind::MIDI
                     } else {
                         continue;
@@ -848,6 +900,189 @@ impl Engine {
                     track
                         .lock()
                         .schedule_session_stop(scene_index, stop_at_sample);
+                }
+            }
+            SessionAction::QueueScene { scene_index } => {
+                let tracks: Vec<_> = self
+                    .state_snapshot
+                    .load_full()
+                    .tracks
+                    .values()
+                    .cloned()
+                    .collect();
+
+                // A previously queued scene is replaced by the new one.
+                Self::cancel_session_scene_queue(&mut self.session_scene_queue, &tracks);
+
+                // Fire when the longest currently playing clip finishes its
+                // current pass; immediately when nothing is playing.
+                let mut max_remaining = 0usize;
+                for track in &tracks {
+                    let track_lock = track.lock();
+                    for clip in &track_lock.rt.playing_session_clips {
+                        let Some(clip_length) =
+                            track_lock.session_clip_length(&clip.clip_id, clip.kind)
+                        else {
+                            continue;
+                        };
+                        if clip_length == 0 {
+                            continue;
+                        }
+                        let loop_end = if clip.loop_enabled && clip.loop_end_samples > 0 {
+                            clip.loop_end_samples.min(clip_length)
+                        } else {
+                            clip_length
+                        };
+                        let position = clip.play_position_samples.min(loop_end);
+                        max_remaining = max_remaining.max(loop_end.saturating_sub(position));
+                    }
+                }
+                let base_sample = if session_active {
+                    self.session_transport_sample
+                } else {
+                    self.transport_sample
+                };
+                let launch_at_sample = base_sample.saturating_add(max_remaining);
+
+                /// How a track behaves when the queued scene launches.
+                enum SceneSwitch {
+                    Play,
+                    Stop,
+                    InheritPlay,
+                    Continue,
+                }
+
+                // Resolve a clip's kind from the timeline clips or the
+                // session clip pool; `None` when the clip is unknown.
+                let clip_kind = |track: &crate::track::TrackData, clip_id: &str| {
+                    if track.audio.clips().iter().any(|c| c.id == clip_id) {
+                        Some(Kind::Audio)
+                    } else if track.midi.clips().iter().any(|c| c.id == clip_id) {
+                        Some(Kind::MIDI)
+                    } else if track
+                        .rt
+                        .session_clip_pool_audio
+                        .iter()
+                        .any(|c| c.id == clip_id)
+                    {
+                        Some(Kind::Audio)
+                    } else if track
+                        .rt
+                        .session_clip_pool_midi
+                        .iter()
+                        .any(|c| c.id == clip_id)
+                    {
+                        Some(Kind::MIDI)
+                    } else {
+                        None
+                    }
+                };
+
+                let mut queue_changed_anything = false;
+                for track in &tracks {
+                    let mut track_lock = track.lock();
+                    // A slot with neither play nor stop marked inherits from
+                    // the same track's slot in the previously playing scene
+                    // (the most recently launched playing clip, falling back
+                    // to the last fired scene). Inheriting "play" plays the
+                    // previous scene's clip: it keeps going when already
+                    // playing and starts when the track is silent. If the
+                    // previous slot is also unmarked, the track keeps doing
+                    // whatever it was doing.
+                    let prev_scene = track_lock
+                        .rt
+                        .playing_session_clips
+                        .last()
+                        .map(|clip| clip.scene_index)
+                        .or(self.session_current_scene);
+                    let (play_marked, stop_marked, slot_clip_id) = track_lock
+                        .rt
+                        .session_slots
+                        .get(&scene_index)
+                        .map(|slot| {
+                            (
+                                slot.play_enabled,
+                                slot.stop_enabled,
+                                Some(slot.clip_id.clone()),
+                            )
+                        })
+                        .unwrap_or((false, false, None));
+                    let (prev_play_marked, prev_stop_marked, prev_clip_id) = prev_scene
+                        .and_then(|scene| track_lock.rt.session_slots.get(&scene))
+                        .map(|slot| (slot.play_enabled, slot.stop_enabled, slot.clip_id.clone()))
+                        .unwrap_or((false, false, String::new()));
+                    let switch = if play_marked {
+                        SceneSwitch::Play
+                    } else if stop_marked {
+                        SceneSwitch::Stop
+                    } else if prev_play_marked {
+                        SceneSwitch::InheritPlay
+                    } else if prev_stop_marked {
+                        SceneSwitch::Stop
+                    } else {
+                        SceneSwitch::Continue
+                    };
+                    match switch {
+                        SceneSwitch::Continue => continue,
+                        SceneSwitch::InheritPlay => {
+                            // The previous scene's clip plays: nothing to do
+                            // while it is playing; start it when the track
+                            // is silent.
+                            if !track_lock.rt.playing_session_clips.is_empty() {
+                                continue;
+                            }
+                            let Some(prev_scene) = prev_scene else {
+                                continue;
+                            };
+                            if prev_clip_id.is_empty() {
+                                continue;
+                            }
+                            let Some(kind) = clip_kind(&track_lock, &prev_clip_id) else {
+                                continue;
+                            };
+                            track_lock.schedule_session_launch(
+                                crate::track::PendingSessionLaunch {
+                                    scene_index: prev_scene,
+                                    clip_id: prev_clip_id,
+                                    kind,
+                                    launch_at_sample,
+                                    loop_enabled: true,
+                                    loop_start_samples: 0,
+                                    loop_end_samples: 0,
+                                },
+                            );
+                            queue_changed_anything = true;
+                            continue;
+                        }
+                        SceneSwitch::Play | SceneSwitch::Stop => {}
+                    }
+                    for clip in &mut track_lock.rt.playing_session_clips {
+                        clip.stop_at_sample = Some(launch_at_sample);
+                    }
+                    queue_changed_anything = true;
+                    if matches!(switch, SceneSwitch::Stop) {
+                        continue;
+                    }
+                    let Some(clip_id) = slot_clip_id else {
+                        // Marked to play but the slot has no clip: the track
+                        // goes silent when the scene launches.
+                        continue;
+                    };
+                    let Some(kind) = clip_kind(&track_lock, &clip_id) else {
+                        continue;
+                    };
+                    track_lock.schedule_session_launch(crate::track::PendingSessionLaunch {
+                        scene_index,
+                        clip_id,
+                        kind,
+                        launch_at_sample,
+                        loop_enabled: true,
+                        loop_start_samples: 0,
+                        loop_end_samples: 0,
+                    });
+                }
+                if queue_changed_anything || max_remaining > 0 {
+                    self.session_scene_queue = Some((scene_index, launch_at_sample));
                 }
             }
             SessionAction::StopAllClips => {
@@ -1132,10 +1367,13 @@ impl Engine {
         self.clip_playback_enabled = true;
         self.session_clip_playback_enabled = false;
         self.session_transport_sample = 0;
+        self.session_scene_queue = None;
+        self.session_current_scene = None;
         for track in self.state_snapshot.load_full().tracks.values() {
             let mut t = track.lock();
             t.set_clip_playback_enabled(true);
             t.set_session_clip_playback_enabled(false);
+            t.stop_all_session_clips_immediate();
         }
         self.publish_transport_snapshot();
         self.set_hw_playing(false).await;
@@ -1312,17 +1550,47 @@ impl Engine {
         let mut track = track.lock();
         match clip_id {
             Some(id) => {
-                let play_enabled = track
+                let on_track = track.audio.clips().iter().any(|clip| clip.id == *id)
+                    || track.midi.clips().iter().any(|clip| clip.id == *id);
+                let in_pool = track
+                    .rt
+                    .session_clip_pool_audio
+                    .iter()
+                    .any(|clip| clip.id == *id)
+                    || track
+                        .rt
+                        .session_clip_pool_midi
+                        .iter()
+                        .any(|clip| clip.id == *id);
+                if !on_track && !in_pool {
+                    let state = self.state.lock();
+                    if let Some(data) = state.unused_audio_clips.iter().find(|clip| clip.id == *id)
+                    {
+                        track
+                            .rt
+                            .session_clip_pool_audio
+                            .push(Arc::new(Self::audio_clip_from_data(data)));
+                    } else if let Some(data) =
+                        state.unused_midi_clips.iter().find(|clip| clip.id == *id)
+                    {
+                        track
+                            .rt
+                            .session_clip_pool_midi
+                            .push(Arc::new(Self::midi_clip_from_data(data)));
+                    }
+                }
+                let (play_enabled, stop_enabled) = track
                     .rt
                     .session_slots
                     .get(&scene_index)
-                    .map(|slot| slot.play_enabled)
-                    .unwrap_or(true);
+                    .map(|slot| (slot.play_enabled, slot.stop_enabled))
+                    .unwrap_or((true, false));
                 track.rt.session_slots.insert(
                     scene_index,
                     SessionSlot {
                         clip_id: id.clone(),
                         play_enabled,
+                        stop_enabled,
                     },
                 );
             }
@@ -1330,6 +1598,7 @@ impl Engine {
                 track.rt.session_slots.remove(&scene_index);
             }
         }
+        track.rt.prune_session_clip_pool();
 
         false
     }
@@ -1460,9 +1729,48 @@ impl Engine {
             }
         };
         let mut track = track.lock();
-        if let Some(slot) = track.rt.session_slots.get_mut(&scene_index) {
-            slot.play_enabled = enabled;
-        }
+        track
+            .rt
+            .session_slots
+            .entry(scene_index)
+            .or_insert_with(|| SessionSlot {
+                clip_id: String::new(),
+                play_enabled: false,
+                stop_enabled: false,
+            })
+            .play_enabled = enabled;
+
+        false
+    }
+
+    pub(crate) async fn handle_track_set_session_slot_stop_enabled(&mut self, a: Action) -> bool {
+        let Action::TrackSetSessionSlotStopEnabled {
+            ref track_name,
+            scene_index,
+            enabled,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let mut track = track.lock();
+        track
+            .rt
+            .session_slots
+            .entry(scene_index)
+            .or_insert_with(|| SessionSlot {
+                clip_id: String::new(),
+                play_enabled: false,
+                stop_enabled: false,
+            })
+            .stop_enabled = enabled;
 
         false
     }

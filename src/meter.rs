@@ -41,4 +41,7 @@ pub struct SessionRuntimeSlotSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct SessionRuntimeSnapshot {
     pub slots: Vec<SessionRuntimeSlotSnapshot>,
+    /// Scene whose launch most recently fired; `None` before any scene
+    /// launch or after the session transport stopped.
+    pub current_scene: Option<usize>,
 }

@@ -475,6 +475,13 @@ pub enum SessionAction {
         scene_index: usize,
         launch_quantization: LaunchQuantization,
     },
+    /// Queue a scene to launch when the longest currently playing clip
+    /// finishes its current pass (immediately when nothing is playing).
+    /// Queueing a different scene replaces the queue. Playing clips stop
+    /// when the queued scene launches.
+    QueueScene {
+        scene_index: usize,
+    },
     StopAllClips,
 }
 
@@ -591,6 +598,18 @@ pub enum Action {
         track_name: String,
         kind: Kind,
         clip_indices: Vec<usize>,
+    },
+    MoveClipToUnused {
+        track_name: String,
+        kind: Kind,
+        clip_indices: Vec<usize>,
+    },
+    DeleteUnusedClips {
+        clip_ids: Vec<String>,
+    },
+    SetUnusedClips {
+        audio: Vec<AudioClipData>,
+        midi: Vec<MidiClipData>,
     },
     SetClipFade {
         track_name: String,
@@ -763,6 +782,11 @@ pub enum Action {
         clip_id: Option<String>,
     },
     TrackSetSessionSlotPlayEnabled {
+        track_name: String,
+        scene_index: usize,
+        enabled: bool,
+    },
+    TrackSetSessionSlotStopEnabled {
         track_name: String,
         scene_index: usize,
         enabled: bool,

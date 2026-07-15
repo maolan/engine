@@ -312,6 +312,12 @@ pub struct Engine {
     clip_playback_enabled: bool,
     session_clip_playback_enabled: bool,
     session_transport_sample: usize,
+    /// Scene queued via [`crate::message::SessionAction::QueueScene`] as
+    /// (scene_index, launch_at_sample); `None` when no scene is queued.
+    session_scene_queue: Option<(usize, usize)>,
+    /// Scene whose launch most recently fired; reported in the session
+    /// runtime snapshot so clients can highlight it as the current scene.
+    session_current_scene: Option<usize>,
     record_enabled: bool,
     step_recording_enabled: bool,
     session_dir: Option<PathBuf>,
@@ -778,6 +784,718 @@ mod tests {
         assert_eq!(clip.end, 220);
         assert_eq!(clip.end.saturating_sub(clip.start), 120);
         assert_eq!(clip.offset, 12);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn move_clip_to_unused_stores_clip_and_undo_restores_it() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_request(Action::MoveClipToUnused {
+                track_name: "track".to_string(),
+                kind: Kind::Audio,
+                clip_indices: vec![0],
+            })
+            .await;
+
+        {
+            let state = engine.state.lock();
+            let track = state.tracks.get("track").expect("track exists").lock();
+            assert!(track.audio.clips().is_empty());
+            assert_eq!(state.unused_audio_clips.len(), 1);
+            assert_eq!(state.unused_audio_clips[0].id, "clip-1");
+            assert_eq!(state.unused_audio_clips[0].name, "audio/clip.wav");
+        }
+
+        engine.handle_request(Action::Undo).await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        let clips = track.audio.clips();
+        let clip = clips.first().expect("clip restored");
+        assert_eq!(clip.id, "clip-1");
+        assert_eq!(clip.name, "audio/clip.wav");
+        assert!(state.unused_audio_clips.is_empty());
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn move_clip_to_unused_keeps_slot_referenced_clip_in_session_pool() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+        engine
+            .handle_request(Action::MoveClipToUnused {
+                track_name: "track".to_string(),
+                kind: Kind::Audio,
+                clip_indices: vec![0],
+            })
+            .await;
+
+        {
+            let state = engine.state.lock();
+            let track = state.tracks.get("track").expect("track exists").lock();
+            assert!(track.audio.clips().is_empty());
+            assert_eq!(state.unused_audio_clips.len(), 1);
+            // Still referenced by a session slot: playback fallback keeps it.
+            assert_eq!(track.rt.session_clip_pool_audio.len(), 1);
+            assert_eq!(track.rt.session_clip_pool_audio[0].id, "clip-1");
+        }
+
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: None,
+            })
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.rt.session_clip_pool_audio.is_empty());
+        assert_eq!(state.unused_audio_clips.len(), 1);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn launch_clip_accepts_clip_from_session_pool() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+        engine
+            .handle_request(Action::MoveClipToUnused {
+                track_name: "track".to_string(),
+                kind: Kind::Audio,
+                clip_indices: vec![0],
+            })
+            .await;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::LaunchClip {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: "clip-1".to_string(),
+                launch_quantization: crate::message::LaunchQuantization::Bar,
+                loop_enabled: true,
+                loop_start_samples: 0,
+                loop_end_samples: 0,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.audio.clips().is_empty());
+        assert_eq!(track.rt.pending_session_launches.len(), 1);
+        assert_eq!(track.rt.pending_session_launches[0].clip_id, "clip-1");
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn launch_scene_accepts_clip_from_session_pool() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+        engine
+            .handle_request(Action::MoveClipToUnused {
+                track_name: "track".to_string(),
+                kind: Kind::Audio,
+                clip_indices: vec![0],
+            })
+            .await;
+
+        engine
+            .handle_request(Action::Session(
+                crate::message::SessionAction::LaunchScene {
+                    scene_index: 0,
+                    launch_quantization: crate::message::LaunchQuantization::Bar,
+                },
+            ))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.audio.clips().is_empty());
+        assert_eq!(track.rt.pending_session_launches.len(), 1);
+        assert_eq!(track.rt.pending_session_launches[0].clip_id, "clip-1");
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn stop_clears_playing_session_clips_and_pending_launches() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::LaunchClip {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: "clip-1".to_string(),
+                launch_quantization: crate::message::LaunchQuantization::Bar,
+                loop_enabled: true,
+                loop_start_samples: 0,
+                loop_end_samples: 0,
+            }))
+            .await;
+        {
+            let state = engine.state.lock();
+            let mut track = state.tracks.get("track").expect("track exists").lock();
+            track
+                .rt
+                .playing_session_clips
+                .push(crate::track::PlayingSessionClip {
+                    scene_index: 0,
+                    clip_id: "clip-1".to_string(),
+                    kind: Kind::Audio,
+                    play_position_samples: 4,
+                    elapsed_samples: 4,
+                    loop_enabled: true,
+                    loop_start_samples: 0,
+                    loop_end_samples: 0,
+                    stop_at_sample: None,
+                    active_midi_notes: std::collections::HashSet::new(),
+                });
+        }
+
+        engine.handle_request(Action::Stop).await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.rt.playing_session_clips.is_empty());
+        assert!(track.rt.pending_session_launches.is_empty());
+    }
+
+    /// Shared setup for QueueScene tests: one track with a 200-sample clip
+    /// playing in scene 0 (at position 150) and a 100-sample clip slotted in
+    /// scene 1, session transport at 1_000.
+    async fn engine_with_playing_and_slotted_clip() -> Engine {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut playing_clip = AudioClip::new("audio/playing.wav".to_string(), 0, 200);
+        playing_clip.id = "clip-playing".to_string();
+        let mut queued_clip = AudioClip::new("audio/queued.wav".to_string(), 0, 100);
+        queued_clip.id = "clip-queued".to_string();
+        track.audio.push_clip(playing_clip);
+        track.audio.push_clip(queued_clip);
+        insert_track(&mut engine, track);
+
+        for (scene_index, clip_id) in [(0, "clip-playing"), (1, "clip-queued")] {
+            engine
+                .handle_request(Action::TrackSetSessionSlot {
+                    track_name: "track".to_string(),
+                    scene_index,
+                    clip_id: Some(clip_id.to_string()),
+                })
+                .await;
+        }
+
+        engine.playing = true;
+        engine.session_clip_playback_enabled = true;
+        engine.session_transport_sample = 1_000;
+        {
+            let state = engine.state.lock();
+            let mut track = state.tracks.get("track").expect("track exists").lock();
+            track
+                .rt
+                .playing_session_clips
+                .push(crate::track::PlayingSessionClip {
+                    scene_index: 0,
+                    clip_id: "clip-playing".to_string(),
+                    kind: Kind::Audio,
+                    play_position_samples: 150,
+                    elapsed_samples: 150,
+                    loop_enabled: true,
+                    loop_start_samples: 0,
+                    loop_end_samples: 0,
+                    stop_at_sample: None,
+                    active_midi_notes: std::collections::HashSet::new(),
+                });
+        }
+        engine
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_launches_when_longest_playing_clip_pass_ends() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+
+        {
+            let state = engine.state.lock();
+            let track = state.tracks.get("track").expect("track exists").lock();
+            // The 200-sample playing clip is at position 150, so the queued
+            // scene fires 50 samples from now and the current clip stops
+            // then.
+            assert_eq!(track.rt.pending_session_launches.len(), 1);
+            let launch = &track.rt.pending_session_launches[0];
+            assert_eq!(launch.scene_index, 1);
+            assert_eq!(launch.clip_id, "clip-queued");
+            assert_eq!(launch.launch_at_sample, 1_050);
+            assert_eq!(
+                track.rt.playing_session_clips[0].stop_at_sample,
+                Some(1_050)
+            );
+        }
+        assert_eq!(engine.session_scene_queue, Some((1, 1_050)));
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_unmarked_slot_keeps_previous_clip_when_inheriting_play() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        // Scene 1 slot is unmarked (neither play nor stop) but has its own
+        // clip; scene 0 slot keeps its default play mark. Inheriting play
+        // plays the previous scene's clip — the slot's own clip is not
+        // launched and the playing clip is not stopped.
+        engine
+            .handle_request(Action::TrackSetSessionSlotPlayEnabled {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                enabled: false,
+            })
+            .await;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.rt.pending_session_launches.is_empty());
+        assert_eq!(track.rt.playing_session_clips[0].stop_at_sample, None);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_inherited_play_starts_previous_clip_when_track_silent() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        // The track is silent but scene 0 was the last current scene and
+        // its slot is play-marked; scene 1's slot is unmarked and clipless.
+        // Inheriting play starts the previous scene's clip.
+        {
+            let state = engine.state.lock();
+            state
+                .tracks
+                .get("track")
+                .expect("track exists")
+                .lock()
+                .rt
+                .playing_session_clips
+                .clear();
+        }
+        engine.session_current_scene = Some(0);
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                clip_id: None,
+            })
+            .await;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert_eq!(track.rt.pending_session_launches.len(), 1);
+        let launch = &track.rt.pending_session_launches[0];
+        assert_eq!(launch.clip_id, "clip-playing");
+        assert_eq!(launch.scene_index, 0);
+        // Nothing is playing, so the queued scene fires immediately.
+        assert_eq!(launch.launch_at_sample, 1_000);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_unmarked_slot_inherits_stop_from_playing_scene() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        // Scene 0 slot is marked stop; scene 1 slot is unmarked.
+        engine
+            .handle_request(Action::TrackSetSessionSlotPlayEnabled {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                enabled: false,
+            })
+            .await;
+        engine
+            .handle_request(Action::TrackSetSessionSlotStopEnabled {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                enabled: true,
+            })
+            .await;
+        engine
+            .handle_request(Action::TrackSetSessionSlotPlayEnabled {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                enabled: false,
+            })
+            .await;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.rt.pending_session_launches.is_empty());
+        assert_eq!(
+            track.rt.playing_session_clips[0].stop_at_sample,
+            Some(1_050)
+        );
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_unmarked_slot_continues_when_previous_scene_also_unmarked() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        // Both scenes' slots are unmarked: the track keeps playing whatever
+        // it was playing through the scene switch.
+        for scene_index in [0, 1] {
+            engine
+                .handle_request(Action::TrackSetSessionSlotPlayEnabled {
+                    track_name: "track".to_string(),
+                    scene_index,
+                    enabled: false,
+                })
+                .await;
+        }
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.rt.pending_session_launches.is_empty());
+        assert_eq!(track.rt.playing_session_clips[0].stop_at_sample, None);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_inherited_play_without_clip_keeps_current_clip() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        // Scene 1's slot is unmarked and has no clip (removed entirely).
+        // The previous scene's slot is play-marked, so the inherited
+        // behavior is "play" — with no clip of its own, the currently
+        // playing clip keeps going instead of the track going silent.
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                clip_id: None,
+            })
+            .await;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.rt.pending_session_launches.is_empty());
+        assert_eq!(track.rt.playing_session_clips[0].stop_at_sample, None);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_replaces_previous_queue() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        for scene_index in [1, 0] {
+            engine
+                .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                    scene_index,
+                }))
+                .await;
+        }
+
+        {
+            let state = engine.state.lock();
+            let track = state.tracks.get("track").expect("track exists").lock();
+            // Only the replacement scene's launch remains pending.
+            assert_eq!(track.rt.pending_session_launches.len(), 1);
+            let launch = &track.rt.pending_session_launches[0];
+            assert_eq!(launch.scene_index, 0);
+            assert_eq!(launch.launch_at_sample, 1_050);
+            assert_eq!(
+                track.rt.playing_session_clips[0].stop_at_sample,
+                Some(1_050)
+            );
+        }
+        assert_eq!(engine.session_scene_queue, Some((0, 1_050)));
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_fire_marks_scene_as_current() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+        assert_eq!(engine.session_current_scene, None);
+
+        // Simulate the fire: the pending launch is consumed and the
+        // scheduled stop has happened, so nothing references the queue's
+        // launch time anymore.
+        {
+            let state = engine.state_snapshot.load_full();
+            let mut track = state.tracks.get("track").expect("track exists").lock();
+            track.rt.pending_session_launches.clear();
+            track.rt.playing_session_clips[0].stop_at_sample = None;
+        }
+        engine.session_transport_sample = 1_050;
+        engine.publish_session_runtime_reports().await;
+
+        assert_eq!(engine.session_scene_queue, None);
+        assert_eq!(engine.session_current_scene, Some(1));
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_clipless_stop_marked_slot_stops_track() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        // Scene 1's slot is clipless but stop-marked. The mark action must
+        // create the slot so the stop survives without a clip.
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                clip_id: None,
+            })
+            .await;
+        engine
+            .handle_request(Action::TrackSetSessionSlotStopEnabled {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                enabled: true,
+            })
+            .await;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert!(track.rt.pending_session_launches.is_empty());
+        assert_eq!(
+            track.rt.playing_session_clips[0].stop_at_sample,
+            Some(1_050)
+        );
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_marker_holds_until_launch_time_when_nothing_scheduled() {
+        let mut engine = engine_with_playing_and_slotted_clip().await;
+        // Scene 1's slot is unmarked and clipless; the playing scene's slot
+        // is play-marked, so the track continues and nothing is scheduled.
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 1,
+                clip_id: None,
+            })
+            .await;
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 1,
+            }))
+            .await;
+        assert_eq!(engine.session_scene_queue, Some((1, 1_050)));
+
+        // The session transport (1_000) has not reached the launch time:
+        // the marker holds and the scene is not current yet.
+        engine.publish_session_runtime_reports().await;
+        assert_eq!(engine.session_scene_queue, Some((1, 1_050)));
+        assert_eq!(engine.session_current_scene, None);
+
+        // Once the transport passes the launch time, the scene becomes
+        // current even though nothing was scheduled.
+        engine.session_transport_sample = 1_050;
+        engine.last_session_report_publish = None;
+        engine.publish_session_runtime_reports().await;
+        assert_eq!(engine.session_scene_queue, None);
+        assert_eq!(engine.session_current_scene, Some(1));
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn queue_scene_with_nothing_playing_launches_immediately() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        track.audio.push_clip(clip);
+        insert_track(&mut engine, track);
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+        engine.playing = true;
+        engine.session_clip_playback_enabled = true;
+        engine.session_transport_sample = 500;
+
+        engine
+            .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
+                scene_index: 0,
+            }))
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert_eq!(track.rt.pending_session_launches.len(), 1);
+        assert_eq!(track.rt.pending_session_launches[0].launch_at_sample, 500);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn set_unused_clips_populates_session_pool_for_slot_referenced_clips() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+
+        // Session restore order: slots are assigned before the unused pool.
+        engine
+            .handle_request(Action::TrackSetSessionSlot {
+                track_name: "track".to_string(),
+                scene_index: 0,
+                clip_id: Some("clip-1".to_string()),
+            })
+            .await;
+        let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
+        clip.id = "clip-1".to_string();
+        let data = crate::history::audio_clip_to_data(&clip);
+        engine
+            .handle_request(Action::SetUnusedClips {
+                audio: vec![data],
+                midi: vec![],
+            })
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("track").expect("track exists").lock();
+        assert_eq!(track.rt.session_clip_pool_audio.len(), 1);
+        assert_eq!(track.rt.session_clip_pool_audio[0].id, "clip-1");
+        assert_eq!(track.rt.session_clip_pool_audio[0].name, "audio/clip.wav");
     }
 
     #[cfg_attr(

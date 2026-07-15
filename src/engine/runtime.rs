@@ -224,6 +224,8 @@ impl Engine {
             clip_playback_enabled: true,
             session_clip_playback_enabled: false,
             session_transport_sample: 0,
+            session_scene_queue: None,
+            session_current_scene: None,
             record_enabled: false,
             step_recording_enabled: false,
             session_dir: None,
@@ -1859,6 +1861,30 @@ impl Engine {
         let mut current = HashMap::<(String, usize), (SessionSlotState, usize, usize)>::new();
         {
             let state = self.state_snapshot.load_full();
+            if let Some((queued_scene, queued_launch_at)) = self.session_scene_queue {
+                // Drop the queue marker once it has fired: no matching
+                // pending launch or scheduled stop remains and the session
+                // transport has passed the launch time. The transport check
+                // matters when the queued scene scheduled nothing (all
+                // tracks continue): the marker must still hold until the
+                // launch time arrives. The fired scene becomes the current
+                // one.
+                let still_pending = state.tracks.values().any(|track| {
+                    let track = track.lock();
+                    track.rt.pending_session_launches.iter().any(|launch| {
+                        launch.scene_index == queued_scene
+                            && launch.launch_at_sample == queued_launch_at
+                    }) || track
+                        .rt
+                        .playing_session_clips
+                        .iter()
+                        .any(|clip| clip.stop_at_sample == Some(queued_launch_at))
+                });
+                if !still_pending && self.session_transport_sample >= queued_launch_at {
+                    self.session_scene_queue = None;
+                    self.session_current_scene = Some(queued_scene);
+                }
+            }
             for (track_name, track) in &state.tracks {
                 let track = track.lock();
                 for launch in &track.rt.pending_session_launches {
@@ -1893,6 +1919,7 @@ impl Engine {
                 }
             },
         ));
+        snapshot.current_scene = self.session_current_scene;
         self.session_runtime_snapshot_producer.publish();
         self.last_session_report_publish = Some(Instant::now());
     }
@@ -2637,6 +2664,14 @@ impl Engine {
                     return;
                 }
             }
+            Action::TrackSetSessionSlotStopEnabled { .. } => {
+                if self
+                    .handle_track_set_session_slot_stop_enabled(a.clone())
+                    .await
+                {
+                    return;
+                }
+            }
             Action::TrackOfflineBounce { .. } => {
                 self.handle_track_offline_bounce(action_to_process).await;
                 return;
@@ -3094,6 +3129,22 @@ impl Engine {
                 ref clip_indices,
             } => {
                 self.remove_clips_from_track(track_name, kind, clip_indices);
+            }
+            Action::MoveClipToUnused {
+                ref track_name,
+                kind,
+                ref clip_indices,
+            } => {
+                self.move_clips_to_unused(track_name, kind, clip_indices);
+            }
+            Action::DeleteUnusedClips { ref clip_ids } => {
+                self.delete_unused_clips(clip_ids);
+            }
+            Action::SetUnusedClips {
+                ref audio,
+                ref midi,
+            } => {
+                self.set_unused_clips(audio.clone(), midi.clone());
             }
             Action::RenameClip {
                 ref track_name,

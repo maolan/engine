@@ -7,8 +7,11 @@ use crate::rubberband::LivePitchShifter;
 
 use crate::kind::Kind;
 use crate::{
-    audio::io::AudioIO,
-    midi::io::{MIDIIO, MidiEvent},
+    audio::{clip::AudioClip, io::AudioIO},
+    midi::{
+        clip::MIDIClip,
+        io::{MIDIIO, MidiEvent},
+    },
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use std::{
@@ -43,6 +46,10 @@ pub struct SessionSlot {
     pub clip_id: String,
     /// Whether this slot takes part in scene launches.
     pub play_enabled: bool,
+    /// Whether this slot stops the track on scene launches. When neither
+    /// `play_enabled` nor `stop_enabled` is set, scene launches inherit the
+    /// behavior of the previously playing scene's slot on the same track.
+    pub stop_enabled: bool,
 }
 
 impl SessionSlot {
@@ -50,6 +57,7 @@ impl SessionSlot {
         Self {
             clip_id,
             play_enabled: true,
+            stop_enabled: false,
         }
     }
 }
@@ -587,6 +595,11 @@ pub struct TrackRt {
     pub playing_session_clips: Vec<PlayingSessionClip>,
     pending_session_midi_note_offs: Vec<MidiEvent>,
     pub session_slots: HashMap<usize, SessionSlot>,
+    /// Clips that left the timeline but are still referenced by session
+    /// slots; session playback falls back to these when the track itself no
+    /// longer holds a clip with the slot's clip id.
+    pub session_clip_pool_audio: Vec<Arc<AudioClip>>,
+    pub session_clip_pool_midi: Vec<Arc<MIDIClip>>,
     folder_input_midi_events: Vec<Vec<MidiEvent>>,
     folder_plugin_midi_node_events: HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
     folder_processed_midi_plugins: HashSet<PluginGraphNode>,
@@ -631,12 +644,27 @@ impl TrackRt {
             playing_session_clips: Vec::new(),
             pending_session_midi_note_offs: Vec::new(),
             session_slots: HashMap::new(),
+            session_clip_pool_audio: Vec::new(),
+            session_clip_pool_midi: Vec::new(),
             folder_input_midi_events: Vec::new(),
             folder_plugin_midi_node_events: HashMap::new(),
             folder_processed_midi_plugins: HashSet::new(),
             folder_clip_playback_active: false,
             folder_record_tap_input_snapshots: Vec::new(),
         }
+    }
+
+    /// Drops pooled session clips that are no longer referenced by any slot.
+    pub(crate) fn prune_session_clip_pool(&mut self) {
+        let referenced: HashSet<&str> = self
+            .session_slots
+            .values()
+            .map(|slot| slot.clip_id.as_str())
+            .collect();
+        self.session_clip_pool_audio
+            .retain(|clip| referenced.contains(clip.id.as_str()));
+        self.session_clip_pool_midi
+            .retain(|clip| referenced.contains(clip.id.as_str()));
     }
 }
 
@@ -2102,6 +2130,54 @@ mod tests {
         track.schedule_session_stop(0, 8);
         track.process();
 
+        assert!(
+            track
+                .rt
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|e| e.event.data == vec![0x80, 60, 64])
+        );
+    }
+
+    #[test]
+    fn stop_all_session_clips_immediate_clears_clips_and_flushes_note_offs() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+
+        track
+            .rt
+            .playing_session_clips
+            .push(super::PlayingSessionClip {
+                scene_index: 0,
+                clip_id: "clip-1".to_string(),
+                kind: Kind::MIDI,
+                play_position_samples: 4,
+                elapsed_samples: 4,
+                loop_enabled: false,
+                loop_start_samples: 0,
+                loop_end_samples: 0,
+                stop_at_sample: None,
+                active_midi_notes: std::collections::HashSet::from([(0, 60)]),
+            });
+        track.schedule_session_launch(super::PendingSessionLaunch {
+            scene_index: 1,
+            clip_id: "clip-2".to_string(),
+            kind: Kind::MIDI,
+            launch_at_sample: 16,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
+        });
+
+        track.stop_all_session_clips_immediate();
+
+        assert!(track.rt.playing_session_clips.is_empty());
+        assert!(track.rt.pending_session_launches.is_empty());
+
+        // The queued note-off is flushed on the next cycle even though no
+        // session clip is active anymore.
+        track.process();
         assert!(
             track
                 .rt
