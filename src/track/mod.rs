@@ -605,6 +605,7 @@ pub struct TrackRt {
     folder_processed_midi_plugins: HashSet<PluginGraphNode>,
     folder_clip_playback_active: bool,
     folder_record_tap_input_snapshots: Vec<Vec<f32>>,
+    plugin_delay_lines: HashMap<(usize, usize), crate::render_plan::DelayLine>,
 }
 
 impl TrackRt {
@@ -651,6 +652,7 @@ impl TrackRt {
             folder_processed_midi_plugins: HashSet::new(),
             folder_clip_playback_active: false,
             folder_record_tap_input_snapshots: Vec::new(),
+            plugin_delay_lines: HashMap::new(),
         }
     }
 
@@ -2327,7 +2329,7 @@ mod tests {
             .collect::<Vec<_>>();
         folder.process_folder_output_with_audio_buffers(
             &mut folder_outputs,
-            &[(child_out_key, child_source.as_slice())],
+            &[(child_out_key, child_source.as_slice(), 0)],
         );
 
         let folder_out = folder.last_audio_outputs()[0].clone();

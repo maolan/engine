@@ -368,9 +368,19 @@ impl TrackData {
         &mut self,
         audio_inputs: &mut [&mut [f32]],
         audio_outputs: &mut [&mut [f32]],
-        source_buffers: &[(usize, &[f32])],
+        source_buffers: &[(usize, &[f32], usize)],
         metronome_output: Option<&mut [f32]>,
     ) -> usize {
+        if !self.output_enabled() {
+            let frames = self.compute_process_frames();
+            for out in audio_outputs.iter_mut() {
+                out.fill(0.0);
+            }
+            if let Some(out) = metronome_output {
+                out.fill(0.0);
+            }
+            return frames;
+        }
         let frames = self.process_render_block_inputs_and_plugins_with_audio_buffers_and_metronome(
             audio_inputs,
             metronome_output,
@@ -379,10 +389,15 @@ impl TrackData {
             self.process_track_plugins_in_graph_order_with_audio_buffers(frames, audio_inputs);
         let mut sources = source_buffers.to_vec();
         for (audio_in, buffer) in self.audio.ins.iter().zip(audio_inputs.iter()) {
-            sources.push((Arc::as_ptr(audio_in) as usize, &**buffer));
+            sources.push((Arc::as_ptr(audio_in) as usize, &**buffer, 0));
         }
+        let graph_latencies = self.current_plugin_graph_source_latencies();
         for (key, buffer) in &plugin_outputs {
-            sources.push((*key, buffer.as_slice()));
+            sources.push((
+                *key,
+                buffer.as_slice(),
+                graph_latencies.get(key).copied().unwrap_or(0),
+            ));
         }
         self.process_folder_output_with_audio_buffers(audio_outputs, &sources);
         frames
@@ -724,17 +739,28 @@ impl TrackData {
     }
 
     fn arena_source_slice<'a>(
-        source_buffers: &'a [(usize, &'a [f32])],
+        source_buffers: &'a [(usize, &'a [f32], usize)],
         source: &Arc<AudioIO>,
     ) -> Option<&'a [f32]> {
         let key = Arc::as_ptr(source) as usize;
         source_buffers
             .iter()
-            .find_map(|(candidate, buffer)| (*candidate == key).then_some(*buffer))
+            .find_map(|(candidate, buffer, _)| (*candidate == key).then_some(*buffer))
+    }
+
+    fn arena_source_latency(
+        source_buffers: &[(usize, &[f32], usize)],
+        source: &Arc<AudioIO>,
+    ) -> usize {
+        let key = Arc::as_ptr(source) as usize;
+        source_buffers
+            .iter()
+            .find_map(|(candidate, _, latency)| (*candidate == key).then_some(*latency))
+            .unwrap_or(0)
     }
 
     fn with_source_buffer<R>(
-        source_buffers: &[(usize, &[f32])],
+        source_buffers: &[(usize, &[f32], usize)],
         source: &Arc<AudioIO>,
         f: impl FnOnce(&[f32]) -> R,
     ) -> Option<R> {
@@ -744,7 +770,7 @@ impl TrackData {
     pub(crate) fn process_folder_output_with_audio_buffers(
         &mut self,
         audio_outputs: &mut [&mut [f32]],
-        source_buffers: &[(usize, &[f32])],
+        source_buffers: &[(usize, &[f32], usize)],
     ) {
         let track_input_events = self.rt.folder_input_midi_events.clone();
         let midi_node_events = self.rt.folder_plugin_midi_node_events.clone();
@@ -845,6 +871,11 @@ impl TrackData {
                 && let Some(sources) = &sources
             {
                 let mut seeded = false;
+                let max_latency = sources
+                    .iter()
+                    .map(|source| Self::arena_source_latency(source_buffers, source))
+                    .max()
+                    .unwrap_or(0);
                 for source in sources {
                     let source_input_monitor = self
                         .audio
@@ -861,23 +892,35 @@ impl TrackData {
                     {
                         continue;
                     }
+                    let source_latency = Self::arena_source_latency(source_buffers, source);
                     if Self::with_source_buffer(source_buffers, source, |source_buf| {
+                        let delay = max_latency.saturating_sub(source_latency);
+                        let line = self
+                            .rt
+                            .plugin_delay_lines
+                            .entry((
+                                Arc::as_ptr(&audio_out) as usize,
+                                Arc::as_ptr(source) as usize,
+                            ))
+                            .or_default();
+                        let mut delayed = vec![0.0; out_samples.len()];
+                        line.process(source_buf, delay, &mut delayed, false);
                         if !seeded {
                             if unity_output_gain {
-                                Self::copy_unity_with_zero_tail(out_samples, source_buf);
+                                Self::copy_unity_with_zero_tail(out_samples, &delayed);
                             } else {
                                 Self::copy_scaled_with_zero_tail(
                                     out_samples,
-                                    source_buf,
+                                    &delayed,
                                     output_gain,
                                 );
                             }
                             seeded = true;
                             wrote_output = true;
                         } else if unity_output_gain {
-                            Self::add_unity(out_samples, source_buf);
+                            Self::add_unity(out_samples, &delayed);
                         } else {
-                            Self::add_scaled(out_samples, source_buf, output_gain);
+                            Self::add_scaled(out_samples, &delayed, output_gain);
                         }
                     })
                     .is_none()

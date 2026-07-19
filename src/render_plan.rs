@@ -30,6 +30,7 @@ use crate::track::TrackData;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A plan shared across the dispatcher, workers and hardware drivers.
 ///
@@ -55,6 +56,7 @@ pub enum Op {
     /// Sum all `inputs` into `output` for a connected consumer port.
     Sum {
         inputs: Vec<BufferId>,
+        delays: Vec<UnsafeCell<DelayLine>>,
         output: BufferId,
     },
     /// Engine task: track / folder section / plugin processing. Keeps the
@@ -87,6 +89,7 @@ pub struct RenderPlan {
     /// every buffer access goes through the node currently executing on this
     /// thread. This is the one audited `unsafe` cell of the design.
     pub buffers: Vec<UnsafeCell<Vec<f32>>>,
+    pub buffer_latencies: Vec<AtomicUsize>,
     /// Nodes in topological order (producers before consumers).
     pub nodes: Vec<Op>,
     /// `indegree[i]` = number of nodes that must finish before `nodes[i]`.
@@ -122,6 +125,111 @@ pub struct RenderPlan {
 // `Send + Sync`).
 unsafe impl Sync for RenderPlan {}
 
+#[derive(Clone, Debug)]
+pub struct DelayLine {
+    buffer: Vec<f32>,
+    pos: usize,
+    delay: usize,
+}
+
+impl DelayLine {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            pos: 0,
+            delay: 0,
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32], delay: usize, output: &mut [f32], add: bool) {
+        if self.delay != delay || self.buffer.len() != delay {
+            self.process_with_transition(input, delay, output, add);
+            return;
+        }
+        self.process_direct(input, delay, output, add);
+    }
+
+    fn process_with_transition(
+        &mut self,
+        input: &[f32],
+        delay: usize,
+        output: &mut [f32],
+        add: bool,
+    ) {
+        let mut old_line = self.clone();
+        let mut old_output = vec![0.0; output.len()];
+        old_line.process_direct(input, self.delay, &mut old_output, false);
+
+        self.reset(delay);
+        let mut new_output = vec![0.0; output.len()];
+        self.process_direct(input, delay, &mut new_output, false);
+
+        let frames = output.len().min(input.len());
+        let fade_frames = frames.clamp(1, 128);
+        for frame in 0..frames {
+            let t = ((frame + 1) as f32 / fade_frames as f32).clamp(0.0, 1.0);
+            let sample = old_output[frame] * (1.0 - t) + new_output[frame] * t;
+            if add {
+                output[frame] += sample;
+            } else {
+                output[frame] = sample;
+            }
+        }
+        if !add && frames < output.len() {
+            output[frames..].fill(0.0);
+        }
+    }
+
+    fn reset(&mut self, delay: usize) {
+        self.delay = delay;
+        self.pos = 0;
+        self.buffer.resize(delay, 0.0);
+        self.buffer.fill(0.0);
+    }
+
+    fn process_direct(&mut self, input: &[f32], delay: usize, output: &mut [f32], add: bool) {
+        if delay == 0 {
+            if add {
+                crate::simd::add_sanitized_inplace(output, input);
+            } else {
+                crate::simd::copy_sanitized_inplace(output, input);
+                if input.len() < output.len() {
+                    output[input.len()..].fill(0.0);
+                }
+            }
+            self.delay = 0;
+            self.buffer.clear();
+            self.pos = 0;
+            return;
+        }
+
+        let frames = output.len().min(input.len());
+        for frame in 0..frames {
+            let delayed = self.buffer[self.pos];
+            self.buffer[self.pos] = input[frame];
+            self.pos += 1;
+            if self.pos == self.buffer.len() {
+                self.pos = 0;
+            }
+            let delayed = if delayed.is_finite() { delayed } else { 0.0 };
+            if add {
+                output[frame] += delayed;
+            } else {
+                output[frame] = delayed;
+            }
+        }
+        if !add && frames < output.len() {
+            output[frames..].fill(0.0);
+        }
+    }
+}
+
+impl Default for DelayLine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderPlan {
     /// Mutable access to an arena buffer, as a raw pointer.
     ///
@@ -146,6 +254,14 @@ impl RenderPlan {
     /// chain must have completed, and no concurrent writer may exist.
     pub unsafe fn buffer(&self, id: BufferId) -> &[f32] {
         unsafe { &*self.buffers[id as usize].get() }
+    }
+
+    pub fn buffer_latency(&self, id: BufferId) -> usize {
+        self.buffer_latencies[id as usize].load(Ordering::Acquire)
+    }
+
+    pub fn set_buffer_latency(&self, id: BufferId, latency: usize) {
+        self.buffer_latencies[id as usize].store(latency, Ordering::Release);
     }
 
     /// Number of arena buffers.
@@ -636,6 +752,10 @@ impl Builder {
             } else {
                 let node = self.push_node(Op::Sum {
                     inputs: sources.clone(),
+                    delays: sources
+                        .iter()
+                        .map(|_| UnsafeCell::new(DelayLine::new()))
+                        .collect(),
                     output,
                 });
                 for src in sources {
@@ -713,9 +833,11 @@ impl Builder {
             .map(|&(from, to)| (remap[from as usize], remap[to as usize]))
             .collect();
 
+        let buffer_count = self.buffers.len();
         let plan = RenderPlan {
             buffer_size: self.buffer_size,
             buffers: self.buffers,
+            buffer_latencies: (0..buffer_count).map(|_| AtomicUsize::new(0)).collect(),
             nodes,
             indegree,
             dependents,
@@ -838,7 +960,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(i, op)| match op {
-                Op::Sum { inputs, output } => Some((i, inputs.clone(), *output)),
+                Op::Sum { inputs, output, .. } => Some((i, inputs.clone(), *output)),
                 _ => None,
             })
             .collect()
@@ -1048,6 +1170,7 @@ mod tests {
             buffers: (0..buffers)
                 .map(|_| UnsafeCell::new(vec![0.0; 64]))
                 .collect(),
+            buffer_latencies: (0..buffers).map(|_| AtomicUsize::new(0)).collect(),
             nodes,
             indegree,
             dependents,
@@ -1067,6 +1190,7 @@ mod tests {
             vec![
                 Op::Sum {
                     inputs: vec![1],
+                    delays: vec![UnsafeCell::new(DelayLine::new())],
                     output: 0,
                 },
                 Op::HwInput {
@@ -1099,10 +1223,12 @@ mod tests {
                 },
                 Op::Sum {
                     inputs: vec![1],
+                    delays: vec![UnsafeCell::new(DelayLine::new())],
                     output: 0,
                 },
                 Op::Sum {
                     inputs: vec![2],
+                    delays: vec![UnsafeCell::new(DelayLine::new())],
                     output: 0,
                 },
             ],

@@ -414,6 +414,26 @@ impl Engine {
         false
     }
 
+    pub(crate) fn is_track_in_muted_folder(
+        &self,
+        track: &crate::track::TrackData,
+        tracks: &std::collections::HashMap<String, crate::state::TrackHandle>,
+    ) -> bool {
+        let mut current = track.parent_track.clone();
+        while let Some(parent_name) = current {
+            if let Some(parent) = tracks.get(&parent_name) {
+                let p = parent.lock();
+                if p.muted() {
+                    return true;
+                }
+                current = p.parent_track.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
     pub(crate) fn folder_has_soloed_descendant(
         &self,
         folder_name: &str,
@@ -529,18 +549,20 @@ impl Engine {
                 let t = track.lock();
                 let was_enabled = t.output_enabled();
                 let in_soloed_folder = self.is_track_in_soloed_folder(&t, tracks);
+                let in_muted_folder = self.is_track_in_muted_folder(&t, tracks);
                 let folder_with_soloed_child =
                     t.is_folder && self.folder_has_soloed_descendant(&t.name, tracks);
                 let enabled = if t.is_master() {
-                    !t.muted()
+                    !t.muted() && !in_muted_folder
                 } else if any_soloed {
                     (t.soloed()
                         || upstream.contains(&t.name)
                         || in_soloed_folder
                         || folder_with_soloed_child)
                         && !t.muted()
+                        && !in_muted_folder
                 } else {
-                    !t.muted()
+                    !t.muted() && !in_muted_folder
                 };
                 t.set_output_enabled(enabled);
                 if was_enabled && !enabled {

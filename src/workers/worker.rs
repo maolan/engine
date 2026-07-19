@@ -19,6 +19,7 @@ pub(crate) struct NodeJobResult {
     pub(crate) node: u32,
     pub(crate) output_linear: Vec<f32>,
     pub(crate) parameter_updates: Vec<Action>,
+    pub(crate) latency_changed: bool,
 }
 
 #[derive(Debug)]
@@ -375,7 +376,7 @@ impl Worker {
     fn arena_source_slices<'a>(
         plan: &'a crate::render_plan::RenderPlan,
         writable: &[crate::render_plan::BufferId],
-    ) -> Vec<(usize, &'a [f32])> {
+    ) -> Vec<(usize, &'a [f32], usize)> {
         plan.port_map
             .iter()
             .filter_map(|(&key, &buf)| {
@@ -386,7 +387,7 @@ impl Worker {
                 // writable outputs. Its producer completed before this task
                 // because the plan routes folder-output dependencies from
                 // child and plugin producer nodes.
-                Some((key, unsafe { plan.buffer(buf) }))
+                Some((key, unsafe { plan.buffer(buf) }, plan.buffer_latency(buf)))
             })
             .collect()
     }
@@ -410,37 +411,46 @@ impl Worker {
     /// so downstream `Sum` nodes and the hardware drain see the result.
     pub(crate) fn process_node_job_result(worker_id: usize, job: NodeJob) -> NodeJobResult {
         let NodeJob { epoch, plan, node } = job;
-        let (output_linear, parameter_updates) = match &plan.nodes[node as usize] {
+        let (output_linear, parameter_updates, latency_changed) = match &plan.nodes[node as usize] {
             Op::Zero { output } => {
                 // Safety: this worker executes this node; the plan's
                 // single-producer-chain invariant guarantees exclusive
                 // access to the output buffer.
                 unsafe { &mut *plan.buffer_ptr(*output) }.fill(0.0);
-                (Vec::new(), Vec::new())
+                plan.set_buffer_latency(*output, 0);
+                (Vec::new(), Vec::new(), false)
             }
-            Op::Sum { inputs, output } => {
+            Op::Sum {
+                inputs,
+                delays,
+                output,
+            } => {
                 // Safety: see `Op::Zero`; additionally, every input buffer's
                 // producer completed before this node was dispatched.
                 let out = unsafe { &mut *plan.buffer_ptr(*output) };
                 out.fill(0.0);
-                let mut sources = inputs.iter();
-                if let Some(&first) = sources.next() {
-                    let src = unsafe { plan.buffer(first) };
-                    crate::simd::copy_sanitized_inplace(out, src);
-                    if src.len() < out.len() {
-                        out[src.len()..].fill(0.0);
-                    }
-                }
-                for &input in sources {
+                let max_latency = inputs
+                    .iter()
+                    .map(|&input| plan.buffer_latency(input))
+                    .max()
+                    .unwrap_or(0);
+                for (idx, &input) in inputs.iter().enumerate() {
                     let src = unsafe { plan.buffer(input) };
-                    crate::simd::add_sanitized_inplace(out, src);
+                    let delay = max_latency.saturating_sub(plan.buffer_latency(input));
+                    // Safety: this Sum node is the only writer of its delay
+                    // lines during this cycle, and the executor never
+                    // dispatches the same node concurrently.
+                    let line = unsafe { &mut *delays[idx].get() };
+                    line.process(src, delay, out, idx != 0);
                 }
-                (Vec::new(), Vec::new())
+                plan.set_buffer_latency(*output, max_latency);
+                (Vec::new(), Vec::new(), false)
             }
-            Op::HwInput { .. } => {
+            Op::HwInput { output, .. } => {
                 // The hardware driver wrote this buffer before the cycle
                 // started; nothing to do.
-                (Vec::new(), Vec::new())
+                plan.set_buffer_latency(*output, 0);
+                (Vec::new(), Vec::new(), false)
             }
             Op::Task { task, ins, outs } => {
                 let track = match task {
@@ -504,6 +514,9 @@ impl Worker {
                             &source_buffers,
                             metronome_output,
                         );
+                        for &out in outs.iter().take(audio_out_count) {
+                            plan.set_buffer_latency(out, t.plugin_graph_latency_samples());
+                        }
                     }
                     ProcessTask::FolderInput(_) => {
                         let metronome_output = Self::metronome_output_buffer(&plan, &t, outs);
@@ -537,6 +550,9 @@ impl Worker {
                             &mut inputs,
                             metronome_output,
                         );
+                        for &input in ins {
+                            plan.set_buffer_latency(input, 0);
+                        }
                     }
                     ProcessTask::FolderOutput(_) => {
                         let source_buffers = Self::arena_source_slices(&plan, outs);
@@ -557,8 +573,16 @@ impl Worker {
                             })
                             .collect::<Vec<_>>();
                         t.process_folder_output_with_audio_buffers(&mut outputs, &source_buffers);
+                        for &out in outs {
+                            plan.set_buffer_latency(out, t.plugin_graph_latency_samples());
+                        }
                     }
                     ProcessTask::Plugin { kind, index, .. } => {
+                        let input_latency = ins
+                            .iter()
+                            .map(|&input| plan.buffer_latency(input))
+                            .max()
+                            .unwrap_or(0);
                         let inputs = Self::arena_input_slices(&plan, ins);
                         let output_ptrs = outs
                             .iter()
@@ -577,12 +601,18 @@ impl Worker {
                             })
                             .collect::<Vec<_>>();
                         t.process_plugin_with_audio_buffers(*kind, *index, &inputs, &mut outputs);
+                        let latency =
+                            input_latency.saturating_add(t.plugin_latency_samples(*kind, *index));
+                        for &out in outs {
+                            plan.set_buffer_latency(out, latency);
+                        }
                     }
                 }
                 t.audio.set_processing(false);
+                let latency_changed = t.take_plugin_latency_changed();
                 let updates = std::mem::take(&mut t.rt.echoed_parameter_updates);
                 let meter = t.output_meter_linear();
-                (meter, updates)
+                (meter, updates, latency_changed)
             }
         };
         NodeJobResult {
@@ -591,6 +621,7 @@ impl Worker {
             node,
             output_linear,
             parameter_updates,
+            latency_changed,
         }
     }
 
@@ -634,6 +665,7 @@ impl From<NodeJobResult> for Message {
             node: result.node,
             output_linear: result.output_linear,
             parameter_updates: result.parameter_updates,
+            latency_changed: result.latency_changed,
         }
     }
 }
@@ -795,8 +827,15 @@ mod tests {
         let plan = RenderPlan {
             buffer_size: 4,
             buffers: (0..3).map(|_| UnsafeCell::new(vec![0.0; 4])).collect(),
+            buffer_latencies: (0..3)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
             nodes: vec![Op::Sum {
                 inputs: vec![0, 1],
+                delays: vec![
+                    UnsafeCell::new(crate::render_plan::DelayLine::new()),
+                    UnsafeCell::new(crate::render_plan::DelayLine::new()),
+                ],
                 output: 2,
             }],
             indegree: vec![0],

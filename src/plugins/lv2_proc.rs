@@ -11,8 +11,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+const SHM_LATENCY_SAMPLES_OFFSET: usize = 84;
+
+unsafe fn latency_samples_atomic(ptr: *mut u8) -> &'static AtomicU32 {
+    unsafe { &*(ptr.add(SHM_LATENCY_SAMPLES_OFFSET) as *const AtomicU32) }
+}
 
 fn wait_for_host_request_complete(
     header: &ShmHeader,
@@ -69,6 +75,8 @@ pub struct Lv2Processor {
     shm_name: String,
 
     crash_count: AtomicU32,
+    last_latency_samples: AtomicUsize,
+    latency_changed: AtomicBool,
 }
 
 // Safety: see the invariants on `child` and `stderr` above. Every other field
@@ -158,6 +166,8 @@ impl Lv2Processor {
             events: Some(events),
             shm_name,
             crash_count: AtomicU32::new(0),
+            last_latency_samples: AtomicUsize::new(0),
+            latency_changed: AtomicBool::new(false),
         })
     }
 
@@ -232,6 +242,25 @@ impl Lv2Processor {
 
     pub fn is_bypassed(&self) -> bool {
         self.bypassed.load(Ordering::Relaxed)
+    }
+
+    pub fn latency_samples(&self) -> usize {
+        let latency = self
+            .mapping
+            .as_ref()
+            .map(|mapping| unsafe {
+                latency_samples_atomic(mapping.as_ptr()).load(Ordering::Acquire) as usize
+            })
+            .unwrap_or(0);
+        let previous = self.last_latency_samples.swap(latency, Ordering::AcqRel);
+        if previous != latency {
+            self.latency_changed.store(true, Ordering::Release);
+        }
+        latency
+    }
+
+    pub fn take_latency_changed(&self) -> bool {
+        self.latency_changed.swap(false, Ordering::AcqRel)
     }
 
     pub fn parameter_values(&self) -> HashMap<u32, f64> {

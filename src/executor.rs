@@ -394,6 +394,10 @@ mod tests {
             },
             Op::Sum {
                 inputs: vec![0, 1],
+                delays: vec![
+                    UnsafeCell::new(crate::render_plan::DelayLine::new()),
+                    UnsafeCell::new(crate::render_plan::DelayLine::new()),
+                ],
                 output: 2,
             },
             Op::Task {
@@ -405,6 +409,9 @@ mod tests {
         RenderPlan {
             buffer_size: 8,
             buffers: (0..4).map(|_| UnsafeCell::new(vec![0.0; 8])).collect(),
+            buffer_latencies: (0..4)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
             nodes,
             indegree: vec![0, 0, 2, 1],
             dependents: vec![vec![2], vec![2], vec![3], vec![]],

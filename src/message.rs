@@ -1426,6 +1426,7 @@ pub enum Message {
         node: u32,
         output_linear: Vec<f32>,
         parameter_updates: Vec<Action>,
+        latency_changed: bool,
     },
     ProcessOfflineBounce(OfflineBounceWork),
     Channel(Sender<Self>),

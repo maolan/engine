@@ -1508,6 +1508,7 @@ impl Engine {
         node: u32,
         output_linear: Vec<f32>,
         parameter_updates: Vec<Action>,
+        latency_changed: bool,
     ) {
         self.push_ready_worker(worker_id);
         let mut complete = self.dispatch_node_jobs(Vec::new()).await;
@@ -1519,6 +1520,10 @@ impl Engine {
                 node
             );
             return;
+        }
+        if latency_changed {
+            self.publish_state_snapshot();
+            self.plan_builder.mark_dirty();
         }
         let plan = self.executor.plan().clone();
         if let Some(crate::render_plan::Op::Task { task, .. }) = plan.nodes.get(node as usize) {
@@ -1560,6 +1565,7 @@ impl Engine {
                 result.node,
                 result.output_linear,
                 result.parameter_updates,
+                result.latency_changed,
             )
             .await;
         }
@@ -3655,9 +3661,17 @@ impl Engine {
                     node,
                     output_linear,
                     parameter_updates,
+                    latency_changed,
                 } => {
-                    self.on_node_done(worker_id, epoch, node, output_linear, parameter_updates)
-                        .await;
+                    self.on_node_done(
+                        worker_id,
+                        epoch,
+                        node,
+                        output_linear,
+                        parameter_updates,
+                        latency_changed,
+                    )
+                    .await;
                 }
                 Message::Channel(s) => {
                     self.clients.push(s);

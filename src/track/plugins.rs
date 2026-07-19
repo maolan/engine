@@ -2100,31 +2100,209 @@ impl TrackData {
         output_buffers.get(&key).map(Vec::as_slice)
     }
 
-    fn sum_graph_audio_inputs(
+    fn plugin_graph_source_latencies(&self) -> HashMap<usize, usize> {
+        self.audio
+            .ins
+            .iter()
+            .map(|input| (Arc::as_ptr(input) as usize, 0))
+            .collect()
+    }
+
+    fn plugin_node_input_latency(
         &self,
+        node: &PluginGraphNode,
+        source_latencies: &HashMap<usize, usize>,
+    ) -> usize {
+        self.plugin_audio_input_ports_for_node(node)
+            .iter()
+            .flat_map(|input| input.connections().iter().cloned().collect::<Vec<_>>())
+            .map(|source| {
+                source_latencies
+                    .get(&(Arc::as_ptr(&source) as usize))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn plugin_audio_input_ports_for_node(&self, node: &PluginGraphNode) -> Vec<Arc<AudioIO>> {
+        match node {
+            PluginGraphNode::ClapPluginInstance(instance_id) => self
+                .clap_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_inputs().to_vec())
+                .unwrap_or_default(),
+            PluginGraphNode::Vst3PluginInstance(instance_id) => self
+                .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_inputs().to_vec())
+                .unwrap_or_default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginGraphNode::Lv2PluginInstance(instance_id) => self
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_inputs().to_vec())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn plugin_latency_samples(&self, kind: PluginKind, index: usize) -> usize {
+        match kind {
+            PluginKind::Clap => self
+                .clap_plugins
+                .get(index)
+                .map(|instance| instance.processor.latency_samples())
+                .unwrap_or(0),
+            PluginKind::Vst3 => self
+                .vst3_plugins
+                .get(index)
+                .map(|instance| instance.processor.latency_samples())
+                .unwrap_or(0),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginKind::Lv2 => self
+                .lv2_plugins
+                .get(index)
+                .map(|instance| instance.processor.latency_samples())
+                .unwrap_or(0),
+        }
+    }
+
+    pub(crate) fn take_plugin_latency_changed(&self) -> bool {
+        let clap_changed = self
+            .clap_plugins
+            .iter()
+            .any(|instance| instance.processor.take_latency_changed());
+        let vst3_changed = self
+            .vst3_plugins
+            .iter()
+            .any(|instance| instance.processor.take_latency_changed());
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let lv2_changed = self
+            .lv2_plugins
+            .iter()
+            .any(|instance| instance.processor.take_latency_changed());
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let lv2_changed = false;
+
+        clap_changed || vst3_changed || lv2_changed
+    }
+
+    pub(crate) fn plugin_graph_latency_samples(&self) -> usize {
+        let source_latencies = self.current_plugin_graph_source_latencies();
+        self.audio
+            .outs
+            .iter()
+            .flat_map(|output| output.connections().iter().cloned().collect::<Vec<_>>())
+            .map(|source| {
+                source_latencies
+                    .get(&(Arc::as_ptr(&source) as usize))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn current_plugin_graph_source_latencies(&self) -> HashMap<usize, usize> {
+        let mut source_latencies = self.plugin_graph_source_latencies();
+        for (kind, index) in self.plugin_process_order() {
+            let node = match kind {
+                PluginKind::Clap => self
+                    .clap_plugins
+                    .get(index)
+                    .map(|instance| PluginGraphNode::ClapPluginInstance(instance.id)),
+                PluginKind::Vst3 => self
+                    .vst3_plugins
+                    .get(index)
+                    .map(|instance| PluginGraphNode::Vst3PluginInstance(instance.id)),
+                #[cfg(all(unix, not(target_os = "macos")))]
+                PluginKind::Lv2 => self
+                    .lv2_plugins
+                    .get(index)
+                    .map(|instance| PluginGraphNode::Lv2PluginInstance(instance.id)),
+            };
+            let Some(node) = node else {
+                continue;
+            };
+            let latency = self
+                .plugin_node_input_latency(&node, &source_latencies)
+                .saturating_add(self.plugin_latency_samples(kind, index));
+            for output in self.plugin_audio_output_ports_for_node(&node) {
+                source_latencies.insert(Arc::as_ptr(&output) as usize, latency);
+            }
+        }
+        source_latencies
+    }
+
+    fn plugin_audio_output_ports_for_node(&self, node: &PluginGraphNode) -> Vec<Arc<AudioIO>> {
+        match node {
+            PluginGraphNode::ClapPluginInstance(instance_id) => self
+                .clap_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_outputs().to_vec())
+                .unwrap_or_default(),
+            PluginGraphNode::Vst3PluginInstance(instance_id) => self
+                .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_outputs().to_vec())
+                .unwrap_or_default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            PluginGraphNode::Lv2PluginInstance(instance_id) => self
+                .lv2_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_outputs().to_vec())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn sum_graph_audio_inputs(
+        &mut self,
         input_ports: &[Arc<AudioIO>],
         frames: usize,
         track_inputs: &[&mut [f32]],
         output_buffers: &HashMap<usize, Vec<f32>>,
+        source_latencies: &HashMap<usize, usize>,
     ) -> Vec<Vec<f32>> {
         input_ports
             .iter()
             .map(|input| {
                 let mut dst = vec![0.0; frames];
-                let mut seeded = false;
-                for source in input.connections().iter() {
+                let sources = input.connections();
+                let max_latency = sources
+                    .iter()
+                    .map(|source| {
+                        source_latencies
+                            .get(&(Arc::as_ptr(source) as usize))
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                for (source_idx, source) in sources.iter().enumerate() {
                     let key = Arc::as_ptr(source) as usize;
                     let Some(src) =
                         self.source_slice_for_graph_key(key, track_inputs, output_buffers)
                     else {
                         continue;
                     };
-                    if !seeded {
-                        crate::simd::copy_sanitized_inplace(&mut dst, src);
-                        seeded = true;
-                    } else {
-                        crate::simd::add_sanitized_inplace(&mut dst, src);
-                    }
+                    let src = src.to_vec();
+                    let latency = source_latencies.get(&key).copied().unwrap_or(0);
+                    let delay = max_latency.saturating_sub(latency);
+                    let line = self
+                        .rt
+                        .plugin_delay_lines
+                        .entry((Arc::as_ptr(input) as usize, source_idx))
+                        .or_default();
+                    line.process(&src, delay, &mut dst, source_idx != 0);
                 }
                 dst
             })
@@ -2140,6 +2318,7 @@ impl TrackData {
         let order = self.plugin_process_order();
         let mut processed = HashSet::<(PluginKind, usize)>::new();
         let mut output_buffers = HashMap::<usize, Vec<f32>>::new();
+        let mut source_latencies = self.plugin_graph_source_latencies();
         let plugin_output_keys = self.plugin_output_keys();
         self.rt.folder_processed_midi_plugins.clear();
         self.rt.folder_plugin_midi_node_events.clear();
@@ -2185,6 +2364,7 @@ impl TrackData {
                             frames,
                             track_inputs,
                             &output_buffers,
+                            &source_latencies,
                         );
                         let mut output_buffers_for_plugin =
                             vec![vec![0.0; frames]; processor.audio_outputs().len()];
@@ -2215,7 +2395,13 @@ impl TrackData {
                             .iter()
                             .zip(output_buffers_for_plugin)
                         {
-                            output_buffers.insert(Arc::as_ptr(port) as usize, buffer);
+                            let key = Arc::as_ptr(port) as usize;
+                            output_buffers.insert(key, buffer);
+                            source_latencies.insert(
+                                key,
+                                self.plugin_node_input_latency(&node, &source_latencies)
+                                    .saturating_add(processor.latency_samples()),
+                            );
                         }
                         for ev in processor.drain_echoed_parameters() {
                             self.rt.echoed_parameter_updates.push(
@@ -2259,6 +2445,7 @@ impl TrackData {
                             frames,
                             track_inputs,
                             &output_buffers,
+                            &source_latencies,
                         );
                         let mut output_buffers_for_plugin =
                             vec![vec![0.0; frames]; processor.audio_outputs().len()];
@@ -2274,7 +2461,13 @@ impl TrackData {
                             .iter()
                             .zip(output_buffers_for_plugin)
                         {
-                            output_buffers.insert(Arc::as_ptr(port) as usize, buffer);
+                            let key = Arc::as_ptr(port) as usize;
+                            output_buffers.insert(key, buffer);
+                            source_latencies.insert(
+                                key,
+                                self.plugin_node_input_latency(&node, &source_latencies)
+                                    .saturating_add(processor.latency_samples()),
+                            );
                         }
                         for ev in processor.drain_echoed_parameters() {
                             self.rt.echoed_parameter_updates.push(
@@ -2317,6 +2510,7 @@ impl TrackData {
                             frames,
                             track_inputs,
                             &output_buffers,
+                            &source_latencies,
                         );
                         let mut output_buffers_for_plugin =
                             vec![vec![0.0; frames]; processor.audio_outputs().len()];
@@ -2332,7 +2526,13 @@ impl TrackData {
                             .iter()
                             .zip(output_buffers_for_plugin)
                         {
-                            output_buffers.insert(Arc::as_ptr(port) as usize, buffer);
+                            let key = Arc::as_ptr(port) as usize;
+                            output_buffers.insert(key, buffer);
+                            source_latencies.insert(
+                                key,
+                                self.plugin_node_input_latency(&node, &source_latencies)
+                                    .saturating_add(processor.latency_samples()),
+                            );
                         }
                         for ev in processor.drain_echoed_parameters() {
                             self.rt.echoed_parameter_updates.push(
