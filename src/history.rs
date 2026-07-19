@@ -1823,7 +1823,78 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         return Some(actions);
     }
 
+    if let Action::ClipMove {
+        kind: Kind::Audio,
+        from,
+        to,
+        copy,
+    } = action
+    {
+        let mut actions = vec![create_inverse_action(action, state)?];
+        if *copy {
+            let dest_track = state.tracks.get(&to.track_name)?;
+            let dest_track = dest_track.lock();
+            append_audio_clip_fade_restores(
+                &mut actions,
+                &to.track_name,
+                &dest_track.audio.clips(),
+            );
+        } else if from.track_name == to.track_name {
+            let track = state.tracks.get(&from.track_name)?;
+            let track = track.lock();
+            let mut clips = track.audio.clips().iter().cloned().collect::<Vec<_>>();
+            if from.clip_index < clips.len() {
+                let moved = clips.remove(from.clip_index);
+                clips.push(moved);
+            }
+            append_audio_clip_fade_restores(&mut actions, &from.track_name, &clips);
+        } else {
+            let source_track = state.tracks.get(&from.track_name)?;
+            let source_track = source_track.lock();
+            let mut source_clips = source_track
+                .audio
+                .clips()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if from.clip_index < source_clips.len() {
+                let moved = source_clips.remove(from.clip_index);
+                source_clips.push(moved);
+            }
+            append_audio_clip_fade_restores(&mut actions, &from.track_name, &source_clips);
+
+            let dest_track = state.tracks.get(&to.track_name)?;
+            let dest_track = dest_track.lock();
+            append_audio_clip_fade_restores(
+                &mut actions,
+                &to.track_name,
+                &dest_track.audio.clips(),
+            );
+        }
+        return Some(actions);
+    }
+
     create_inverse_action(action, state).map(|a| vec![a])
+}
+
+fn append_audio_clip_fade_restores(
+    actions: &mut Vec<Action>,
+    track_name: &str,
+    clips: &[Arc<crate::audio::clip::AudioClip>],
+) {
+    actions.extend(
+        clips
+            .iter()
+            .enumerate()
+            .map(|(clip_index, clip)| Action::SetClipFade {
+                track_name: track_name.to_string(),
+                clip_index,
+                kind: Kind::Audio,
+                fade_enabled: clip.fade_enabled,
+                fade_in_samples: clip.fade_in_samples,
+                fade_out_samples: clip.fade_out_samples,
+            }),
+    );
 }
 
 #[cfg(test)]
@@ -1898,6 +1969,58 @@ mod tests {
         let undo = history.undo().unwrap();
         assert!(matches!(undo.as_slice(), [Action::SetLoopEnabled(false)]));
         assert!(history.undo().is_none());
+    }
+
+    #[test]
+    fn inverse_audio_clip_move_restores_cross_section_fades() {
+        let track = Track::new("Synth".to_string(), 1, 1, 0, 0, 128, 48_000.0);
+        let mut first = AudioClip::new("first.wav".to_string(), 0, 100);
+        first.fade_in_samples = 11;
+        first.fade_out_samples = 12;
+        let mut second = AudioClip::new("second.wav".to_string(), 150, 250);
+        second.fade_in_samples = 21;
+        second.fade_out_samples = 22;
+        track.audio.push_clip(first);
+        track.audio.push_clip(second);
+        let state = make_state_with_track(track);
+
+        let actions = create_inverse_actions(
+            &Action::ClipMove {
+                kind: Kind::Audio,
+                from: ClipMoveFrom {
+                    track_name: "Synth".to_string(),
+                    clip_index: 0,
+                },
+                to: ClipMoveTo {
+                    track_name: "Synth".to_string(),
+                    sample_offset: 80,
+                    input_channel: 0,
+                },
+                copy: false,
+            },
+            &state,
+        )
+        .unwrap();
+
+        assert!(matches!(actions[0], Action::ClipMove { .. }));
+        assert!(matches!(
+            actions[1],
+            Action::SetClipFade {
+                clip_index: 0,
+                fade_in_samples: 21,
+                fade_out_samples: 22,
+                ..
+            }
+        ));
+        assert!(matches!(
+            actions[2],
+            Action::SetClipFade {
+                clip_index: 1,
+                fade_in_samples: 11,
+                fade_out_samples: 12,
+                ..
+            }
+        ));
     }
 
     #[test]
