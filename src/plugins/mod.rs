@@ -60,6 +60,7 @@ pub fn resolve_plugin_identifier(kind: PluginKind, identifier: &str) -> Result<S
                 .map(|p| p.path)
                 .ok_or_else(|| format!("VST3 plugin ID not found: {identifier}"))
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
         PluginKind::Lv2 => {
             let plugins = scan_plugins::<Lv2PluginInfo>("lv2")
                 .map_err(|e| format!("failed to scan LV2 plugins: {e}"))?;

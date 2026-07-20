@@ -57,6 +57,7 @@ impl Engine {
                     .map(|p| p.path)
                     .ok_or_else(|| format!("VST3 plugin ID not found: {identifier}"))
             }
+            #[cfg(all(unix, not(target_os = "macos")))]
             PluginKind::Lv2 => {
                 let plugins =
                     crate::plugins::scan_plugins::<crate::plugins::types::Lv2PluginInfo>("lv2")

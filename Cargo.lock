@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "alsa",
  "arc-swap",
