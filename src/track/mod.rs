@@ -1737,6 +1737,32 @@ mod tests {
     }
 
     #[test]
+    fn child_track_cannot_become_master() {
+        let mut track = Track::new("child".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.parent_track = Some("folder".to_string());
+        assert!(!track.is_master());
+
+        track.toggle_master();
+        assert!(!track.is_master());
+
+        track.set_master(true);
+        assert!(!track.is_master());
+    }
+
+    #[test]
+    fn master_track_can_be_unmastered_even_when_child() {
+        let mut track = Track::new("child".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.parent_track = Some("folder".to_string());
+        track.is_master.store(true, Ordering::Relaxed);
+
+        track.toggle_master();
+        assert!(!track.is_master());
+
+        track.set_master(true);
+        assert!(!track.is_master());
+    }
+
+    #[test]
     fn normal_track_can_be_toggled_master() {
         let track = Track::new("t".to_string(), 2, 2, 0, 0, 64, 48_000.0);
         assert!(!track.is_master());

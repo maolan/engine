@@ -2036,6 +2036,16 @@ impl Engine {
             return;
         }
 
+        // The master track cannot be made part of a folder.
+        if parent_name.is_some() && track.lock().is_master() {
+            self.notify_clients(Err(format!(
+                "Track '{}' is the master track and cannot be made part of a folder",
+                track_name
+            )))
+            .await;
+            return;
+        }
+
         // Validate the new parent is a folder (if any).
         if let Some(parent_name) = parent_name {
             let state = self.state.lock();

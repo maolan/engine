@@ -2957,4 +2957,78 @@ mod tests {
             "folder track master toggle should still be echoed to clients: {msg:?}"
         );
     }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn track_toggle_master_ignored_for_child_track() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let mut child = Track::new("child".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        child.parent_track = Some("folder".to_string());
+        insert_track(&mut engine, child);
+
+        engine
+            .handle_request_inner(Action::TrackToggleMaster("child".to_string()), false)
+            .await;
+
+        {
+            let state = engine.state.lock();
+            assert!(!state.tracks.get("child").unwrap().lock().is_master());
+        }
+
+        let msg = tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;
+        assert!(
+            matches!(
+                msg,
+                Ok(Some(Message::Response(Ok(Action::TrackToggleMaster(ref name)))))
+                    if name == "child"
+            ),
+            "child track master toggle should still be echoed to clients: {msg:?}"
+        );
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
+    async fn track_set_parent_rejects_master_track() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        let folder = Track::new_folder("folder".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        insert_track(&mut engine, folder);
+        let track = Track::new("master".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.is_master.store(true, Ordering::Relaxed);
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_request_inner(
+                Action::TrackSetParent {
+                    track_name: "master".to_string(),
+                    parent_name: Some("folder".to_string()),
+                },
+                false,
+            )
+            .await;
+
+        {
+            let state = engine.state.lock();
+            assert!(
+                state
+                    .tracks
+                    .get("master")
+                    .unwrap()
+                    .lock()
+                    .parent_track
+                    .is_none()
+            );
+        }
+
+        let msg = tokio::time::timeout(TokioDuration::from_millis(100), client_rx.recv()).await;
+        assert!(
+            matches!(msg, Ok(Some(Message::Response(Err(_))))),
+            "setting master track as folder child should report an error"
+        );
+    }
 }

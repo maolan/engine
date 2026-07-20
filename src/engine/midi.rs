@@ -1016,7 +1016,7 @@ impl Engine {
                     if let Some(track) = state.tracks.get(track_name) {
                         let can_toggle = {
                             let t = track.lock();
-                            t.is_master() || !t.is_folder
+                            t.is_master() || (!t.is_folder && t.parent_track.is_none())
                         };
                         if can_toggle {
                             track.lock().toggle_master();

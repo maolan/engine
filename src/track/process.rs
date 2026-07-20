@@ -1150,15 +1150,15 @@ impl TrackData {
         self.soloed.load(Ordering::Relaxed)
     }
     pub fn toggle_master(&self) {
-        // A folder track can never become master; an already-master folder
-        // is allowed to toggle off to recover from invalid legacy states.
-        if !self.is_master() && self.is_folder {
+        // A folder or child track can never become master; an already-master
+        // track is allowed to toggle off to recover from invalid legacy states.
+        if !self.is_master() && (self.is_folder || self.parent_track.is_some()) {
             return;
         }
         self.is_master.fetch_not(Ordering::Relaxed);
     }
     pub fn set_master(&self, master: bool) {
-        if master && self.is_folder {
+        if master && (self.is_folder || self.parent_track.is_some()) {
             return;
         }
         self.is_master.store(master, Ordering::Relaxed);
