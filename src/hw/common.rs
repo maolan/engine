@@ -50,6 +50,31 @@ pub fn output_meter_linear_from_plan(
     out
 }
 
+/// Read the plan's hardware-output arena buffers and return them as an
+/// interleaved `f32` vector suitable for feeding into an EBU R128 loudness
+/// meter.
+pub fn interleaved_hw_out_samples(plan: &crate::render_plan::RenderPlan) -> Vec<f32> {
+    let ch_count = plan.hw_out_map.len();
+    if ch_count == 0 {
+        return Vec::new();
+    }
+
+    let channel_bufs: Vec<&[f32]> = plan
+        .hw_out_map
+        .iter()
+        .map(|&(buf, _channel)| {
+            // Safety: called after the cycle completed — no node writes these
+            // buffers now.
+            unsafe { plan.buffer(buf) }
+        })
+        .collect();
+
+    let frame_count = channel_bufs.first().map(|b| b.len()).unwrap_or(0);
+    (0..frame_count)
+        .flat_map(|frame| channel_bufs.iter().map(move |buf| buf[frame]))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{channel_balance_gain, output_meter_linear};

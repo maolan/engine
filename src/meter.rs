@@ -1,8 +1,10 @@
+use crate::loudness::LoudnessValues;
 use crate::message::SessionSlotState;
 
 #[derive(Clone, Debug, Default)]
 pub struct MeterSnapshot {
     pub hw_out_db: Vec<f32>,
+    pub hw_out_lufs: Option<LoudnessValues>,
     pub track_meters: Vec<(String, Vec<f32>)>,
 }
 

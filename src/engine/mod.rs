@@ -357,6 +357,8 @@ pub struct Engine {
     plan_builder: crate::plan_builder::PlanBuilder,
     latest_hw_out_meter_db: Arc<Vec<f32>>,
     latest_track_meter_snapshot: Arc<Vec<(String, Vec<f32>)>>,
+    hw_out_loudness_meter: Option<crate::loudness::LoudnessMeter>,
+    latest_hw_out_lufs: Option<crate::loudness::LoudnessValues>,
     history: History,
     history_group: Option<UndoEntry>,
     history_suspended: bool,

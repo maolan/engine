@@ -258,6 +258,8 @@ impl Engine {
             pending_node_jobs: VecDeque::new(),
             latest_hw_out_meter_db: Arc::new(Vec::new()),
             latest_track_meter_snapshot: Arc::new(Vec::new()),
+            hw_out_loudness_meter: None,
+            latest_hw_out_lufs: None,
             history: History::default(),
             history_group: None,
             history_suspended: false,
@@ -809,6 +811,7 @@ impl Engine {
                 Ok(Action::MeterSnapshot {
                     hw_out_db,
                     track_meters,
+                    ..
                 }) => {
                     let mut args: Vec<OscArg> = Vec::new();
                     args.push(OscArg::Int(hw_out_db.len() as i32));
@@ -1259,7 +1262,9 @@ impl Engine {
         } else {
             10.0_f32.powf(self.hw_out_level_db / 20.0)
         };
-        let should_notify_interval = self.should_publish_hw_out_meters();
+
+        // Send master gain/balance to the driver. If there is no active audio
+        // backend there is nothing further to meter.
         if let Some(worker) = &self.hw_worker {
             let _ = worker
                 .tx
@@ -1268,18 +1273,12 @@ impl Engine {
                     balance: self.hw_out_balance,
                 })
                 .await;
-            if !should_notify_interval {
-                return;
-            }
         } else {
             #[cfg(unix)]
             {
                 if let Some(jack) = self.jack_runtime.as_ref() {
                     jack.set_output_gain_linear(gain);
                     jack.set_output_balance(self.hw_out_balance);
-                    if !should_notify_interval {
-                        return;
-                    }
                 } else {
                     return;
                 }
@@ -1289,25 +1288,18 @@ impl Engine {
                 return;
             }
         }
-        let peaks_linear = if self.hw_worker.is_some() {
-            let plan = self.executor.plan().clone();
-            crate::hw::common::output_meter_linear_from_plan(&plan, gain, self.hw_out_balance)
-        } else {
-            #[cfg(unix)]
-            {
-                if self.jack_runtime.is_none() {
-                    return;
-                }
-                // Read the plan's hardware-output arena buffers (the driver
-                // drain source) instead of the legacy bridge ports.
-                let plan = self.executor.plan().clone();
-                crate::hw::common::output_meter_linear_from_plan(&plan, gain, self.hw_out_balance)
-            }
-            #[cfg(not(unix))]
-            {
-                return;
-            }
-        };
+
+        // Loudness must be fed every cycle so integrated LUFS is accurate.
+        self.feed_hw_out_loudness_meter();
+
+        let should_notify_interval = self.should_publish_hw_out_meters();
+        if !should_notify_interval {
+            return;
+        }
+
+        let plan = self.executor.plan().clone();
+        let peaks_linear =
+            crate::hw::common::output_meter_linear_from_plan(&plan, gain, self.hw_out_balance);
         if self.hw_out_peak_hold_linear.len() != peaks_linear.len() {
             self.hw_out_peak_hold_linear.resize(peaks_linear.len(), 0.0);
         }
@@ -1318,8 +1310,7 @@ impl Engine {
             self.hw_out_peak_hold_linear[idx] = next;
             held_peaks.push(next);
         }
-        let should_notify =
-            should_notify_interval && self.should_publish_hw_out_linear(&held_peaks);
+        let should_notify = self.should_publish_hw_out_linear(&held_peaks);
         let meter_db: Vec<f32> = held_peaks
             .into_iter()
             .map(Self::meter_linear_to_db)
@@ -1328,6 +1319,39 @@ impl Engine {
         if should_notify {
             self.maybe_notify_hw_out_meter(meter_db).await;
         }
+    }
+
+    fn feed_hw_out_loudness_meter(&mut self) {
+        let Some(info) = self.hw_driver_info else {
+            return;
+        };
+        let plan = self.executor.plan();
+        let channels = plan.hw_out_map.len();
+        if channels == 0 {
+            return;
+        }
+        let sample_rate = info.sample_rate as u32;
+
+        let needs_recreate = self
+            .hw_out_loudness_meter
+            .as_ref()
+            .is_none_or(|m| m.channels() != channels || m.sample_rate() != sample_rate);
+        if needs_recreate {
+            self.hw_out_loudness_meter =
+                crate::loudness::LoudnessMeter::new(channels, sample_rate).ok();
+        }
+
+        if let Some(meter) = self.hw_out_loudness_meter.as_mut() {
+            let interleaved = crate::hw::common::interleaved_hw_out_samples(plan);
+            meter.feed_interleaved(&interleaved);
+        }
+    }
+
+    fn update_hw_out_lufs_readout(&mut self) {
+        self.latest_hw_out_lufs = self
+            .hw_out_loudness_meter
+            .as_ref()
+            .map(|meter| meter.values());
     }
 
     pub(crate) fn preload_track_clips_spawn(&self) {
@@ -2156,11 +2180,16 @@ impl Engine {
     }
 
     pub(crate) fn publish_meter_snapshot(&mut self) {
+        // Query LUFS at the same cadence as the VU meter snapshot rather than
+        // every audio cycle, which keeps the CPU cost low.
+        self.update_hw_out_lufs_readout();
+
         let snapshot = self.meter_snapshot_producer.write_buffer();
         snapshot.hw_out_db.clear();
         snapshot
             .hw_out_db
             .extend(self.latest_hw_out_meter_db.iter().copied());
+        snapshot.hw_out_lufs = self.latest_hw_out_lufs;
         snapshot.track_meters.clear();
         snapshot
             .track_meters
@@ -2681,6 +2710,7 @@ impl Engine {
             Action::RequestMeterSnapshot => {
                 self.notify_clients(Ok(Action::MeterSnapshot {
                     hw_out_db: self.latest_hw_out_meter_db.clone(),
+                    hw_out_lufs: self.latest_hw_out_lufs,
                     track_meters: self.latest_track_meter_snapshot.clone(),
                 }))
                 .await;
