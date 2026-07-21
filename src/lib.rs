@@ -1,5 +1,5 @@
 mod audio;
-mod audio_codec;
+pub mod audio_codec;
 pub mod client;
 pub mod connectable;
 mod engine;
