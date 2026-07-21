@@ -876,6 +876,17 @@ impl ClapProcessor {
         if let Some(ref mapping) = self.mapping {
             let header = unsafe { header_mut(mapping.as_ptr()) };
             header.set_parent_window(window);
+            header.set_gui_parent_api(maolan_plugin_protocol::protocol::GuiParentApi::X11);
+            return Ok(());
+        }
+        Err("No active host to set parent window".to_string())
+    }
+
+    pub fn gui_set_parent_wayland(&self, window: usize) -> Result<(), String> {
+        if let Some(ref mapping) = self.mapping {
+            let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.set_parent_window(window);
+            header.set_gui_parent_api(maolan_plugin_protocol::protocol::GuiParentApi::Wayland);
             return Ok(());
         }
         Err("No active host to set parent window".to_string())
@@ -889,6 +900,10 @@ impl ClapProcessor {
             } else {
                 GuiMode::Embedded
             });
+            if floating {
+                header.set_parent_window(0);
+                header.set_gui_parent_api(maolan_plugin_protocol::protocol::GuiParentApi::None);
+            }
             return Ok(());
         }
         Err("No active host to set GUI mode".to_string())

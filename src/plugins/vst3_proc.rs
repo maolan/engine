@@ -559,6 +559,10 @@ impl Vst3Processor {
             } else {
                 GuiMode::Embedded
             });
+            if floating {
+                header.set_parent_window(0);
+                header.set_gui_parent_api(maolan_plugin_protocol::protocol::GuiParentApi::None);
+            }
             return Ok(());
         }
         Err("No active host to set GUI mode".to_string())
