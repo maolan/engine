@@ -152,7 +152,7 @@ fn decode_with_symphonia(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
             sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
         }
         let buf = sample_buf.as_mut().unwrap();
-        buf.copy_planar_ref(decoded);
+        buf.copy_interleaved_ref(decoded);
         samples.extend_from_slice(buf.samples());
     }
 
@@ -617,5 +617,74 @@ impl DitherRng {
     fn uniform_half(&mut self) -> f32 {
         let u = self.next_u64() >> 32;
         (u as f32 / 4_294_967_296.0) - 0.5
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_stereo_wav_returns_interleaved_samples() {
+        let path =
+            std::env::temp_dir().join(format!("maolan_stereo_decode_{}.wav", std::process::id()));
+        write_test_wav_f32(
+            &path,
+            &[
+                0.10, 0.60, //
+                0.20, 0.70, //
+                0.30, 0.80, //
+                0.40, 0.90,
+            ],
+            2,
+            48_000,
+        )
+        .expect("write test wav");
+
+        let (samples, channels, sample_rate) =
+            decode_audio_to_f32_interleaved_sync(&path).expect("decode test wav");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(channels, 2);
+        assert_eq!(sample_rate, 48_000);
+        assert_eq!(samples.len(), 8);
+        for (actual, expected) in samples
+            .iter()
+            .zip([0.10, 0.60, 0.20, 0.70, 0.30, 0.80, 0.40, 0.90])
+        {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    fn write_test_wav_f32(
+        path: &Path,
+        samples: &[f32],
+        channels: usize,
+        sample_rate: u32,
+    ) -> io::Result<()> {
+        let bytes_per_sample = 4usize;
+        let block_align = (channels * bytes_per_sample) as u16;
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data_size = samples.len() * bytes_per_sample;
+        let riff_size = 36 + data_size as u32;
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(b"RIFF")?;
+        file.write_all(&riff_size.to_le_bytes())?;
+        file.write_all(b"WAVE")?;
+        file.write_all(b"fmt ")?;
+        file.write_all(&16u32.to_le_bytes())?;
+        file.write_all(&3u16.to_le_bytes())?;
+        file.write_all(&(channels as u16).to_le_bytes())?;
+        file.write_all(&sample_rate.to_le_bytes())?;
+        file.write_all(&byte_rate.to_le_bytes())?;
+        file.write_all(&block_align.to_le_bytes())?;
+        file.write_all(&32u16.to_le_bytes())?;
+        file.write_all(b"data")?;
+        file.write_all(&(data_size as u32).to_le_bytes())?;
+        for sample in samples {
+            file.write_all(&sample.to_le_bytes())?;
+        }
+        Ok(())
     }
 }
