@@ -1,152 +1,237 @@
 use std::io::{self, Write};
 use std::path::Path;
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+
+use oxideav_core::{
+    AudioFrame, CodecId, CodecParameters, Frame, MediaType, Packet, RuntimeContext, SampleFormat,
+    StreamInfo, TimeBase,
+};
+
+/// Export format selector for [`encode_audio_to_file`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioEncodeFormat {
+    /// Microsoft RIFF/WAVE, integer or float PCM.
+    Wav(WavBitDepth),
+    /// Native FLAC (`*.flac`). The `u16` is the desired bit depth
+    /// (16, 24 or 32).
+    Flac(u16),
+    /// Ogg-encapsulated FLAC (`*.ogg`). The `u16` is the desired bit
+    /// depth (16, 24 or 32).
+    OggFlac(u16),
+    /// MPEG-1/2/2.5 Layer III (`*.mp3`). Uses a sensible CBR bitrate
+    /// chosen from the standard Layer III ladder based on sample rate
+    /// and channel count.
+    Mp3,
+}
+
+/// WAV PCM bit-depth / sample-format choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WavBitDepth {
+    Int16,
+    Int24,
+    Int32,
+    Float32,
+}
+
+/// Dither mode applied when quantising floating-point samples to an
+/// integer target format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioDither {
+    #[default]
+    None,
+    Rectangular,
+    Triangular,
+}
 
 /// Decode an audio file to interleaved `f32` samples.
 ///
-/// The format is detected from the file extension (case-insensitive):
-/// `.wav`, `.flac`, or `.opus`. Returns `(samples, channels, sample_rate)`.
+/// The format is auto-detected by Symphonia for `.wav`, `.flac`, `.mp3`,
+/// `.ogg`/`.vorbis`, `.m4a`/`.aac`/`.alac`, and friends.
+/// Returns `(samples, channels, sample_rate)`.
 /// All decode paths emit samples in the range `[-1.0, 1.0]`.
 pub fn decode_audio_to_f32_interleaved_sync(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
-    let ext = file_extension(path)?;
-    match ext.as_str() {
-        "wav" => decode_wav(path),
-        "flac" => decode_flac(path),
-        "opus" => decode_opus(path),
-        _ => Err(io::Error::other(format!(
-            "Unsupported audio extension '{ext}' for '{}'",
-            path.display()
-        ))),
-    }
+    decode_with_symphonia(path)
 }
 
 /// Decode a WAV file preferentially, falling back to the general decoder.
 ///
-/// This preserves the old "try the WAV-specific path first" behavior for
-/// callers that want to avoid the format-detection overhead/differences for
-/// `.wav` inputs.
+/// This used to short-circuit `.wav` inputs to a dedicated path. Symphonia
+/// handles WAV natively, so this now simply delegates to the unified decoder.
 pub fn decode_audio_to_f32_interleaved_preferring_wav(
     path: &Path,
 ) -> io::Result<(Vec<f32>, usize, u32)> {
-    if file_extension(path)?.eq_ignore_ascii_case("wav")
-        && let Ok(ok) = decode_wav(path)
-    {
-        return Ok(ok);
-    }
     decode_audio_to_f32_interleaved_sync(path)
 }
 
-fn file_extension(path: &Path) -> io::Result<String> {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .ok_or_else(|| io::Error::other(format!("Missing file extension for '{}'", path.display())))
-}
-
 // ---------------------------------------------------------------------------
-// WAV
+// Symphonia decode (WAV, FLAC, MP3, Vorbis, AAC, ALAC, ...)
 // ---------------------------------------------------------------------------
 
-fn decode_wav(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
-    let mut reader = hound::WavReader::open(path)
-        .map_err(|e| io::Error::other(format!("Failed to open WAV '{}': {e}", path.display())))?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    let sample_rate = spec.sample_rate;
-    let bits_per_sample = spec.bits_per_sample;
+fn decode_with_symphonia(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| io::Error::other(format!("Failed to open '{}': {e}", path.display())))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let format_opts = FormatOptions::default();
+    let metadata_opts = MetadataOptions::default();
+    let decoder_opts = DecoderOptions::default();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &format_opts, &metadata_opts)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "Symphonia failed to probe format for '{}': {e}",
+                path.display()
+            ))
+        })?;
+    let mut format = probed.format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .or_else(|| format.tracks().first())
+        .ok_or_else(|| {
+            io::Error::other(format!("No usable audio track in '{}'", path.display()))
+        })?;
+
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(48_000);
+    let track_id = track.id;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &decoder_opts)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "Symphonia failed to create decoder for '{}': {e}",
+                path.display()
+            ))
+        })?;
+
+    let mut sample_buf = None;
     let mut samples = Vec::new();
-    match spec.sample_format {
-        hound::SampleFormat::Float => {
-            for s in reader.samples::<f32>() {
-                let v = s.map_err(|e| {
-                    io::Error::other(format!("WAV decode error for '{}': {e}", path.display()))
-                })?;
-                samples.push(v.clamp(-1.0, 1.0));
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
             }
-        }
-        hound::SampleFormat::Int => {
-            for s in reader.samples::<i32>() {
-                let v = s.map_err(|e| {
-                    io::Error::other(format!("WAV decode error for '{}': {e}", path.display()))
-                })?;
-                samples.push(int_sample_to_f32(v, bits_per_sample));
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "Symphonia read error for '{}': {e}",
+                    path.display()
+                )));
             }
+        };
+
+        if packet.track_id() != track_id {
+            continue;
         }
+
+        let decoded = decoder.decode(&packet).map_err(|e| {
+            io::Error::other(format!(
+                "Symphonia decode error for '{}': {e}",
+                path.display()
+            ))
+        })?;
+
+        if sample_buf.is_none() {
+            let spec = *decoded.spec();
+            sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
+        }
+        let buf = sample_buf.as_mut().unwrap();
+        buf.copy_planar_ref(decoded);
+        samples.extend_from_slice(buf.samples());
     }
 
     if samples.is_empty() {
         return Err(io::Error::other(format!(
-            "WAV '{}' contains no samples",
+            "No samples decoded from '{}'",
             path.display()
         )));
     }
+
     Ok((samples, channels, sample_rate))
 }
 
+// ---------------------------------------------------------------------------
+// Encode entry point
+// ---------------------------------------------------------------------------
+
+/// Encode interleaved `f32` samples to a file using OxideAV.
+///
+/// `samples` must be interleaved (`ch0 ch1 ... chN ...`).
+/// `channels` is clamped to at least 1. `sample_rate` must be non-zero.
+/// Integer formats are quantised from the `[-1.0, 1.0]` float range; for
+/// WAV and FLAC the requested bit depth is honoured, while MP3 always
+/// uses 16-bit PCM internally.
+pub fn encode_audio_to_file(
+    path: &Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    format: AudioEncodeFormat,
+    dither: AudioDither,
+) -> io::Result<()> {
+    let channels = channels.max(1);
+    if sample_rate == 0 {
+        return Err(io::Error::other("encode: sample_rate must be > 0"));
+    }
+    if channels > 8 {
+        return Err(io::Error::other(format!(
+            "encode: channel count {channels} exceeds the supported maximum of 8"
+        )));
+    }
+    if !samples.len().is_multiple_of(channels) {
+        return Err(io::Error::other(
+            "encode: sample slice length is not a multiple of channels",
+        ));
+    }
+
+    match format {
+        AudioEncodeFormat::Wav(depth) => {
+            encode_wav(path, samples, channels, sample_rate, depth, dither)
+        }
+        AudioEncodeFormat::Flac(bits) => {
+            encode_flac_to_file(path, samples, channels, sample_rate, bits, dither)
+        }
+        AudioEncodeFormat::OggFlac(bits) => {
+            encode_ogg_flac(path, samples, channels, sample_rate, bits, dither)
+        }
+        AudioEncodeFormat::Mp3 => encode_mp3(path, samples, channels, sample_rate, dither),
+    }
+}
+
+/// Backwards-compatible WAV writer: 32-bit float PCM.
 pub fn write_wav_f32(
     path: &Path,
     samples: &[f32],
     channels: usize,
     sample_rate: u32,
 ) -> io::Result<()> {
-    let bytes_per_sample = 4usize;
-    let block_align = (channels.max(1) * bytes_per_sample) as u16;
-    let byte_rate = sample_rate * u32::from(block_align);
-    let data_size = samples
-        .len()
-        .checked_mul(bytes_per_sample)
-        .ok_or_else(|| io::Error::other("WAV data too large"))? as u32;
-    let riff_size = 36u32
-        .checked_add(data_size)
-        .ok_or_else(|| io::Error::other("WAV file too large"))?;
-
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(b"RIFF")?;
-    file.write_all(&riff_size.to_le_bytes())?;
-    file.write_all(b"WAVE")?;
-    file.write_all(b"fmt ")?;
-    file.write_all(&16u32.to_le_bytes())?;
-    file.write_all(&3u16.to_le_bytes())?;
-    file.write_all(&(channels.max(1) as u16).to_le_bytes())?;
-    file.write_all(&sample_rate.to_le_bytes())?;
-    file.write_all(&byte_rate.to_le_bytes())?;
-    file.write_all(&block_align.to_le_bytes())?;
-    file.write_all(&32u16.to_le_bytes())?;
-    file.write_all(b"data")?;
-    file.write_all(&data_size.to_le_bytes())?;
-    for &sample in samples {
-        file.write_all(&sample.clamp(-1.0, 1.0).to_le_bytes())?;
-    }
-    Ok(())
+    encode_audio_to_file(
+        path,
+        samples,
+        channels,
+        sample_rate,
+        AudioEncodeFormat::Wav(WavBitDepth::Float32),
+        AudioDither::None,
+    )
 }
 
-// ---------------------------------------------------------------------------
-// FLAC
-// ---------------------------------------------------------------------------
-
-fn decode_flac(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
-    let bytes = std::fs::read(path)?;
-    let decoded = libflac_rs::decode(&bytes)
-        .ok_or_else(|| io::Error::other(format!("Failed to decode FLAC '{}'", path.display())))?;
-
-    let channels = decoded.channels as usize;
-    let sample_rate = decoded.sample_rate;
-    let bits_per_sample = decoded.bits_per_sample as u16;
-
-    let mut samples = Vec::with_capacity(decoded.interleaved.len());
-    for v in decoded.interleaved {
-        samples.push(int_sample_to_f32(v, bits_per_sample));
-    }
-
-    if samples.is_empty() {
-        return Err(io::Error::other(format!(
-            "FLAC '{}' contains no samples",
-            path.display()
-        )));
-    }
-    Ok((samples, channels, sample_rate))
-}
-
+/// Backwards-compatible native FLAC writer.
 pub fn write_flac(
     path: &Path,
     samples: &[f32],
@@ -154,333 +239,383 @@ pub fn write_flac(
     sample_rate: u32,
     bits_per_sample: u16,
 ) -> io::Result<()> {
-    if channels == 0 {
-        return Err(io::Error::other("FLAC write: channels must be > 0"));
-    }
-    if !samples.len().is_multiple_of(channels) {
-        return Err(io::Error::other(
-            "FLAC write: sample slice length is not a multiple of channels",
-        ));
-    }
-    if !matches!(bits_per_sample, 16 | 24 | 32) {
-        return Err(io::Error::other(format!(
-            "FLAC write: unsupported bits_per_sample {bits_per_sample} (use 16, 24, or 32)"
-        )));
-    }
-
-    let pcm: Vec<i32> = samples
-        .iter()
-        .map(|&s| f32_sample_to_int(s, bits_per_sample))
-        .collect();
-
-    let config =
-        libflac_rs::EncoderConfig::new(channels as u32, bits_per_sample as u32, sample_rate);
-    let encoder = libflac_rs::Encoder::new(config);
-    let encoded = encoder.encode(&pcm);
-
-    std::fs::write(path, encoded)?;
-    Ok(())
+    encode_audio_to_file(
+        path,
+        samples,
+        channels,
+        sample_rate,
+        AudioEncodeFormat::Flac(bits_per_sample),
+        AudioDither::None,
+    )
 }
 
 // ---------------------------------------------------------------------------
-// Opus (Ogg Opus container)
+// WAV
 // ---------------------------------------------------------------------------
 
-fn decode_opus(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
-    use ogg::PacketReader;
-
-    let file = std::fs::File::open(path)?;
-    let mut reader = PacketReader::new(file);
-
-    // First packet: OpusHead
-    let head_packet = reader
-        .read_packet()
-        .map_err(|e| io::Error::other(format!("Ogg read error for '{}': {e}", path.display())))?
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "Opus file '{}' contains no packets",
-                path.display()
-            ))
-        })?;
-
-    if !head_packet.data.starts_with(b"OpusHead") {
-        return Err(io::Error::other(format!(
-            "Opus file '{}' missing OpusHead header",
-            path.display()
-        )));
-    }
-    let channels = parse_opus_head_channels(&head_packet.data)?;
-
-    // Second packet: OpusTags (skip)
-    let _tags_packet = reader
-        .read_packet()
-        .map_err(|e| io::Error::other(format!("Ogg read error for '{}': {e}", path.display())))?;
-
-    // Remaining packets are audio.
-    let sample_rate = 48_000;
-    let mut decoder = opus_rs::OpusDecoder::new(sample_rate, channels).map_err(|e| {
-        io::Error::other(format!(
-            "Opus decoder init failed for '{}': {e}",
-            path.display()
-        ))
-    })?;
-
-    let mut output = Vec::new();
-    loop {
-        let packet = match reader.read_packet() {
-            Ok(Some(p)) => p,
-            Ok(None) => break,
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "Ogg read error for '{}': {e}",
-                    path.display()
-                )));
-            }
-        };
-
-        let frame_size = opus_packet_frame_size(&packet.data, sample_rate).ok_or_else(|| {
-            io::Error::other(format!(
-                "Invalid Opus packet framing in '{}'",
-                path.display()
-            ))
-        })?;
-
-        let mut frame = vec![0.0f32; frame_size * channels];
-        decoder
-            .decode(&packet.data, frame_size, &mut frame)
-            .map_err(|e| {
-                io::Error::other(format!("Opus decode error for '{}': {e}", path.display()))
-            })?;
-        output.extend_from_slice(&frame);
-    }
-
-    if output.is_empty() {
-        return Err(io::Error::other(format!(
-            "Opus file '{}' contains no audio",
-            path.display()
-        )));
-    }
-    Ok((output, channels, sample_rate as u32))
-}
-
-pub fn write_opus(
+fn encode_wav(
     path: &Path,
     samples: &[f32],
     channels: usize,
     sample_rate: u32,
-    bitrate_bps: i32,
+    depth: WavBitDepth,
+    dither: AudioDither,
 ) -> io::Result<()> {
-    use ogg::{PacketWriteEndInfo, PacketWriter};
+    let (codec_id, sample_format) = match depth {
+        WavBitDepth::Int16 => ("pcm_s16le", SampleFormat::S16),
+        WavBitDepth::Int24 => ("pcm_s24le", SampleFormat::S24),
+        WavBitDepth::Int32 => ("pcm_s32le", SampleFormat::S32),
+        WavBitDepth::Float32 => ("pcm_f32le", SampleFormat::F32),
+    };
+    let bytes = pack_interleaved_samples(samples, sample_format, dither)?;
 
-    if channels == 0 || channels > 2 {
-        return Err(io::Error::other(
-            "Opus write: only mono and stereo are supported",
-        ));
-    }
-    if !samples.len().is_multiple_of(channels) {
-        return Err(io::Error::other(
-            "Opus write: sample slice length is not a multiple of channels",
-        ));
-    }
-    if !matches!(sample_rate, 8_000 | 12_000 | 16_000 | 24_000 | 48_000) {
-        return Err(io::Error::other(format!(
-            "Opus write: unsupported sample rate {sample_rate} (use 8000, 12000, 16000, 24000, or 48000)"
-        )));
-    }
+    let mut ctx = RuntimeContext::new();
+    oxideav_basic::register(&mut ctx);
 
-    let total_samples = samples.len() / channels;
-    // 20 ms frames are the standard Opus frame size and are valid for all
-    // supported sample rates / applications.
-    let frame_size = (sample_rate as usize / 50).max(1);
-
-    let mut encoder =
-        opus_rs::OpusEncoder::new(sample_rate as i32, channels, opus_rs::Application::Audio)
-            .map_err(|e| io::Error::other(format!("Opus encoder init failed: {e}")))?;
-    encoder.bitrate_bps = bitrate_bps;
-
+    let stream = audio_stream_info(codec_id, channels, sample_rate, sample_format, None);
     let file = std::fs::File::create(path)?;
-    let mut writer = PacketWriter::new(file);
-    let serial = ogg_serial_from_path(path);
-
-    // OpusHead must be the sole packet on the first page.
-    writer.write_packet(
-        opus_head(channels as u8, sample_rate),
-        serial,
-        PacketWriteEndInfo::EndPage,
-        0,
-    )?;
-
-    // OpusTags on its own page.
-    writer.write_packet(opus_tags(), serial, PacketWriteEndInfo::EndPage, 0)?;
-
-    let mut packet_buf = vec![0u8; 4000];
-    let mut encoded_granule: u64 = 0;
-
-    for frame_idx in 0..frame_count(total_samples, frame_size) {
-        let start = frame_idx * frame_size;
-        let end = ((start + frame_size).min(total_samples)).max(start);
-        let actual_len = end - start;
-
-        // Opus requires a full frame; pad the tail with silence.
-        let mut frame_input = vec![0.0f32; frame_size * channels];
-        frame_input[..actual_len * channels]
-            .copy_from_slice(&samples[start * channels..end * channels]);
-
-        let encoded_len = encoder
-            .encode(&frame_input, frame_size, &mut packet_buf)
-            .map_err(|e| io::Error::other(format!("Opus encode failed: {e}")))?;
-
-        encoded_granule = encoded_granule.saturating_add(frame_size as u64);
-        // For the final frame use the real sample count as the granule position
-        // so compliant decoders can trim the padding.
-        let is_last = frame_idx == frame_count(total_samples, frame_size) - 1;
-        let granule = if is_last {
-            total_samples.min(encoded_granule as usize) as u64
-        } else {
-            encoded_granule
-        };
-
-        let end_info = if is_last {
-            PacketWriteEndInfo::EndStream
-        } else {
-            PacketWriteEndInfo::NormalPacket
-        };
-        writer.write_packet(
-            packet_buf[..encoded_len].to_vec(),
-            serial,
-            end_info,
-            granule,
-        )?;
-    }
-
+    let output: Box<dyn oxideav_core::WriteSeek> = Box::new(file);
+    let mut mux = ctx
+        .containers
+        .open_muxer("wav", output, std::slice::from_ref(&stream))
+        .map_err(oxideav_err_to_io)?;
+    mux.write_header().map_err(oxideav_err_to_io)?;
+    let packet = Packet::new(0, TimeBase::new(1, sample_rate as i64), bytes);
+    mux.write_packet(&packet).map_err(oxideav_err_to_io)?;
+    mux.write_trailer().map_err(oxideav_err_to_io)?;
     Ok(())
 }
 
-fn parse_opus_head_channels(head: &[u8]) -> io::Result<usize> {
-    if head.len() < 10 || head[8] != 1 {
+// ---------------------------------------------------------------------------
+// FLAC (native and Ogg)
+// ---------------------------------------------------------------------------
+
+fn encode_flac_to_file(
+    path: &Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    dither: AudioDither,
+) -> io::Result<()> {
+    let (packets, output_params) =
+        encode_flac_packets(samples, channels, sample_rate, bits_per_sample, dither)?;
+
+    let mut ctx = RuntimeContext::new();
+    oxideav_flac::register(&mut ctx);
+
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, sample_rate as i64),
+        duration: None,
+        start_time: Some(0),
+        params: output_params,
+    };
+    let file = std::fs::File::create(path)?;
+    let output: Box<dyn oxideav_core::WriteSeek> = Box::new(file);
+    let mut mux = ctx
+        .containers
+        .open_muxer("flac", output, std::slice::from_ref(&stream))
+        .map_err(oxideav_err_to_io)?;
+    mux.write_header().map_err(oxideav_err_to_io)?;
+    for pkt in &packets {
+        mux.write_packet(pkt).map_err(oxideav_err_to_io)?;
+    }
+    mux.write_trailer().map_err(oxideav_err_to_io)?;
+    Ok(())
+}
+
+/// Returns the encoded FLAC frame packets and the finalised output
+/// parameters (including the STREAMINFO extradata).
+fn encode_flac_packets(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    dither: AudioDither,
+) -> io::Result<(Vec<Packet>, CodecParameters)> {
+    let sample_format = flac_sample_format(bits_per_sample)?;
+    let bytes = pack_interleaved_samples(samples, sample_format, dither)?;
+
+    let mut ctx = RuntimeContext::new();
+    oxideav_flac::register(&mut ctx);
+
+    let params = audio_codec_params("flac", channels, sample_rate, sample_format, None);
+    let mut enc = ctx
+        .codecs
+        .first_encoder(&params)
+        .map_err(oxideav_err_to_io)?;
+
+    let frame = AudioFrame {
+        samples: (samples.len() / channels) as u32,
+        pts: Some(0),
+        data: vec![bytes],
+    };
+    enc.send_frame(&Frame::Audio(frame))
+        .map_err(oxideav_err_to_io)?;
+    enc.flush().map_err(oxideav_err_to_io)?;
+
+    let mut packets = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => return Err(oxideav_err_to_io(e)),
+        }
+    }
+
+    Ok((packets, enc.output_params().clone()))
+}
+
+fn encode_ogg_flac(
+    path: &Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    dither: AudioDither,
+) -> io::Result<()> {
+    let (packets, output_params) =
+        encode_flac_packets(samples, channels, sample_rate, bits_per_sample, dither)?;
+
+    // Build the FLAC-in-Ogg mapping header packet:
+    // 0x7F "FLAC" major minor header_packets_be "fLaC"
+    let mut mapping = Vec::with_capacity(13);
+    mapping.push(0x7F);
+    mapping.extend_from_slice(b"FLAC");
+    mapping.push(0x01); // mapping major version
+    mapping.push(0x00); // mapping minor version
+    // One header packet follows the mapping header: the STREAMINFO block.
+    mapping.extend_from_slice(&1u16.to_be_bytes());
+    mapping.extend_from_slice(b"fLaC");
+
+    let streaminfo = output_params.extradata;
+
+    let mut writer = oxideav_ogg::framing::PageWriter::new(0).with_page_target(4096);
+    writer.push_packet(&mapping, 0);
+    writer.flush_page();
+    writer.push_packet(&streaminfo, 0);
+    writer.flush_page();
+
+    for pkt in &packets {
+        let granule = pkt
+            .pts
+            .map(|pts| pts + pkt.duration.unwrap_or(0))
+            .unwrap_or(0);
+        writer.push_packet(&pkt.data, granule);
+    }
+
+    std::fs::write(path, writer.finish())?;
+    Ok(())
+}
+
+fn flac_sample_format(bits_per_sample: u16) -> io::Result<SampleFormat> {
+    match bits_per_sample {
+        8 => Ok(SampleFormat::U8),
+        16 => Ok(SampleFormat::S16),
+        24 => Ok(SampleFormat::S24),
+        32 => Ok(SampleFormat::S32),
+        _ => Err(io::Error::other(format!(
+            "FLAC bit depth {bits_per_sample} not supported (use 8, 16, 24 or 32)"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MP3
+// ---------------------------------------------------------------------------
+
+fn encode_mp3(
+    path: &Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    dither: AudioDither,
+) -> io::Result<()> {
+    if channels > 2 {
         return Err(io::Error::other(
-            "OpusHead header is too short or has unsupported version",
+            "MP3 encode: only mono and stereo are supported",
         ));
     }
-    let channels = head[9] as usize;
-    if channels == 0 {
-        return Err(io::Error::other("OpusHead reports zero channels"));
-    }
-    Ok(channels)
-}
+    let bitrate = mp3_default_bitrate(sample_rate, channels);
+    let bytes = pack_interleaved_samples(samples, SampleFormat::S16, dither)?;
 
-fn opus_head(channels: u8, sample_rate: u32) -> Vec<u8> {
-    let mut head = Vec::with_capacity(19);
-    head.extend_from_slice(b"OpusHead");
-    head.push(1); // version
-    head.push(channels);
-    head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
-    head.extend_from_slice(&sample_rate.to_le_bytes()); // input sample rate
-    head.extend_from_slice(&0i16.to_le_bytes()); // output gain
-    head.push(0); // channel mapping family (mono/stereo)
-    head
-}
+    let mut ctx = RuntimeContext::new();
+    oxideav_mp3::register(&mut ctx);
 
-fn opus_tags() -> Vec<u8> {
-    let vendor = b"maolan-engine";
-    let mut tags = Vec::with_capacity(8 + 4 + vendor.len() + 4);
-    tags.extend_from_slice(b"OpusTags");
-    tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-    tags.extend_from_slice(vendor);
-    tags.extend_from_slice(&0u32.to_le_bytes()); // user comment count
-    tags
-}
+    let params = audio_codec_params(
+        "mp3",
+        channels,
+        sample_rate,
+        SampleFormat::S16,
+        Some(bitrate as u64),
+    );
+    let mut enc = ctx
+        .codecs
+        .first_encoder(&params)
+        .map_err(oxideav_err_to_io)?;
 
-fn ogg_serial_from_path(path: &Path) -> u32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    path.as_os_str().hash(&mut hasher);
-    hasher.finish() as u32
-}
+    let frame = AudioFrame {
+        samples: (samples.len() / channels) as u32,
+        pts: Some(0),
+        data: vec![bytes],
+    };
+    enc.send_frame(&Frame::Audio(frame))
+        .map_err(oxideav_err_to_io)?;
+    enc.flush().map_err(oxideav_err_to_io)?;
 
-/// Compute the total number of fixed-size frames needed for `total_samples`,
-/// padding the final frame if necessary.
-fn frame_count(total_samples: usize, frame_size: usize) -> usize {
-    if total_samples == 0 {
-        return 0;
-    }
-    total_samples.div_ceil(frame_size)
-}
-
-/// Determine the total number of samples encoded by an Opus packet.
-/// The TOC byte describes the mode and the per-sub-frame duration; this
-/// helper multiplies by the number of sub-frames to obtain the value that
-/// the opus-rs decoder expects as `frame_size`.
-fn opus_packet_frame_size(packet: &[u8], sample_rate: i32) -> Option<usize> {
-    if packet.is_empty() {
-        return None;
-    }
-    let toc = packet[0];
-
-    let sub_frame_duration_ms = if toc & 0x80 != 0 {
-        // CELT-only
-        match (toc >> 3) & 0x03 {
-            0 => 2,
-            1 => 5,
-            2 => 10,
-            _ => 20,
+    let mut file = std::fs::File::create(path)?;
+    loop {
+        match enc.receive_packet() {
+            Ok(pkt) => file.write_all(&pkt.data)?,
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => return Err(oxideav_err_to_io(e)),
         }
-    } else if toc & 0x60 == 0x60 {
-        // Hybrid
-        if ((toc >> 3) & 0x01) == 0 { 10 } else { 20 }
+    }
+    Ok(())
+}
+
+fn mp3_default_bitrate(sample_rate: u32, channels: usize) -> u32 {
+    // MPEG-1 (32/44.1/48 kHz) ladder
+    if sample_rate >= 32_000 {
+        if channels >= 2 { 192_000 } else { 128_000 }
+    } else if sample_rate >= 16_000 {
+        // MPEG-2 LSF (16/22.05/24 kHz) ladder
+        if channels >= 2 { 96_000 } else { 64_000 }
     } else {
-        // SILK-only
-        match (toc >> 3) & 0x03 {
-            0 => 10,
-            1 => 20,
-            2 => 40,
-            _ => 60,
-        }
-    };
-
-    let sub_frame_size = (sample_rate as i64 * sub_frame_duration_ms as i64 / 1000).max(1) as usize;
-    let code = toc & 0x03;
-    let frame_count = match code {
-        0 => 1,
-        1 | 2 => 2,
-        3 => {
-            if packet.len() < 2 {
-                return None;
-            }
-            let n = (packet[1] & 0x3F) as usize;
-            if n == 0 {
-                return None;
-            }
-            n
-        }
-        _ => return None,
-    };
-
-    Some(sub_frame_size * frame_count)
+        // MPEG-2.5 (8/11.025/12 kHz) ladder
+        if channels >= 2 { 48_000 } else { 32_000 }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Sample format conversions
+// Helpers
 // ---------------------------------------------------------------------------
 
-fn int_sample_to_f32(v: i32, bits_per_sample: u16) -> f32 {
-    let divisor = match bits_per_sample {
-        8 => 128.0,
-        16 => 32_768.0,
-        24 => 8_388_608.0,
-        32 => 2_147_483_648.0,
-        _ => 2.0f32.powi(bits_per_sample as i32 - 1),
-    };
-    (v as f32 / divisor).clamp(-1.0, 1.0)
+fn audio_codec_params(
+    codec_id: &str,
+    channels: usize,
+    sample_rate: u32,
+    sample_format: SampleFormat,
+    bit_rate: Option<u64>,
+) -> CodecParameters {
+    let mut params = CodecParameters::audio(CodecId::new(codec_id));
+    params.media_type = MediaType::Audio;
+    params.channels = Some(channels as u16);
+    params.sample_rate = Some(sample_rate);
+    params.sample_format = Some(sample_format);
+    if let Some(br) = bit_rate {
+        params.bit_rate = Some(br);
+    }
+    params
 }
 
-fn f32_sample_to_int(v: f32, bits_per_sample: u16) -> i32 {
-    let max_positive = match bits_per_sample {
-        16 => 32_767i32,
-        24 => 8_388_607i32,
-        32 => 2_147_483_647i32,
-        _ => ((1u64 << (bits_per_sample - 1)) - 1) as i32,
-    };
-    (v.clamp(-1.0, 1.0) * max_positive as f32).round() as i32
+fn audio_stream_info(
+    codec_id: &str,
+    channels: usize,
+    sample_rate: u32,
+    sample_format: SampleFormat,
+    bit_rate: Option<u64>,
+) -> StreamInfo {
+    let params = audio_codec_params(codec_id, channels, sample_rate, sample_format, bit_rate);
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, sample_rate as i64),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
+fn pack_interleaved_samples(
+    samples: &[f32],
+    format: SampleFormat,
+    dither: AudioDither,
+) -> io::Result<Vec<u8>> {
+    let bytes_per_sample = format.bytes_per_sample();
+    let mut out = Vec::with_capacity(samples.len().saturating_mul(bytes_per_sample));
+    let mut rng = DitherRng::new(0x1234_5678_9abc_defe);
+
+    for &sample in samples {
+        let s = sample.clamp(-1.0, 1.0);
+        match format {
+            SampleFormat::U8 => {
+                let v = ((s + 1.0) * 127.5 + dither_offset(&mut rng, dither)).round() as u8;
+                out.push(v);
+            }
+            SampleFormat::S16 => {
+                let scale = i16::MAX as f32;
+                let q = quantize_with_dither(s, scale, &mut rng, dither)
+                    .round()
+                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                out.extend_from_slice(&q.to_le_bytes());
+            }
+            SampleFormat::S24 => {
+                let scale = 8_388_607.0;
+                let q = quantize_with_dither(s, scale, &mut rng, dither)
+                    .round()
+                    .clamp(-8_388_608.0, 8_388_607.0) as i32;
+                let b = q.to_le_bytes();
+                out.extend_from_slice(&b[..3]);
+            }
+            SampleFormat::S32 => {
+                let scale = i32::MAX as f32;
+                let q = quantize_with_dither(s, scale, &mut rng, dither)
+                    .round()
+                    .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+                out.extend_from_slice(&q.to_le_bytes());
+            }
+            SampleFormat::F32 => {
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+            _ => {
+                return Err(io::Error::other(format!(
+                    "unsupported sample format {format:?}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn quantize_with_dither(sample: f32, scale: f32, rng: &mut DitherRng, dither: AudioDither) -> f32 {
+    let d = dither_offset(rng, dither);
+    (sample + d / scale).clamp(-1.0, 1.0) * scale
+}
+
+fn dither_offset(rng: &mut DitherRng, dither: AudioDither) -> f32 {
+    match dither {
+        AudioDither::None => 0.0,
+        AudioDither::Rectangular => rng.uniform_half(),
+        AudioDither::Triangular => rng.uniform_half() + rng.uniform_half(),
+    }
+}
+
+fn oxideav_err_to_io(e: oxideav_core::Error) -> io::Error {
+    io::Error::other(format!("OxideAV error: {e}"))
+}
+
+/// Tiny deterministic PRNG used for export dither.
+struct DitherRng {
+    state: u64,
+}
+
+impl DitherRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64*
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        self.state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform random value in [-0.5, 0.5).
+    fn uniform_half(&mut self) -> f32 {
+        let u = self.next_u64() >> 32;
+        (u as f32 / 4_294_967_296.0) - 0.5
+    }
 }
