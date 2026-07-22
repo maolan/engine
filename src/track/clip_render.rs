@@ -2,7 +2,7 @@
 use crate::clap::ClapMidiOutputEvent;
 use crate::message::{PluginGraphNode, PluginKind};
 #[cfg(unix)]
-use crate::rubberband::LivePitchShifter;
+use crate::pitch_shift::LivePitchShifter;
 
 use super::*;
 use crate::{audio::io::AudioIO, midi::io::MidiEvent};
@@ -580,7 +580,7 @@ impl TrackData {
                                 effective_channels,
                                 formant,
                             )
-                            .expect("rubberband live shifter"),
+                            .expect("pitch shifter"),
                         });
                 shifter.shifter.set_formant_preserved(formant);
                 let block_size = shifter.shifter.block_size();

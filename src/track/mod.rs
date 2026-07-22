@@ -3,7 +3,7 @@ use super::{audio::track::AudioTrack, midi::track::MIDITrack};
 use crate::clap::ClapMidiOutputEvent;
 use crate::message::{PluginGraphConnection, PluginGraphNode};
 #[cfg(unix)]
-use crate::rubberband::LivePitchShifter;
+use crate::pitch_shift::LivePitchShifter;
 
 use crate::kind::Kind;
 use crate::{

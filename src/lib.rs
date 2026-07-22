@@ -15,12 +15,12 @@ pub mod meter;
 mod midi;
 pub mod modulator;
 mod osc;
+#[cfg(unix)]
+mod pitch_shift;
 mod plan_builder;
 pub mod plugins;
 pub mod render_plan;
 mod routing;
-#[cfg(unix)]
-mod rubberband;
 pub mod simd;
 pub mod state;
 mod track;
