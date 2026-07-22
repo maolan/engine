@@ -158,7 +158,11 @@ impl TrackData {
                     midi_inputs: proc.midi_input_count(),
                     midi_outputs: proc.midi_output_count(),
                     state: include_state
-                        .then(|| serde_json::to_value(proc.snapshot_state()).ok())
+                        .then(|| {
+                            proc.snapshot_state()
+                                .ok()
+                                .and_then(|state| serde_json::to_value(state).ok())
+                        })
                         .flatten(),
                     bypassed: proc.is_bypassed(),
                 },
@@ -818,6 +822,47 @@ impl TrackData {
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
         instance.processor.update_file_reference(index, path)
+    }
+
+    pub fn drain_plugin_parameter_echoes(&mut self) -> Vec<crate::message::Action> {
+        let mut updates = Vec::new();
+        let track_name = self.name.clone();
+
+        for instance in &self.clap_plugins {
+            for ev in instance.processor.drain_echoed_parameters() {
+                updates.push(crate::message::Action::TrackSetClapParameter {
+                    track_name: track_name.clone(),
+                    instance_id: instance.id,
+                    param_id: ev.param_index,
+                    value: ev.value as f64,
+                });
+            }
+        }
+
+        for instance in &self.vst3_plugins {
+            for ev in instance.processor.drain_echoed_parameters() {
+                updates.push(crate::message::Action::TrackSetVst3Parameter {
+                    track_name: track_name.clone(),
+                    instance_id: instance.id,
+                    param_id: ev.param_index,
+                    value: ev.value,
+                });
+            }
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for instance in &self.lv2_plugins {
+            for ev in instance.processor.drain_echoed_parameters() {
+                updates.push(crate::message::Action::TrackSetLv2ControlValue {
+                    track_name: track_name.clone(),
+                    instance_id: instance.id,
+                    index: ev.param_index,
+                    value: ev.value,
+                });
+            }
+        }
+
+        updates
     }
 
     pub fn load_vst3_plugin(
@@ -2519,8 +2564,20 @@ impl TrackData {
                             .iter_mut()
                             .map(Vec::as_mut_slice)
                             .collect::<Vec<_>>();
-                        let midi_outputs =
-                            processor.process_with_audio_buffers(frames, &inputs, &mut outputs);
+                        let midi_outputs = processor.process_with_audio_buffers(
+                            frames,
+                            crate::plugins::types::Lv2TransportInfo {
+                                transport_sample: self.rt.transport_sample,
+                                playing: (self.disk_monitor().iter().any(|&m| m)
+                                    || self.midi_disk_monitor().iter().any(|&m| m))
+                                    && self.rt.clip_playback_enabled,
+                                bpm: self.rt.tempo_bpm,
+                                tsig_num: self.rt.tsig_num,
+                                tsig_denom: self.rt.tsig_denom,
+                            },
+                            &inputs,
+                            &mut outputs,
+                        );
                         for (port, buffer) in processor
                             .audio_outputs()
                             .iter()

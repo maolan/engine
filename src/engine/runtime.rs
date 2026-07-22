@@ -1573,6 +1573,23 @@ impl Engine {
         }
     }
 
+    pub(crate) async fn poll_stopped_plugin_parameter_echoes(&mut self) {
+        if self.playing || self.transport_running {
+            return;
+        }
+
+        let state = self.state_snapshot.load_full();
+        let mut updates = Vec::new();
+        for track in state.tracks.values() {
+            updates.extend(track.lock().drain_plugin_parameter_echoes());
+        }
+        drop(state);
+
+        for action in updates {
+            self.notify_clients(Ok(action)).await;
+        }
+    }
+
     pub(crate) async fn poll_node_worker_results(&mut self) {
         let mut results = Vec::new();
         for worker in &mut self.workers {
@@ -2915,6 +2932,12 @@ impl Engine {
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackSetLv2PluginState { .. } => {
+                if Self::box_bool(self.handle_track_set_lv2_plugin_state(a.clone())).await {
+                    return;
+                }
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
             Action::ClipSetLv2PluginState { ref track_name, .. } => {
                 self.notify_clients(Err(format!(
                     "Track '{}': clip LV2 plugin state changes are not supported",
@@ -3260,6 +3283,12 @@ impl Engine {
                 }
             }
             Action::TrackVst3Parameters { .. } => {}
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Action::TrackSetLv2ControlValue { .. } => {
+                if Self::box_bool(self.handle_track_set_lv2_control_value(a.clone())).await {
+                    return;
+                }
+            }
             #[cfg(all(unix, not(target_os = "macos")))]
             Action::TrackGetLv2PluginControls { .. } => {
                 if Self::box_bool(self.handle_track_get_lv2_plugin_controls(a.clone())).await {
@@ -3665,12 +3694,14 @@ impl Engine {
                 _ = tick.tick() => {
                     self.poll_node_worker_results().await;
                     self.poll_jack_hw_finished().await;
+                    self.poll_stopped_plugin_parameter_echoes().await;
                     self.on_executor_tick().await;
                     continue;
                 }
             };
             self.poll_node_worker_results().await;
             self.poll_jack_hw_finished().await;
+            self.poll_stopped_plugin_parameter_echoes().await;
             match message {
                 Message::Ready(id) => {
                     // A bounce worker's terminal Ready cleans up its job even

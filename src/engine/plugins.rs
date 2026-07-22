@@ -1881,6 +1881,61 @@ impl Engine {
         false
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(crate) async fn handle_track_set_lv2_plugin_state(&mut self, a: Action) -> bool {
+        let Action::TrackSetLv2PluginState {
+            ref track_name,
+            instance_id,
+            ref state,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track.lock().lv2_restore_state(instance_id, state) {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(crate) async fn handle_track_set_lv2_control_value(&mut self, a: Action) -> bool {
+        let Action::TrackSetLv2ControlValue {
+            ref track_name,
+            instance_id,
+            index,
+            value,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track.lock().set_lv2_control_value(
+                    instance_id,
+                    index as usize,
+                    f64::from(value),
+                ) {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
     pub(crate) async fn handle_track_vst3_restore_state(&mut self, a: Action) -> bool {
         let Action::TrackVst3RestoreState {
             ref track_name,

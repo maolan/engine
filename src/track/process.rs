@@ -715,8 +715,20 @@ impl TrackData {
                     &self.rt.folder_plugin_midi_node_events,
                 );
                 let _lv2_input = midi_inputs.first().cloned().unwrap_or_default();
-                let outputs =
-                    processor.process_with_audio_buffers(frames, audio_inputs, audio_outputs);
+                let outputs = processor.process_with_audio_buffers(
+                    frames,
+                    crate::plugins::types::Lv2TransportInfo {
+                        transport_sample: self.rt.transport_sample,
+                        playing: (self.disk_monitor().iter().any(|&m| m)
+                            || self.midi_disk_monitor().iter().any(|&m| m))
+                            && self.rt.clip_playback_enabled,
+                        bpm: self.rt.tempo_bpm,
+                        tsig_num: self.rt.tsig_num,
+                        tsig_denom: self.rt.tsig_denom,
+                    },
+                    audio_inputs,
+                    audio_outputs,
+                );
                 let track_name = self.name.clone();
                 for ev in processor.drain_echoed_parameters() {
                     self.rt.echoed_parameter_updates.push(

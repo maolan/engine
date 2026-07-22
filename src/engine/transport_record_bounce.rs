@@ -1410,6 +1410,7 @@ impl Engine {
         {
             self.notify_clients(Err(e)).await;
         }
+        self.notify_clients(Ok(Action::Play)).await;
         self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
             .await;
         self.preload_track_clips().await;

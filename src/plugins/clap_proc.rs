@@ -251,7 +251,10 @@ impl ClapProcessor {
     }
 
     pub fn set_bypassed(&self, bypassed: bool) {
-        self.bypassed.store(bypassed, Ordering::Relaxed);
+        let previous = self.bypassed.swap(bypassed, Ordering::Relaxed);
+        if previous != bypassed {
+            self.latency_changed.store(true, Ordering::Release);
+        }
     }
 
     pub fn is_bypassed(&self) -> bool {
@@ -259,6 +262,13 @@ impl ClapProcessor {
     }
 
     pub fn latency_samples(&self) -> usize {
+        if self.bypassed.load(Ordering::Relaxed) {
+            let previous = self.last_latency_samples.swap(0, Ordering::AcqRel);
+            if previous != 0 {
+                self.latency_changed.store(true, Ordering::Release);
+            }
+            return 0;
+        }
         let latency = self
             .mapping
             .as_ref()
@@ -1188,6 +1198,29 @@ mod tests {
             output_buffers[0].iter().all(|&s| s == 1.0),
             "after crash, output should be bypass copy of input"
         );
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
+    #[test]
+    fn clap_bypass_reports_zero_latency() {
+        let host_bin = find_host_binary();
+        if !host_bin.exists() {
+            return;
+        }
+        let processor = ClapProcessor::new(48000.0, 256, "__test__", 1, 1, host_bin)
+            .expect("should create CLAP processor");
+        let mapping = processor.mapping.as_ref().expect("mapping exists");
+        unsafe {
+            latency_samples_atomic(mapping.as_ptr()).store(128, Ordering::Release);
+        }
+
+        assert_eq!(processor.latency_samples(), 128);
+        processor.set_bypassed(true);
+        assert_eq!(processor.latency_samples(), 0);
+        assert!(processor.take_latency_changed());
     }
 
     #[cfg_attr(

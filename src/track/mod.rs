@@ -483,8 +483,12 @@ impl ClipPluginRuntime {
                     .iter_mut()
                     .map(Vec::as_mut_slice)
                     .collect::<Vec<_>>();
-                let midi_outputs =
-                    processor.process_with_audio_buffers(frames, &inputs, &mut outputs);
+                let midi_outputs = processor.process_with_audio_buffers(
+                    frames,
+                    crate::plugins::types::Lv2TransportInfo::default(),
+                    &inputs,
+                    &mut outputs,
+                );
                 for (port, buffer) in processor
                     .audio_outputs()
                     .iter()
