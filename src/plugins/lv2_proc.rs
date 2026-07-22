@@ -237,7 +237,10 @@ impl Lv2Processor {
     }
 
     pub fn set_bypassed(&self, bypassed: bool) {
-        self.bypassed.store(bypassed, Ordering::Relaxed);
+        let previous = self.bypassed.swap(bypassed, Ordering::Relaxed);
+        if previous != bypassed {
+            self.latency_changed.store(true, Ordering::Release);
+        }
     }
 
     pub fn is_bypassed(&self) -> bool {
@@ -245,6 +248,13 @@ impl Lv2Processor {
     }
 
     pub fn latency_samples(&self) -> usize {
+        if self.bypassed.load(Ordering::Relaxed) {
+            let previous = self.last_latency_samples.swap(0, Ordering::AcqRel);
+            if previous != 0 {
+                self.latency_changed.store(true, Ordering::Release);
+            }
+            return 0;
+        }
         let latency = self
             .mapping
             .as_ref()
@@ -608,6 +618,7 @@ impl Lv2Processor {
     pub fn process_with_audio_buffers(
         &self,
         frames: usize,
+        transport: crate::plugins::types::Lv2TransportInfo,
         audio_inputs: &[&[f32]],
         audio_outputs: &mut [&mut [f32]],
     ) -> Vec<MidiEvent> {
@@ -652,11 +663,11 @@ impl Lv2Processor {
             ipc::configure_shm_header(ptr, frames, num_in, num_out, midi_in_count, midi_out_count);
 
             let t = transport_mut(ptr);
-            t.playhead_sample = 0;
-            t.tempo = 120.0;
-            t.numerator = 4;
-            t.denominator = 4;
-            t.flags = 1;
+            t.playhead_sample = transport.transport_sample as u64;
+            t.tempo = transport.bpm;
+            t.numerator = u32::from(transport.tsig_num);
+            t.denominator = u32::from(transport.tsig_denom);
+            t.flags = u32::from(transport.playing);
 
             ipc::copy_input_slices_to_shm(audio_inputs, ptr, frames);
 
@@ -902,7 +913,12 @@ mod tests {
             .iter_mut()
             .map(Vec::as_mut_slice)
             .collect::<Vec<_>>();
-        processor.process_with_audio_buffers(256, &inputs, &mut outputs);
+        processor.process_with_audio_buffers(
+            256,
+            crate::plugins::types::Lv2TransportInfo::default(),
+            &inputs,
+            &mut outputs,
+        );
 
         let out_buf = &output_buffers[0];
         let first_few: Vec<f32> = out_buf.iter().take(10).copied().collect();
@@ -911,5 +927,24 @@ mod tests {
             "after crash, output should be bypass copy of input, got: {:?}",
             first_few
         );
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
+    #[test]
+    fn lv2_bypass_reports_zero_latency() {
+        let processor = Lv2Processor::new(48000.0, 256, "__test__", 1, 1, find_host_binary())
+            .expect("should create LV2 processor");
+        let mapping = processor.mapping.as_ref().expect("mapping exists");
+        unsafe {
+            latency_samples_atomic(mapping.as_ptr()).store(128, Ordering::Release);
+        }
+
+        assert_eq!(processor.latency_samples(), 128);
+        processor.set_bypassed(true);
+        assert_eq!(processor.latency_samples(), 0);
+        assert!(processor.take_latency_changed());
     }
 }

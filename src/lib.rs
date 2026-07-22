@@ -94,7 +94,8 @@ pub type EngineInit = (
 );
 
 pub fn init() -> EngineInit {
-    let (tx, rx) = channel::<message::Message>(32);
+    let command_queue_capacity = num_cpus::get().saturating_mul(4).max(128);
+    let (tx, rx) = channel::<message::Message>(command_queue_capacity);
     let (meter_producer, meter_consumer) =
         triple_buffer::triple_buffer(meter::MeterSnapshot::default());
     let (transport_producer, transport_consumer) =

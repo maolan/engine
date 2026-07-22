@@ -34,6 +34,15 @@ pub struct ClapTransportInfo {
     pub tsig_denom: u16,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Lv2TransportInfo {
+    pub transport_sample: usize,
+    pub playing: bool,
+    pub bpm: f64,
+    pub tsig_num: u16,
+    pub tsig_denom: u16,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClapGuiInfo {
     pub api: String,

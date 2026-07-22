@@ -1,6 +1,6 @@
 [package]
 name = "maolan-engine"
-version = "0.2.39"
+version = "0.2.40"
 edition = "2024"
 description = "Audio engine for the Maolan DAW with audio/MIDI tracks, routing, export, and out-of-process CLAP/VST3/LV2 plugin support"
 license = "BSD-2-Clause"
