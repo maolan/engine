@@ -940,6 +940,7 @@ mod tests {
     use super::{AudioClipBuffer, HwMidiOutEvent, Track};
     use crate::audio::clip::AudioClip;
     use crate::audio::io::AudioIO;
+    use crate::midi::io::MIDIIO;
     use crate::{kind::Kind, message::PluginGraphNode};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -1703,6 +1704,54 @@ mod tests {
     }
 
     #[test]
+    fn connect_audio_connectable_links_track_input_to_child_input() {
+        let mut track = Track::new_folder("Parent".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let child = Arc::new(Track::new("Child".to_string(), 1, 1, 0, 0, 8, 48_000.0));
+        track.child_tracks.push(child);
+
+        track
+            .connect_audio_connectable(
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+                crate::connectable::ConnectableRef::ChildTrack("Child".to_string()),
+                0,
+            )
+            .unwrap();
+
+        let parent_in = track.audio.ins[0].clone();
+        assert!(
+            track.child_tracks[0].lock().audio.ins[0]
+                .connections()
+                .iter()
+                .any(|c| Arc::ptr_eq(c, &parent_in))
+        );
+    }
+
+    #[test]
+    fn connect_midi_connectable_links_track_input_to_child_input() {
+        let mut track = Track::new_folder("Parent".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        let child = Arc::new(Track::new("Child".to_string(), 0, 0, 1, 1, 8, 48_000.0));
+        track.child_tracks.push(child);
+
+        track
+            .connect_midi_connectable(
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+                crate::connectable::ConnectableRef::ChildTrack("Child".to_string()),
+                0,
+            )
+            .unwrap();
+
+        let parent_in = track.midi.ins[0].clone();
+        assert!(
+            track.child_tracks[0].lock().midi.ins[0]
+                .sources()
+                .iter()
+                .any(|s| Arc::ptr_eq(s, &parent_in))
+        );
+    }
+
+    #[test]
     fn connect_audio_connectable_rejects_track_input_as_source() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         let err = track
@@ -1714,6 +1763,58 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("cannot be used as an audio source"));
+    }
+
+    #[test]
+    fn disconnect_audio_connectable_allows_track_input_source() {
+        let mut track = Track::new("Parent".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let child = Arc::new(Track::new("Child".to_string(), 1, 1, 0, 0, 8, 48_000.0));
+        {
+            let child_lock = child.lock();
+            AudioIO::connect(&track.audio.ins[0], &child_lock.audio.ins[0]);
+        }
+        track.child_tracks.push(child);
+
+        track
+            .disconnect_audio_connectable(
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+                crate::connectable::ConnectableRef::ChildTrack("Child".to_string()),
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.child_tracks[0].lock().audio.ins[0]
+                .connections()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn disconnect_midi_connectable_allows_track_input_source() {
+        let mut track = Track::new("Parent".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        let child = Arc::new(Track::new("Child".to_string(), 0, 0, 1, 1, 8, 48_000.0));
+        {
+            let child_lock = child.lock();
+            MIDIIO::connect(&track.midi.ins[0], &child_lock.midi.ins[0]);
+        }
+        track.child_tracks.push(child);
+
+        track
+            .disconnect_midi_connectable(
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+                crate::connectable::ConnectableRef::ChildTrack("Child".to_string()),
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.child_tracks[0].lock().midi.ins[0]
+                .sources()
+                .is_empty()
+        );
     }
 
     #[test]

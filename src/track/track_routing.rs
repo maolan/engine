@@ -517,6 +517,39 @@ impl TrackData {
         }
     }
 
+    fn disconnectable_audio_source(
+        &self,
+        connectable: &ConnectableRef,
+        port: usize,
+    ) -> Result<Arc<AudioIO>, String> {
+        use crate::connectable::AudioPorts;
+        match connectable {
+            ConnectableRef::TrackInput => self
+                .audio_inputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track input audio port {port} not found")),
+            _ => self.connectable_audio_output(connectable, port),
+        }
+    }
+
+    fn connectable_audio_source(
+        &self,
+        from: &ConnectableRef,
+        from_port: usize,
+        to: &ConnectableRef,
+    ) -> Result<Arc<AudioIO>, String> {
+        use crate::connectable::AudioPorts;
+        match (from, to) {
+            (ConnectableRef::TrackInput, ConnectableRef::ChildTrack(_)) => self
+                .audio_inputs()
+                .get(from_port)
+                .cloned()
+                .ok_or_else(|| format!("Track input audio port {from_port} not found")),
+            _ => self.connectable_audio_output(from, from_port),
+        }
+    }
+
     pub(crate) fn connectable_midi_output(
         &self,
         connectable: &ConnectableRef,
@@ -605,6 +638,39 @@ impl TrackData {
         }
     }
 
+    fn disconnectable_midi_source(
+        &self,
+        connectable: &ConnectableRef,
+        port: usize,
+    ) -> Result<Arc<MIDIIO>, String> {
+        use crate::connectable::MidiPorts;
+        match connectable {
+            ConnectableRef::TrackInput => self
+                .midi_inputs()
+                .get(port)
+                .cloned()
+                .ok_or_else(|| format!("Track input MIDI port {port} not found")),
+            _ => self.connectable_midi_output(connectable, port),
+        }
+    }
+
+    fn connectable_midi_source(
+        &self,
+        from: &ConnectableRef,
+        from_port: usize,
+        to: &ConnectableRef,
+    ) -> Result<Arc<MIDIIO>, String> {
+        use crate::connectable::MidiPorts;
+        match (from, to) {
+            (ConnectableRef::TrackInput, ConnectableRef::ChildTrack(_)) => self
+                .midi_inputs()
+                .get(from_port)
+                .cloned()
+                .ok_or_else(|| format!("Track input MIDI port {from_port} not found")),
+            _ => self.connectable_midi_output(from, from_port),
+        }
+    }
+
     pub fn connect_audio_connectable(
         &mut self,
         from: ConnectableRef,
@@ -612,7 +678,7 @@ impl TrackData {
         to: ConnectableRef,
         to_port: usize,
     ) -> Result<(), String> {
-        let source = self.connectable_audio_output(&from, from_port)?;
+        let source = self.connectable_audio_source(&from, from_port, &to)?;
         let target = self.connectable_audio_input(&to, to_port)?;
         if from == to && from_port == to_port {
             return Err("Cannot connect an audio port to itself".to_string());
@@ -629,7 +695,7 @@ impl TrackData {
         to: ConnectableRef,
         to_port: usize,
     ) -> Result<(), String> {
-        let source = self.connectable_audio_output(&from, from_port)?;
+        let source = self.disconnectable_audio_source(&from, from_port)?;
         let target = self.connectable_audio_input(&to, to_port)?;
         AudioIO::disconnect(&source, &target)?;
         self.invalidate_audio_route_cache();
@@ -643,7 +709,7 @@ impl TrackData {
         to: ConnectableRef,
         to_port: usize,
     ) -> Result<(), String> {
-        let source = self.connectable_midi_output(&from, from_port)?;
+        let source = self.connectable_midi_source(&from, from_port, &to)?;
         let target = self.connectable_midi_input(&to, to_port)?;
         if from == to && from_port == to_port {
             return Err("Cannot connect a MIDI port to itself".to_string());
@@ -660,7 +726,7 @@ impl TrackData {
         to: ConnectableRef,
         to_port: usize,
     ) -> Result<(), String> {
-        let source = self.connectable_midi_output(&from, from_port)?;
+        let source = self.disconnectable_midi_source(&from, from_port)?;
         let target = self.connectable_midi_input(&to, to_port)?;
         MIDIIO::disconnect(&source, &target)?;
         self.invalidate_midi_route_cache();
