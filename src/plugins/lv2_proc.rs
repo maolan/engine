@@ -121,7 +121,7 @@ impl Lv2Processor {
         })?;
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
-        if !ipc::wait_for_ready(header, Duration::from_secs(10)) {
+        if !ipc::wait_for_ready(header, &mut child, Duration::from_secs(10)) {
             let _ = child.kill();
             return Err("LV2 host did not signal ready".to_string());
         }

@@ -741,6 +741,14 @@ impl Builder {
     /// Create the `Sum`/`Zero` nodes for every consumer port, wire the edges,
     /// topologically sort, and freeze into a `RenderPlan`.
     fn finish(mut self) -> RenderPlan {
+        // The same consumer port can be registered more than once (e.g. a
+        // plugin input port referenced by multiple routing records). Each port
+        // owns exactly one arena buffer, so only one Sum/Zero node may write
+        // it; deduplicate by `Arc` pointer identity before emitting nodes.
+        let mut seen = HashSet::new();
+        self.consumer_ports
+            .retain(|p| seen.insert(Arc::as_ptr(p) as usize));
+
         for port in self.consumer_ports.clone() {
             let output = self.buffer_for(&port);
             let sources: Vec<BufferId> = {

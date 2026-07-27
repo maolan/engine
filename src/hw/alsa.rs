@@ -100,7 +100,7 @@ impl HwDriver {
         let capture_target = desired_channels(&capture, rate as usize, period, buffer_frames);
         let playback_target = desired_channels(&playback, rate as usize, period, buffer_frames);
 
-        let (channels_in, capture_format) = configure_pcm(
+        let (channels_in, capture_format, capture_period) = configure_pcm(
             &capture,
             rate as usize,
             capture_target,
@@ -108,7 +108,7 @@ impl HwDriver {
             buffer_frames,
             bits,
         )?;
-        let (channels_out, playback_format) = configure_pcm(
+        let (channels_out, playback_format, playback_period) = configure_pcm(
             &playback,
             rate as usize,
             playback_target,
@@ -116,6 +116,17 @@ impl HwDriver {
             buffer_frames,
             bits,
         )?;
+
+        let actual_period = capture_period.max(playback_period).max(1);
+        if actual_period != period || capture_period != playback_period {
+            tracing::info!(
+                "ALSA requested period {} adjusted to {} (capture={}, playback={})",
+                period,
+                actual_period,
+                capture_period,
+                playback_period
+            );
+        }
 
         let actual_rate = capture
             .hw_params_current()
@@ -125,10 +136,10 @@ impl HwDriver {
 
         let sample_rate = actual_rate as usize;
         let audio_ins: Vec<Arc<AudioIO>> = (0..channels_in)
-            .map(|_| Arc::new(AudioIO::new(period)))
+            .map(|_| Arc::new(AudioIO::new(actual_period)))
             .collect();
         let audio_outs: Vec<Arc<AudioIO>> = (0..channels_out)
-            .map(|_| Arc::new(AudioIO::new(period)))
+            .map(|_| Arc::new(AudioIO::new(actual_period)))
             .collect();
 
         let mut driver = Self {
@@ -139,7 +150,7 @@ impl HwDriver {
             output_gain_linear: 1.0,
             output_balance: 0.0,
             sample_rate,
-            period_frames: period,
+            period_frames: actual_period,
             channels_in,
             channels_out,
             nperiods,
@@ -148,15 +159,15 @@ impl HwDriver {
             output_latency_frames: options.output_latency_frames,
             capture_format,
             playback_format,
-            capture_buffer_i8: vec![0; period * channels_in],
-            capture_buffer_i16: vec![0; period * channels_in],
-            capture_buffer_i32: vec![0; period * channels_in],
-            capture_temp_i32: vec![0; period * channels_in],
-            capture_f32_buffer: vec![0.0; period * channels_in],
-            playback_buffer_i8: vec![0; period * channels_out],
-            playback_buffer_i16: vec![0; period * channels_out],
-            playback_buffer_i32: vec![0; period * channels_out],
-            playback_f32_buffer: vec![0.0; period * channels_out],
+            capture_buffer_i8: vec![0; actual_period * channels_in],
+            capture_buffer_i16: vec![0; actual_period * channels_in],
+            capture_buffer_i32: vec![0; actual_period * channels_in],
+            capture_temp_i32: vec![0; actual_period * channels_in],
+            capture_f32_buffer: vec![0.0; actual_period * channels_in],
+            playback_buffer_i8: vec![0; actual_period * channels_out],
+            playback_buffer_i16: vec![0; actual_period * channels_out],
+            playback_buffer_i32: vec![0; actual_period * channels_out],
+            playback_f32_buffer: vec![0.0; actual_period * channels_out],
             playing: Arc::new(AtomicBool::new(false)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             xrun_count: 0,
@@ -177,13 +188,25 @@ impl HwDriver {
     pub fn set_playing(&mut self, playing: bool) {
         self.playing.store(playing, Ordering::Relaxed);
         if playing {
-            if self.capture.state() != State::Running {
-                let _ = self.capture.prepare();
-                let _ = self.capture.start();
+            match self.capture.state() {
+                State::Running => {}
+                State::Prepared => {
+                    let _ = self.capture.start();
+                }
+                _ => {
+                    let _ = self.capture.prepare();
+                    let _ = self.capture.start();
+                }
             }
-            if self.playback.state() != State::Running {
-                let _ = self.playback.prepare();
-                let _ = self.playback.start();
+            match self.playback.state() {
+                State::Running => {}
+                State::Prepared => {
+                    let _ = self.playback.start();
+                }
+                _ => {
+                    let _ = self.playback.prepare();
+                    let _ = self.playback.start();
+                }
             }
         } else {
             self.force_silence_now();
@@ -846,10 +869,11 @@ fn desired_channels(pcm: &PCM, rate: usize, period_frames: usize, buffer_frames:
     if hwp.set_access(Access::RWInterleaved).is_err() {
         return 2;
     }
-    hwp.get_channels_max()
-        .map(|v| v as usize)
-        .unwrap_or(2)
-        .max(1)
+    // Always open stereo. Opening the maximum channel count on multi-channel
+    // hardware (e.g. a 32-channel USB mixer exposed through PipeWire) places
+    // the stereo mix on channels 0/1, which often do not map to the device's
+    // main monitor/output pair and results in audible silence.
+    2
 }
 
 fn configure_pcm(
@@ -859,7 +883,7 @@ fn configure_pcm(
     period_frames: usize,
     buffer_frames: usize,
     bits: i32,
-) -> Result<(usize, SampleFormat), String> {
+) -> Result<(usize, SampleFormat, usize), String> {
     let hwp = HwParams::any(pcm).map_err(|e| e.to_string())?;
     hwp.set_access(Access::RWInterleaved)
         .map_err(|e| e.to_string())?;
@@ -899,8 +923,9 @@ fn configure_pcm(
         .map_err(|e| e.to_string())?
         .get_channels()
         .map_err(|e| e.to_string())? as usize;
+    let actual_period = actual_period.max(1) as usize;
 
-    Ok((actual_channels.max(1), format))
+    Ok((actual_channels.max(1), format, actual_period))
 }
 
 #[derive(Debug, Clone, Copy)]

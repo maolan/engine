@@ -1395,8 +1395,10 @@ impl Engine {
         };
 
         tracing::debug!(
-            "Action::Play pressed, transport_sample={}",
-            self.transport_sample
+            "Action::Play pressed, transport_sample={} awaiting={} handling={}",
+            self.transport_sample,
+            self.awaiting_hwfinished,
+            self.handling_hwfinished
         );
         self.playing = true;
         self.transport_running = true;

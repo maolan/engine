@@ -6,6 +6,9 @@ use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Poll interval used while waiting for the plugin host to signal readiness.
+const HOST_READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn unique_instance_id(format: &str) -> String {
@@ -80,13 +83,26 @@ pub fn append_parent_log_level(cmd: &mut Command) {
     }
 }
 
-pub fn wait_for_ready(header: &ShmHeader, timeout: Duration) -> bool {
+pub fn wait_for_ready(header: &ShmHeader, child: &mut Child, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if header.ready.load(Ordering::Acquire) != 0 {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::warn!(
+                    status = %status,
+                    "plugin host exited without signalling ready"
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to poll plugin host status");
+            }
+        }
+        std::thread::sleep(HOST_READY_POLL_INTERVAL);
     }
     false
 }

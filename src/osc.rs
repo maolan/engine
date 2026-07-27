@@ -58,6 +58,7 @@ impl OscServer {
                         let packet = &buf[..len];
                         match parse_osc_request(packet) {
                             Ok(action) => {
+                                tracing::debug!(%src_addr, ?action, "OSC request received");
                                 if tx
                                     .blocking_send(Message::OscRequest {
                                         action,
@@ -65,10 +66,12 @@ impl OscServer {
                                     })
                                     .is_err()
                                 {
+                                    tracing::debug!("OSC request send failed; stopping server");
                                     break;
                                 }
                             }
                             Err(reason) => {
+                                tracing::debug!(%src_addr, %reason, "OSC request parse error");
                                 let reply = build_error_packet(&reason);
                                 let _ = socket.send_to(&reply, src_addr);
                             }

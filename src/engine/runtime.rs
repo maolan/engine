@@ -3689,9 +3689,11 @@ impl Engine {
                     let Some(message) = message else {
                         break;
                     };
+                    tracing::debug!(?message, "engine work loop received message");
                     message
                 }
                 _ = tick.tick() => {
+                    tracing::trace!("engine work loop tick");
                     self.poll_node_worker_results().await;
                     self.poll_jack_hw_finished().await;
                     self.poll_stopped_plugin_parameter_echoes().await;
@@ -3748,6 +3750,7 @@ impl Engine {
                     self.plan_builder.mark_dirty();
                 }
                 Message::OscRequest { action, reply_to } => {
+                    tracing::debug!(%reply_to, ?action, "engine received OscRequest");
                     self.osc_reply_target = Some(reply_to);
                     self.dispatch_request(action).await;
                     self.osc_reply_target = None;
