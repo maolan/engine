@@ -78,7 +78,7 @@ impl Worker {
                         vec![0xB0 | channel.min(15), cc.min(127), cc_value],
                     ));
                 }
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 OfflineAutomationTarget::Lv2Parameter {
                     instance_id,
                     index,

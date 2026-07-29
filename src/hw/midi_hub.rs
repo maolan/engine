@@ -172,7 +172,7 @@ struct MidiInputDevice {
     parser: MidiParser,
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 #[derive(Debug)]
 struct MidiInputWaiter {
     kq: i32,
@@ -181,7 +181,7 @@ struct MidiInputWaiter {
     wake_write_fd: RawFd,
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 impl MidiInputWaiter {
     fn new() -> Result<Self, String> {
         let kq = unsafe { libc::kqueue() };
@@ -301,14 +301,14 @@ impl MidiInputWaiter {
     }
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 impl Drop for MidiInputWaiter {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 unsafe impl Send for MidiInputWaiter {}
 
 #[cfg(target_os = "linux")]

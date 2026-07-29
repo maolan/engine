@@ -129,7 +129,7 @@ pub enum ModulatorTarget {
         min: f32,
         max: f32,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Lv2Parameter {
         track_name: String,
         instance_id: usize,
@@ -152,7 +152,7 @@ impl ModulatorTarget {
             | Self::ClapParameter { track_name, .. }
             | Self::Vst3Parameter { track_name, .. }
             | Self::MidiCc { track_name, .. } => Some(track_name),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Self::Lv2Parameter { track_name, .. } => Some(track_name),
             Self::HwOutVolume { .. } | Self::HwOutBalance { .. } => None,
         }

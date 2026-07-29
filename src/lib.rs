@@ -29,7 +29,7 @@ pub mod workers;
 pub use workers::worker;
 
 pub use plugins::clap_proc;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 pub use plugins::lv2_proc;
 pub use plugins::vst3_proc;
 
@@ -51,21 +51,13 @@ pub mod vst3 {
         pub use crate::plugins::types::Vst3PluginState;
     }
 }
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 pub mod lv2 {
     pub use crate::plugins::types::Lv2PluginInfo;
 }
 
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;
-
-#[cfg(target_os = "macos")]
-pub fn discover_coreaudio_devices() -> Vec<String> {
-    hw::coreaudio::device::list_devices()
-        .into_iter()
-        .map(|d| d.name)
-        .collect()
-}
 
 pub fn enable_flush_denormals_to_zero() {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]

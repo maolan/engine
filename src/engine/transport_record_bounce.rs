@@ -1,10 +1,6 @@
 use super::*;
-#[cfg(target_os = "macos")]
-use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "macos")]
-use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
@@ -1232,9 +1228,9 @@ impl Engine {
             let mut frozen_track_count = 0usize;
             let mut audio_clip_count = 0usize;
             let mut midi_clip_count = 0usize;
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             let mut lv2_instance_count = 0usize;
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            #[cfg(not(unix))]
             let lv2_instance_count = 0usize;
             let mut vst3_instance_count = 0usize;
             let mut clap_instance_count = 0usize;
@@ -1246,7 +1242,7 @@ impl Engine {
                 }
                 audio_clip_count += t.audio.clips().len();
                 midi_clip_count += t.midi.clips().len();
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 {
                     lv2_instance_count += t.lv2_plugins.len();
                 }
@@ -1263,7 +1259,7 @@ impl Engine {
                 clap_instance_count,
             )
         };
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        #[cfg(not(unix))]
         let _lv2_instance_count = lv2_instance_count;
         let pending_hw_midi_events = self.pending_hw_midi_events.len()
             + self
@@ -1290,7 +1286,7 @@ impl Engine {
             frozen_track_count,
             audio_clip_count,
             midi_clip_count,
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             lv2_instance_count,
             vst3_instance_count,
             clap_instance_count,

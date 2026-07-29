@@ -1,6 +1,4 @@
 use super::{audio::track::AudioTrack, midi::track::MIDITrack};
-#[cfg(target_os = "macos")]
-use crate::clap::ClapMidiOutputEvent;
 use crate::message::{PluginGraphConnection, PluginGraphNode};
 #[cfg(unix)]
 use crate::pitch_shift::LivePitchShifter;
@@ -33,7 +31,7 @@ mod plugins;
 mod process;
 mod session;
 mod track_routing;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 pub use instances::Lv2Instance;
 pub use instances::{ClapInstance, Vst3Instance};
 
@@ -87,7 +85,7 @@ pub(crate) struct ClipPluginRuntime {
     outputs: Vec<Arc<AudioIO>>,
     clap_plugins: Vec<ClapInstance>,
     vst3_plugins: Vec<Vst3Instance>,
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     lv2_plugins: Vec<Lv2Instance>,
     plugin_midi_connections: Vec<PluginGraphConnection>,
 }
@@ -154,7 +152,7 @@ impl ClipPluginRuntime {
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip VST3 output port: {id}:{port}")),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(id) => self
                 .lv2_plugins
                 .iter()
@@ -185,7 +183,7 @@ impl ClipPluginRuntime {
                 .find(|instance| instance.id == *id)
                 .and_then(|instance| instance.processor.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("Invalid clip VST3 input port: {id}:{port}")),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(id) => self
                 .lv2_plugins
                 .iter()
@@ -296,7 +294,7 @@ impl ClipPluginRuntime {
                     .map(|port| Arc::as_ptr(port) as usize),
             );
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         for instance in &self.lv2_plugins {
             keys.extend(
                 instance
@@ -319,11 +317,11 @@ impl ClipPluginRuntime {
         let plugin_output_keys = self.clip_plugin_output_keys();
         let mut clap_processed = vec![false; self.clap_plugins.len()];
         let mut vst3_processed = vec![false; self.vst3_plugins.len()];
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         let mut lv2_processed = vec![false; self.lv2_plugins.len()];
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         let mut remaining = clap_processed.len() + vst3_processed.len() + lv2_processed.len();
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        #[cfg(not(unix))]
         let mut remaining = clap_processed.len() + vst3_processed.len();
 
         while remaining > 0 {
@@ -445,7 +443,7 @@ impl ClipPluginRuntime {
                 progressed = true;
             }
 
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             for (idx, done) in lv2_processed.iter_mut().enumerate() {
                 if *done {
                     continue;
@@ -757,13 +755,13 @@ pub struct TrackData {
     pub midi: MIDITrack,
     pub clap_plugins: Vec<ClapInstance>,
     pub vst3_plugins: Vec<Vst3Instance>,
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub lv2_plugins: Vec<Lv2Instance>,
     pub plugin_midi_connections: Vec<PluginGraphConnection>,
 
     pub next_clap_instance_id: AtomicUsize,
     pub next_vst3_instance_id: AtomicUsize,
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub next_lv2_instance_id: AtomicUsize,
     pub next_plugin_instance_id: AtomicUsize,
     pub sample_rate: f64,

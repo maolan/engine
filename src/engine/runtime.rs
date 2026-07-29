@@ -1,16 +1,12 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::hw::alsa::MidiHub;
-#[cfg(target_os = "macos")]
-use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "freebsd")]
 use crate::hw::oss::MidiHub;
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "windows")]
 use crate::hw::wasapi::MidiHub;
-#[cfg(target_os = "macos")]
-use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
@@ -73,10 +69,10 @@ impl Engine {
     pub(crate) const METER_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
     pub(crate) const SESSION_RUNTIME_REPORT_INTERVAL: Duration = Duration::from_millis(50);
     pub(crate) const TRACK_PROCESS_TIMEOUT: Duration = Duration::from_millis(250);
-    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+    #[cfg(unix)]
     pub(crate) const HW_OUT_METER_LINEAR_EPSILON: f32 = 0.0025;
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) fn session_plugins_dir(&self) -> Option<PathBuf> {
         self.session_dir.as_ref().map(|d| d.join("plugins"))
     }
@@ -235,10 +231,10 @@ impl Engine {
             hw_out_balance: 0.0,
             hw_out_muted: false,
             last_hw_out_meter_publish: None,
-            #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+            #[cfg(unix)]
             last_hw_out_meter_linear: vec![],
             hw_out_peak_hold_linear: vec![],
-            #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+            #[cfg(unix)]
             hw_out_meter_publish_phase: false,
             last_track_meter_publish: None,
             last_meter_snapshot_publish: None,
@@ -367,7 +363,7 @@ impl Engine {
         let mut per_track: HashMap<String, (Option<f32>, Option<f32>)> = HashMap::new();
         let mut clap_params: HashMap<(String, usize, u32), f64> = HashMap::new();
         let mut vst3_params: HashMap<(String, usize, u32), f32> = HashMap::new();
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         let mut lv2_params: HashMap<(String, usize, u32), f32> = HashMap::new();
         let mut midi_cc_events: HashMap<String, Vec<MidiEvent>> = HashMap::new();
 
@@ -440,7 +436,7 @@ impl Engine {
                         vst3_params
                             .insert((track_name.clone(), *instance_id, *param_id), param_value);
                     }
-                    #[cfg(all(unix, not(target_os = "macos")))]
+                    #[cfg(unix)]
                     ModulatorTarget::Lv2Parameter {
                         track_name,
                         instance_id,
@@ -527,7 +523,7 @@ impl Engine {
                 });
             }
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         for ((track_name, instance_id, index), value) in lv2_params {
             if let Some(track) = state.tracks.get(&track_name).cloned()
                 && track
@@ -885,7 +881,7 @@ impl Engine {
                         &build_osc_packet("/response/vst3_plugins", &types, &args),
                     );
                 }
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 Ok(Action::Lv2Plugins(plugins)) => {
                     let args: Vec<OscArg> = plugins
                         .iter()
@@ -901,7 +897,7 @@ impl Engine {
                 | Ok(Action::Vst3PluginsUnavailable { error }) => {
                     self.send_osc_reply(reply_to, &build_error_packet(error));
                 }
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 Ok(Action::Lv2PluginsUnavailable { error }) => {
                     self.send_osc_reply(reply_to, &build_error_packet(error));
                 }
@@ -958,7 +954,7 @@ impl Engine {
                         ),
                     );
                 }
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 Ok(Action::TrackLv2PluginControls {
                     track_name,
                     instance_id,
@@ -1006,7 +1002,7 @@ impl Engine {
                         ),
                     );
                 }
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 Ok(Action::TrackLv2Midnam {
                     track_name,
                     note_names,
@@ -1091,7 +1087,7 @@ impl Engine {
             | Action::Session(_) => {
                 self.handle_request(a).await;
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::ListLv2Plugins => {
                 self.handle_request(a).await;
             }
@@ -1234,7 +1230,7 @@ impl Engine {
     }
 
     pub(crate) fn should_publish_hw_out_linear(&mut self, peaks_linear: &[f32]) -> bool {
-        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+        #[cfg(unix)]
         {
             self.hw_out_meter_publish_phase = !self.hw_out_meter_publish_phase;
             if !self.hw_out_meter_publish_phase {
@@ -1256,7 +1252,7 @@ impl Engine {
                 .extend_from_slice(peaks_linear);
             true
         }
-        #[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd")))]
+        #[cfg(not(unix))]
         {
             let _ = peaks_linear;
             false
@@ -2213,7 +2209,7 @@ impl Engine {
         self.last_track_meter_publish = None;
         self.last_meter_snapshot_publish = None;
         self.hw_out_peak_hold_linear.fill(0.0);
-        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+        #[cfg(unix)]
         {
             self.last_hw_out_meter_linear.clear();
         }
@@ -2671,7 +2667,7 @@ impl Engine {
             Action::SetSessionPath(ref path) => {
                 self.session_dir = Some(Path::new(path).to_path_buf());
                 self.ensure_session_subdirs();
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 let _lv2_dir = self.session_plugins_dir();
                 for track in self.state_snapshot.load_full().tracks.values() {
                     track.lock().set_session_base_dir(self.session_dir.clone());
@@ -2989,13 +2985,13 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackSetLv2PluginState { .. } => {
                 if Self::box_bool(self.handle_track_set_lv2_plugin_state(a.clone())).await {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::ClipSetLv2PluginState { ref track_name, .. } => {
                 self.notify_clients(Err(format!(
                     "Track '{}': clip LV2 plugin state changes are not supported",
@@ -3008,7 +3004,7 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackGetLv2Midnam { .. } => {
                 if Self::box_bool(self.handle_track_get_lv2_midnam(a.clone())).await {
                     return;
@@ -3060,15 +3056,15 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::ListLv2Plugins => {
                 if Self::box_bool(self.handle_list_lv2_plugins(a.clone())).await {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::Lv2Plugins(_) => {}
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::Lv2PluginsUnavailable { .. } => {}
             Action::ListVst3Plugins => {
                 if Self::box_bool(self.handle_list_vst3_plugins(a.clone())).await {
@@ -3178,7 +3174,7 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackLoadLv2Plugin {
                 ref track_name,
                 ref plugin_uri,
@@ -3195,7 +3191,7 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackUnloadLv2Plugin {
                 ref track_name,
                 ref plugin_uri,
@@ -3207,7 +3203,7 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackUnloadLv2PluginInstance {
                 ref track_name,
                 instance_id,
@@ -3219,7 +3215,7 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackShowLv2Gui { .. } => {
                 if Self::box_bool(self.handle_track_show_lv2_gui(a.clone())).await {
                     return;
@@ -3341,25 +3337,25 @@ impl Engine {
                 }
             }
             Action::TrackVst3Parameters { .. } => {}
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackSetLv2ControlValue { .. } => {
                 if Self::box_bool(self.handle_track_set_lv2_control_value(a.clone())).await {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackGetLv2PluginControls { .. } => {
                 if Self::box_bool(self.handle_track_get_lv2_plugin_controls(a.clone())).await {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackLv2SnapshotState { .. } => {
                 if Self::box_bool(self.handle_track_lv2_snapshot_state(a.clone())).await {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::ClipLv2SnapshotState { .. } => {
                 if Self::box_bool(self.handle_clip_lv2_snapshot_state(a.clone())).await {
                     return;
@@ -3569,7 +3565,6 @@ impl Engine {
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = (source, destination);
                     self.notify_clients(Err(
                         "JACK backend is not available on this platform build".to_string(),
                     ))
@@ -3641,6 +3636,7 @@ impl Engine {
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = (source, destination);
                     self.notify_clients(Err(
                         "JACK backend is not available on this platform build".to_string(),
                     ))
@@ -3703,15 +3699,15 @@ impl Engine {
                     return;
                 }
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackLv2PluginControls { .. } => {}
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::ClipLv2PluginControls { .. } => {}
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackLv2StateSnapshot { .. } => {}
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::ClipLv2StateSnapshot { .. } => {}
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             Action::TrackLv2Midnam { .. } => {}
             Action::TrackClapNoteNames { .. } => {}
             Action::SessionDiagnosticsReport { .. } => {}

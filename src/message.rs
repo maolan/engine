@@ -1,6 +1,6 @@
 use crate::clap::{ClapParameterInfo, ClapPluginInfo};
 pub use crate::connectable::{ConnectableConnection, ConnectableRef};
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 use crate::lv2::Lv2PluginInfo;
 use crate::midi::io::MidiEvent;
 use crate::state::TrackHandle;
@@ -83,7 +83,7 @@ pub enum OfflineAutomationTarget {
         channel: u8,
         cc: u8,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Lv2Parameter {
         instance_id: usize,
         index: u32,
@@ -210,7 +210,7 @@ pub enum PluginGraphNode {
     TrackOutput,
     ClapPluginInstance(usize),
     Vst3PluginInstance(usize),
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Lv2PluginInstance(usize),
 }
 
@@ -255,7 +255,7 @@ pub struct Lv2PluginState {
     pub properties: Vec<Lv2StateProperty>,
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lv2ControlPortInfo {
     pub index: u32,
@@ -280,7 +280,7 @@ pub type PluginGraphSnapshot = (Vec<PluginGraphPlugin>, Vec<PluginGraphConnectio
 pub enum PluginKind {
     Clap,
     Vst3,
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Lv2,
 }
 
@@ -882,55 +882,55 @@ pub enum Action {
     TrackClearPlugins {
         track_name: String,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackSetLv2PluginState {
         track_name: String,
         instance_id: usize,
         state: Vec<u8>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     ClipSetLv2PluginState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         state: Vec<u8>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackLv2SnapshotState {
         track_name: String,
         instance_id: usize,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     ClipLv2SnapshotState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackLv2StateSnapshot {
         track_name: String,
         instance_id: usize,
         state: Vec<u8>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackGetLv2PluginControls {
         track_name: String,
         instance_id: usize,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     ClipGetLv2PluginControls {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackLv2PluginControls {
         track_name: String,
         instance_id: usize,
         controls: Vec<Lv2ControlPortInfo>,
         instance_access_handle: Option<usize>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     ClipLv2PluginControls {
         track_name: String,
         clip_idx: usize,
@@ -938,11 +938,11 @@ pub enum Action {
         controls: Vec<Lv2ControlPortInfo>,
         instance_access_handle: Option<usize>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackGetLv2Midnam {
         track_name: String,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackLv2Midnam {
         track_name: String,
         note_names: std::collections::HashMap<u8, String>,
@@ -954,14 +954,14 @@ pub enum Action {
         track_name: String,
         note_names: std::collections::HashMap<u8, String>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackSetLv2ControlValue {
         track_name: String,
         instance_id: usize,
         index: u32,
         value: f32,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     ClipSetLv2ControlValue {
         track_name: String,
         clip_idx: usize,
@@ -969,7 +969,7 @@ pub enum Action {
         index: u32,
         value: f32,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     ClipLv2StateSnapshot {
         track_name: String,
         clip_idx: usize,
@@ -1042,11 +1042,11 @@ pub enum Action {
         to: ConnectableRef,
         to_port: usize,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     ListLv2Plugins,
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Lv2Plugins(Vec<Lv2PluginInfo>),
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Lv2PluginsUnavailable {
         error: String,
     },
@@ -1184,18 +1184,18 @@ pub enum Action {
         track_name: String,
         instance_id: usize,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackLoadLv2Plugin {
         track_name: String,
         plugin_uri: String,
         instance_id: Option<usize>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackUnloadLv2Plugin {
         track_name: String,
         plugin_uri: String,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     TrackUnloadLv2PluginInstance {
         track_name: String,
         instance_id: usize,
@@ -1373,7 +1373,7 @@ pub enum Action {
         frozen_track_count: usize,
         audio_clip_count: usize,
         midi_clip_count: usize,
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         lv2_instance_count: usize,
         vst3_instance_count: usize,
         clap_instance_count: usize,

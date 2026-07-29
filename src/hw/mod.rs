@@ -3,13 +3,11 @@ pub mod alsa;
 pub mod common;
 pub mod config;
 pub mod convert_policy;
-#[cfg(target_os = "macos")]
-pub mod coreaudio;
 pub mod error_fmt;
 #[cfg(unix)]
 pub mod jack;
 pub mod latency;
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+#[cfg(unix)]
 pub mod midi_hub;
 pub mod options;
 #[cfg(target_os = "freebsd")]

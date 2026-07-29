@@ -11,7 +11,7 @@ It provides:
 - Track routing and plugin graph routing
 - Offline bounce and export helpers
 - **Out-of-process (OOP) plugin hosting** for CLAP, VST3, and LV2 (Unix) — each plugin runs in a separate OS process for crash isolation
-- Platform audio backends for Linux, macOS, FreeBSD, and Windows (WASAPI)
+- Platform audio backends for Linux, FreeBSD, and Windows (WASAPI)
 
 ## Architecture
 
@@ -24,9 +24,9 @@ Plugins are never loaded directly into the DAW. If a plugin crashes, only its ho
 
 ## Platform support
 
-| Feature | Linux | macOS | FreeBSD | Windows |
+| Feature | Linux | FreeBSD | Windows |
 |---------|-------|-------|---------|---------|
-| Audio backend | ALSA, JACK | CoreAudio | ALSA, JACK | WASAPI |
+| Audio backend | ALSA, JACK |  | ALSA, JACK | WASAPI |
 | CLAP hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
 | VST3 hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
 | LV2 hosting | ✅ OOP | ❌ | ✅ OOP | N/A |

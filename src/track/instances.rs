@@ -1,6 +1,3 @@
-#[cfg(target_os = "macos")]
-use crate::clap::ClapMidiOutputEvent;
-
 use std::sync::Arc;
 
 pub struct ClapInstance {
@@ -43,13 +40,13 @@ impl Vst3Instance {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 pub struct Lv2Instance {
     pub id: usize,
     pub processor: crate::lv2_proc::SharedLv2Processor,
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 impl std::fmt::Debug for Lv2Instance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Lv2Instance")
@@ -59,7 +56,7 @@ impl std::fmt::Debug for Lv2Instance {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 impl Lv2Instance {
     pub(crate) fn new(id: usize, processor: crate::lv2_proc::SharedLv2Processor) -> Self {
         Self { id, processor }
@@ -106,7 +103,7 @@ impl crate::connectable::MidiPorts for Vst3Instance {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 impl crate::connectable::AudioPorts for Lv2Instance {
     fn audio_inputs(&self) -> Vec<Arc<crate::audio::io::AudioIO>> {
         self.processor.audio_inputs().to_vec()
@@ -117,7 +114,7 @@ impl crate::connectable::AudioPorts for Lv2Instance {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 impl crate::connectable::MidiPorts for Lv2Instance {
     fn midi_inputs(&self) -> Vec<Arc<crate::midi::io::MIDIIO>> {
         self.processor.midi_input_ports().to_vec()

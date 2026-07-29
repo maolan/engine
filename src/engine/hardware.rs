@@ -1,8 +1,6 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::hw::alsa::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "macos")]
-use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
 #[cfg(unix)]
 use crate::hw::jack::JackRuntime;
 #[cfg(target_os = "windows")]
@@ -19,8 +17,6 @@ use crate::hw::traits::HwWorkerDriver;
 use crate::hw::wasapi::{self, HwDriver};
 #[cfg(target_os = "linux")]
 use crate::workers::alsa_worker::HwWorker;
-#[cfg(target_os = "macos")]
-use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "freebsd")]
 use crate::workers::oss_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
@@ -33,7 +29,7 @@ use crate::{
     hw::{config, traits::HwDevice},
     message::{Action, Message},
 };
-#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+#[cfg(unix)]
 use std::fs::read_dir;
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
@@ -46,7 +42,7 @@ impl Engine {
         devices
     }
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+    #[cfg(unix)]
     pub(crate) fn discover_midi_hw_devices_from_dir(path: &str, prefixes: &[&str]) -> Vec<String> {
         let devices = read_dir(path)
             .map(|rd| {
@@ -76,21 +72,6 @@ impl Engine {
         let devices = {
             let mut devices = wasapi::list_midi_input_devices();
             devices.extend(wasapi::list_midi_output_devices());
-            Self::finalize_midi_hw_devices(devices)
-        };
-        #[cfg(target_os = "macos")]
-        let devices = {
-            let mut devices = Vec::new();
-            for source in coremidi::Sources {
-                if let Some(name) = source.display_name() {
-                    devices.push(name);
-                }
-            }
-            for dest in coremidi::Destinations {
-                if let Some(name) = dest.display_name() {
-                    devices.push(name);
-                }
-            }
             Self::finalize_midi_hw_devices(devices)
         };
         devices
@@ -124,8 +105,6 @@ impl Engine {
         let label = "OSS";
         #[cfg(target_os = "openbsd")]
         let label = "sndio";
-        #[cfg(target_os = "macos")]
-        let label = "CoreAudio";
         label
     }
 

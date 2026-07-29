@@ -34,8 +34,6 @@ pub fn parse_automation_lanes(
 
 #[cfg(target_os = "linux")]
 use crate::hw::alsa::{HwDriver, MidiHub};
-#[cfg(target_os = "macos")]
-use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
 #[cfg(unix)]
 use crate::hw::jack::JackRuntime;
 #[cfg(target_os = "freebsd")]
@@ -44,8 +42,6 @@ use crate::hw::oss::{HwDriver, MidiHub};
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "windows")]
 use crate::hw::wasapi::{HwDriver, MidiHub};
-#[cfg(target_os = "macos")]
-use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
@@ -327,10 +323,10 @@ pub struct Engine {
     hw_out_balance: f32,
     hw_out_muted: bool,
     last_hw_out_meter_publish: Option<Instant>,
-    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+    #[cfg(unix)]
     last_hw_out_meter_linear: Vec<f32>,
     hw_out_peak_hold_linear: Vec<f32>,
-    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+    #[cfg(unix)]
     hw_out_meter_publish_phase: bool,
     last_track_meter_publish: Option<Instant>,
     last_meter_snapshot_publish: Option<Instant>,

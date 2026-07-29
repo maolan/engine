@@ -29,7 +29,7 @@ pub enum ConnectableRef {
     ChildTrack(String),
     ClapPlugin(usize),
     Vst3Plugin(usize),
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Lv2Plugin(usize),
 }
 

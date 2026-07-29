@@ -489,7 +489,7 @@ impl Builder {
                     proc.midi_output_ports().to_vec(),
                 )
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             PluginKind::Lv2 => {
                 let proc = t.lv2_plugins[index].processor.clone();
                 (
@@ -598,7 +598,7 @@ impl Builder {
                 target_keys.insert(ConnectableRef::Vst3Plugin(id), node);
                 plugin_nodes.push(node);
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             for idx in 0..t.lv2_plugins.len() {
                 let node = self.push_plugin(&track, &t, PluginKind::Lv2, idx, folder_input);
                 let id = t.lv2_plugins[idx].id;
@@ -676,7 +676,7 @@ impl Builder {
             for idx in 0..t.vst3_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Vst3, idx, task);
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             for idx in 0..t.lv2_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Lv2, idx, task);
             }
@@ -701,7 +701,7 @@ impl Builder {
                 let proc = t.vst3_plugins[index].processor.clone();
                 (proc.audio_inputs().to_vec(), proc.audio_outputs().to_vec())
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             PluginKind::Lv2 => {
                 let proc = t.lv2_plugins[index].processor.clone();
                 (proc.audio_inputs().to_vec(), proc.audio_outputs().to_vec())

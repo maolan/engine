@@ -1,11 +1,7 @@
 use super::*;
-#[cfg(target_os = "macos")]
-use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 use crate::message::{Action, PluginKind};
-#[cfg(target_os = "macos")]
-use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use std::path::Path;
@@ -51,7 +47,7 @@ impl Engine {
                     .map(|p| p.path)
                     .ok_or_else(|| format!("VST3 plugin ID not found: {identifier}"))
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             PluginKind::Lv2 => {
                 let plugins =
                     crate::plugins::scan_plugins::<crate::plugins::types::Lv2PluginInfo>("lv2")
@@ -349,7 +345,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_load_lv2_plugin(
         &mut self,
         track_name: &str,
@@ -399,7 +395,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_unload_lv2_plugin(
         &mut self,
         track_name: &str,
@@ -442,7 +438,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_unload_lv2_plugin_instance(
         &mut self,
         track_name: &str,
@@ -709,11 +705,11 @@ impl Engine {
         let result = if format.eq_ignore_ascii_case("CLAP") {
             track.lock().set_clap_plugin_resource_dir(instance_id, dir)
         } else if format.eq_ignore_ascii_case("LV2") {
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             {
                 track.lock().set_lv2_plugin_resource_dir(instance_id, dir)
             }
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            #[cfg(not(unix))]
             Err("LV2 is not supported on this platform".to_string())
         } else {
             Err(format!(
@@ -752,11 +748,11 @@ impl Engine {
         let result = if format.eq_ignore_ascii_case("CLAP") {
             track.clip_set_clap_plugin_resource_dir(clip_idx, instance_id, dir)
         } else if format.eq_ignore_ascii_case("LV2") {
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             {
                 track.clip_set_lv2_plugin_resource_dir(clip_idx, instance_id, dir)
             }
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            #[cfg(not(unix))]
             Err("LV2 is not supported on this platform".to_string())
         } else {
             Err(format!(
@@ -1208,7 +1204,7 @@ impl Engine {
                 let result = match format.as_str() {
                     "CLAP" => track.lock().set_clap_plugin_bypassed(instance_id, bypassed),
                     "VST3" => track.lock().set_vst3_plugin_bypassed(instance_id, bypassed),
-                    #[cfg(all(unix, not(target_os = "macos")))]
+                    #[cfg(unix)]
                     "LV2" => track.lock().set_lv2_plugin_bypassed(instance_id, bypassed),
                     _ => Err(format!("Unknown plugin format for bypass: {format}")),
                 };
@@ -1531,7 +1527,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_get_lv2_plugin_controls(&mut self, a: Action) -> bool {
         let Action::TrackGetLv2PluginControls {
             ref track_name,
@@ -1562,7 +1558,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_lv2_snapshot_state(&mut self, a: Action) -> bool {
         let Action::TrackLv2SnapshotState {
             ref track_name,
@@ -1592,7 +1588,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_clip_lv2_snapshot_state(&mut self, a: Action) -> bool {
         let Action::ClipLv2SnapshotState {
             ref track_name,
@@ -1706,7 +1702,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_get_lv2_midnam(&mut self, a: Action) -> bool {
         let Action::TrackGetLv2Midnam { ref track_name } = a else {
             return false;
@@ -1729,7 +1725,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_list_lv2_plugins(&mut self, a: Action) -> bool {
         let Action::ListLv2Plugins = a else {
             return false;
@@ -1850,7 +1846,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_show_lv2_gui(&mut self, a: Action) -> bool {
         let Action::TrackShowLv2Gui {
             ref track_name,
@@ -1875,7 +1871,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_set_lv2_plugin_state(&mut self, a: Action) -> bool {
         let Action::TrackSetLv2PluginState {
             ref track_name,
@@ -1900,7 +1896,7 @@ impl Engine {
         false
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     pub(crate) async fn handle_track_set_lv2_control_value(&mut self, a: Action) -> bool {
         let Action::TrackSetLv2ControlValue {
             ref track_name,

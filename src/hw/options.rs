@@ -9,21 +9,6 @@ pub struct HwOptions {
     pub output_latency_frames: usize,
 }
 
-#[cfg(target_os = "macos")]
-impl Default for HwOptions {
-    fn default() -> Self {
-        Self {
-            exclusive: false,
-            period_frames: 512,
-            nperiods: 1,
-            ignore_hwbuf: false,
-            sync_mode: true,
-            input_latency_frames: 0,
-            output_latency_frames: 0,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

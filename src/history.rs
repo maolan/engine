@@ -211,7 +211,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::TrackDisconnectAudio { .. }
         | Action::TrackConnectMidi { .. }
         | Action::TrackDisconnectMidi { .. } => true,
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         Action::TrackLoadLv2Plugin { .. }
         | Action::TrackUnloadLv2PluginInstance { .. }
         | Action::TrackSetLv2ControlValue { .. } => true,
@@ -1092,7 +1092,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 instance_id: track.next_vst3_instance_id.load(Ordering::Relaxed),
             })
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         Action::TrackLoadLv2Plugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -1166,7 +1166,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                     .iter()
                     .find(|i| i.id == *instance_id)
                     .map(|i| i.processor.is_bypassed()),
-                #[cfg(all(unix, not(target_os = "macos")))]
+                #[cfg(unix)]
                 "LV2" => track
                     .lv2_plugins
                     .iter()
@@ -1181,7 +1181,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 bypassed: current_bypassed.unwrap_or(!*bypassed),
             })
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         Action::TrackSetLv2ControlValue { .. } => None,
         Action::ModifyMidiNotes {
             track_name,
@@ -1399,7 +1399,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
         ]);
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     if let Action::TrackUnloadLv2PluginInstance {
         track_name,
         instance_id,
@@ -1640,7 +1640,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 });
             }
 
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             for instance in &track.lv2_plugins {
                 let id = instance.id;
                 let uri = instance.processor.uri().to_string();
@@ -2078,7 +2078,7 @@ mod tests {
             plugin_id: "/tmp/test.vst3".to_string(),
             instance_id: None,
         }));
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         {
             assert!(should_record(&Action::TrackLoadLv2Plugin {
                 track_name: "t".to_string(),
@@ -2863,7 +2863,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     fn create_inverse_action_for_lv2_load_uses_next_runtime_instance_id() {
         let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track.next_lv2_instance_id.store(5, Ordering::Relaxed);

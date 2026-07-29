@@ -1,6 +1,6 @@
 [package]
 name = "maolan-engine"
-version = "0.2.45"
+version = "0.2.46"
 edition = "2024"
 description = "Audio engine for the Maolan DAW with audio/MIDI tracks, routing, export, and out-of-process CLAP/VST3/LV2 plugin support"
 license = "BSD-2-Clause"
@@ -46,7 +46,3 @@ jack = "0.13.5"
 cpal = { version = "0.17.3" }
 midir = "0.11.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-coreaudio-sys = "0.2.17"
-coremidi = "0.9.0"

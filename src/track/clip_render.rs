@@ -1,5 +1,3 @@
-#[cfg(target_os = "macos")]
-use crate::clap::ClapMidiOutputEvent;
 use crate::message::{PluginGraphNode, PluginKind};
 #[cfg(unix)]
 use crate::pitch_shift::LivePitchShifter;
@@ -112,13 +110,13 @@ impl TrackData {
         match kind {
             "track_input" => Some(PluginGraphNode::TrackInput),
             "track_output" => Some(PluginGraphNode::TrackOutput),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             "plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
                 .and_then(|node| {
                     matches!(node, PluginGraphNode::Lv2PluginInstance(_)).then(|| node.clone())
                 }),
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            #[cfg(not(unix))]
             "plugin" => None,
             "vst3_plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
@@ -219,7 +217,7 @@ impl TrackData {
             outputs,
             clap_plugins: Vec::new(),
             vst3_plugins: Vec::new(),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             lv2_plugins: Vec::new(),
             plugin_midi_connections: Vec::new(),
         };
@@ -300,7 +298,7 @@ impl TrackData {
                             .push(Vst3Instance::new(id, Arc::new(processor)));
                         runtime_nodes.push(PluginGraphNode::Vst3PluginInstance(id));
                     }
-                    #[cfg(all(unix, not(target_os = "macos")))]
+                    #[cfg(unix)]
                     "LV2" | "lv2" => {
                         let host_binary = match crate::plugins::ipc::find_plugin_host_binary() {
                             Some(b) => b,
@@ -320,7 +318,7 @@ impl TrackData {
                         runtime
                             .lv2_plugins
                             .push(Lv2Instance::new(id, Arc::new(processor)));
-                        #[cfg(all(unix, not(target_os = "macos")))]
+                        #[cfg(unix)]
                         runtime_nodes.push(PluginGraphNode::Lv2PluginInstance(id));
                     }
                     _ => {}

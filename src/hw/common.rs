@@ -17,7 +17,7 @@ pub fn output_meter_linear(port_count: usize, gain: f32, balance: f32) -> Vec<f3
         .collect()
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub fn output_meter_db(port_count: usize, gain: f32, balance: f32) -> Vec<f32> {
     output_meter_linear(port_count, gain, balance)
         .into_iter()

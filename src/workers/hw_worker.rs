@@ -70,7 +70,7 @@ impl<B: Backend> HwWorker<B> {
         #[cfg(unix)]
         {
             let thread = unsafe { libc::pthread_self() };
-            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+            #[cfg(unix)]
             let c_name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
             #[cfg(target_os = "linux")]
             unsafe {
@@ -231,11 +231,6 @@ impl<B: Backend> HwWorker<B> {
         if let Err(e) = Self::configure_rt_thread(B::WORKER_THREAD_NAME, RT_PRIORITY_WORKER) {
             error!("{} worker realtime priority not enabled: {}", B::LABEL, e);
         }
-        #[cfg(target_os = "macos")]
-        unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-        }
-
         #[cfg(unix)]
         {
             let has_fds = self

@@ -506,13 +506,13 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             no_args(args, Action::ListClapPluginsWithCapabilities)
         }
         "/query/vst3_plugins" => no_args(args, Action::ListVst3Plugins),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "/query/lv2_plugins" => no_args(args, Action::ListLv2Plugins),
         "/query/clap_note_names" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackGetClapNoteNames { track_name })
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "/query/lv2_midnam" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackGetLv2Midnam { track_name })
@@ -1041,7 +1041,7 @@ fn parse_plugin_load(track_name: String, format: &str, path: String) -> Result<A
             plugin_id: path,
             instance_id: None,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::TrackLoadLv2Plugin {
             track_name,
             plugin_uri: path,
@@ -1061,7 +1061,7 @@ fn parse_plugin_unload(track_name: String, format: &str, path: String) -> Result
             track_name,
             plugin_id: path,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::TrackUnloadLv2Plugin {
             track_name,
             plugin_uri: path,
@@ -1084,7 +1084,7 @@ fn parse_plugin_unload_instance(
             track_name,
             instance_id,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::TrackUnloadLv2PluginInstance {
             track_name,
             instance_id,
@@ -1098,9 +1098,6 @@ fn parse_plugin_parameters_query(
     format: &str,
     instance_id: usize,
 ) -> Result<Action, String> {
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    let _ = (&track_name, clip_idx, instance_id);
-
     match format {
         "clap" => Ok(Action::TrackGetClapParameters {
             track_name,
@@ -1110,7 +1107,7 @@ fn parse_plugin_parameters_query(
             track_name,
             instance_id,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::TrackGetLv2PluginControls {
             track_name,
             instance_id,
@@ -1125,8 +1122,11 @@ fn parse_clip_plugin_parameters_query(
     clip_idx: usize,
     instance_id: usize,
 ) -> Result<Action, String> {
+    #[cfg(not(unix))]
+    let _ = (&track_name, clip_idx, instance_id);
+
     match format {
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::ClipGetLv2PluginControls {
             track_name,
             clip_idx,
@@ -1152,7 +1152,7 @@ fn parse_plugin_show_gui(
             track_name,
             instance_id,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::TrackShowLv2Gui {
             track_name,
             instance_id,
@@ -1175,7 +1175,7 @@ fn parse_plugin_snapshot_state(
             track_name,
             instance_id,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::TrackLv2SnapshotState {
             track_name,
             instance_id,
@@ -1207,7 +1207,7 @@ fn parse_plugin_restore_state(
                 state,
             })
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::TrackSetLv2PluginState {
             track_name,
             instance_id,
@@ -1234,7 +1234,7 @@ fn parse_clip_plugin_snapshot_state(
             clip_idx,
             instance_id,
         }),
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::ClipLv2SnapshotState {
             track_name,
             clip_idx,
@@ -1272,7 +1272,7 @@ fn parse_clip_plugin_restore_state(
                 state,
             })
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => Ok(Action::ClipSetLv2PluginState {
             track_name,
             clip_idx,
@@ -1792,7 +1792,7 @@ fn parse_plugin_graph_node(value: &str) -> Result<PluginGraphNode, String> {
                     .map_err(|_| format!("Invalid vst3 instance id: {rest}"))?;
                 return Ok(PluginGraphNode::Vst3PluginInstance(id));
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             if let Some(rest) = value.strip_prefix("lv2_") {
                 let id = rest
                     .parse()
@@ -1871,7 +1871,7 @@ fn parse_connectable_ref(value: &str) -> Result<ConnectableRef, String> {
                     .map_err(|_| format!("Invalid vst3 instance id: {rest}"))?;
                 return Ok(ConnectableRef::Vst3Plugin(id));
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             if let Some(rest) = value.strip_prefix("lv2_") {
                 let id = rest
                     .parse()
@@ -1954,7 +1954,7 @@ fn parse_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> {
                 value,
             })
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => {
             let index = param_id;
             let value = args.next_float()?;
@@ -2076,7 +2076,7 @@ fn parse_clip_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> 
                 value,
             })
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         "lv2" => {
             let index = param_id;
             let value = args.next_float()?;
@@ -3182,7 +3182,7 @@ mod tests {
                 if track_name == "drums" && instance_id == 0
         ));
 
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         {
             let packet = osc_packet_with_args(
                 "/plugin/snapshot_state",
@@ -3305,7 +3305,7 @@ mod tests {
                 if track_name == "drums" && clip_idx == 1 && instance_id == 0
         ));
 
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         {
             let packet = osc_packet_with_args(
                 "/clip_plugin/snapshot_state",
@@ -3419,7 +3419,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     fn parses_lv2_midnam_query() {
         let packet = osc_packet_with_args(
             "/query/lv2_midnam",

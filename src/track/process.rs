@@ -1,6 +1,4 @@
 use crate::audio::track::AudioTrack;
-#[cfg(target_os = "macos")]
-use crate::clap::ClapMidiOutputEvent;
 use crate::message::{PluginGraphNode, PluginKind};
 use crate::midi::track::MIDITrack;
 
@@ -57,12 +55,12 @@ impl TrackData {
             midi: MIDITrack::new(io.midi_ins, io.midi_outs),
             clap_plugins: Vec::new(),
             vst3_plugins: Vec::new(),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             lv2_plugins: Vec::new(),
             plugin_midi_connections: Vec::new(),
             next_clap_instance_id: AtomicUsize::new(0),
             next_vst3_instance_id: AtomicUsize::new(0),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             next_lv2_instance_id: AtomicUsize::new(0),
             next_plugin_instance_id: AtomicUsize::new(0),
             sample_rate,
@@ -698,7 +696,7 @@ impl TrackData {
                 }
                 self.rt.folder_processed_midi_plugins.insert(node);
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(unix)]
             PluginKind::Lv2 => {
                 if index >= self.lv2_plugins.len() {
                     return;

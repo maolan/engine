@@ -1,6 +1,3 @@
-#[cfg(target_os = "macos")]
-use crate::clap::ClapMidiOutputEvent;
-
 use super::*;
 use crate::kind::Kind;
 use crate::midi::io::MidiEvent;

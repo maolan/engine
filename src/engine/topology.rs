@@ -1,10 +1,6 @@
 use super::*;
-#[cfg(target_os = "macos")]
-use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "macos")]
-use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
@@ -833,7 +829,7 @@ impl Engine {
         clip_indices: &[usize],
     ) {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
-            let mut track = track.lock();
+            let track = track.lock();
             let mut indices = clip_indices.to_vec();
             indices.sort_unstable();
             indices.dedup();
@@ -845,7 +841,10 @@ impl Engine {
                         }
                     }
                     #[cfg(unix)]
-                    track.rt.clip_pitch_shifters.clear();
+                    {
+                        let mut track = track;
+                        track.rt.clip_pitch_shifters.clear();
+                    }
                 }
                 Kind::MIDI => {
                     for idx in indices.into_iter().rev() {
