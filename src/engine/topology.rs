@@ -1778,6 +1778,11 @@ impl Engine {
     ) {
         match kind {
             Kind::Audio => {
+                if from_track == to_track && from_track != "hw:in" && to_track != "hw:out" {
+                    self.notify_clients(Err("Circular routing is not allowed!".into()))
+                        .await;
+                    return;
+                }
                 let (from_audio_io, to_audio_io) =
                     self.resolve_audio_route_ports(from_track, from_port, to_track, to_port);
                 match (from_audio_io, to_audio_io) {

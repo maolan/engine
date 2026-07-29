@@ -1164,10 +1164,24 @@ impl Engine {
 
     pub(crate) async fn request_hw_cycle(&mut self) {
         if self.awaiting_hwfinished {
-            tracing::debug!("request_hw_cycle skipped (already awaiting)");
+            tracing::info!(
+                playing = self.playing,
+                transport_running = self.transport_running,
+                transport_sample = self.transport_sample,
+                session_transport_sample = self.session_transport_sample,
+                cycle_samples = self.current_cycle_samples(),
+                "request_hw_cycle skipped because HWFinished is still pending"
+            );
             return;
         }
-        tracing::debug!("request_hw_cycle sending TracksFinished");
+        tracing::info!(
+            playing = self.playing,
+            transport_running = self.transport_running,
+            transport_sample = self.transport_sample,
+            session_transport_sample = self.session_transport_sample,
+            cycle_samples = self.current_cycle_samples(),
+            "request_hw_cycle sending TracksFinished"
+        );
         self.apply_hw_out_gain_and_meter().await;
         self.publish_meter_snapshot_if_due();
         if let Some((after_frames, loop_start, cycle_end_sample)) =
@@ -1192,6 +1206,7 @@ impl Engine {
             match worker.tx.send(Message::TracksFinished).await {
                 Ok(_) => {
                     self.awaiting_hwfinished = true;
+                    tracing::info!("request_hw_cycle is now awaiting HWFinished");
                 }
                 Err(e) => {
                     error!("Error sending TracksFinished {e}");
@@ -1628,10 +1643,24 @@ impl Engine {
 
     pub(crate) async fn handle_hw_finished(&mut self) {
         if !self.awaiting_hwfinished {
-            tracing::debug!("HWFinished ignored (not awaiting)");
+            tracing::info!(
+                playing = self.playing,
+                transport_running = self.transport_running,
+                transport_sample = self.transport_sample,
+                session_transport_sample = self.session_transport_sample,
+                cycle_samples = self.current_cycle_samples(),
+                "HWFinished ignored because engine was not awaiting it"
+            );
             return;
         }
-        tracing::debug!("HWFinished handling; playing={}", self.playing);
+        tracing::info!(
+            playing = self.playing,
+            transport_running = self.transport_running,
+            transport_sample = self.transport_sample,
+            session_transport_sample = self.session_transport_sample,
+            cycle_samples = self.current_cycle_samples(),
+            "HWFinished handling"
+        );
         self.handling_hwfinished = true;
         self.awaiting_hwfinished = false;
         #[cfg(unix)]
@@ -1710,18 +1739,28 @@ impl Engine {
         }
         self.pending_hw_midi_events.clear();
         self.pending_hw_midi_events_by_device.clear();
+        let cycle_samples = self.current_cycle_samples();
         if self.transport_running {
             if self.transport_panic_flush_pending {
                 self.transport_panic_flush_pending = false;
+                tracing::info!("transport advance skipped for panic flush cycle");
             } else if self.transport_restart_pending {
                 self.transport_restart_pending = false;
+                tracing::info!("transport advance skipped for restart cycle");
             } else {
-                let next = self
-                    .transport_sample
-                    .saturating_add(self.current_cycle_samples());
+                let before = self.transport_sample;
+                let next = self.transport_sample.saturating_add(cycle_samples);
                 let normalized = self.normalize_transport_sample(next);
                 let wrapped = normalized != next;
                 self.transport_sample = normalized;
+                tracing::info!(
+                    before,
+                    delta = cycle_samples,
+                    next,
+                    normalized,
+                    wrapped,
+                    "transport advanced after HWFinished"
+                );
                 self.publish_transport_snapshot();
                 if wrapped {
                     if self.notified_loop_wrap_sample == Some(self.transport_sample) {
@@ -1732,11 +1771,23 @@ impl Engine {
                     }
                 }
             }
+        } else {
+            tracing::info!(
+                playing = self.playing,
+                cycle_samples,
+                "transport not advanced because transport_running is false"
+            );
         }
         if self.session_clip_playback_enabled && self.playing {
-            self.session_transport_sample = self
-                .session_transport_sample
-                .saturating_add(self.current_cycle_samples());
+            let before = self.session_transport_sample;
+            self.session_transport_sample =
+                self.session_transport_sample.saturating_add(cycle_samples);
+            tracing::info!(
+                before,
+                delta = cycle_samples,
+                after = self.session_transport_sample,
+                "session transport advanced after HWFinished"
+            );
         }
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
@@ -1744,7 +1795,17 @@ impl Engine {
                 self.notify_clients(Ok(action)).await;
             }
         }
-        self.start_plan_cycle().await;
+        let cycle_started = self.start_plan_cycle().await;
+        if self.hw_worker.is_some() && !cycle_started && self.playing {
+            self.request_hw_cycle().await;
+        }
+        tracing::info!(
+            cycle_started,
+            hw_worker = self.hw_worker.is_some(),
+            awaiting_hwfinished = self.awaiting_hwfinished,
+            executor_complete = self.executor.cycle_complete(),
+            "HWFinished rearm decision"
+        );
         #[cfg(unix)]
         {
             if self.jack_runtime.is_some() {
@@ -3767,10 +3828,24 @@ impl Engine {
                 }
                 Message::HWFinished => {
                     if !self.awaiting_hwfinished {
-                        tracing::debug!("HWFinished ignored (not awaiting)");
+                        tracing::info!(
+                            playing = self.playing,
+                            transport_running = self.transport_running,
+                            transport_sample = self.transport_sample,
+                            session_transport_sample = self.session_transport_sample,
+                            cycle_samples = self.current_cycle_samples(),
+                            "HWFinished ignored because engine was not awaiting it"
+                        );
                         continue;
                     }
-                    tracing::debug!("HWFinished handling; playing={}", self.playing);
+                    tracing::info!(
+                        playing = self.playing,
+                        transport_running = self.transport_running,
+                        transport_sample = self.transport_sample,
+                        session_transport_sample = self.session_transport_sample,
+                        cycle_samples = self.current_cycle_samples(),
+                        "HWFinished handling"
+                    );
                     self.handling_hwfinished = true;
                     self.awaiting_hwfinished = false;
                     #[cfg(unix)]
@@ -3850,18 +3925,28 @@ impl Engine {
                     }
                     self.pending_hw_midi_events.clear();
                     self.pending_hw_midi_events_by_device.clear();
+                    let cycle_samples = self.current_cycle_samples();
                     if self.transport_running {
                         if self.transport_panic_flush_pending {
                             self.transport_panic_flush_pending = false;
+                            tracing::info!("transport advance skipped for panic flush cycle");
                         } else if self.transport_restart_pending {
                             self.transport_restart_pending = false;
+                            tracing::info!("transport advance skipped for restart cycle");
                         } else {
-                            let next = self
-                                .transport_sample
-                                .saturating_add(self.current_cycle_samples());
+                            let before = self.transport_sample;
+                            let next = self.transport_sample.saturating_add(cycle_samples);
                             let normalized = self.normalize_transport_sample(next);
                             let wrapped = normalized != next;
                             self.transport_sample = normalized;
+                            tracing::info!(
+                                before,
+                                delta = cycle_samples,
+                                next,
+                                normalized,
+                                wrapped,
+                                "transport advanced after HWFinished"
+                            );
                             self.publish_transport_snapshot();
                             if wrapped {
                                 if self.notified_loop_wrap_sample == Some(self.transport_sample) {
@@ -3874,11 +3959,23 @@ impl Engine {
                                 }
                             }
                         }
+                    } else {
+                        tracing::info!(
+                            playing = self.playing,
+                            cycle_samples,
+                            "transport not advanced because transport_running is false"
+                        );
                     }
                     if self.session_clip_playback_enabled && self.playing {
-                        self.session_transport_sample = self
-                            .session_transport_sample
-                            .saturating_add(self.current_cycle_samples());
+                        let before = self.session_transport_sample;
+                        self.session_transport_sample =
+                            self.session_transport_sample.saturating_add(cycle_samples);
+                        tracing::info!(
+                            before,
+                            delta = cycle_samples,
+                            after = self.session_transport_sample,
+                            "session transport advanced after HWFinished"
+                        );
                     }
                     {
                         let echoes = self.apply_modulators(self.active_transport_sample());
@@ -3886,7 +3983,17 @@ impl Engine {
                             self.notify_clients(Ok(action)).await;
                         }
                     }
-                    self.start_plan_cycle().await;
+                    let cycle_started = self.start_plan_cycle().await;
+                    if self.hw_worker.is_some() && !cycle_started && self.playing {
+                        self.request_hw_cycle().await;
+                    }
+                    tracing::info!(
+                        cycle_started,
+                        hw_worker = self.hw_worker.is_some(),
+                        awaiting_hwfinished = self.awaiting_hwfinished,
+                        executor_complete = self.executor.cycle_complete(),
+                        "HWFinished rearm decision"
+                    );
                     #[cfg(unix)]
                     {
                         if self.jack_runtime.is_some() {

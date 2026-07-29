@@ -1238,6 +1238,27 @@ impl TrackData {
                     processed_blocks.len(),
                     processed_blocks.first().and_then(|b| b.first())
                 );
+                {
+                    static CLIP_RENDER_PEAK_LOG_COUNT: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let peak = processed_blocks
+                        .iter()
+                        .map(|block| crate::simd::peak_abs(block))
+                        .fold(0.0_f32, f32::max);
+                    let count = CLIP_RENDER_PEAK_LOG_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count < 32 || peak > 0.0 {
+                        tracing::info!(
+                            track = %self.name,
+                            clip = %clip.name,
+                            from,
+                            copy_len,
+                            channels = processed_blocks.len(),
+                            peak,
+                            "clip audio render peak"
+                        );
+                    }
+                }
                 for (in_channel, in_samples) in inputs.iter_mut().enumerate() {
                     if !self
                         .disk_monitor()

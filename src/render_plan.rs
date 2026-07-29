@@ -751,9 +751,19 @@ impl Builder {
 
         for port in self.consumer_ports.clone() {
             let output = self.buffer_for(&port);
+            let readers = self.port_readers.get(&output).cloned().unwrap_or_default();
             let sources: Vec<BufferId> = {
                 let conns = port.connections();
-                conns.iter().map(|p| self.buffer_for(p)).collect()
+                conns
+                    .iter()
+                    .filter_map(|p| {
+                        let src = self.buffer_for(p);
+                        match self.producer.get(&src) {
+                            Some(producer) if readers.contains(producer) => None,
+                            _ => Some(src),
+                        }
+                    })
+                    .collect()
             };
             let node = if sources.is_empty() {
                 self.push_node(Op::Zero { output })
@@ -782,10 +792,8 @@ impl Builder {
                 node
             };
             // Every task reading this port runs after its Sum/Zero node.
-            if let Some(readers) = self.port_readers.get(&output).cloned() {
-                for reader in readers {
-                    self.edges.insert((node, reader));
-                }
+            for reader in readers {
+                self.edges.insert((node, reader));
             }
         }
 
@@ -1022,6 +1030,28 @@ mod tests {
     }
 
     #[test]
+    fn default_passthrough_stays_inside_track_task() {
+        let track = make_track("t", 1, 1);
+        let plan = RenderPlan::compile(&state_with(vec![track]), &[], &[], 64);
+        plan.verify().expect("invariants");
+
+        let task = task_node(&plan, "t", is_track);
+        let zeros = plan
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| match op {
+                Op::Zero { .. } => Some(idx),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(zeros.len(), 1, "track input is not fed by its own output");
+        assert!(zeros[0] < task, "input zero before the track task");
+        assert!(plan.forced.is_empty());
+    }
+
+    #[test]
     fn two_sources_insert_sum_with_two_inputs() {
         let a = make_track("a", 0, 1);
         let b = make_track("b", 0, 1);
@@ -1163,6 +1193,7 @@ mod tests {
         let (out_buf, out_chan) = plan.hw_out_map[0];
         assert_eq!(out_chan, 0);
         assert!(sums.iter().any(|(_, _, output)| *output == out_buf));
+        assert!(plan.forced.is_empty());
     }
 
     /// Build a plan by hand for `verify` negative tests.

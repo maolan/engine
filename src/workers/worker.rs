@@ -612,6 +612,30 @@ impl Worker {
                 let latency_changed = t.take_plugin_latency_changed();
                 let updates = std::mem::take(&mut t.rt.echoed_parameter_updates);
                 let meter = t.output_meter_linear();
+                {
+                    static TRACK_OUTPUT_PEAK_LOG_COUNT: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let peak = meter.iter().copied().fold(0.0_f32, f32::max);
+                    let count = TRACK_OUTPUT_PEAK_LOG_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count < 64 || peak > 0.0 {
+                        let task_kind = match task {
+                            ProcessTask::Track(_) => "track",
+                            ProcessTask::FolderInput(_) => "folder_input",
+                            ProcessTask::FolderOutput(_) => "folder_output",
+                            ProcessTask::Plugin { .. } => "plugin",
+                        };
+                        tracing::info!(
+                            worker_id,
+                            node,
+                            track = %t.name,
+                            task_kind,
+                            peak,
+                            meter = ?meter,
+                            "track output meter peak"
+                        );
+                    }
+                }
                 (meter, updates, latency_changed)
             }
         };

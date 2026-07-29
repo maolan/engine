@@ -251,6 +251,7 @@ impl HwDriver {
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
+        let wait_started = Instant::now();
         let tick_deadline = Instant::now() + Duration::from_millis(500);
         let mut ticked = false;
         while Instant::now() < tick_deadline {
@@ -271,6 +272,7 @@ impl HwDriver {
         if !ticked {
             return Err("Timed out waiting for WASAPI callback".to_string());
         }
+        let wait_ms = wait_started.elapsed().as_millis();
 
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
@@ -311,9 +313,27 @@ impl HwDriver {
         let gain = self.output_gain_linear;
         let balance = self.output_balance;
         let mut interleaved = vec![0.0_f32; frames.saturating_mul(channels)];
+        let plan_active = self.plan_slot.is_some();
+        let mut hw_out_map_len = 0usize;
+        let mut plan_meter_peak = 0.0_f32;
+        tracing::info!(
+            wait_ms,
+            playing = self.playing,
+            frames,
+            channels,
+            input_channels = self.input_channels,
+            have_input_frames = have_frames,
+            consume_frames,
+            plan_active,
+            "WASAPI cycle rendering after callback tick"
+        );
         if self.playing {
             if let Some(slot) = &self.plan_slot {
                 let plan = slot.load();
+                hw_out_map_len = plan.hw_out_map.len();
+                plan_meter_peak = common::output_meter_linear_from_plan(&plan, gain, balance)
+                    .into_iter()
+                    .fold(0.0_f32, f32::max);
                 crate::hw::ports::write_interleaved_from_arena(
                     &plan,
                     frames,
@@ -330,8 +350,44 @@ impl HwDriver {
                 let _ = (gain, balance);
             }
         }
+        {
+            static OUTPUT_PEAK_LOG_COUNT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let peak = crate::simd::peak_abs(&interleaved);
+            let count = OUTPUT_PEAK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 32 || peak > 0.0 {
+                tracing::info!(
+                    playing = self.playing,
+                    frames,
+                    channels,
+                    plan_active,
+                    hw_out_map_len,
+                    gain,
+                    balance,
+                    plan_meter_peak,
+                    peak,
+                    "WASAPI interleaved output peak"
+                );
+            }
+        }
 
-        let _ = self.output_tx.try_send(interleaved);
+        match self.output_tx.try_send(interleaved) {
+            Ok(()) => {
+                tracing::info!(
+                    frames,
+                    channels,
+                    "WASAPI cycle submitted interleaved output buffer"
+                );
+            }
+            Err(e) => {
+                tracing::info!(
+                    frames,
+                    channels,
+                    error = %e,
+                    "WASAPI cycle could not submit output buffer"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -356,10 +412,11 @@ fn select_output_device(host: &cpal::Host, requested: &str) -> Option<cpal::Devi
     }
     let devices = host.output_devices().ok()?;
     for dev in devices {
-        if let Ok(desc) = dev.description()
-            && desc.name().eq_ignore_ascii_case(requested)
-        {
-            return Some(dev);
+        if let Ok(desc) = dev.description() {
+            let name = desc.name();
+            if name.eq_ignore_ascii_case(requested) {
+                return Some(dev);
+            }
         }
     }
     None
