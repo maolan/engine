@@ -332,7 +332,44 @@ impl Worker {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    pub(crate) fn try_enable_realtime(_priority: i32) -> Result<(), String> {
+        use std::{cell::Cell, ffi::OsStr, os::windows::ffi::OsStrExt};
+
+        #[link(name = "avrt")]
+        unsafe extern "system" {
+            fn AvSetMmThreadCharacteristicsW(task_name: *const u16, task_index: *mut u32) -> isize;
+        }
+
+        thread_local! {
+            static MMCSS_TASK_HANDLE: Cell<isize> = const { Cell::new(0) };
+        }
+
+        MMCSS_TASK_HANDLE.with(|handle| {
+            if handle.get() != 0 {
+                return Ok(());
+            }
+
+            let task_name: Vec<u16> = OsStr::new("Pro Audio")
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let mut task_index = 0_u32;
+            let mmcss_handle =
+                unsafe { AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index) };
+            if mmcss_handle == 0 {
+                Err(format!(
+                    "AvSetMmThreadCharacteristicsW(Pro Audio) failed: {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                handle.set(mmcss_handle);
+                Ok(())
+            }
+        })
+    }
+
+    #[cfg(all(not(unix), not(target_os = "windows")))]
     pub(crate) fn try_enable_realtime(_priority: i32) -> Result<(), String> {
         Err("Realtime thread priority is not supported on this platform".to_string())
     }
@@ -625,7 +662,7 @@ impl Worker {
                             ProcessTask::FolderOutput(_) => "folder_output",
                             ProcessTask::Plugin { .. } => "plugin",
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             worker_id,
                             node,
                             track = %t.name,

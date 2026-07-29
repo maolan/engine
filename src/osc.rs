@@ -1098,6 +1098,9 @@ fn parse_plugin_parameters_query(
     format: &str,
     instance_id: usize,
 ) -> Result<Action, String> {
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = (&track_name, clip_idx, instance_id);
+
     match format {
         "clap" => Ok(Action::TrackGetClapParameters {
             track_name,

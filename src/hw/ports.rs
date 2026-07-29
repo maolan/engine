@@ -98,6 +98,7 @@ pub fn write_interleaved_from_arena(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn clear_hw_arena_buffers(plan: &crate::render_plan::RenderPlan) {
     for &(_, buf) in &plan.hw_in_map {
         // Safety: stop/silence runs at a hardware cycle boundary; the driver

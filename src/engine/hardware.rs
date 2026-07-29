@@ -13,8 +13,10 @@ use crate::hw::oss as hw;
 use crate::hw::oss::{HwDriver, HwOptions};
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
+#[cfg(target_os = "freebsd")]
+use crate::hw::traits::HwWorkerDriver;
 #[cfg(target_os = "windows")]
-use crate::hw::wasapi::{self, HwDriver, MidiHub};
+use crate::hw::wasapi::{self, HwDriver};
 #[cfg(target_os = "linux")]
 use crate::workers::alsa_worker::HwWorker;
 #[cfg(target_os = "macos")]
@@ -28,10 +30,7 @@ use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     audio::io::AudioIO,
     engine::HwDriverInfo,
-    hw::{
-        config,
-        traits::{HwDevice, HwWorkerDriver},
-    },
+    hw::{config, traits::HwDevice},
     message::{Action, Message},
 };
 #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
@@ -670,6 +669,7 @@ impl Engine {
         }
         #[cfg(not(unix))]
         {
+            let _ = &a;
             self.notify_clients(Err(
                 "JACK backend is not available on this platform build".to_string()
             ))
@@ -752,6 +752,7 @@ impl Engine {
         }
         #[cfg(not(unix))]
         {
+            let _ = &a;
             self.notify_clients(Err(
                 "JACK backend is not available on this platform build".to_string()
             ))
@@ -802,6 +803,7 @@ impl Engine {
         }
         #[cfg(not(unix))]
         {
+            let _ = &a;
             self.notify_clients(Err(
                 "JACK backend is not available on this platform build".to_string()
             ))
@@ -884,6 +886,7 @@ impl Engine {
         }
         #[cfg(not(unix))]
         {
+            let _ = &a;
             self.notify_clients(Err(
                 "JACK backend is not available on this platform build".to_string()
             ))

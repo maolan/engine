@@ -1,19 +1,13 @@
 use super::*;
 #[cfg(target_os = "macos")]
 use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "windows")]
-use crate::hw::options::HwOptions;
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "windows")]
-use crate::hw::wasapi::{self, HwDriver, MidiHub};
 use crate::message::{Action, PluginKind};
 #[cfg(target_os = "macos")]
 use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
-#[cfg(target_os = "windows")]
-use crate::workers::wasapi_worker::HwWorker;
 use std::path::Path;
 
 impl Engine {

@@ -113,7 +113,47 @@ impl<B: Backend> HwWorker<B> {
             }
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(target_os = "windows")]
+        {
+            use std::{cell::Cell, ffi::OsStr, os::windows::ffi::OsStrExt};
+
+            #[link(name = "avrt")]
+            unsafe extern "system" {
+                fn AvSetMmThreadCharacteristicsW(
+                    task_name: *const u16,
+                    task_index: *mut u32,
+                ) -> isize;
+            }
+
+            let _ = priority;
+            thread_local! {
+                static MMCSS_TASK_HANDLE: Cell<isize> = const { Cell::new(0) };
+            }
+
+            MMCSS_TASK_HANDLE.with(|handle| {
+                if handle.get() != 0 {
+                    return Ok(());
+                }
+
+                let task_name: Vec<u16> = OsStr::new("Pro Audio")
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                let mut task_index = 0_u32;
+                let mmcss_handle =
+                    unsafe { AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index) };
+                if mmcss_handle == 0 {
+                    Err(format!(
+                        "AvSetMmThreadCharacteristicsW({name}, Pro Audio) failed: {}",
+                        std::io::Error::last_os_error()
+                    ))
+                } else {
+                    handle.set(mmcss_handle);
+                    Ok(())
+                }
+            })
+        }
+        #[cfg(all(not(unix), not(target_os = "windows")))]
         {
             let _ = name;
             let _ = priority;
@@ -121,22 +161,16 @@ impl<B: Backend> HwWorker<B> {
         }
     }
 
+    #[cfg(unix)]
     fn lock_memory_pages() -> Result<(), String> {
-        #[cfg(unix)]
-        {
-            let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(format!(
-                    "mlockall(MCL_CURRENT|MCL_FUTURE) failed: {}",
-                    std::io::Error::last_os_error()
-                ))
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            Err("mlockall is not supported on this platform".to_string())
+        let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "mlockall(MCL_CURRENT|MCL_FUTURE) failed: {}",
+                std::io::Error::last_os_error()
+            ))
         }
     }
 
@@ -188,8 +222,11 @@ impl<B: Backend> HwWorker<B> {
 
     pub async fn work(mut self) {
         crate::enable_flush_denormals_to_zero();
-        if let Err(e) = Self::lock_memory_pages() {
-            error!("{} worker memory lock not enabled: {}", B::LABEL, e);
+        #[cfg(unix)]
+        {
+            if let Err(e) = Self::lock_memory_pages() {
+                error!("{} worker memory lock not enabled: {}", B::LABEL, e);
+            }
         }
         if let Err(e) = Self::configure_rt_thread(B::WORKER_THREAD_NAME, RT_PRIORITY_WORKER) {
             error!("{} worker realtime priority not enabled: {}", B::LABEL, e);

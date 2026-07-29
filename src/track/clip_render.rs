@@ -1248,7 +1248,7 @@ impl TrackData {
                     let count = CLIP_RENDER_PEAK_LOG_COUNT
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if count < 32 || peak > 0.0 {
-                        tracing::info!(
+                        tracing::debug!(
                             track = %self.name,
                             clip = %clip.name,
                             from,

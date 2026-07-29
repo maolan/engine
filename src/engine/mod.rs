@@ -38,20 +38,16 @@ use crate::hw::alsa::{HwDriver, MidiHub};
 use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
 #[cfg(unix)]
 use crate::hw::jack::JackRuntime;
-#[cfg(target_os = "windows")]
-use crate::hw::options::HwOptions;
 #[cfg(target_os = "freebsd")]
 use crate::hw::oss::{HwDriver, MidiHub};
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "windows")]
-use crate::hw::wasapi::{self, HwDriver, MidiHub};
+use crate::hw::wasapi::{HwDriver, MidiHub};
 #[cfg(target_os = "macos")]
 use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
-#[cfg(target_os = "windows")]
-use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     history::{History, UndoEntry},
     kind::Kind,

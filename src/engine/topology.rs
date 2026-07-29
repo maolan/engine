@@ -1,18 +1,12 @@
 use super::*;
 #[cfg(target_os = "macos")]
 use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "windows")]
-use crate::hw::options::HwOptions;
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "windows")]
-use crate::hw::wasapi::{self, HwDriver, MidiHub};
 #[cfg(target_os = "macos")]
 use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
-#[cfg(target_os = "windows")]
-use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     audio::clip::AudioClip,
     audio::io::AudioIO,
@@ -1091,7 +1085,7 @@ impl Engine {
         let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
-        let mut track = track.lock();
+        let track = track.lock();
         match kind {
             Kind::Audio => {
                 track.audio.update_clip(clip_index, |clip| {
@@ -1099,7 +1093,10 @@ impl Engine {
                     clip.name = new_name.to_string();
                 });
                 #[cfg(unix)]
-                track.rt.clip_pitch_shifters.clear();
+                {
+                    let mut track = track;
+                    track.rt.clip_pitch_shifters.clear();
+                }
             }
             Kind::MIDI => {
                 track.midi.update_clip(clip_index, |clip| {
@@ -1147,7 +1144,7 @@ impl Engine {
         let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
-        let mut track = track.lock();
+        let track = track.lock();
         match kind {
             Kind::Audio => {
                 track.audio.update_clip(clip_index, |clip| {
@@ -1164,7 +1161,10 @@ impl Engine {
                     clip.pitch_correction_formant_compensation = None;
                 });
                 #[cfg(unix)]
-                track.rt.clip_pitch_shifters.clear();
+                {
+                    let mut track = track;
+                    track.rt.clip_pitch_shifters.clear();
+                }
             }
             Kind::MIDI => {
                 track.midi.update_clip(clip_index, |clip| {
@@ -1186,14 +1186,17 @@ impl Engine {
         let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
-        let mut track = track.lock();
+        let track = track.lock();
         match kind {
             Kind::Audio => {
                 track.audio.update_clip(clip_index, |clip| {
                     clip.name = name;
                 });
                 #[cfg(unix)]
-                track.rt.clip_pitch_shifters.clear();
+                {
+                    let mut track = track;
+                    track.rt.clip_pitch_shifters.clear();
+                }
             }
             Kind::MIDI => {
                 track.midi.update_clip(clip_index, |clip| {
@@ -1243,7 +1246,7 @@ impl Engine {
         pitch_correction_formant_compensation: Option<bool>,
     ) {
         if let Some(track) = self.state.lock().tracks.get(track_name) {
-            let mut track = track.lock();
+            let track = track.lock();
             track.audio.update_clip(clip_index, |clip| {
                 clip.pitch_correction_preview_name = preview_name;
                 clip.pitch_correction_source_name = source_name;
@@ -1255,7 +1258,10 @@ impl Engine {
                 clip.pitch_correction_formant_compensation = pitch_correction_formant_compensation;
             });
             #[cfg(unix)]
-            track.rt.clip_pitch_shifters.clear();
+            {
+                let mut track = track;
+                track.rt.clip_pitch_shifters.clear();
+            }
         }
     }
 
@@ -1640,19 +1646,9 @@ impl Engine {
                 .await;
             return;
         }
-        let maybe_hw = if let Some(info) = self.hw_driver_info {
-            Some((info.cycle_samples, info.sample_rate as f64))
-        } else {
-            #[cfg(unix)]
-            if let Some(jack) = &self.jack_runtime {
-                let j = jack;
-                Some((j.buffer_size, j.sample_rate as f64))
-            } else {
-                None
-            }
-            #[cfg(not(unix))]
-            None
-        };
+        let maybe_hw = self
+            .hw_driver_info
+            .map(|info| (info.cycle_samples, info.sample_rate as f64));
 
         if let Some((chsamples, sample_rate)) = maybe_hw {
             let track = if folder {

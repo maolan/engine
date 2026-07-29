@@ -6,7 +6,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Host, HostId, SampleFormat, Stream, StreamConfig};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::error;
@@ -89,7 +89,8 @@ impl HwDriver {
             .map(|_| Arc::new(AudioIO::new(period_frames)))
             .collect();
 
-        let (output_tx, output_rx) = mpsc::sync_channel::<Vec<f32>>(8);
+        let output_queue_periods = options.nperiods.max(2);
+        let (output_tx, output_rx) = mpsc::sync_channel::<Vec<f32>>(output_queue_periods);
         let (cycle_tick_tx, cycle_tick_rx) = mpsc::sync_channel::<()>(8);
         let stop_requested = Arc::new(AtomicBool::new(false));
 
@@ -251,28 +252,8 @@ impl HwDriver {
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
+        self.discard_stale_cycle_ticks()?;
         let wait_started = Instant::now();
-        let tick_deadline = Instant::now() + Duration::from_millis(500);
-        let mut ticked = false;
-        while Instant::now() < tick_deadline {
-            if self.stop_requested.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            match self.cycle_tick_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) => {
-                    ticked = true;
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("WASAPI callback channel disconnected".to_string());
-                }
-            }
-        }
-        if !ticked {
-            return Err("Timed out waiting for WASAPI callback".to_string());
-        }
-        let wait_ms = wait_started.elapsed().as_millis();
 
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
@@ -316,8 +297,7 @@ impl HwDriver {
         let plan_active = self.plan_slot.is_some();
         let mut hw_out_map_len = 0usize;
         let mut plan_meter_peak = 0.0_f32;
-        tracing::info!(
-            wait_ms,
+        tracing::debug!(
             playing = self.playing,
             frames,
             channels,
@@ -325,7 +305,7 @@ impl HwDriver {
             have_input_frames = have_frames,
             consume_frames,
             plan_active,
-            "WASAPI cycle rendering after callback tick"
+            "WASAPI cycle preparing output period"
         );
         if self.playing {
             if let Some(slot) = &self.plan_slot {
@@ -355,8 +335,8 @@ impl HwDriver {
                 std::sync::atomic::AtomicUsize::new(0);
             let peak = crate::simd::peak_abs(&interleaved);
             let count = OUTPUT_PEAK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count < 32 || peak > 0.0 {
-                tracing::info!(
+            if count < 8 {
+                tracing::debug!(
                     playing = self.playing,
                     frames,
                     channels,
@@ -371,24 +351,63 @@ impl HwDriver {
             }
         }
 
-        match self.output_tx.try_send(interleaved) {
-            Ok(()) => {
-                tracing::info!(
-                    frames,
-                    channels,
-                    "WASAPI cycle submitted interleaved output buffer"
-                );
-            }
-            Err(e) => {
-                tracing::info!(
-                    frames,
-                    channels,
-                    error = %e,
-                    "WASAPI cycle could not submit output buffer"
-                );
+        self.queue_output_period(interleaved)?;
+        let wait_ms = wait_started.elapsed().as_millis();
+        self.wait_for_cycle_tick()?;
+        tracing::debug!(
+            wait_ms,
+            frames,
+            channels,
+            "WASAPI cycle submitted output and observed callback tick"
+        );
+        Ok(())
+    }
+
+    fn discard_stale_cycle_ticks(&mut self) -> Result<(), String> {
+        loop {
+            match self.cycle_tick_rx.try_recv() {
+                Ok(()) => {}
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    return Err("WASAPI callback channel disconnected".to_string());
+                }
             }
         }
-        Ok(())
+    }
+
+    fn queue_output_period(&mut self, mut interleaved: Vec<f32>) -> Result<(), String> {
+        loop {
+            if self.stop_requested.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match self.output_tx.try_send(interleaved) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(buffer)) => {
+                    interleaved = buffer;
+                    self.wait_for_cycle_tick()?;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err("WASAPI output callback channel disconnected".to_string());
+                }
+            }
+        }
+    }
+
+    fn wait_for_cycle_tick(&mut self) -> Result<(), String> {
+        let tick_deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < tick_deadline {
+            if self.stop_requested.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match self.cycle_tick_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("WASAPI callback channel disconnected".to_string());
+                }
+            }
+        }
+        Err("Timed out waiting for WASAPI callback".to_string())
     }
 
     pub fn run_assist_step(&mut self) -> Result<bool, String> {

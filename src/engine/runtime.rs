@@ -3,20 +3,16 @@ use super::*;
 use crate::hw::alsa::MidiHub;
 #[cfg(target_os = "macos")]
 use crate::hw::coreaudio::{HwDriver, HwOptions, MidiHub};
-#[cfg(target_os = "windows")]
-use crate::hw::options::HwOptions;
 #[cfg(target_os = "freebsd")]
 use crate::hw::oss::MidiHub;
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "windows")]
-use crate::hw::wasapi::{self, HwDriver, MidiHub};
+use crate::hw::wasapi::MidiHub;
 #[cfg(target_os = "macos")]
 use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
-#[cfg(target_os = "windows")]
-use crate::workers::wasapi_worker::HwWorker;
 use crate::{
     history::{History, UndoEntry},
     message::{Action, HwMidiEvent, Message, ProcessTask, SessionSlotState},
@@ -1164,7 +1160,7 @@ impl Engine {
 
     pub(crate) async fn request_hw_cycle(&mut self) {
         if self.awaiting_hwfinished {
-            tracing::info!(
+            tracing::debug!(
                 playing = self.playing,
                 transport_running = self.transport_running,
                 transport_sample = self.transport_sample,
@@ -1174,7 +1170,7 @@ impl Engine {
             );
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             playing = self.playing,
             transport_running = self.transport_running,
             transport_sample = self.transport_sample,
@@ -1206,7 +1202,7 @@ impl Engine {
             match worker.tx.send(Message::TracksFinished).await {
                 Ok(_) => {
                     self.awaiting_hwfinished = true;
-                    tracing::info!("request_hw_cycle is now awaiting HWFinished");
+                    tracing::debug!("request_hw_cycle is now awaiting HWFinished");
                 }
                 Err(e) => {
                     error!("Error sending TracksFinished {e}");
@@ -1641,6 +1637,7 @@ impl Engine {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) async fn handle_hw_finished(&mut self) {
         if !self.awaiting_hwfinished {
             tracing::info!(
@@ -1653,7 +1650,7 @@ impl Engine {
             );
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             playing = self.playing,
             transport_running = self.transport_running,
             transport_sample = self.transport_sample,
@@ -1753,7 +1750,7 @@ impl Engine {
                 let normalized = self.normalize_transport_sample(next);
                 let wrapped = normalized != next;
                 self.transport_sample = normalized;
-                tracing::info!(
+                tracing::debug!(
                     before,
                     delta = cycle_samples,
                     next,
@@ -1772,7 +1769,7 @@ impl Engine {
                 }
             }
         } else {
-            tracing::info!(
+            tracing::debug!(
                 playing = self.playing,
                 cycle_samples,
                 "transport not advanced because transport_running is false"
@@ -1782,7 +1779,7 @@ impl Engine {
             let before = self.session_transport_sample;
             self.session_transport_sample =
                 self.session_transport_sample.saturating_add(cycle_samples);
-            tracing::info!(
+            tracing::debug!(
                 before,
                 delta = cycle_samples,
                 after = self.session_transport_sample,
@@ -1799,7 +1796,7 @@ impl Engine {
         if self.hw_worker.is_some() && !cycle_started && self.playing {
             self.request_hw_cycle().await;
         }
-        tracing::info!(
+        tracing::debug!(
             cycle_started,
             hw_worker = self.hw_worker.is_some(),
             awaiting_hwfinished = self.awaiting_hwfinished,
@@ -3572,6 +3569,7 @@ impl Engine {
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = (source, destination);
                     self.notify_clients(Err(
                         "JACK backend is not available on this platform build".to_string(),
                     ))
@@ -3607,6 +3605,7 @@ impl Engine {
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = (source, destination);
                     self.notify_clients(Err(
                         "JACK backend is not available on this platform build".to_string(),
                     ))
@@ -3838,7 +3837,7 @@ impl Engine {
                         );
                         continue;
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         playing = self.playing,
                         transport_running = self.transport_running,
                         transport_sample = self.transport_sample,
@@ -3939,7 +3938,7 @@ impl Engine {
                             let normalized = self.normalize_transport_sample(next);
                             let wrapped = normalized != next;
                             self.transport_sample = normalized;
-                            tracing::info!(
+                            tracing::debug!(
                                 before,
                                 delta = cycle_samples,
                                 next,
@@ -3960,7 +3959,7 @@ impl Engine {
                             }
                         }
                     } else {
-                        tracing::info!(
+                        tracing::debug!(
                             playing = self.playing,
                             cycle_samples,
                             "transport not advanced because transport_running is false"
@@ -3970,7 +3969,7 @@ impl Engine {
                         let before = self.session_transport_sample;
                         self.session_transport_sample =
                             self.session_transport_sample.saturating_add(cycle_samples);
-                        tracing::info!(
+                        tracing::debug!(
                             before,
                             delta = cycle_samples,
                             after = self.session_transport_sample,
@@ -3987,7 +3986,7 @@ impl Engine {
                     if self.hw_worker.is_some() && !cycle_started && self.playing {
                         self.request_hw_cycle().await;
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         cycle_started,
                         hw_worker = self.hw_worker.is_some(),
                         awaiting_hwfinished = self.awaiting_hwfinished,

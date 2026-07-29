@@ -362,8 +362,11 @@ impl RenderPlan {
             for pair in sorted.windows(2) {
                 if !self.reachable(pair[0], pair[1]) {
                     return Err(format!(
-                        "buffer {buffer} written by unordered nodes {} and {}",
-                        pair[0], pair[1]
+                        "buffer {buffer} written by unordered nodes {} ({:?}) and {} ({:?})",
+                        pair[0],
+                        self.nodes[pair[0] as usize],
+                        pair[1],
+                        self.nodes[pair[1] as usize]
                     ));
                 }
             }
