@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 
@@ -376,6 +377,12 @@ pub struct Engine {
     midi_cc_gate: HashMap<(String, u8, u8), bool>,
     modulators: Vec<crate::modulator::Modulator>,
     modulator_values: Option<Arc<std::collections::HashMap<usize, f32>>>,
+    /// Wakes the dispatcher immediately when a node worker pushes a result,
+    /// instead of waiting for the 1 ms periodic tick. This is critical on
+    /// Windows, where the default timer quantum coarsens short waits.
+    node_result_notify: Arc<Notify>,
+    #[cfg(target_os = "windows")]
+    _windows_timer_guard: Option<crate::WindowsTimerResolutionGuard>,
 }
 
 type MidiEditParseResult = (

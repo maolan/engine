@@ -2,18 +2,42 @@ use crate::audio::io::AudioIO;
 use crate::hw::{common, options::HwOptions, traits};
 use crate::message::HwMidiEvent;
 use crate::midi::io::MidiEvent;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Host, HostId, SampleFormat, Stream, StreamConfig};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
+use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::io::Write;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tracing::error;
+use tracing::{debug, error, info, warn};
+use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Media::Audio::{
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    DEVICE_STATE_ACTIVE, IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioRenderClient,
+    IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
+};
+use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
+use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, STGM_READ,
+};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
+use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::core::{Interface, PCWSTR, PWSTR};
 
 const MIDI_IN_PREFIX: &str = "winmidi:in:";
 const MIDI_OUT_PREFIX: &str = "winmidi:out:";
 const WASAPI_PREFIX: &str = "wasapi:";
+const REFTIME_PER_SEC: i64 = 10_000_000;
 
 impl Default for HwOptions {
     fn default() -> Self {
@@ -29,9 +53,91 @@ impl Default for HwOptions {
     }
 }
 
+#[derive(Clone, Copy)]
+enum WasapiMode {
+    SharedLowLatency,
+    Exclusive,
+}
+
+impl WasapiMode {
+    fn from_options(options: &HwOptions) -> Self {
+        if options.exclusive {
+            Self::Exclusive
+        } else {
+            Self::SharedLowLatency
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SharedLowLatency => "WASAPI shared low latency",
+            Self::Exclusive => "WASAPI exclusive",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StreamInfo {
+    sample_rate: usize,
+    channels: usize,
+    period_frames: usize,
+    actual_buffer_frames: usize,
+    latency_frames: usize,
+}
+
+struct OutputStream {
+    shutdown_event: HANDLE,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl OutputStream {
+    fn stop(&mut self) {
+        unsafe {
+            let _ = SetEvent(self.shutdown_event);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for OutputStream {
+    fn drop(&mut self) {
+        self.stop();
+        unsafe {
+            let _ = CloseHandle(self.shutdown_event);
+        }
+    }
+}
+
+struct InputStream {
+    shutdown_event: HANDLE,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl InputStream {
+    fn stop(&mut self) {
+        unsafe {
+            let _ = SetEvent(self.shutdown_event);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for InputStream {
+    fn drop(&mut self) {
+        self.stop();
+        unsafe {
+            let _ = CloseHandle(self.shutdown_event);
+        }
+    }
+}
+
 pub struct HwDriver {
-    input_stream: Option<Stream>,
-    output_stream: Stream,
+    input_stream: Option<InputStream>,
+    output_stream: OutputStream,
     input_rx: Option<Receiver<Vec<f32>>>,
     output_tx: SyncSender<Vec<f32>>,
     cycle_tick_rx: Receiver<()>,
@@ -44,10 +150,10 @@ pub struct HwDriver {
     period_frames: usize,
     input_channels: usize,
     output_channels: usize,
+    input_latency_frames: usize,
+    output_latency_frames: usize,
     playing: bool,
     stop_requested: Arc<AtomicBool>,
-    /// Current render plan; when set, the RT cycle reads/writes plan arena
-    /// buffers instead of the legacy port buffers.
     plan_slot: Option<Arc<crate::render_plan::PlanSlot>>,
 }
 
@@ -59,115 +165,64 @@ impl HwDriver {
         _bits: i32,
         options: HwOptions,
     ) -> Result<Self, String> {
-        let (host, requested_name, backend_label) = select_backend_host_and_device(device)?;
-        let output_device = select_output_device(&host, requested_name)
-            .ok_or_else(|| format!("No matching {backend_label} output device for '{device}'"))?;
-        let output_cfg = select_f32_output_config(&output_device, rate)?;
-
-        let sample_rate = output_cfg.sample_rate as usize;
-        let period_frames = options.period_frames.max(1);
-        let output_channels = output_cfg.channels as usize;
-        let audio_outs: Vec<Arc<AudioIO>> = (0..output_channels)
-            .map(|_| Arc::new(AudioIO::new(period_frames)))
-            .collect();
-
-        let maybe_input_device = if let Some(input_name) = input_device {
-            select_input_device(&host, input_name)
-        } else {
-            select_input_device(&host, requested_name)
-        };
-        let maybe_input_cfg = maybe_input_device
-            .as_ref()
-            .map(|d| select_f32_input_config(d, sample_rate as i32))
-            .transpose()?;
-
-        let input_channels = maybe_input_cfg
-            .as_ref()
-            .map(|cfg| cfg.channels as usize)
-            .unwrap_or(0);
-        let audio_ins: Vec<Arc<AudioIO>> = (0..input_channels)
-            .map(|_| Arc::new(AudioIO::new(period_frames)))
-            .collect();
-
-        let output_queue_periods = options.nperiods.max(2);
+        let mode = WasapiMode::from_options(&options);
+        let requested_output = strip_wasapi_prefix(device);
+        let requested_input = input_device
+            .map(strip_wasapi_prefix)
+            .unwrap_or(requested_output);
+        let requested_rate = rate.max(1) as u32;
+        let requested_period_frames = options.period_frames.max(1);
+        let output_queue_periods = options.nperiods.max(4);
         let (output_tx, output_rx) = mpsc::sync_channel::<Vec<f32>>(output_queue_periods);
-        let (cycle_tick_tx, cycle_tick_rx) = mpsc::sync_channel::<()>(8);
+        let (cycle_tick_tx, cycle_tick_rx) =
+            mpsc::sync_channel::<()>(output_queue_periods.saturating_mul(4));
         let stop_requested = Arc::new(AtomicBool::new(false));
 
-        let output_stream = {
-            let mut pending = Vec::<f32>::new();
-            let mut pending_idx = 0usize;
-            let mut frames_since_tick = 0usize;
-            output_device
-                .build_output_stream(
-                    &output_cfg,
-                    move |data: &mut [f32], _| {
-                        crate::enable_flush_denormals_to_zero();
-                        let channels = output_channels.max(1);
-                        let callback_frames = data.len() / channels;
-                        for sample in data.iter_mut() {
-                            loop {
-                                if pending_idx < pending.len() {
-                                    *sample = pending[pending_idx];
-                                    pending_idx += 1;
-                                    break;
-                                }
-                                match output_rx.try_recv() {
-                                    Ok(next) => {
-                                        pending = next;
-                                        pending_idx = 0;
-                                    }
-                                    Err(_) => {
-                                        *sample = 0.0;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        frames_since_tick = frames_since_tick.saturating_add(callback_frames);
-                        while frames_since_tick >= period_frames {
-                            let _ = cycle_tick_tx.try_send(());
-                            frames_since_tick -= period_frames;
-                        }
-                    },
-                    move |_e| (),
-                    None,
-                )
-                .map_err(|e| format!("Failed to build {backend_label} output stream: {e}"))?
-        };
-        output_stream
-            .play()
-            .map_err(|e| format!("Failed to start {backend_label} output stream: {e}"))?;
+        let (output_stream, output_info) = start_output_stream(
+            requested_output.to_string(),
+            requested_rate,
+            requested_period_frames,
+            mode,
+            output_rx,
+            cycle_tick_tx,
+        )?;
 
-        let (input_stream, input_rx) =
-            if let (Some(input_device), Some(input_cfg)) = (maybe_input_device, maybe_input_cfg) {
-                let (input_tx, input_rx) = mpsc::sync_channel::<Vec<f32>>(8);
-                let chunk_len = period_frames.saturating_mul(input_channels.max(1));
-                let input_stream = {
-                    let mut stash: Vec<f32> = Vec::with_capacity(chunk_len.saturating_mul(2));
-                    input_device
-                        .build_input_stream(
-                            &input_cfg,
-                            move |data: &[f32], _| {
-                                crate::enable_flush_denormals_to_zero();
-                                stash.extend_from_slice(data);
-                                while stash.len() >= chunk_len {
-                                    let chunk: Vec<f32> = stash.drain(..chunk_len).collect();
-                                    let _ = input_tx.try_send(chunk);
-                                }
-                            },
-                            move |_e| (),
-                            None,
-                        )
-                        .map_err(|e| format!("Failed to build {backend_label} input stream: {e}"))?
-                };
-                input_stream
-                    .play()
-                    .map_err(|e| format!("Failed to start {backend_label} input stream: {e}"))?;
-                (Some(input_stream), Some(input_rx))
-            } else {
-                (None, None)
+        let sample_rate = output_info.sample_rate;
+        let period_frames = output_info.period_frames;
+        let output_channels = output_info.channels;
+        let audio_outs = (0..output_channels)
+            .map(|_| Arc::new(AudioIO::new(period_frames)))
+            .collect();
+
+        let (input_stream, input_rx, input_channels, input_latency_frames) =
+            match start_input_stream(
+                requested_input.to_string(),
+                sample_rate as u32,
+                period_frames,
+                mode,
+            ) {
+                Ok((stream, rx, info)) => {
+                    (Some(stream), Some(rx), info.channels, info.latency_frames)
+                }
+                Err(err) => {
+                    debug!(err, "WASAPI input disabled");
+                    (None, None, 0, 0)
+                }
             };
+
+        let audio_ins = (0..input_channels)
+            .map(|_| Arc::new(AudioIO::new(period_frames)))
+            .collect();
+
+        debug!(
+            mode = mode.label(),
+            period_frames,
+            output_actual_buffer_frames = output_info.actual_buffer_frames,
+            input_channels,
+            output_channels,
+            sample_rate,
+            "WASAPI backend opened"
+        );
 
         Ok(Self {
             input_stream,
@@ -184,6 +239,8 @@ impl HwDriver {
             period_frames,
             input_channels,
             output_channels,
+            input_latency_frames,
+            output_latency_frames: output_info.latency_frames,
             playing: false,
             stop_requested,
             plan_slot: None,
@@ -203,9 +260,9 @@ impl HwDriver {
     }
 
     pub fn close_fds(&mut self) {
-        let _ = self.output_stream.pause();
-        if let Some(stream) = &self.input_stream {
-            let _ = stream.pause();
+        self.output_stream.stop();
+        if let Some(stream) = &mut self.input_stream {
+            stream.stop();
         }
     }
 
@@ -252,9 +309,7 @@ impl HwDriver {
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
-        self.discard_stale_cycle_ticks()?;
-        let wait_started = Instant::now();
-
+        info!("wasapi run_cycle start");
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
         if let Some(rx) = &self.input_rx {
@@ -269,9 +324,6 @@ impl HwDriver {
         let consume_samples = consume_frames.saturating_mul(input_channels);
 
         if let Some(slot) = &self.plan_slot {
-            // Slice off any queued samples beyond this cycle: the legacy path
-            // reads only `consume_samples` and zero-pads the rest, and
-            // `fill_arena_from_interleaved` zero-fills past the slice end.
             let plan = slot.load();
             crate::hw::ports::fill_arena_from_interleaved(
                 &plan,
@@ -294,26 +346,9 @@ impl HwDriver {
         let gain = self.output_gain_linear;
         let balance = self.output_balance;
         let mut interleaved = vec![0.0_f32; frames.saturating_mul(channels)];
-        let plan_active = self.plan_slot.is_some();
-        let mut hw_out_map_len = 0usize;
-        let mut plan_meter_peak = 0.0_f32;
-        tracing::debug!(
-            playing = self.playing,
-            frames,
-            channels,
-            input_channels = self.input_channels,
-            have_input_frames = have_frames,
-            consume_frames,
-            plan_active,
-            "WASAPI cycle preparing output period"
-        );
         if self.playing {
             if let Some(slot) = &self.plan_slot {
                 let plan = slot.load();
-                hw_out_map_len = plan.hw_out_map.len();
-                plan_meter_peak = common::output_meter_linear_from_plan(&plan, gain, balance)
-                    .into_iter()
-                    .fold(0.0_f32, f32::max);
                 crate::hw::ports::write_interleaved_from_arena(
                     &plan,
                     frames,
@@ -326,53 +361,25 @@ impl HwDriver {
                         }
                     },
                 );
-            } else {
-                let _ = (gain, balance);
-            }
-        }
-        {
-            static OUTPUT_PEAK_LOG_COUNT: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
-            let peak = crate::simd::peak_abs(&interleaved);
-            let count = OUTPUT_PEAK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count < 8 {
-                tracing::debug!(
-                    playing = self.playing,
-                    frames,
-                    channels,
-                    plan_active,
-                    hw_out_map_len,
-                    gain,
-                    balance,
-                    plan_meter_peak,
-                    peak,
-                    "WASAPI interleaved output peak"
-                );
             }
         }
 
-        self.queue_output_period(interleaved)?;
-        let wait_ms = wait_started.elapsed().as_millis();
-        self.wait_for_cycle_tick()?;
-        tracing::debug!(
-            wait_ms,
-            frames,
-            channels,
-            "WASAPI cycle submitted output and observed callback tick"
-        );
-        Ok(())
-    }
-
-    fn discard_stale_cycle_ticks(&mut self) -> Result<(), String> {
-        loop {
-            match self.cycle_tick_rx.try_recv() {
-                Ok(()) => {}
-                Err(TryRecvError::Empty) => return Ok(()),
-                Err(TryRecvError::Disconnected) => {
-                    return Err("WASAPI callback channel disconnected".to_string());
+        if let Ok(path) = std::env::var("MAOLAN_WASAPI_DUMP") {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let mut bytes = Vec::with_capacity(interleaved.len() * 4);
+                for sample in &interleaved {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
                 }
+                let _ = file.write_all(&bytes);
             }
         }
+
+        info!("wasapi run_cycle rendered");
+        self.queue_output_period(interleaved)
     }
 
     fn queue_output_period(&mut self, mut interleaved: Vec<f32>) -> Result<(), String> {
@@ -381,13 +388,18 @@ impl HwDriver {
                 return Ok(());
             }
             match self.output_tx.try_send(interleaved) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    info!("wasapi queue_output_period sent");
+                    return Ok(());
+                }
                 Err(TrySendError::Full(buffer)) => {
                     interleaved = buffer;
+                    info!("wasapi queue_output_period waiting for tick");
                     self.wait_for_cycle_tick()?;
+                    info!("wasapi queue_output_period tick done");
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    return Err("WASAPI output callback channel disconnected".to_string());
+                    return Err("WASAPI output thread disconnected".to_string());
                 }
             }
         }
@@ -400,14 +412,20 @@ impl HwDriver {
                 return Ok(());
             }
             match self.cycle_tick_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Ok(()) => {
+                    info!("wasapi cycle tick received");
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    info!("wasapi cycle tick timeout");
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("WASAPI callback channel disconnected".to_string());
+                    return Err("WASAPI cycle clock disconnected".to_string());
                 }
             }
         }
-        Err("Timed out waiting for WASAPI callback".to_string())
+        Err("Timed out waiting for WASAPI render event".to_string())
     }
 
     pub fn run_assist_step(&mut self) -> Result<bool, String> {
@@ -425,108 +443,751 @@ impl HwDriver {
 
 unsafe impl Send for HwDriver {}
 
-fn select_output_device(host: &cpal::Host, requested: &str) -> Option<cpal::Device> {
-    if requested.eq_ignore_ascii_case("default") || requested.is_empty() {
-        return host.default_output_device();
-    }
-    let devices = host.output_devices().ok()?;
-    for dev in devices {
-        if let Ok(desc) = dev.description() {
-            let name = desc.name();
-            if name.eq_ignore_ascii_case(requested) {
-                return Some(dev);
+fn start_output_stream(
+    requested_device: String,
+    requested_rate: u32,
+    period_frames: usize,
+    mode: WasapiMode,
+    output_rx: Receiver<Vec<f32>>,
+    cycle_tick_tx: SyncSender<()>,
+) -> Result<(OutputStream, StreamInfo), String> {
+    let shutdown_event = create_event("WASAPI output shutdown", true)?;
+    let shutdown_event_raw = shutdown_event.0 as usize;
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let thread = thread::Builder::new()
+        .name("maolan-wasapi-output".to_string())
+        .spawn(move || {
+            let shutdown_event = HANDLE(shutdown_event_raw as *mut c_void);
+            let result = run_output_thread(
+                requested_device,
+                requested_rate,
+                period_frames,
+                mode,
+                output_rx,
+                cycle_tick_tx,
+                ready_tx.clone(),
+                shutdown_event,
+            );
+            if let Err(err) = &result {
+                error!("WASAPI output thread failed: {err}");
+                let _ = ready_tx.try_send(Err(err.clone()));
             }
+        })
+        .map_err(|e| format!("Failed to spawn WASAPI output thread: {e}"))?;
+
+    match ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| format!("Timed out opening {}", mode.label()))?
+    {
+        Ok(info) => Ok((
+            OutputStream {
+                shutdown_event,
+                thread: Some(thread),
+            },
+            info,
+        )),
+        Err(err) => {
+            unsafe {
+                let _ = SetEvent(shutdown_event);
+            }
+            let _ = thread.join();
+            unsafe {
+                let _ = CloseHandle(shutdown_event);
+            }
+            Err(err)
         }
     }
-    None
 }
 
-fn select_input_device(host: &cpal::Host, requested: &str) -> Option<cpal::Device> {
-    let requested = requested
-        .strip_prefix(WASAPI_PREFIX)
-        .unwrap_or(requested)
-        .trim();
-    if requested.eq_ignore_ascii_case("default") || requested.is_empty() {
-        return host.default_input_device();
-    }
-    let Ok(devices) = host.input_devices() else {
-        return host.default_input_device();
-    };
-    let mut fuzzy_match: Option<cpal::Device> = None;
-    let requested_lc = requested.to_lowercase();
-    for dev in devices {
-        if let Ok(desc) = dev.description() {
-            let name = desc.name();
-            if name.eq_ignore_ascii_case(requested) {
-                return Some(dev);
+fn start_input_stream(
+    requested_device: String,
+    sample_rate: u32,
+    period_frames: usize,
+    mode: WasapiMode,
+) -> Result<(InputStream, Receiver<Vec<f32>>, StreamInfo), String> {
+    let shutdown_event = create_event("WASAPI input shutdown", true)?;
+    let shutdown_event_raw = shutdown_event.0 as usize;
+    let (input_tx, input_rx) = mpsc::sync_channel::<Vec<f32>>(8);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let thread = thread::Builder::new()
+        .name("maolan-wasapi-input".to_string())
+        .spawn(move || {
+            let shutdown_event = HANDLE(shutdown_event_raw as *mut c_void);
+            let result = run_input_thread(
+                requested_device,
+                sample_rate,
+                period_frames,
+                mode,
+                input_tx,
+                ready_tx.clone(),
+                shutdown_event,
+            );
+            if let Err(err) = &result {
+                error!("WASAPI input thread failed: {err}");
+                let _ = ready_tx.try_send(Err(err.clone()));
             }
-            if fuzzy_match.is_none() {
-                let name_lc = name.to_lowercase();
-                if name_lc.contains(&requested_lc) || requested_lc.contains(&name_lc) {
-                    fuzzy_match = Some(dev);
+        })
+        .map_err(|e| format!("Failed to spawn WASAPI input thread: {e}"))?;
+
+    match ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| format!("Timed out opening {} input", mode.label()))?
+    {
+        Ok(info) => Ok((
+            InputStream {
+                shutdown_event,
+                thread: Some(thread),
+            },
+            input_rx,
+            info,
+        )),
+        Err(err) => {
+            unsafe {
+                let _ = SetEvent(shutdown_event);
+            }
+            let _ = thread.join();
+            unsafe {
+                let _ = CloseHandle(shutdown_event);
+            }
+            Err(err)
+        }
+    }
+}
+
+fn run_output_thread(
+    requested_device: String,
+    requested_rate: u32,
+    period_frames: usize,
+    mode: WasapiMode,
+    output_rx: Receiver<Vec<f32>>,
+    cycle_tick_tx: SyncSender<()>,
+    ready_tx: SyncSender<Result<StreamInfo, String>>,
+    shutdown_event: HANDLE,
+) -> Result<(), String> {
+    let _com = ComApartment::new()?;
+    let device = select_device(eRender, &requested_device)?;
+    let client = open_client(&device, eRender, requested_rate, period_frames, mode)?;
+    let render_client = unsafe {
+        client
+            .client
+            .GetService::<IAudioRenderClient>()
+            .map_err(|e| format!("Failed to get WASAPI render client: {e}"))?
+    };
+    unsafe {
+        client
+            .client
+            .SetEventHandle(client.event)
+            .map_err(|e| format!("Failed to set WASAPI render event: {e}"))?;
+    }
+    prime_output_with_silence(&client, &render_client)?;
+    let info = client.info();
+    unsafe {
+        client
+            .client
+            .Start()
+            .map_err(|e| format!("Failed to start WASAPI output: {e}"))?;
+    }
+    let _ = ready_tx.try_send(Ok(info));
+
+    let mut pending = VecDeque::<f32>::new();
+    loop {
+        let handles = [shutdown_event, client.event];
+        let wait = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+        if wait == WAIT_OBJECT_0 {
+            break;
+        }
+        if wait.0 != WAIT_OBJECT_0.0 + 1 {
+            return Err("WASAPI output wait failed".to_string());
+        }
+
+        fill_output_available(
+            &client,
+            &render_client,
+            &output_rx,
+            &cycle_tick_tx,
+            &mut pending,
+        )?;
+    }
+
+    unsafe {
+        let _ = client.client.Stop();
+    }
+    Ok(())
+}
+
+fn run_input_thread(
+    requested_device: String,
+    sample_rate: u32,
+    period_frames: usize,
+    mode: WasapiMode,
+    input_tx: SyncSender<Vec<f32>>,
+    ready_tx: SyncSender<Result<StreamInfo, String>>,
+    shutdown_event: HANDLE,
+) -> Result<(), String> {
+    let _com = ComApartment::new()?;
+    let device = select_device(eCapture, &requested_device)?;
+    let client = open_client(&device, eCapture, sample_rate, period_frames, mode)?;
+    let capture_client = unsafe {
+        client
+            .client
+            .GetService::<IAudioCaptureClient>()
+            .map_err(|e| format!("Failed to get WASAPI capture client: {e}"))?
+    };
+    unsafe {
+        client
+            .client
+            .SetEventHandle(client.event)
+            .map_err(|e| format!("Failed to set WASAPI capture event: {e}"))?;
+        client
+            .client
+            .Start()
+            .map_err(|e| format!("Failed to start WASAPI input: {e}"))?;
+    }
+
+    let info = client.info();
+    let _ = ready_tx.try_send(Ok(info));
+    let chunk_samples = period_frames.saturating_mul(client.channels);
+    let mut reservoir = VecDeque::<f32>::with_capacity(chunk_samples.saturating_mul(2));
+    loop {
+        let handles = [shutdown_event, client.event];
+        let wait = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+        if wait == WAIT_OBJECT_0 {
+            break;
+        }
+        if wait.0 != WAIT_OBJECT_0.0 + 1 {
+            return Err("WASAPI input wait failed".to_string());
+        }
+
+        drain_input_available(&capture_client, client.channels, &mut reservoir)?;
+        while reservoir.len() >= chunk_samples {
+            let mut chunk = Vec::with_capacity(chunk_samples);
+            for _ in 0..chunk_samples {
+                if let Some(sample) = reservoir.pop_front() {
+                    chunk.push(sample);
                 }
             }
+            let _ = input_tx.try_send(chunk);
         }
     }
-    fuzzy_match.or_else(|| host.default_input_device())
+
+    unsafe {
+        let _ = client.client.Stop();
+    }
+    Ok(())
 }
 
-fn select_backend_host_and_device(device: &str) -> Result<(Host, &str, &'static str), String> {
-    let requested = device.strip_prefix(WASAPI_PREFIX).unwrap_or(device).trim();
-    let host = cpal::host_from_id(HostId::Wasapi).unwrap_or_else(|_| cpal::default_host());
-    Ok((host, requested, "WASAPI"))
+struct WasapiClient {
+    client: IAudioClient,
+    event: HANDLE,
+    actual_buffer_frames: usize,
+    sample_rate: usize,
+    channels: usize,
+    period_frames: usize,
+    latency_frames: usize,
 }
 
-fn select_f32_output_config(
-    device: &cpal::Device,
-    requested_rate: i32,
-) -> Result<StreamConfig, String> {
-    let ranges: Vec<_> = device
-        .supported_output_configs()
-        .map_err(|e| format!("Failed to query output stream configs: {e}"))?
-        .filter(|r| r.sample_format() == SampleFormat::F32)
-        .collect();
+impl WasapiClient {
+    fn info(&self) -> StreamInfo {
+        StreamInfo {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            period_frames: self.period_frames,
+            actual_buffer_frames: self.actual_buffer_frames,
+            latency_frames: self.latency_frames,
+        }
+    }
+}
 
-    let rate = requested_rate.max(1) as u32;
+impl Drop for WasapiClient {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
 
-    if let Some(range) = ranges.iter().find(|r| {
-        let min = r.min_sample_rate();
-        let max = r.max_sample_rate();
-        rate >= min && rate <= max
-    }) {
-        return Ok(range.with_sample_rate(rate).config());
+fn open_client(
+    device: &IMMDevice,
+    flow: windows::Win32::Media::Audio::EDataFlow,
+    requested_rate: u32,
+    period_frames: usize,
+    mode: WasapiMode,
+) -> Result<WasapiClient, String> {
+    let client = unsafe {
+        device
+            .Activate::<IAudioClient>(CLSCTX_ALL, None)
+            .map_err(|e| format!("Failed to activate WASAPI client: {e}"))?
+    };
+    let format = build_float_mix_format(&client, requested_rate, mode)?;
+    let sample_rate = format.Format.nSamplesPerSec;
+    let stream_flags = match mode {
+        WasapiMode::SharedLowLatency => {
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+        }
+        WasapiMode::Exclusive => AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    };
+
+    let actual_period_frames = match mode {
+        WasapiMode::SharedLowLatency => initialise_low_latency(&client, &format, period_frames)?,
+        WasapiMode::Exclusive => {
+            initialise_exclusive(&client, &format, period_frames, stream_flags)?
+        }
+    } as usize;
+
+    let actual_buffer_frames = unsafe {
+        client
+            .GetBufferSize()
+            .map_err(|e| format!("Failed to query WASAPI buffer size: {e}"))?
+    } as usize;
+    let latency_hns = unsafe { client.GetStreamLatency().unwrap_or_default() };
+    let latency_frames = ref_time_to_frames(latency_hns, sample_rate) as usize;
+    let event = if flow == eRender {
+        create_event("WASAPI render event", false)?
+    } else if flow == eCapture {
+        create_event("WASAPI capture event", false)?
+    } else {
+        create_event("WASAPI event", false)?
+    };
+    let channels = format.Format.nChannels;
+    warn!(
+        flow = if flow == eRender { "render" } else { "capture" },
+        actual_buffer_frames,
+        sample_rate,
+        actual_period_frames,
+        channels,
+        latency_frames,
+        "WASAPI stream opened"
+    );
+
+    Ok(WasapiClient {
+        client,
+        event,
+        actual_buffer_frames,
+        sample_rate: sample_rate as usize,
+        channels: format.Format.nChannels as usize,
+        period_frames: actual_period_frames,
+        latency_frames,
+    })
+}
+
+fn initialise_low_latency(
+    client: &IAudioClient,
+    format: &WAVEFORMATEXTENSIBLE,
+    period_frames: usize,
+) -> Result<u32, String> {
+    let client3 = client
+        .cast::<IAudioClient3>()
+        .map_err(|_| "WASAPI shared low-latency mode requires IAudioClient3".to_string())?;
+    let mut default_period = 0;
+    let mut fundamental_period = 0;
+    let mut min_period = 0;
+    let mut max_period = 0;
+    unsafe {
+        client3
+            .GetSharedModeEnginePeriod(
+                &format.Format,
+                &mut default_period,
+                &mut fundamental_period,
+                &mut min_period,
+                &mut max_period,
+            )
+            .map_err(|e| format!("Failed to query WASAPI shared low-latency periods: {e}"))?;
+    }
+    let period = align_low_latency_period(
+        period_frames as u32,
+        default_period,
+        fundamental_period,
+        min_period,
+        max_period,
+    );
+    warn!(
+        requested_period_frames = period_frames,
+        default_period,
+        fundamental_period,
+        min_period,
+        max_period,
+        selected_period = period,
+        "WASAPI shared low-latency period selection"
+    );
+    unsafe {
+        client3
+            .InitializeSharedAudioStream(
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                period,
+                &format.Format,
+                None,
+            )
+            .map_err(|e| format!("Failed to initialize WASAPI shared low-latency stream: {e}"))?;
+    }
+    Ok(period)
+}
+
+fn initialise_exclusive(
+    client: &IAudioClient,
+    format: &WAVEFORMATEXTENSIBLE,
+    period_frames: usize,
+    stream_flags: u32,
+) -> Result<u32, String> {
+    let period_hns = frames_to_ref_time(period_frames as u32, format.Format.nSamplesPerSec);
+    unsafe {
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                stream_flags,
+                period_hns,
+                period_hns,
+                &format.Format,
+                None,
+            )
+            .map_err(|e| format!("Failed to initialize WASAPI exclusive stream: {e}"))?;
+    }
+    Ok(period_frames as u32)
+}
+
+fn build_float_mix_format(
+    client: &IAudioClient,
+    requested_rate: u32,
+    mode: WasapiMode,
+) -> Result<WAVEFORMATEXTENSIBLE, String> {
+    let mix_ptr = unsafe {
+        client
+            .GetMixFormat()
+            .map_err(|e| format!("Failed to query WASAPI mix format: {e}"))?
+    };
+    if mix_ptr.is_null() {
+        return Err("WASAPI returned a null mix format".to_string());
     }
 
-    ranges
-        .first()
-        .map(|r| r.with_max_sample_rate().config())
-        .ok_or_else(|| "No F32 WASAPI output stream configuration was found".to_string())
-}
+    let mix = unsafe { *mix_ptr };
+    unsafe {
+        CoTaskMemFree(Some(mix_ptr.cast::<c_void>()));
+    }
+    let channels = mix.nChannels.max(1);
+    let sample_rate = requested_rate.max(1);
+    let block_align = channels.saturating_mul(4);
+    let channel_mask = if channels <= 32 {
+        (1_u32 << channels) - 1
+    } else {
+        0
+    };
 
-fn select_f32_input_config(
-    device: &cpal::Device,
-    requested_rate: i32,
-) -> Result<StreamConfig, String> {
-    let ranges: Vec<_> = device
-        .supported_input_configs()
-        .map_err(|e| format!("Failed to query input stream configs: {e}"))?
-        .filter(|r| r.sample_format() == SampleFormat::F32)
-        .collect();
+    let mut format = WAVEFORMATEXTENSIBLE::default();
+    format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE as u16;
+    format.Format.nChannels = channels;
+    format.Format.nSamplesPerSec = sample_rate;
+    format.Format.nAvgBytesPerSec = sample_rate.saturating_mul(block_align as u32);
+    format.Format.nBlockAlign = block_align;
+    format.Format.wBitsPerSample = 32;
+    format.Format.cbSize =
+        (std::mem::size_of::<WAVEFORMATEXTENSIBLE>() - std::mem::size_of::<WAVEFORMATEX>()) as u16;
+    format.Samples.wValidBitsPerSample = 32;
+    format.dwChannelMask = channel_mask;
+    format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
-    let rate = requested_rate.max(1) as u32;
-
-    if let Some(range) = ranges.iter().find(|r| {
-        let min = r.min_sample_rate();
-        let max = r.max_sample_rate();
-        rate >= min && rate <= max
-    }) {
-        return Ok(range.with_sample_rate(rate).config());
+    let mut closest: *mut WAVEFORMATEX = ptr::null_mut();
+    let share_mode = match mode {
+        WasapiMode::SharedLowLatency => AUDCLNT_SHAREMODE_SHARED,
+        WasapiMode::Exclusive => AUDCLNT_SHAREMODE_EXCLUSIVE,
+    };
+    let closest_out = match mode {
+        WasapiMode::SharedLowLatency => Some(&mut closest as *mut *mut WAVEFORMATEX),
+        WasapiMode::Exclusive => None,
+    };
+    let supported = unsafe { client.IsFormatSupported(share_mode, &format.Format, closest_out) };
+    if !closest.is_null() {
+        unsafe {
+            CoTaskMemFree(Some(closest.cast::<c_void>()));
+        }
+    }
+    if supported.is_err() {
+        return Err(format!(
+            "WASAPI device does not support 32-bit float at {sample_rate} Hz"
+        ));
     }
 
-    ranges
-        .first()
-        .map(|r| r.with_max_sample_rate().config())
-        .ok_or_else(|| "No F32 WASAPI input stream configuration was found".to_string())
+    Ok(format)
+}
+
+fn fill_output_available(
+    client: &WasapiClient,
+    render_client: &IAudioRenderClient,
+    output_rx: &Receiver<Vec<f32>>,
+    cycle_tick_tx: &SyncSender<()>,
+    pending: &mut VecDeque<f32>,
+) -> Result<usize, String> {
+    let available_frames = unsafe {
+        let padding = client
+            .client
+            .GetCurrentPadding()
+            .map_err(|e| format!("Failed to query WASAPI output padding: {e}"))?;
+        client.actual_buffer_frames.saturating_sub(padding as usize)
+    };
+    let pending_before = pending.len();
+    if available_frames == 0 {
+        tracing::info!(
+            available_frames,
+            pending_before,
+            "fill_output_available: no space"
+        );
+        return Ok(0);
+    }
+
+    let mut periods_received = 0usize;
+    while pending.len() < available_frames.saturating_mul(client.channels) {
+        match output_rx.try_recv() {
+            Ok(period) => {
+                let period_len = period.len();
+                pending.extend(period);
+                periods_received += 1;
+                let tick_sent = cycle_tick_tx.try_send(()).is_ok();
+                tracing::info!(
+                    period_len,
+                    tick_sent,
+                    "fill_output_available: received period"
+                );
+            }
+            Err(_) => break,
+        }
+    }
+
+    let sample_count = available_frames.saturating_mul(client.channels);
+    let buffer = unsafe {
+        render_client
+            .GetBuffer(available_frames as u32)
+            .map_err(|e| format!("Failed to get WASAPI output buffer: {e}"))?
+    };
+    let dst = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<f32>(), sample_count) };
+    let pending_after = pending.len();
+    let mut underrun = false;
+    for sample in dst.iter_mut() {
+        if let Some(src) = pending.pop_front() {
+            *sample = src;
+        } else {
+            *sample = 0.0;
+            underrun = true;
+        }
+    }
+    unsafe {
+        render_client
+            .ReleaseBuffer(available_frames as u32, 0)
+            .map_err(|e| format!("Failed to release WASAPI output buffer: {e}"))?;
+    }
+    tracing::info!(
+        available_frames,
+        channels = client.channels,
+        pending_before,
+        pending_after,
+        periods_received,
+        underrun,
+        "fill_output_available: wrote buffer"
+    );
+    if underrun {
+        debug!(available_frames, "WASAPI output underrun");
+    }
+    Ok(available_frames)
+}
+
+fn prime_output_with_silence(
+    client: &WasapiClient,
+    render_client: &IAudioRenderClient,
+) -> Result<(), String> {
+    let buffer = unsafe {
+        render_client
+            .GetBuffer(client.actual_buffer_frames as u32)
+            .map_err(|e| format!("Failed to prime WASAPI output: {e}"))?
+    };
+    let sample_count = client.actual_buffer_frames.saturating_mul(client.channels);
+    unsafe {
+        ptr::write_bytes(buffer.cast::<f32>(), 0, sample_count);
+        render_client
+            .ReleaseBuffer(
+                client.actual_buffer_frames as u32,
+                AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
+            )
+            .map_err(|e| format!("Failed to release primed WASAPI output: {e}"))?;
+    }
+    Ok(())
+}
+
+fn drain_input_available(
+    capture_client: &IAudioCaptureClient,
+    channels: usize,
+    reservoir: &mut VecDeque<f32>,
+) -> Result<(), String> {
+    loop {
+        let mut data = ptr::null_mut();
+        let mut frames = 0_u32;
+        let mut flags = 0_u32;
+        let result =
+            unsafe { capture_client.GetBuffer(&mut data, &mut frames, &mut flags, None, None) };
+        if result.is_err() || frames == 0 {
+            break;
+        }
+        let samples = frames as usize * channels;
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
+            reservoir.extend(std::iter::repeat_n(0.0, samples));
+        } else {
+            let src = unsafe { std::slice::from_raw_parts(data.cast::<f32>(), samples) };
+            reservoir.extend(src.iter().copied());
+        }
+        if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
+            debug!(frames, "WASAPI input discontinuity");
+        }
+        unsafe {
+            capture_client
+                .ReleaseBuffer(frames)
+                .map_err(|e| format!("Failed to release WASAPI input buffer: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn align_low_latency_period(
+    requested: u32,
+    default_period: u32,
+    fundamental_period: u32,
+    min_period: u32,
+    max_period: u32,
+) -> u32 {
+    let requested = requested.max(min_period).min(max_period);
+    if fundamental_period == 0 {
+        return requested.max(default_period);
+    }
+    let steps = requested.div_ceil(fundamental_period);
+    let aligned = steps.saturating_mul(fundamental_period);
+    aligned.max(min_period).min(max_period)
+}
+
+fn frames_to_ref_time(frames: u32, sample_rate: u32) -> i64 {
+    ((frames as i64) * REFTIME_PER_SEC + sample_rate as i64 - 1) / sample_rate as i64
+}
+
+fn ref_time_to_frames(ref_time: i64, sample_rate: u32) -> u32 {
+    ((ref_time * sample_rate as i64 + REFTIME_PER_SEC - 1) / REFTIME_PER_SEC) as u32
+}
+
+fn create_event(label: &str, manual_reset: bool) -> Result<HANDLE, String> {
+    unsafe {
+        CreateEventW(None, manual_reset, false, PCWSTR::null())
+            .map_err(|e| format!("Failed to create {label}: {e}"))
+    }
+}
+
+struct ComApartment;
+
+impl ComApartment {
+    fn new() -> Result<Self, String> {
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(|e| format!("Failed to initialize COM: {e}"))?;
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+fn select_device(
+    flow: windows::Win32::Media::Audio::EDataFlow,
+    requested: &str,
+) -> Result<IMMDevice, String> {
+    let enumerator = unsafe {
+        CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|e| format!("Failed to create WASAPI device enumerator: {e}"))?
+    };
+    if requested.eq_ignore_ascii_case("default") || requested.is_empty() {
+        return unsafe {
+            enumerator
+                .GetDefaultAudioEndpoint(flow, eConsole)
+                .map_err(|e| format!("Failed to get default WASAPI device: {e}"))
+        };
+    }
+
+    let devices = unsafe {
+        enumerator
+            .EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)
+            .map_err(|e| format!("Failed to enumerate WASAPI devices: {e}"))?
+    };
+    find_device_in_collection(&devices, requested)
+        .ok_or_else(|| format!("No matching WASAPI device for '{requested}'"))
+}
+
+fn find_device_in_collection(devices: &IMMDeviceCollection, requested: &str) -> Option<IMMDevice> {
+    let requested_lc = requested.to_lowercase();
+    let count = unsafe { devices.GetCount().ok()? };
+    let mut fuzzy = None;
+    for idx in 0..count {
+        let device = unsafe { devices.Item(idx).ok()? };
+        let id = device_id(&device).unwrap_or_default();
+        let friendly = device_friendly_name(&device).unwrap_or_default();
+        if id.eq_ignore_ascii_case(requested) || friendly.eq_ignore_ascii_case(requested) {
+            return Some(device);
+        }
+        if fuzzy.is_none() {
+            let id_lc = id.to_lowercase();
+            let friendly_lc = friendly.to_lowercase();
+            if id_lc.contains(&requested_lc)
+                || friendly_lc.contains(&requested_lc)
+                || requested_lc.contains(&friendly_lc)
+            {
+                fuzzy = Some(device);
+            }
+        }
+    }
+    fuzzy
+}
+
+fn strip_wasapi_prefix(device: &str) -> &str {
+    device.strip_prefix(WASAPI_PREFIX).unwrap_or(device).trim()
+}
+
+fn device_id(device: &IMMDevice) -> Option<String> {
+    let id = unsafe { device.GetId().ok()? };
+    let value = pwstr_to_string(id);
+    unsafe {
+        CoTaskMemFree(Some(id.0.cast::<c_void>()));
+    }
+    Some(value)
+}
+
+fn device_friendly_name(device: &IMMDevice) -> Option<String> {
+    let store = unsafe { device.OpenPropertyStore(STGM_READ).ok()? };
+    let mut value =
+        unsafe { store.GetValue(&DEVPKEY_Device_FriendlyName as *const _ as *const _) }.ok()?;
+    let variant = unsafe { &value.Anonymous.Anonymous };
+    if variant.vt != VT_LPWSTR {
+        unsafe {
+            let _ = PropVariantClear(&mut value);
+        }
+        return None;
+    }
+    let text = unsafe { pwstr_to_string(variant.Anonymous.pwszVal) };
+    unsafe {
+        let _ = PropVariantClear(&mut value);
+    }
+    Some(text)
+}
+
+fn pwstr_to_string(value: PWSTR) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *value.0.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(value.0, len))
+    }
 }
 
 pub fn list_midi_input_devices() -> Vec<String> {
@@ -688,10 +1349,7 @@ impl MidiHub {
 
 impl Drop for HwDriver {
     fn drop(&mut self) {
-        if let Some(stream) = &self.input_stream {
-            let _ = stream.pause();
-        }
-        let _ = self.output_stream.pause();
+        self.close_fds();
     }
 }
 
@@ -739,10 +1397,7 @@ impl traits::HwWorkerDriver for HwDriver {
 
     fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
-        let _ = self.output_stream.pause();
-        if let Some(stream) = &self.input_stream {
-            let _ = stream.pause();
-        }
+        self.close_fds();
     }
 
     fn run_cycle_for_worker(&mut self) -> Result<(), String> {
@@ -768,7 +1423,10 @@ impl traits::HwDevice for HwDriver {
     }
 
     fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {
-        ((0, 0), (0, 0))
+        (
+            (self.input_latency_frames, self.input_latency_frames),
+            (self.output_latency_frames, self.output_latency_frames),
+        )
     }
 }
 

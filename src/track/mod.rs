@@ -1044,6 +1044,38 @@ mod tests {
     }
 
     #[test]
+    fn clip_direct_graph_accepts_capitalized_audio_kind() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        let mut clip = AudioClip::new("clip".to_string(), 0, 4);
+        clip.fade_enabled = false;
+        clip.plugin_graph_json = Some(serde_json::json!({
+            "plugins": [],
+            "connections": [{
+                "from_node": "TrackInput",
+                "from_port": 0,
+                "to_node": "TrackOutput",
+                "to_port": 0,
+                "kind": "Audio"
+            }]
+        }));
+        track.audio.push_clip(clip);
+        track.rt.audio_clip_cache.insert(
+            "clip".to_string(),
+            Arc::new(AudioClipBuffer {
+                channels: 1,
+                samples: vec![0.8, 0.0, 0.0, 0.0],
+            }),
+        );
+
+        track.process();
+
+        let out = track.last_audio_outputs()[0].clone();
+        assert_eq!(out[0], 0.8);
+    }
+
+    #[test]
     fn record_tap_captures_live_input_with_disk_monitor_on_and_input_monitor_off() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         track.set_input_monitor(vec![false]);

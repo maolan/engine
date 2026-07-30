@@ -185,7 +185,7 @@ impl TrackData {
                 continue;
             }
             match connection.get("kind").and_then(Value::as_str) {
-                Some("audio") | Some("Audio") => {}
+                Some(kind) if kind.eq_ignore_ascii_case("audio") => {}
                 _ => continue,
             }
             let Some(source) = input_blocks.get(from_port) else {

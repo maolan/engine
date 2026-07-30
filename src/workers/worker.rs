@@ -448,6 +448,7 @@ impl Worker {
     /// so downstream `Sum` nodes and the hardware drain see the result.
     pub(crate) fn process_node_job_result(worker_id: usize, job: NodeJob) -> NodeJobResult {
         let NodeJob { epoch, plan, node } = job;
+        let start = Instant::now();
         let (output_linear, parameter_updates, latency_changed) = match &plan.nodes[node as usize] {
             Op::Zero { output } => {
                 // Safety: this worker executes this node; the plan's
@@ -676,6 +677,8 @@ impl Worker {
                 (meter, updates, latency_changed)
             }
         };
+        let dur_us = start.elapsed().as_micros() as u64;
+        tracing::info!(worker_id, node, dur_us, "process_node_job_result done");
         NodeJobResult {
             worker_id,
             epoch,

@@ -77,6 +77,44 @@ pub fn enable_flush_denormals_to_zero() {
     }
 }
 
+/// RAII guard that restores the previous Windows timer resolution on drop.
+#[cfg(target_os = "windows")]
+pub struct WindowsTimerResolutionGuard;
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsTimerResolutionGuard {
+    fn drop(&mut self) {
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            fn timeEndPeriod(period: u32) -> u32;
+        }
+        unsafe {
+            timeEndPeriod(1);
+        }
+    }
+}
+
+/// Request a 1 ms Windows timer resolution so that tokio's 1 ms poll interval
+/// (and other waits) actually fire near 1 ms instead of being rounded up to
+/// the default ~15.6 ms quantum. Without this, the engine's dependent node
+/// chain is processed too slowly on Windows and WASAPI output underruns.
+#[cfg(target_os = "windows")]
+pub fn enable_windows_high_resolution_timer() -> Option<WindowsTimerResolutionGuard> {
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+    }
+    unsafe {
+        if timeBeginPeriod(1) == 0 {
+            tracing::info!("Windows timer resolution set to 1 ms");
+            Some(WindowsTimerResolutionGuard)
+        } else {
+            tracing::warn!("Failed to set Windows timer resolution to 1 ms");
+            None
+        }
+    }
+}
+
 pub type EngineInit = (
     Sender<message::Message>,
     JoinHandle<()>,

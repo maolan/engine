@@ -205,6 +205,7 @@ impl<B: Backend> HwWorker<B> {
     /// so configure it for every cycle — the pool may hand each cycle to a
     /// different thread.
     fn run_cycle_blocking(mut driver: B::Driver) -> (B::Driver, Result<(), String>) {
+        let rt_start = std::time::Instant::now();
         if let Err(e) = Self::configure_rt_thread(B::WORKER_THREAD_NAME, RT_PRIORITY_WORKER) {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
@@ -216,7 +217,11 @@ impl<B: Backend> HwWorker<B> {
                 );
             }
         }
+        let rt_us = rt_start.elapsed().as_micros() as u64;
+        let cycle_start = std::time::Instant::now();
         let result = driver.run_cycle_for_worker();
+        let cycle_us = cycle_start.elapsed().as_micros() as u64;
+        tracing::info!(rt_us, cycle_us, "run_cycle_blocking timing");
         (driver, result)
     }
 

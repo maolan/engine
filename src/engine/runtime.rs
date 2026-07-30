@@ -24,6 +24,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::error;
 
@@ -271,6 +272,9 @@ impl Engine {
             midi_cc_gate: HashMap::new(),
             modulators: Vec::new(),
             modulator_values: None,
+            #[cfg(target_os = "windows")]
+            _windows_timer_guard: crate::enable_windows_high_resolution_timer(),
+            node_result_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -701,6 +705,7 @@ impl Engine {
             let (mut node_result_tx, node_result_rx) = rtrb::RingBuffer::new(64);
             let node_quit = Arc::new(AtomicBool::new(false));
             let node_quit_thread = node_quit.clone();
+            let node_result_notify = self.node_result_notify.clone();
             let node_thread_handle = std::thread::Builder::new()
                 .name(format!("maolan-node-worker-{id}"))
                 .spawn(move || {
@@ -719,7 +724,10 @@ impl Engine {
                                 let mut result = Worker::process_node_job_result(id, job);
                                 loop {
                                     match node_result_tx.push(result) {
-                                        Ok(()) => break,
+                                        Ok(()) => {
+                                            node_result_notify.notify_one();
+                                            break;
+                                        }
                                         Err(rtrb::PushError::Full(returned)) => {
                                             if node_quit_thread
                                                 .load(std::sync::atomic::Ordering::Acquire)
@@ -1155,6 +1163,7 @@ impl Engine {
     }
 
     pub(crate) async fn request_hw_cycle(&mut self) {
+        tracing::info!("request_hw_cycle enter");
         if self.awaiting_hwfinished {
             tracing::debug!(
                 playing = self.playing,
@@ -1204,6 +1213,7 @@ impl Engine {
                     error!("Error sending TracksFinished {e}");
                 }
             }
+            tracing::info!("request_hw_cycle sent TracksFinished");
         }
     }
 
@@ -1635,6 +1645,7 @@ impl Engine {
 
     #[cfg(unix)]
     pub(crate) async fn handle_hw_finished(&mut self) {
+        tracing::info!("handle_hw_finished enter");
         if !self.awaiting_hwfinished {
             tracing::info!(
                 playing = self.playing,
@@ -1789,7 +1800,13 @@ impl Engine {
             }
         }
         let cycle_started = self.start_plan_cycle().await;
-        if self.hw_worker.is_some() && !cycle_started && self.playing {
+        // If a plan cycle is still running, its completion will request the
+        // hardware cycle. Requesting here would replay stale arena buffers.
+        if self.hw_worker.is_some()
+            && !cycle_started
+            && self.playing
+            && self.executor.cycle_complete()
+        {
             self.request_hw_cycle().await;
         }
         tracing::debug!(
@@ -3735,10 +3752,10 @@ impl Engine {
         self.notify_clients(Ok(action_to_process)).await;
     }
     pub async fn work(&mut self) {
-        // Periodic tick drains fixed-thread node-worker result rings and
-        // force-completes timed-out nodes even when no worker result arrives.
-        let mut tick = tokio::time::interval(Duration::from_millis(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Wake immediately when a fixed-thread node worker pushes a result;
+        // a slower periodic tick still force-completes timed-out nodes.
+        let mut timeout_tick = tokio::time::interval(Duration::from_millis(10));
+        timeout_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let message = tokio::select! {
                 message = self.rx.recv() => {
@@ -3746,20 +3763,24 @@ impl Engine {
                         break;
                     };
                     tracing::debug!(?message, "engine work loop received message");
-                    message
+                    Some(message)
                 }
-                _ = tick.tick() => {
-                    tracing::trace!("engine work loop tick");
-                    self.poll_node_worker_results().await;
-                    self.poll_jack_hw_finished().await;
-                    self.poll_stopped_plugin_parameter_echoes().await;
-                    self.on_executor_tick().await;
-                    continue;
+                _ = self.node_result_notify.notified() => {
+                    tracing::trace!("engine work loop woken by node result");
+                    None
+                }
+                _ = timeout_tick.tick() => {
+                    tracing::trace!("engine work loop timeout tick");
+                    None
                 }
             };
             self.poll_node_worker_results().await;
             self.poll_jack_hw_finished().await;
             self.poll_stopped_plugin_parameter_echoes().await;
+            self.on_executor_tick().await;
+            let Some(message) = message else {
+                continue;
+            };
             match message {
                 Message::Ready(id) => {
                     // A bounce worker's terminal Ready cleans up its job even
@@ -3841,6 +3862,7 @@ impl Engine {
                         cycle_samples = self.current_cycle_samples(),
                         "HWFinished handling"
                     );
+                    tracing::info!("HWFinished enter");
                     self.handling_hwfinished = true;
                     self.awaiting_hwfinished = false;
                     #[cfg(unix)]
@@ -3979,7 +4001,13 @@ impl Engine {
                         }
                     }
                     let cycle_started = self.start_plan_cycle().await;
-                    if self.hw_worker.is_some() && !cycle_started && self.playing {
+                    // If a plan cycle is still running, its completion will request the
+                    // hardware cycle. Requesting here would replay stale arena buffers.
+                    if self.hw_worker.is_some()
+                        && !cycle_started
+                        && self.playing
+                        && self.executor.cycle_complete()
+                    {
                         self.request_hw_cycle().await;
                     }
                     tracing::debug!(
@@ -3995,6 +4023,7 @@ impl Engine {
                             self.awaiting_hwfinished = true;
                         }
                     }
+                    tracing::info!("HWFinished exit");
                     self.handling_hwfinished = false;
                 }
                 Message::HWMidiEvents(events) => {
