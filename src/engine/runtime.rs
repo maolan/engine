@@ -2929,6 +2929,17 @@ impl Engine {
                     return;
                 }
             }
+            Action::TrackSetMpeZone { .. } => {
+                if Self::box_bool(self.handle_track_set_mpe_zone(a.clone())).await {
+                    return;
+                }
+            }
+            Action::TrackSetMpePitchBendSensitivity { .. } => {
+                if Self::box_bool(self.handle_track_set_mpe_pitch_bend_sensitivity(a.clone())).await
+                {
+                    return;
+                }
+            }
             Action::TrackSetFrozen { .. } => {
                 if Self::box_bool(self.handle_track_set_frozen(a.clone())).await {
                     return;

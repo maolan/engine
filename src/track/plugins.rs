@@ -1928,18 +1928,24 @@ impl TrackData {
     }
 
     pub(crate) fn collect_track_input_midi_events(&mut self) -> Vec<Vec<MidiEvent>> {
-        let mut events: Vec<Vec<MidiEvent>> = Vec::with_capacity(self.midi.ins.len());
         self.rt.record_tap_midi_in.clear();
         let midi_disk_monitor = self.midi_disk_monitor();
         let midi_input_monitor = self.midi_input_monitor();
         let midi_lane_channels = self.midi_lane_channels();
         let midi_disk_active = midi_disk_monitor.iter().any(|&m| m);
         let clip_playback_active = midi_disk_active && self.rt.clip_playback_enabled;
+        // Collect raw events from MIDI inputs first; allocation needs mutable
+        // access to `self` (for the MPE voice allocator), so it is done after
+        // the input borrow is released.
+        let mut lane_buffers: Vec<Vec<MidiEvent>> = Vec::with_capacity(self.midi.ins.len());
         for (lane, input) in self.midi.ins.iter().enumerate() {
             // Safety: plan single-writer invariant — this task is the sole
             // writer of its own ports this cycle; sources it reads were
             // produced by earlier plan nodes (LOCKLESS.md Phase 3).
             let mut buffer = unsafe { input.buffer_mut() };
+            for event in buffer.iter() {
+                self.mpe_state.feed(&event.data);
+            }
             self.rt.record_tap_midi_in.extend(buffer.iter().cloned());
             let monitor = midi_input_monitor.get(lane).copied().unwrap_or(false);
             if clip_playback_active && !monitor {
@@ -1951,10 +1957,14 @@ impl TrackData {
             }
             buffer.sort_by_key(|event| event.frame);
             input.mark_finished();
-            events.push(buffer.clone());
+            lane_buffers.push(std::mem::take(&mut *buffer));
+        }
+        for buffer in &mut lane_buffers {
+            *buffer = self.allocate_mpe_events(std::mem::take(buffer));
+            buffer.sort_by_key(|event| event.frame);
         }
         self.rt.record_tap_midi_in.sort_by_key(|e| e.frame);
-        events
+        lane_buffers
     }
 
     pub(crate) fn event_matches_midi_channel(event: &MidiEvent, channel: u8) -> bool {

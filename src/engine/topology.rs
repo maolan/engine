@@ -1645,6 +1645,14 @@ impl Engine {
                 .await;
             return;
         }
+        if !folder && !self.history_suspended && audio_ins + midi_ins + audio_outs + midi_outs == 0
+        {
+            self.notify_clients(Err(
+                "Track must have at least one audio or MIDI input/output".to_string(),
+            ))
+            .await;
+            return;
+        }
         let maybe_hw = self
             .hw_driver_info
             .map(|info| (info.cycle_samples, info.sample_rate as f64));
@@ -2966,6 +2974,52 @@ impl Engine {
             }
         };
         track.lock().set_midi_lane_channel(lane, channel);
+
+        false
+    }
+
+    pub(crate) async fn handle_track_set_mpe_zone(&mut self, a: Action) -> bool {
+        let Action::TrackSetMpeZone {
+            ref track_name,
+            manager_channel,
+            member_count,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        track.lock().set_mpe_zone(manager_channel, member_count);
+
+        false
+    }
+
+    pub(crate) async fn handle_track_set_mpe_pitch_bend_sensitivity(&mut self, a: Action) -> bool {
+        let Action::TrackSetMpePitchBendSensitivity {
+            ref track_name,
+            channel,
+            semitones,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        track
+            .lock()
+            .set_mpe_pitch_bend_sensitivity(channel, semitones);
 
         false
     }

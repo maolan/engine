@@ -467,8 +467,14 @@ impl TrackData {
                         break;
                     }
                     let frame = out_offset + (source_sample - content_start);
-                    if frame < frames {
-                        input_events[input_lane].push(MidiEvent::new(frame as u32, data.clone()));
+                    if frame >= frames {
+                        continue;
+                    }
+                    for allocated in
+                        self.allocate_mpe_event(MidiEvent::new(frame as u32, data.clone()))
+                    {
+                        let data = allocated.data.clone();
+                        input_events[input_lane].push(allocated);
                         if let Some(&status) = data.first() {
                             let channel = status & 0x0F;
                             if let Some(&note) = data.get(1) {

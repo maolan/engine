@@ -12,7 +12,7 @@ pub mod loudness;
 pub use loudness::LoudnessValues;
 pub mod message;
 pub mod meter;
-mod midi;
+pub mod midi;
 pub mod modulator;
 mod osc;
 #[cfg(unix)]

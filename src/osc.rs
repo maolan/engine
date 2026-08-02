@@ -3,9 +3,9 @@ use crate::kind::Kind;
 use crate::message::{
     Action, AudioClipData, ClipMoveFrom, ClipMoveTo, GlobalMidiLearnTarget, LaunchQuantization,
     Message, MidiClipData, MidiControllerData, MidiLearnBinding, MidiNoteData, MidiRawEventData,
-    OfflineAutomationLane, OfflineAutomationTarget, PitchCorrectionPointData, PluginGraphNode,
-    SessionMidiLearnTarget, TempoPoint, TimeSignaturePoint, TrackAutomationMode, TrackColor,
-    TrackMidiLearnTarget,
+    MpeExpressionCurve, MpeExpressionPoint, MpeNoteExpression, OfflineAutomationLane,
+    OfflineAutomationTarget, PitchCorrectionPointData, PluginGraphNode, SessionMidiLearnTarget,
+    TempoPoint, TimeSignaturePoint, TrackAutomationMode, TrackColor, TrackMidiLearnTarget,
 };
 use crate::modulator::Modulator;
 use std::{
@@ -1519,7 +1519,42 @@ fn parse_midi_note_data(value: &serde_json::Value) -> Option<MidiNoteData> {
         pitch: value.get("pitch")?.as_u64()? as u8,
         velocity: value.get("velocity")?.as_u64()? as u8,
         channel: value.get("channel")?.as_u64()? as u8,
+        mpe: value
+            .get("mpe")
+            .and_then(parse_mpe_note_expression)
+            .unwrap_or_default(),
     })
+}
+
+fn parse_mpe_note_expression(value: &serde_json::Value) -> Option<MpeNoteExpression> {
+    Some(MpeNoteExpression {
+        pitch_bend: value
+            .get("pitch_bend")
+            .and_then(parse_mpe_expression_curve)
+            .unwrap_or_default(),
+        pressure: value
+            .get("pressure")
+            .and_then(parse_mpe_expression_curve)
+            .unwrap_or_default(),
+        timbre: value
+            .get("timbre")
+            .and_then(parse_mpe_expression_curve)
+            .unwrap_or_default(),
+    })
+}
+
+fn parse_mpe_expression_curve(value: &serde_json::Value) -> Option<MpeExpressionCurve> {
+    let points = value
+        .as_array()?
+        .iter()
+        .filter_map(|p| {
+            Some(MpeExpressionPoint {
+                sample_offset: p.get("sample_offset")?.as_u64()? as usize,
+                value: p.get("value")?.as_u64()? as u16,
+            })
+        })
+        .collect();
+    Some(MpeExpressionCurve { points })
 }
 
 fn parse_midi_controller_data(value: &serde_json::Value) -> Option<MidiControllerData> {

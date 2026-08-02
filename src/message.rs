@@ -18,6 +18,25 @@ pub struct TrackColor {
     pub a: f32,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MpeExpressionPoint {
+    pub sample_offset: usize,
+    /// Pitch bend uses 0..=16383 (8192 center); pressure and timbre use 0..=127.
+    pub value: u16,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MpeExpressionCurve {
+    pub points: Vec<MpeExpressionPoint>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MpeNoteExpression {
+    pub pitch_bend: MpeExpressionCurve,
+    pub pressure: MpeExpressionCurve,
+    pub timbre: MpeExpressionCurve,
+}
+
 #[derive(Clone, Debug)]
 pub struct MidiNoteData {
     pub start_sample: usize,
@@ -25,6 +44,7 @@ pub struct MidiNoteData {
     pub pitch: u8,
     pub velocity: u8,
     pub channel: u8,
+    pub mpe: MpeNoteExpression,
 }
 
 #[derive(Clone, Debug)]
@@ -781,6 +801,16 @@ pub enum Action {
         track_name: String,
         lane: usize,
         channel: Option<u8>,
+    },
+    TrackSetMpeZone {
+        track_name: String,
+        manager_channel: u8,
+        member_count: u8,
+    },
+    TrackSetMpePitchBendSensitivity {
+        track_name: String,
+        channel: u8,
+        semitones: u8,
     },
     TrackSetFrozen {
         track_name: String,

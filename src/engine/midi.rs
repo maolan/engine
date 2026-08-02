@@ -4,7 +4,10 @@ use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
-    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
+    message::{
+        Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, MpeExpressionPoint,
+        MpeNoteExpression,
+    },
     midi::io::MidiEvent,
 };
 use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
@@ -200,6 +203,9 @@ impl Engine {
         let mut controllers = Vec::<MidiControllerData>::new();
         let mut passthrough_events = Vec::<(u64, Vec<u8>)>::new();
         let mut active_notes: HashMap<(u8, u8), Vec<(u64, u8)>> = HashMap::new();
+        // For per-note MPE expression we track the most recent active note on
+        // each channel; expression events on that channel are attached to it.
+        let mut active_mpe_by_channel: [Option<(u8, MpeNoteExpression)>; 16] = [const { None }; 16];
 
         for track in &smf.tracks {
             let mut tick = 0_u64;
@@ -218,6 +224,11 @@ impl Engine {
                                     {
                                         let start_sample = ticks_to_samples(start_tick);
                                         let end_sample = ticks_to_samples(tick);
+                                        let mpe = active_mpe_by_channel[channel_u8 as usize]
+                                            .take()
+                                            .filter(|(active_pitch, _)| *active_pitch == pitch)
+                                            .map(|(_, mpe)| mpe)
+                                            .unwrap_or_default();
                                         notes.push(MidiNoteData {
                                             start_sample,
                                             length_samples: end_sample
@@ -226,6 +237,7 @@ impl Engine {
                                             pitch,
                                             velocity: start_vel,
                                             channel: channel_u8,
+                                            mpe,
                                         });
                                     }
                                 } else {
@@ -233,6 +245,8 @@ impl Engine {
                                         .entry((channel_u8, pitch))
                                         .or_default()
                                         .push((tick, velocity));
+                                    active_mpe_by_channel[channel_u8 as usize] =
+                                        Some((pitch, MpeNoteExpression::default()));
                                 }
                             }
                             midly::MidiMessage::NoteOff { key, .. } => {
@@ -242,6 +256,11 @@ impl Engine {
                                 {
                                     let start_sample = ticks_to_samples(start_tick);
                                     let end_sample = ticks_to_samples(tick);
+                                    let mpe = active_mpe_by_channel[channel_u8 as usize]
+                                        .take()
+                                        .filter(|(active_pitch, _)| *active_pitch == pitch)
+                                        .map(|(_, mpe)| mpe)
+                                        .unwrap_or_default();
                                     notes.push(MidiNoteData {
                                         start_sample,
                                         length_samples: end_sample
@@ -250,16 +269,95 @@ impl Engine {
                                         pitch,
                                         velocity: start_vel,
                                         channel: channel_u8,
+                                        mpe,
                                     });
                                 }
                             }
                             midly::MidiMessage::Controller { controller, value } => {
+                                let controller_u8 = controller.as_int();
+                                if controller_u8 == 74
+                                    && let Some((active_pitch, expr)) =
+                                        active_mpe_by_channel[channel_u8 as usize].as_mut()
+                                {
+                                    expr.timbre.points.push(MpeExpressionPoint {
+                                        sample_offset: ticks_to_samples(tick).saturating_sub(
+                                            ticks_to_samples(
+                                                active_notes
+                                                    .get(&(channel_u8, *active_pitch))
+                                                    .and_then(|v| v.last())
+                                                    .map(|(t, _)| *t)
+                                                    .unwrap_or(tick),
+                                            ),
+                                        ),
+                                        value: value.as_int() as u16,
+                                    });
+                                    // MPE per-note timbre is note-attached; do not also emit
+                                    // it as a track controller event.
+                                    continue;
+                                }
                                 controllers.push(MidiControllerData {
                                     sample: ticks_to_samples(tick),
-                                    controller: controller.as_int(),
+                                    controller: controller_u8,
                                     value: value.as_int(),
                                     channel: channel_u8,
                                 });
+                            }
+                            midly::MidiMessage::PitchBend { bend } => {
+                                if let Some((active_pitch, expr)) =
+                                    active_mpe_by_channel[channel_u8 as usize].as_mut()
+                                {
+                                    expr.pitch_bend.points.push(MpeExpressionPoint {
+                                        sample_offset: ticks_to_samples(tick).saturating_sub(
+                                            ticks_to_samples(
+                                                active_notes
+                                                    .get(&(channel_u8, *active_pitch))
+                                                    .and_then(|v| v.last())
+                                                    .map(|(t, _)| *t)
+                                                    .unwrap_or(tick),
+                                            ),
+                                        ),
+                                        // midly returns pitch bend as a signed offset around 8192.
+                                        value: (bend.as_int() + 8192).clamp(0, 16383) as u16,
+                                    });
+                                    // MPE per-note pitch bend is note-attached; do not also emit
+                                    // it as a passthrough event.
+                                    continue;
+                                }
+                                let mut data = Vec::with_capacity(3);
+                                if (LiveEvent::Midi { channel, message })
+                                    .write(&mut data)
+                                    .is_ok()
+                                {
+                                    passthrough_events.push((ticks_to_samples(tick) as u64, data));
+                                }
+                            }
+                            midly::MidiMessage::ChannelAftertouch { vel } => {
+                                if let Some((active_pitch, expr)) =
+                                    active_mpe_by_channel[channel_u8 as usize].as_mut()
+                                {
+                                    expr.pressure.points.push(MpeExpressionPoint {
+                                        sample_offset: ticks_to_samples(tick).saturating_sub(
+                                            ticks_to_samples(
+                                                active_notes
+                                                    .get(&(channel_u8, *active_pitch))
+                                                    .and_then(|v| v.last())
+                                                    .map(|(t, _)| *t)
+                                                    .unwrap_or(tick),
+                                            ),
+                                        ),
+                                        value: vel.as_int() as u16,
+                                    });
+                                    // MPE per-note pressure is note-attached; do not also emit it
+                                    // as a passthrough event.
+                                    continue;
+                                }
+                                let mut data = Vec::with_capacity(3);
+                                if (LiveEvent::Midi { channel, message })
+                                    .write(&mut data)
+                                    .is_ok()
+                                {
+                                    passthrough_events.push((ticks_to_samples(tick) as u64, data));
+                                }
                             }
                             _ => {
                                 let mut data = Vec::with_capacity(3);
@@ -296,12 +394,18 @@ impl Engine {
             for (start_tick, velocity) in starts {
                 let start_sample = ticks_to_samples(start_tick);
                 let end_sample = ticks_to_samples(start_tick.saturating_add(ppq / 8));
+                let mpe = active_mpe_by_channel[channel as usize]
+                    .take()
+                    .filter(|(active_pitch, _)| *active_pitch == pitch)
+                    .map(|(_, mpe)| mpe)
+                    .unwrap_or_default();
                 notes.push(MidiNoteData {
                     start_sample,
                     length_samples: end_sample.saturating_sub(start_sample).max(1),
                     pitch,
                     velocity,
                     channel,
+                    mpe,
                 });
             }
         }
@@ -345,6 +449,38 @@ impl Engine {
             let end = note.start_sample.saturating_add(note.length_samples).max(1) as u64;
             events.push((start, 2, vec![0x90 | channel, pitch, velocity]));
             events.push((end, 0, vec![0x80 | channel, pitch, 64]));
+            for point in &note.mpe.pitch_bend.points {
+                let sample = note
+                    .start_sample
+                    .saturating_add(point.sample_offset)
+                    .min(end as usize) as u64;
+                let value = point.value.min(16383);
+                let lsb = (value & 0x7F) as u8;
+                let msb = ((value >> 7) & 0x7F) as u8;
+                events.push((sample, 1, vec![0xE0 | channel, lsb, msb]));
+            }
+            for point in &note.mpe.pressure.points {
+                let sample = note
+                    .start_sample
+                    .saturating_add(point.sample_offset)
+                    .min(end as usize) as u64;
+                events.push((
+                    sample,
+                    1,
+                    vec![0xD0 | channel, (point.value.min(127)) as u8],
+                ));
+            }
+            for point in &note.mpe.timbre.points {
+                let sample = note
+                    .start_sample
+                    .saturating_add(point.sample_offset)
+                    .min(end as usize) as u64;
+                events.push((
+                    sample,
+                    1,
+                    vec![0xB0 | channel, 74, (point.value.min(127)) as u8],
+                ));
+            }
         }
         for ctrl in controllers {
             let channel = ctrl.channel.min(15);
@@ -1392,5 +1528,121 @@ impl Engine {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Engine;
+    use crate::message::{MpeExpressionCurve, MpeExpressionPoint, MpeNoteExpression};
+    use std::path::PathBuf;
+
+    #[test]
+    fn mpe_expression_round_trips_through_midi_file() {
+        let sample_rate = 48_000;
+        let channel = 1; // MIDI channel 2 (0-indexed)
+        let pitch = 60;
+        let velocity = 100;
+        let note_start = 4_800_usize;
+        let note_length = 9_600_usize;
+
+        let events: Vec<(u64, Vec<u8>)> = vec![
+            (note_start as u64, vec![0x90 | channel, pitch, velocity]),
+            (
+                (note_start + 2_400) as u64,
+                vec![0xE0 | channel, 0x10, 0x4E],
+            ), // pitch bend 10000
+            ((note_start + 4_800) as u64, vec![0xD0 | channel, 80]), // pressure
+            ((note_start + 7_200) as u64, vec![0xB0 | channel, 74, 60]), // timbre CC74
+            (
+                (note_start + note_length) as u64,
+                vec![0x80 | channel, pitch, 64],
+            ),
+        ];
+
+        let path = PathBuf::from(format!(
+            "{}/maolan_mpe_round_trip_{}.mid",
+            std::env::temp_dir().display(),
+            std::process::id()
+        ));
+        Engine::write_midi_file(&path, sample_rate, &events).expect("write midi file");
+
+        let (notes, controllers, _passthrough) =
+            Engine::parse_midi_clip_for_edit(&path, sample_rate as f64, 0)
+                .expect("parse midi clip");
+
+        assert_eq!(notes.len(), 1, "expected one parsed note");
+        assert!(
+            controllers.is_empty(),
+            "CC74 on active member channel should be attached to note"
+        );
+
+        let note = &notes[0];
+        assert_eq!(note.start_sample, note_start);
+        assert_eq!(note.length_samples, note_length);
+        assert_eq!(note.pitch, pitch);
+        assert_eq!(note.velocity, velocity);
+        assert_eq!(note.channel, channel);
+
+        assert_eq!(
+            note.mpe,
+            MpeNoteExpression {
+                pitch_bend: MpeExpressionCurve {
+                    points: vec![MpeExpressionPoint {
+                        sample_offset: 2_400,
+                        value: 10_000,
+                    }],
+                },
+                pressure: MpeExpressionCurve {
+                    points: vec![MpeExpressionPoint {
+                        sample_offset: 4_800,
+                        value: 80,
+                    }],
+                },
+                timbre: MpeExpressionCurve {
+                    points: vec![MpeExpressionPoint {
+                        sample_offset: 7_200,
+                        value: 60,
+                    }],
+                },
+            }
+        );
+
+        let emitted = Engine::midi_events_from_notes_and_controllers(&notes, &controllers);
+        let note_on = emitted.iter().find(|(_, d)| {
+            d.len() == 3 && d[0] == (0x90 | channel) && d[1] == pitch && d[2] == velocity
+        });
+        let note_off = emitted
+            .iter()
+            .find(|(_, d)| d.len() == 3 && d[0] == (0x80 | channel) && d[1] == pitch);
+        let pitch_bend = emitted
+            .iter()
+            .find(|(_, d)| d.len() == 3 && d[0] == (0xE0 | channel));
+        let pressure = emitted
+            .iter()
+            .find(|(_, d)| d.len() == 2 && d[0] == (0xD0 | channel));
+        let timbre = emitted
+            .iter()
+            .find(|(_, d)| d.len() == 3 && d[0] == (0xB0 | channel) && d[1] == 74);
+
+        assert!(note_on.is_some(), "missing note on");
+        assert!(note_off.is_some(), "missing note off");
+        assert_eq!(
+            pitch_bend.map(|(_, d)| d.clone()),
+            Some(vec![0xE0 | channel, 0x10, 0x4E]),
+            "pitch bend mismatch"
+        );
+        assert_eq!(
+            pressure.map(|(_, d)| d.clone()),
+            Some(vec![0xD0 | channel, 80]),
+            "pressure mismatch"
+        );
+        assert_eq!(
+            timbre.map(|(_, d)| d.clone()),
+            Some(vec![0xB0 | channel, 74, 60]),
+            "timbre mismatch"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

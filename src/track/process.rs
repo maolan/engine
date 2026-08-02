@@ -63,6 +63,7 @@ impl TrackData {
             #[cfg(unix)]
             next_lv2_instance_id: AtomicUsize::new(0),
             next_plugin_instance_id: AtomicUsize::new(0),
+            mpe_state: MpeState::new(),
             sample_rate,
             process_block_size: AtomicUsize::new(buffer_size.max(1)),
             force_realtime_domain: false,
@@ -1098,6 +1099,59 @@ impl TrackData {
             *slot = channel.map(|channel| channel.min(15));
             self.midi_lane_channels.store(lanes);
         }
+    }
+
+    pub fn mpe_state(&self) -> &MpeState {
+        &self.mpe_state
+    }
+
+    pub fn mpe_state_mut(&mut self) -> &mut MpeState {
+        &mut self.mpe_state
+    }
+
+    pub fn set_mpe_zone(&mut self, manager_channel: u8, member_count: u8) {
+        self.mpe_state.configure_zone(manager_channel, member_count);
+        self.reset_mpe_voice_allocator();
+    }
+
+    pub fn set_mpe_pitch_bend_sensitivity(&mut self, channel: u8, semitones: u8) {
+        self.mpe_state
+            .set_pitch_bend_sensitivity(channel, semitones);
+        self.reset_mpe_voice_allocator();
+    }
+
+    fn reset_mpe_voice_allocator(&mut self) {
+        self.rt.mpe_voice_allocator = self
+            .mpe_state
+            .active_zone()
+            .cloned()
+            .map(crate::midi::mpe::MpeVoiceAllocator::new);
+    }
+
+    pub(crate) fn allocate_mpe_events(&mut self, events: Vec<MidiEvent>) -> Vec<MidiEvent> {
+        let Some(ref mut allocator) = self.rt.mpe_voice_allocator else {
+            return events;
+        };
+        events
+            .into_iter()
+            .flat_map(|event| {
+                allocator
+                    .feed(&event.data)
+                    .into_iter()
+                    .map(move |data| MidiEvent::new(event.frame, data))
+            })
+            .collect()
+    }
+
+    pub(crate) fn allocate_mpe_event(&mut self, event: MidiEvent) -> Vec<MidiEvent> {
+        let Some(ref mut allocator) = self.rt.mpe_voice_allocator else {
+            return vec![event];
+        };
+        allocator
+            .feed(&event.data)
+            .into_iter()
+            .map(|data| MidiEvent::new(event.frame, data))
+            .collect()
     }
 
     pub fn input_monitor(&self) -> Arc<Vec<bool>> {

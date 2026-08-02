@@ -1,4 +1,4 @@
-use super::{audio::track::AudioTrack, midi::track::MIDITrack};
+use super::{audio::track::AudioTrack, midi::mpe::MpeState, midi::track::MIDITrack};
 use crate::message::{PluginGraphConnection, PluginGraphNode};
 #[cfg(unix)]
 use crate::pitch_shift::LivePitchShifter;
@@ -597,6 +597,7 @@ pub struct TrackRt {
     pub playing_session_clips: Vec<PlayingSessionClip>,
     pending_session_midi_note_offs: Vec<MidiEvent>,
     pub session_slots: HashMap<usize, SessionSlot>,
+    pub mpe_voice_allocator: Option<crate::midi::mpe::MpeVoiceAllocator>,
     /// Clips that left the timeline but are still referenced by session
     /// slots; session playback falls back to these when the track itself no
     /// longer holds a clip with the slot's clip id.
@@ -647,6 +648,7 @@ impl TrackRt {
             playing_session_clips: Vec::new(),
             pending_session_midi_note_offs: Vec::new(),
             session_slots: HashMap::new(),
+            mpe_voice_allocator: None,
             session_clip_pool_audio: Vec::new(),
             session_clip_pool_midi: Vec::new(),
             folder_input_midi_events: Vec::new(),
@@ -764,6 +766,7 @@ pub struct TrackData {
     #[cfg(unix)]
     pub next_lv2_instance_id: AtomicUsize,
     pub next_plugin_instance_id: AtomicUsize,
+    pub mpe_state: MpeState,
     pub sample_rate: f64,
     process_block_size: AtomicUsize,
     force_realtime_domain: bool,
@@ -1546,6 +1549,67 @@ mod tests {
         assert_eq!(
             track.rt.pending_hw_midi_out_events[1].event,
             crate::midi::io::MidiEvent::new(2, vec![0x90, 60, 100])
+        );
+    }
+
+    #[test]
+    fn midi_clip_with_mpe_allocates_note_to_member_channel() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.set_mpe_zone(0, 2);
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            8,
+        ));
+        track.rt.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100])]),
+        );
+
+        track.process();
+
+        assert!(
+            track
+                .rt
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|e| e.event.data == vec![0x91, 60, 100])
+        );
+    }
+
+    #[test]
+    fn midi_clip_with_mpe_matches_note_off_to_allocated_member_channel() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.set_mpe_zone(0, 2);
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            8,
+        ));
+        track.rt.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (4, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert!(
+            track
+                .rt
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|e| e.event.data == vec![0x91, 60, 100])
+        );
+        assert!(
+            track
+                .rt
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|e| e.event.data == vec![0x81, 60, 64])
         );
     }
 

@@ -717,7 +717,7 @@ impl TrackData {
     }
 
     pub(crate) fn collect_midi_clip_events_recursive(
-        &self,
+        &mut self,
         clip: &crate::midi::clip::MIDIClip,
         parent_start: usize,
         input_events: &mut [Vec<MidiEvent>],
@@ -730,9 +730,12 @@ impl TrackData {
             return;
         }
         if !clip.grouped_clips.is_empty() {
-            for child in &clip.grouped_clips {
+            // Collect children into a local list first so the recursive calls
+            // can borrow `self` mutably while sharing the same event buffer.
+            let children: Vec<_> = clip.grouped_clips.to_vec();
+            for child in children {
                 self.collect_midi_clip_events_recursive(
-                    child,
+                    &child,
                     clip_start,
                     input_events,
                     frames,
@@ -754,7 +757,7 @@ impl TrackData {
             return;
         }
         let clip_end = clip_start.saturating_add(clip_len);
-        let Some(events) = self.rt.midi_clip_cache.get(&clip.name) else {
+        let Some(events) = self.rt.midi_clip_cache.get(&clip.name).cloned() else {
             return;
         };
         for (segment_start, segment_end, out_offset) in segments {
@@ -782,15 +785,20 @@ impl TrackData {
                     frame_idx = frame_idx.min(frames.saturating_sub(1));
                 }
                 if frame_idx < frames {
-                    input_events[input_lane].push(MidiEvent::new(frame_idx as u32, data.clone()));
+                    input_events[input_lane].extend(
+                        self.allocate_mpe_event(MidiEvent::new(frame_idx as u32, data.clone())),
+                    );
                 }
             }
             if to == clip_end {
                 let frame_idx = out_offset
                     .saturating_add(clip_end.saturating_sub(*segment_start))
                     .min(frames.saturating_sub(1));
-                for data in Self::synthetic_note_offs_at_clip_end(events, clip.offset, clip_len) {
-                    input_events[input_lane].push(MidiEvent::new(frame_idx as u32, data));
+                for data in
+                    Self::synthetic_note_offs_at_clip_end(events.as_ref(), clip.offset, clip_len)
+                {
+                    input_events[input_lane]
+                        .extend(self.allocate_mpe_event(MidiEvent::new(frame_idx as u32, data)));
                 }
             }
         }
@@ -1299,6 +1307,7 @@ impl TrackData {
             self.collect_midi_clip_events_recursive(clip, 0, input_events, frames, &segments);
         }
         for events in input_events.iter_mut() {
+            *events = self.allocate_mpe_events(std::mem::take(events));
             events.sort_by_key(|event| event.frame);
         }
     }
