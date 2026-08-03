@@ -96,9 +96,12 @@ pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String>
         ));
     }
 
-    let json = String::from_utf8_lossy(&output.stdout);
+    // Plugin DLLs may write debug output to stdout before the JSON payload.
+    // Extract only the JSON portion (from the first '{' onwards).
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let json = raw.find('{').map(|i| &raw[i..]).unwrap_or(&raw);
     let parsed: ScanOutput<Vec<T>> =
-        serde_json::from_str(&json).map_err(|e| format!("failed to parse scan JSON: {e}"))?;
+        serde_json::from_str(json).map_err(|e| format!("failed to parse scan JSON: {e}"))?;
 
     for error in &parsed.errors {
         tracing::error!(

@@ -866,31 +866,60 @@ fn build_float_mix_format(
     }
     let channels = mix.nChannels.max(1);
     let sample_rate = requested_rate.max(1);
-    let block_align = channels.saturating_mul(4);
+
+    // Try 32-bit float first.
+    if let Ok(fmt) = try_wasapi_format(client, channels, sample_rate, 32, true, mode) {
+        return Ok(fmt);
+    }
+    warn!("WASAPI device does not support 32-bit float, falling back to 16-bit PCM");
+
+    // Fall back to 16-bit integer PCM.
+    try_wasapi_format(client, channels, sample_rate, 16, false, mode)
+        .map_err(|_| format!("WASAPI device does not support 32-bit float or 16-bit PCM at {sample_rate} Hz"))
+}
+
+fn try_wasapi_format(
+    client: &IAudioClient,
+    channels: u16,
+    sample_rate: u32,
+    bits: u16,
+    is_float: bool,
+    mode: WasapiMode,
+) -> Result<WAVEFORMATEXTENSIBLE, String> {
+    let bytes_per_sample = (bits / 8) as u16;
+    let block_align = channels.saturating_mul(bytes_per_sample);
     let channel_mask = if channels <= 32 {
         (1_u32 << channels) - 1
     } else {
         0
     };
 
-    let mut format = WAVEFORMATEXTENSIBLE::default();
-    format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE as u16;
-    format.Format.nChannels = channels;
-    format.Format.nSamplesPerSec = sample_rate;
-    format.Format.nAvgBytesPerSec = sample_rate.saturating_mul(block_align as u32);
-    format.Format.nBlockAlign = block_align;
-    format.Format.wBitsPerSample = 32;
-    format.Format.cbSize =
-        (std::mem::size_of::<WAVEFORMATEXTENSIBLE>() - std::mem::size_of::<WAVEFORMATEX>()) as u16;
-    format.Samples.wValidBitsPerSample = 32;
-    format.dwChannelMask = channel_mask;
-    format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-
-    let mut closest: *mut WAVEFORMATEX = ptr::null_mut();
     let share_mode = match mode {
         WasapiMode::SharedLowLatency => AUDCLNT_SHAREMODE_SHARED,
         WasapiMode::Exclusive => AUDCLNT_SHAREMODE_EXCLUSIVE,
     };
+
+    let mut format = WAVEFORMATEXTENSIBLE::default();
+    if is_float {
+        format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE as u16;
+        format.Format.cbSize = (std::mem::size_of::<WAVEFORMATEXTENSIBLE>()
+            - std::mem::size_of::<WAVEFORMATEX>())
+            as u16;
+        format.Samples.wValidBitsPerSample = bits;
+        format.dwChannelMask = channel_mask;
+        format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    } else {
+        // Use plain WAVE_FORMAT_PCM for maximum compatibility.
+        format.Format.wFormatTag = 1; // WAVE_FORMAT_PCM
+        format.Format.cbSize = 0;
+    }
+    format.Format.nChannels = channels;
+    format.Format.nSamplesPerSec = sample_rate;
+    format.Format.nAvgBytesPerSec = sample_rate.saturating_mul(block_align as u32);
+    format.Format.nBlockAlign = block_align;
+    format.Format.wBitsPerSample = bits;
+
+    let mut closest: *mut WAVEFORMATEX = ptr::null_mut();
     let closest_out = match mode {
         WasapiMode::SharedLowLatency => Some(&mut closest as *mut *mut WAVEFORMATEX),
         WasapiMode::Exclusive => None,
@@ -902,9 +931,7 @@ fn build_float_mix_format(
         }
     }
     if supported.is_err() {
-        return Err(format!(
-            "WASAPI device does not support 32-bit float at {sample_rate} Hz"
-        ));
+        return Err("format not supported".to_string());
     }
 
     Ok(format)
