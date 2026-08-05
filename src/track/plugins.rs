@@ -219,6 +219,18 @@ impl TrackData {
         plugins
     }
 
+    pub(crate) fn refresh_clap_audio_ports_from_hosts(&self) {
+        for instance in &self.clap_plugins {
+            if let Err(e) = instance.processor.refresh_audio_ports_from_host() {
+                tracing::warn!(
+                    "CLAP audio port refresh failed for '{}': {}",
+                    instance.processor.name(),
+                    e
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     pub fn set_lv2_plugin_bypassed(
         &self,
@@ -2380,7 +2392,7 @@ impl TrackData {
                         let processor = self.clap_plugins[idx].processor.clone();
                         let input_ports = processor.audio_inputs();
                         if !Self::graph_audio_inputs_ready(
-                            input_ports,
+                            &input_ports,
                             &plugin_output_keys,
                             &output_buffers,
                         ) {
@@ -2394,7 +2406,7 @@ impl TrackData {
                             &self.rt.folder_plugin_midi_node_events,
                         );
                         let input_buffers = self.sum_graph_audio_inputs(
-                            input_ports,
+                            &input_ports,
                             frames,
                             track_inputs,
                             &output_buffers,

@@ -334,9 +334,10 @@ impl ClipPluginRuntime {
                 let processor = self.clap_plugins[idx].processor.clone();
                 let midi_ready = Self::plugin_midi_inputs_ready(processor.midi_input_ports());
                 let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
+                let input_ports = processor.audio_inputs();
                 if !midi_ready
                     || !Self::clip_audio_inputs_ready(
-                        processor.audio_inputs(),
+                        &input_ports,
                         &plugin_output_keys,
                         &output_buffers,
                     )
@@ -344,8 +345,7 @@ impl ClipPluginRuntime {
                     continue;
                 }
                 let _midi_inputs = Self::prepare_plugin_midi_inputs(processor.midi_input_ports());
-                let input_buffers = processor
-                    .audio_inputs()
+                let input_buffers = input_ports
                     .iter()
                     .map(|input| {
                         Self::sum_clip_audio_port(

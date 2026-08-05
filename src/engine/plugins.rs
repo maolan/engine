@@ -494,6 +494,7 @@ impl Engine {
         };
         let (plugins, connections, connectable_connections) = {
             let track = track.lock();
+            track.refresh_clap_audio_ports_from_hosts();
             let plugins_start = std::time::Instant::now();
             let plugins = track.plugin_graph_plugins(include_state);
             let plugins_ms = plugins_start.elapsed().as_millis();

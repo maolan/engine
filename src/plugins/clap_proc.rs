@@ -4,7 +4,7 @@ use crate::plugins::ipc;
 use crate::plugins::types::{
     ClapMidiOutputEvent, ClapParamUpdate, ClapParameterInfo, ClapTransportInfo,
 };
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::ringbuf::RingBuffer;
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration, Instant};
 
 const SHM_LATENCY_SAMPLES_OFFSET: usize = 84;
+const REQUEST_CLAP_AUDIO_PORTS: u32 = 12;
 
 unsafe fn latency_samples_atomic(ptr: *mut u8) -> &'static AtomicU32 {
     unsafe { &*(ptr.add(SHM_LATENCY_SAMPLES_OFFSET) as *const AtomicU32) }
@@ -52,10 +53,11 @@ pub struct ClapProcessor {
     path: String,
     plugin_id: String,
     name: String,
-    audio_inputs: Vec<Arc<AudioIO>>,
-    audio_outputs: Vec<Arc<AudioIO>>,
-    main_audio_inputs: usize,
-    main_audio_outputs: usize,
+    buffer_size: usize,
+    audio_inputs: ArcSwap<Vec<Arc<AudioIO>>>,
+    audio_outputs: ArcSwap<Vec<Arc<AudioIO>>>,
+    main_audio_inputs: AtomicUsize,
+    main_audio_outputs: AtomicUsize,
     midi_input_count: usize,
     midi_output_count: usize,
     midi_input_ports: Vec<Arc<MIDIIO>>,
@@ -163,10 +165,11 @@ impl ClapProcessor {
             path: plugin_spec.to_string(),
             plugin_id: plugin_id.to_string(),
             name,
-            audio_inputs,
-            audio_outputs,
-            main_audio_inputs: actual_audio_in as usize,
-            main_audio_outputs: actual_audio_out as usize,
+            buffer_size,
+            audio_inputs: ArcSwap::from_pointee(audio_inputs),
+            audio_outputs: ArcSwap::from_pointee(audio_outputs),
+            main_audio_inputs: AtomicUsize::new(actual_audio_in as usize),
+            main_audio_outputs: AtomicUsize::new(actual_audio_out as usize),
             midi_input_count: actual_midi_in as usize,
             midi_output_count: actual_midi_out as usize,
             midi_input_ports,
@@ -197,12 +200,64 @@ impl ClapProcessor {
     }
 
     pub fn setup_audio_ports(&self) {
-        for port in &self.audio_inputs {
+        for port in self.audio_inputs() {
             port.setup();
         }
-        for port in &self.audio_outputs {
+        for port in self.audio_outputs() {
             port.setup();
         }
+    }
+
+    fn disconnect_all(port: &Arc<AudioIO>) {
+        let connections = port.connections();
+        for other in connections.iter() {
+            let _ = AudioIO::disconnect(other, port);
+        }
+    }
+
+    fn resize_audio_ports(ports: &mut Vec<Arc<AudioIO>>, len: usize, buffer_size: usize) {
+        if ports.len() > len {
+            for port in &ports[len..] {
+                Self::disconnect_all(port);
+            }
+            ports.truncate(len);
+        }
+        while ports.len() < len {
+            ports.push(Arc::new(AudioIO::new(buffer_size)));
+        }
+    }
+
+    fn refresh_audio_ports_from_scratch(&self, ptr: *mut u8) -> bool {
+        let Some((audio_in, audio_out, _, _)) = (unsafe { read_port_counts_from_scratch(ptr) })
+        else {
+            return false;
+        };
+        let audio_in = audio_in as usize;
+        let audio_out = audio_out as usize;
+        self.main_audio_inputs.store(audio_in, Ordering::Release);
+        self.main_audio_outputs.store(audio_out, Ordering::Release);
+        let mut changed = false;
+
+        let current_inputs = self.audio_inputs.load_full();
+        let current_input_len = current_inputs.len();
+        drop(current_inputs);
+        if current_input_len != audio_in {
+            let mut inputs = self.audio_inputs.load_full().as_ref().clone();
+            Self::resize_audio_ports(&mut inputs, audio_in, self.buffer_size);
+            self.audio_inputs.store(Arc::new(inputs));
+            changed = true;
+        }
+
+        let current_outputs = self.audio_outputs.load_full();
+        let current_output_len = current_outputs.len();
+        drop(current_outputs);
+        if current_output_len != audio_out {
+            let mut outputs = self.audio_outputs.load_full().as_ref().clone();
+            Self::resize_audio_ports(&mut outputs, audio_out, self.buffer_size);
+            self.audio_outputs.store(Arc::new(outputs));
+            changed = true;
+        }
+        changed
     }
 
     pub fn setup_midi_ports(&self) {
@@ -218,20 +273,20 @@ impl ClapProcessor {
         }
     }
 
-    pub fn audio_inputs(&self) -> &[Arc<AudioIO>] {
-        &self.audio_inputs
+    pub fn audio_inputs(&self) -> Vec<Arc<AudioIO>> {
+        self.audio_inputs.load_full().as_ref().clone()
     }
 
-    pub fn audio_outputs(&self) -> &[Arc<AudioIO>] {
-        &self.audio_outputs
+    pub fn audio_outputs(&self) -> Vec<Arc<AudioIO>> {
+        self.audio_outputs.load_full().as_ref().clone()
     }
 
     pub fn main_audio_input_count(&self) -> usize {
-        self.main_audio_inputs
+        self.main_audio_inputs.load(Ordering::Acquire)
     }
 
     pub fn main_audio_output_count(&self) -> usize {
-        self.main_audio_outputs
+        self.main_audio_outputs.load(Ordering::Acquire)
     }
 
     pub fn midi_input_count(&self) -> usize {
@@ -852,7 +907,39 @@ impl ClapProcessor {
     pub fn run_host_callbacks_main_thread(&self) {}
 
     pub fn reconfigure_ports_if_needed(&self) -> Result<bool, String> {
-        Ok(false)
+        let Some(mapping) = self.mapping.as_ref() else {
+            return Ok(false);
+        };
+        Ok(self.refresh_audio_ports_from_scratch(mapping.as_ptr()))
+    }
+
+    pub fn refresh_audio_ports_from_host(&self) -> Result<bool, String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(mapping), Some(events)) => (mapping, events),
+            _ => return Ok(false),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+        header
+            .request_type
+            .store(REQUEST_CLAP_AUDIO_PORTS, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for CLAP audio ports: {e}"));
+        }
+
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to CLAP audio ports: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        header.request_type.store(0, Ordering::Release);
+        if status != 1 {
+            return Err("CLAP audio port enumeration failed in host".to_string());
+        }
+        Ok(self.refresh_audio_ports_from_scratch(ptr))
     }
 
     pub fn ui_begin_session(&self) {}
