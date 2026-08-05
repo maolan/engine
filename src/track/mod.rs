@@ -1008,6 +1008,137 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_plugin_audio_removes_default_track_passthrough() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+
+        track
+            .disconnect_plugin_audio(
+                PluginGraphNode::TrackInput,
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.audio.outs[0]
+                .connections()
+                .iter()
+                .all(|conn| !Arc::ptr_eq(conn, &track.audio.ins[0]))
+        );
+        assert!(track.plugin_graph_connections().iter().all(|conn| {
+            !(conn.kind == Kind::Audio
+                && conn.from_node == PluginGraphNode::TrackInput
+                && conn.from_port == 0
+                && conn.to_node == PluginGraphNode::TrackOutput
+                && conn.to_port == 0)
+        }));
+    }
+
+    #[test]
+    fn connect_plugin_audio_recreates_default_track_passthrough() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track
+            .disconnect_plugin_audio(
+                PluginGraphNode::TrackInput,
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        track
+            .connect_plugin_audio(
+                PluginGraphNode::TrackInput,
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.audio.outs[0]
+                .connections()
+                .iter()
+                .any(|conn| Arc::ptr_eq(conn, &track.audio.ins[0]))
+        );
+    }
+
+    #[test]
+    fn plugin_cycle_detection_assumes_track_passthrough() {
+        let mut track = Track::new("t".to_string(), 1, 1, 1, 1, 8, 48_000.0);
+        track.clear_default_passthrough();
+
+        assert!(
+            track
+                .plugin_connected_neighbors(Kind::Audio, &PluginGraphNode::TrackInput)
+                .contains(&PluginGraphNode::TrackOutput)
+        );
+        assert!(
+            track
+                .plugin_connected_neighbors(Kind::MIDI, &PluginGraphNode::TrackInput)
+                .contains(&PluginGraphNode::TrackOutput)
+        );
+    }
+
+    #[test]
+    fn disconnect_plugin_midi_removes_default_track_passthrough() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+
+        track
+            .disconnect_plugin_midi(
+                PluginGraphNode::TrackInput,
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.midi.outs[0]
+                .sources()
+                .iter()
+                .all(|source| !Arc::ptr_eq(source, &track.midi.ins[0]))
+        );
+        assert!(track.plugin_graph_connections().iter().all(|conn| {
+            !(conn.kind == Kind::MIDI
+                && conn.from_node == PluginGraphNode::TrackInput
+                && conn.from_port == 0
+                && conn.to_node == PluginGraphNode::TrackOutput
+                && conn.to_port == 0)
+        }));
+    }
+
+    #[test]
+    fn connect_plugin_midi_recreates_default_track_passthrough() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track
+            .disconnect_plugin_midi(
+                PluginGraphNode::TrackInput,
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        track
+            .connect_plugin_midi(
+                PluginGraphNode::TrackInput,
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.midi.outs[0]
+                .sources()
+                .iter()
+                .any(|source| Arc::ptr_eq(source, &track.midi.ins[0]))
+        );
+    }
+
+    #[test]
     fn track_input_passthrough_respects_input_monitor() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         let input = [0.5, -0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -1852,7 +1983,7 @@ mod tests {
             .connect_audio_connectable(
                 crate::connectable::ConnectableRef::TrackInput,
                 0,
-                crate::connectable::ConnectableRef::TrackOutput,
+                crate::connectable::ConnectableRef::ClapPlugin(0),
                 0,
             )
             .unwrap_err();
@@ -1886,6 +2017,34 @@ mod tests {
     }
 
     #[test]
+    fn connect_audio_connectable_recreates_default_track_passthrough() {
+        let mut track = Track::new("Parent".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        track.clear_default_passthrough();
+
+        track
+            .connect_audio_connectable(
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+                crate::connectable::ConnectableRef::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.audio.outs[0]
+                .connections()
+                .iter()
+                .any(|c| Arc::ptr_eq(c, &track.audio.ins[0]))
+        );
+        assert!(
+            track.audio.ins[0]
+                .connections()
+                .iter()
+                .all(|c| !Arc::ptr_eq(c, &track.audio.outs[0]))
+        );
+    }
+
+    #[test]
     fn disconnect_midi_connectable_allows_track_input_source() {
         let mut track = Track::new("Parent".to_string(), 0, 0, 1, 1, 8, 48_000.0);
         let child = Arc::new(Track::new("Child".to_string(), 0, 0, 1, 1, 8, 48_000.0));
@@ -1908,6 +2067,28 @@ mod tests {
             track.child_tracks[0].lock().midi.ins[0]
                 .sources()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn connect_midi_connectable_recreates_default_track_passthrough() {
+        let mut track = Track::new("Parent".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.clear_default_passthrough();
+
+        track
+            .connect_midi_connectable(
+                crate::connectable::ConnectableRef::TrackInput,
+                0,
+                crate::connectable::ConnectableRef::TrackOutput,
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            track.midi.outs[0]
+                .sources()
+                .iter()
+                .any(|s| Arc::ptr_eq(s, &track.midi.ins[0]))
         );
     }
 

@@ -539,7 +539,8 @@ impl TrackData {
     ) -> Result<Arc<AudioIO>, String> {
         use crate::connectable::AudioPorts;
         match (from, to) {
-            (ConnectableRef::TrackInput, ConnectableRef::ChildTrack(_)) => self
+            (ConnectableRef::TrackInput, ConnectableRef::ChildTrack(_))
+            | (ConnectableRef::TrackInput, ConnectableRef::TrackOutput) => self
                 .audio_inputs()
                 .get(from_port)
                 .cloned()
@@ -660,7 +661,8 @@ impl TrackData {
     ) -> Result<Arc<MIDIIO>, String> {
         use crate::connectable::MidiPorts;
         match (from, to) {
-            (ConnectableRef::TrackInput, ConnectableRef::ChildTrack(_)) => self
+            (ConnectableRef::TrackInput, ConnectableRef::ChildTrack(_))
+            | (ConnectableRef::TrackInput, ConnectableRef::TrackOutput) => self
                 .midi_inputs()
                 .get(from_port)
                 .cloned()
@@ -681,7 +683,11 @@ impl TrackData {
         if from == to && from_port == to_port {
             return Err("Cannot connect an audio port to itself".to_string());
         }
-        AudioIO::connect(&source, &target);
+        if matches!(from, ConnectableRef::TrackInput) && matches!(to, ConnectableRef::TrackOutput) {
+            AudioIO::connect_directed(&source, &target);
+        } else {
+            AudioIO::connect(&source, &target);
+        }
         self.invalidate_audio_route_cache();
         Ok(())
     }

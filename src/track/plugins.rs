@@ -1377,9 +1377,13 @@ impl TrackData {
     ) -> Result<(), String> {
         let source = self.plugin_source_io(&from_node, from_port)?;
         let target = self.plugin_target_io(&to_node, to_port)?;
-        if routing::would_create_cycle(&from_node, &to_node, |node| {
-            self.plugin_connected_neighbors(Kind::Audio, node)
-        }) {
+        let is_track_passthrough = matches!(from_node, PluginGraphNode::TrackInput)
+            && matches!(to_node, PluginGraphNode::TrackOutput);
+        if !is_track_passthrough
+            && routing::would_create_cycle(&from_node, &to_node, |node| {
+                self.plugin_connected_neighbors(Kind::Audio, node)
+            })
+        {
             return Err("Circular routing is not allowed!".to_string());
         }
         if matches!(from_node, PluginGraphNode::TrackInput) {
@@ -1417,9 +1421,13 @@ impl TrackData {
         if from_node == to_node && from_port == to_port {
             return Err("Cannot connect a MIDI port to itself".to_string());
         }
-        if routing::would_create_cycle(&from_node, &to_node, |node| {
-            self.plugin_connected_neighbors(Kind::MIDI, node)
-        }) {
+        let is_track_passthrough = matches!(from_node, PluginGraphNode::TrackInput)
+            && matches!(to_node, PluginGraphNode::TrackOutput);
+        if !is_track_passthrough
+            && routing::would_create_cycle(&from_node, &to_node, |node| {
+                self.plugin_connected_neighbors(Kind::MIDI, node)
+            })
+        {
             return Err("Circular routing is not allowed!".to_string());
         }
 
@@ -1895,6 +1903,9 @@ impl TrackData {
         current_node: &PluginGraphNode,
     ) -> Vec<PluginGraphNode> {
         let mut nodes = HashSet::new();
+        if matches!(current_node, PluginGraphNode::TrackInput) {
+            nodes.insert(PluginGraphNode::TrackOutput);
+        }
         for conn in self.plugin_graph_connections() {
             if conn.kind == kind && &conn.from_node == current_node {
                 nodes.insert(conn.to_node);

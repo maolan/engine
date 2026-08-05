@@ -476,6 +476,48 @@ mod tests {
         engine.publish_state_snapshot();
     }
 
+    #[tokio::test]
+    async fn same_track_audio_connect_creates_internal_passthrough() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let mut track = Track::new("Synth".to_string(), 2, 2, 0, 0, 64, 48_000.0);
+        track.clear_default_passthrough();
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_connect("Synth", 0, "Synth", 0, Kind::Audio)
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("Synth").unwrap().lock();
+        assert!(
+            track.audio.outs[0]
+                .connections()
+                .iter()
+                .any(|conn| std::sync::Arc::ptr_eq(conn, &track.audio.ins[0]))
+        );
+    }
+
+    #[tokio::test]
+    async fn same_track_midi_connect_creates_internal_passthrough() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let mut track = Track::new("Synth".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        track.clear_default_passthrough();
+        insert_track(&mut engine, track);
+
+        engine
+            .handle_connect("Synth", 0, "Synth", 0, Kind::MIDI)
+            .await;
+
+        let state = engine.state.lock();
+        let track = state.tracks.get("Synth").unwrap().lock();
+        assert!(
+            track.midi.outs[0]
+                .sources()
+                .iter()
+                .any(|source| std::sync::Arc::ptr_eq(source, &track.midi.ins[0]))
+        );
+    }
+
     fn osc_packet(address: &str) -> Vec<u8> {
         fn push_padded_osc_string(packet: &mut Vec<u8>, value: &str) {
             packet.extend_from_slice(value.as_bytes());

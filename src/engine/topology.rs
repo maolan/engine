@@ -1782,8 +1782,32 @@ impl Engine {
         match kind {
             Kind::Audio => {
                 if from_track == to_track && from_track != "hw:in" && to_track != "hw:out" {
-                    self.notify_clients(Err("Circular routing is not allowed!".into()))
-                        .await;
+                    let Some(track) = self.state.lock().tracks.get(from_track).cloned() else {
+                        self.notify_clients(Err(format!("Track '{from_track}' not found")))
+                            .await;
+                        return;
+                    };
+                    let result = {
+                        let mut track = track.lock();
+                        track.connect_audio_connectable(
+                            crate::connectable::ConnectableRef::TrackInput,
+                            to_port,
+                            crate::connectable::ConnectableRef::TrackOutput,
+                            from_port,
+                        )
+                    };
+                    if let Err(e) = result {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                    self.notify_clients(Ok(Action::TrackConnectAudio {
+                        track_name: from_track.to_string(),
+                        from: crate::connectable::ConnectableRef::TrackInput,
+                        from_port: to_port,
+                        to: crate::connectable::ConnectableRef::TrackOutput,
+                        to_port: from_port,
+                    }))
+                    .await;
                     return;
                 }
                 let (from_audio_io, to_audio_io) =
@@ -1832,10 +1856,41 @@ impl Engine {
 
                 if from_hw_in_device.is_none()
                     && to_hw_out_device.is_none()
+                    && from_track != to_track
                     && self.check_if_leads_to_kind(Kind::MIDI, to_track, from_track)
                 {
                     self.notify_clients(Err("Circular routing is not allowed!".into()))
                         .await;
+                    return;
+                }
+
+                if from_track == to_track {
+                    let Some(track) = self.state.lock().tracks.get(from_track).cloned() else {
+                        self.notify_clients(Err(format!("Track '{from_track}' not found")))
+                            .await;
+                        return;
+                    };
+                    let result = {
+                        let mut track = track.lock();
+                        track.connect_midi_connectable(
+                            crate::connectable::ConnectableRef::TrackInput,
+                            to_port,
+                            crate::connectable::ConnectableRef::TrackOutput,
+                            from_port,
+                        )
+                    };
+                    if let Err(e) = result {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                    self.notify_clients(Ok(Action::TrackConnectMidi {
+                        track_name: from_track.to_string(),
+                        from: crate::connectable::ConnectableRef::TrackInput,
+                        from_port: to_port,
+                        to: crate::connectable::ConnectableRef::TrackOutput,
+                        to_port: from_port,
+                    }))
+                    .await;
                     return;
                 }
 
@@ -1945,6 +2000,63 @@ impl Engine {
         else {
             return;
         };
+
+        if from_track == to_track && from_track != "hw:in" && to_track != "hw:out" {
+            let Some(track) = self.state.lock().tracks.get(from_track).cloned() else {
+                self.notify_clients(Err(format!("Track '{from_track}' not found")))
+                    .await;
+                return;
+            };
+            match kind {
+                Kind::Audio => {
+                    let result = {
+                        let mut track = track.lock();
+                        track.disconnect_audio_connectable(
+                            crate::connectable::ConnectableRef::TrackInput,
+                            to_port,
+                            crate::connectable::ConnectableRef::TrackOutput,
+                            from_port,
+                        )
+                    };
+                    if let Err(e) = result {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                    self.notify_clients(Ok(Action::TrackDisconnectAudio {
+                        track_name: from_track.clone(),
+                        from: crate::connectable::ConnectableRef::TrackInput,
+                        from_port: to_port,
+                        to: crate::connectable::ConnectableRef::TrackOutput,
+                        to_port: from_port,
+                    }))
+                    .await;
+                }
+                Kind::MIDI => {
+                    let result = {
+                        let mut track = track.lock();
+                        track.disconnect_midi_connectable(
+                            crate::connectable::ConnectableRef::TrackInput,
+                            to_port,
+                            crate::connectable::ConnectableRef::TrackOutput,
+                            from_port,
+                        )
+                    };
+                    if let Err(e) = result {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                    self.notify_clients(Ok(Action::TrackDisconnectMidi {
+                        track_name: from_track.clone(),
+                        from: crate::connectable::ConnectableRef::TrackInput,
+                        from_port: to_port,
+                        to: crate::connectable::ConnectableRef::TrackOutput,
+                        to_port: from_port,
+                    }))
+                    .await;
+                }
+            }
+            return;
+        }
 
         if kind == Kind::Audio {
             if let Err(e) = self.disconnect_audio_route_and_notify(action.clone()).await {
