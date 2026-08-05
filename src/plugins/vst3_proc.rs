@@ -67,6 +67,40 @@ unsafe impl Sync for Vst3Processor {}
 pub type SharedVst3Processor = Arc<Vst3Processor>;
 
 impl Vst3Processor {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        input_count: usize,
+        output_count: usize,
+        buffer_size: usize,
+    ) -> Self {
+        Self {
+            path: "test.vst3".to_string(),
+            plugin_id: "test.plugin.vst3".to_string(),
+            name: "Test VST3".to_string(),
+            audio_inputs: (0..input_count)
+                .map(|_| Arc::new(AudioIO::new(buffer_size)))
+                .collect(),
+            audio_outputs: (0..output_count)
+                .map(|_| Arc::new(AudioIO::new(buffer_size)))
+                .collect(),
+            main_audio_inputs: input_count,
+            main_audio_outputs: output_count,
+            midi_input_ports: Vec::new(),
+            midi_output_ports: Vec::new(),
+            param_infos: Vec::new(),
+            param_values: HashMap::new(),
+            bypassed: Arc::new(AtomicBool::new(false)),
+            child: UnsafeCell::new(None),
+            stderr: ArcSwapOption::from(None),
+            mapping: None,
+            events: None,
+            shm_name: String::new(),
+            crash_count: AtomicU32::new(0),
+            last_latency_samples: AtomicUsize::new(0),
+            latency_changed: AtomicBool::new(false),
+        }
+    }
+
     pub fn new(
         sample_rate: f64,
         buffer_size: usize,

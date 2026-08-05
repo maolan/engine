@@ -227,34 +227,60 @@ impl ClapProcessor {
         }
     }
 
+    fn resize_len_preserving_connected_ports(
+        ports: &[Arc<AudioIO>],
+        requested_len: usize,
+    ) -> usize {
+        if requested_len >= ports.len() {
+            return requested_len;
+        }
+
+        ports
+            .iter()
+            .enumerate()
+            .skip(requested_len)
+            .filter(|(_, port)| !port.connections().is_empty())
+            .map(|(index, _)| index + 1)
+            .max()
+            .unwrap_or(requested_len)
+    }
+
     fn refresh_audio_ports_from_scratch(&self, ptr: *mut u8) -> bool {
         let Some((audio_in, audio_out, _, _)) = (unsafe { read_port_counts_from_scratch(ptr) })
         else {
             return false;
         };
-        let audio_in = audio_in as usize;
-        let audio_out = audio_out as usize;
-        self.main_audio_inputs.store(audio_in, Ordering::Release);
-        self.main_audio_outputs.store(audio_out, Ordering::Release);
         let mut changed = false;
 
         let current_inputs = self.audio_inputs.load_full();
         let current_input_len = current_inputs.len();
+        let audio_in =
+            Self::resize_len_preserving_connected_ports(current_inputs.as_ref(), audio_in as usize);
         drop(current_inputs);
-        if current_input_len != audio_in {
+        if current_input_len != audio_in
+            || self.main_audio_inputs.load(Ordering::Acquire) != audio_in
+        {
             let mut inputs = self.audio_inputs.load_full().as_ref().clone();
             Self::resize_audio_ports(&mut inputs, audio_in, self.buffer_size);
             self.audio_inputs.store(Arc::new(inputs));
+            self.main_audio_inputs.store(audio_in, Ordering::Release);
             changed = true;
         }
 
         let current_outputs = self.audio_outputs.load_full();
         let current_output_len = current_outputs.len();
+        let audio_out = Self::resize_len_preserving_connected_ports(
+            current_outputs.as_ref(),
+            audio_out as usize,
+        );
         drop(current_outputs);
-        if current_output_len != audio_out {
+        if current_output_len != audio_out
+            || self.main_audio_outputs.load(Ordering::Acquire) != audio_out
+        {
             let mut outputs = self.audio_outputs.load_full().as_ref().clone();
             Self::resize_audio_ports(&mut outputs, audio_out, self.buffer_size);
             self.audio_outputs.store(Arc::new(outputs));
+            self.main_audio_outputs.store(audio_out, Ordering::Release);
             changed = true;
         }
         changed
@@ -1173,6 +1199,7 @@ fn split_plugin_spec(spec: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn find_host_binary() -> PathBuf {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -1184,6 +1211,31 @@ mod tests {
             .join("target")
             .join("debug")
             .join("maolan-plugin-host")
+    }
+
+    #[test]
+    fn resize_len_preserves_connected_trailing_audio_ports() {
+        let first = Arc::new(AudioIO::new(256));
+        let second = Arc::new(AudioIO::new(256));
+        let target = Arc::new(AudioIO::new(256));
+        AudioIO::connect(&second, &target);
+
+        let ports = vec![first, second];
+
+        assert_eq!(
+            ClapProcessor::resize_len_preserving_connected_ports(&ports, 1),
+            2
+        );
+    }
+
+    #[test]
+    fn resize_len_shrinks_unconnected_trailing_audio_ports() {
+        let ports = vec![Arc::new(AudioIO::new(256)), Arc::new(AudioIO::new(256))];
+
+        assert_eq!(
+            ClapProcessor::resize_len_preserving_connected_ports(&ports, 1),
+            1
+        );
     }
 
     #[cfg_attr(

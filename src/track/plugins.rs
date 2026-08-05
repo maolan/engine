@@ -602,7 +602,15 @@ impl TrackData {
         state: &crate::clap::ClapPluginState,
     ) -> Result<(), String> {
         if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.restore_state(state);
+            instance.processor.restore_state(state)?;
+            if let Err(e) = instance.processor.refresh_audio_ports_from_host() {
+                tracing::warn!(
+                    "CLAP audio port refresh failed after restoring '{}': {}",
+                    instance.processor.name(),
+                    e
+                );
+            }
+            return Ok(());
         }
         Err(format!(
             "Track '{}' does not have CLAP instance id: {}",
@@ -2758,5 +2766,41 @@ impl TrackData {
 
     pub fn take_hw_midi_out_events(&mut self) -> Vec<HwMidiOutEvent> {
         std::mem::take(&mut self.rt.pending_hw_midi_out_events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_output_route_reports_only_connected_ports() {
+        let mut track = TrackData::new("Synth".to_string(), 2, 2, 0, 0, 256, 48_000.0);
+        track.vst3_plugins.push(Vst3Instance::new(
+            7,
+            Arc::new(crate::vst3_proc::Vst3Processor::new_for_test(2, 2, 256)),
+        ));
+
+        track
+            .connect_plugin_audio(
+                PluginGraphNode::Vst3PluginInstance(7),
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .expect("connect first output");
+
+        let plugin_output_routes = track
+            .plugin_graph_connections()
+            .into_iter()
+            .filter(|connection| {
+                connection.from_node == PluginGraphNode::Vst3PluginInstance(7)
+                    && connection.to_node == PluginGraphNode::TrackOutput
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(plugin_output_routes.len(), 1);
+        assert_eq!(plugin_output_routes[0].from_port, 0);
+        assert_eq!(plugin_output_routes[0].to_port, 0);
     }
 }
