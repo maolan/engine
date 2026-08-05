@@ -227,35 +227,17 @@ impl ClapProcessor {
         }
     }
 
-    fn resize_len_preserving_connected_ports(
-        ports: &[Arc<AudioIO>],
-        requested_len: usize,
-    ) -> usize {
-        if requested_len >= ports.len() {
-            return requested_len;
-        }
-
-        ports
-            .iter()
-            .enumerate()
-            .skip(requested_len)
-            .filter(|(_, port)| !port.connections().is_empty())
-            .map(|(index, _)| index + 1)
-            .max()
-            .unwrap_or(requested_len)
-    }
-
     fn refresh_audio_ports_from_scratch(&self, ptr: *mut u8) -> bool {
         let Some((audio_in, audio_out, _, _)) = (unsafe { read_port_counts_from_scratch(ptr) })
         else {
             return false;
         };
+        let audio_in = audio_in as usize;
+        let audio_out = audio_out as usize;
         let mut changed = false;
 
         let current_inputs = self.audio_inputs.load_full();
         let current_input_len = current_inputs.len();
-        let audio_in =
-            Self::resize_len_preserving_connected_ports(current_inputs.as_ref(), audio_in as usize);
         drop(current_inputs);
         if current_input_len != audio_in
             || self.main_audio_inputs.load(Ordering::Acquire) != audio_in
@@ -269,10 +251,6 @@ impl ClapProcessor {
 
         let current_outputs = self.audio_outputs.load_full();
         let current_output_len = current_outputs.len();
-        let audio_out = Self::resize_len_preserving_connected_ports(
-            current_outputs.as_ref(),
-            audio_out as usize,
-        );
         drop(current_outputs);
         if current_output_len != audio_out
             || self.main_audio_outputs.load(Ordering::Acquire) != audio_out
@@ -1214,28 +1192,18 @@ mod tests {
     }
 
     #[test]
-    fn resize_len_preserves_connected_trailing_audio_ports() {
+    fn resize_audio_ports_disconnects_truncated_connected_ports() {
         let first = Arc::new(AudioIO::new(256));
         let second = Arc::new(AudioIO::new(256));
         let target = Arc::new(AudioIO::new(256));
         AudioIO::connect(&second, &target);
+        let mut ports = vec![first, second.clone()];
 
-        let ports = vec![first, second];
+        ClapProcessor::resize_audio_ports(&mut ports, 1, 256);
 
-        assert_eq!(
-            ClapProcessor::resize_len_preserving_connected_ports(&ports, 1),
-            2
-        );
-    }
-
-    #[test]
-    fn resize_len_shrinks_unconnected_trailing_audio_ports() {
-        let ports = vec![Arc::new(AudioIO::new(256)), Arc::new(AudioIO::new(256))];
-
-        assert_eq!(
-            ClapProcessor::resize_len_preserving_connected_ports(&ports, 1),
-            1
-        );
+        assert_eq!(ports.len(), 1);
+        assert!(second.connections().is_empty());
+        assert!(target.connections().is_empty());
     }
 
     #[cfg_attr(
