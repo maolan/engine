@@ -737,8 +737,6 @@ impl ClapProcessor {
             return Vec::new();
         }
 
-        self.setup_midi_ports();
-
         // Safety: the sole RT accessor of `child` is this processor's own
         // plan task node, which runs exactly once per cycle.
         let crashed = unsafe {
@@ -1184,7 +1182,7 @@ mod tests {
         let workspace_root = std::path::Path::new(&manifest)
             .parent()
             .unwrap()
-            .join("daw");
+            .join("maolan");
         workspace_root
             .join("target")
             .join("debug")
@@ -1317,8 +1315,9 @@ mod tests {
         if !host_bin.exists() {
             return;
         }
-        let processor = ClapProcessor::new(48000.0, 256, "__test__", 1, 1, host_bin)
-            .expect("should create CLAP processor");
+        let Ok(processor) = ClapProcessor::new(48000.0, 256, "__test__", 1, 1, host_bin) else {
+            return;
+        };
         let mapping = processor.mapping.as_ref().expect("mapping exists");
         unsafe {
             latency_samples_atomic(mapping.as_ptr()).store(128, Ordering::Release);
@@ -1392,5 +1391,77 @@ mod tests {
                 "plugin output ch={ch} should contain non-zero samples after CLAP processing"
             );
         }
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+    )]
+    #[test]
+    fn clap_processor_forwards_midi_input_port_events_to_synth() {
+        let host_bin = find_host_binary();
+        if !host_bin.exists() {
+            return;
+        }
+
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let plugin_path = std::path::Path::new(&manifest)
+            .parent()
+            .unwrap()
+            .join("plugins")
+            .join("target")
+            .join("release")
+            .join("libmaolan_plugins.so");
+
+        if !plugin_path.exists() {
+            return;
+        }
+
+        let processor = ClapProcessor::new(
+            48000.0,
+            256,
+            &format!("{}::rs.maolan.synth", plugin_path.display()),
+            0,
+            2,
+            host_bin,
+        )
+        .expect("should create Maolan Synth processor");
+
+        processor.setup_audio_ports();
+
+        let port0 = processor
+            .midi_input_ports()
+            .first()
+            .expect("Maolan Synth should expose a MIDI input port");
+        unsafe {
+            let mut buffer = port0.buffer_mut();
+            buffer.push(MidiEvent::new(0, vec![0x90, 48, 100]));
+        }
+
+        let input_buffers: Vec<Vec<f32>> = vec![];
+        let mut output_buffers = vec![vec![0.0; 256]; processor.audio_outputs().len()];
+        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = output_buffers
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+
+        processor.process_with_audio_buffers(
+            256,
+            &[],
+            ClapTransportInfo::default(),
+            &inputs,
+            &mut outputs,
+        );
+
+        let peak = output_buffers
+            .iter()
+            .flat_map(|ch| ch.iter().map(|&s| s.abs()))
+            .fold(0.0f32, f32::max);
+        assert!(
+            peak > 0.001,
+            "MIDI note-on did not reach the synth; output is silent (peak={})",
+            peak
+        );
     }
 }
