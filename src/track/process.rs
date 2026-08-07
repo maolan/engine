@@ -530,18 +530,6 @@ impl TrackData {
             if session_active {
                 self.mix_session_midi_into_inputs(&mut track_input_midi_events, frames);
             }
-            for (lane, input) in self.midi.ins.iter().enumerate() {
-                // Safety: plan single-writer invariant — this task is the sole
-                // writer of its own ports this cycle; sources it reads were
-                // produced by earlier plan nodes (LOCKLESS.md Phase 3).
-                let mut buffer = unsafe { input.buffer_mut() };
-                buffer.clear();
-                if let Some(events) = track_input_midi_events.get(lane) {
-                    buffer.extend_from_slice(events);
-                }
-                buffer.sort_by_key(|event| event.frame);
-                input.mark_finished();
-            }
             for (lane, audio_in) in audio_inputs.iter_mut().enumerate() {
                 if !input_monitor.get(lane).copied().unwrap_or(false) {
                     audio_in.fill(0.0);
@@ -562,6 +550,19 @@ impl TrackData {
                     mix_elapsed
                 );
             }
+        }
+
+        for (lane, input) in self.midi.ins.iter().enumerate() {
+            // Safety: plan single-writer invariant — this task is the sole
+            // writer of its own ports this cycle; sources it reads were
+            // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+            let mut buffer = unsafe { input.buffer_mut() };
+            buffer.clear();
+            if let Some(events) = track_input_midi_events.get(lane) {
+                buffer.extend_from_slice(events);
+            }
+            buffer.sort_by_key(|event| event.frame);
+            input.mark_finished();
         }
 
         self.rt.folder_input_midi_events = track_input_midi_events.clone();

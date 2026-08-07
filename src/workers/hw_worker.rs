@@ -217,11 +217,10 @@ impl<B: Backend> HwWorker<B> {
                 );
             }
         }
-        let rt_us = rt_start.elapsed().as_micros() as u64;
-        let cycle_start = std::time::Instant::now();
+        let _rt_us = rt_start.elapsed().as_micros() as u64;
+        let _cycle_start = std::time::Instant::now();
         let result = driver.run_cycle_for_worker();
-        let cycle_us = cycle_start.elapsed().as_micros() as u64;
-        tracing::info!(rt_us, cycle_us, "run_cycle_blocking timing");
+        let _cycle_us = _cycle_start.elapsed().as_micros() as u64;
         (driver, result)
     }
 

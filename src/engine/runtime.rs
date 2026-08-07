@@ -1163,7 +1163,6 @@ impl Engine {
     }
 
     pub(crate) async fn request_hw_cycle(&mut self) {
-        tracing::info!("request_hw_cycle enter");
         if self.awaiting_hwfinished {
             tracing::debug!(
                 playing = self.playing,
@@ -1207,13 +1206,11 @@ impl Engine {
             match worker.tx.send(Message::TracksFinished).await {
                 Ok(_) => {
                     self.awaiting_hwfinished = true;
-                    tracing::debug!("request_hw_cycle is now awaiting HWFinished");
                 }
                 Err(e) => {
                     error!("Error sending TracksFinished {e}");
                 }
             }
-            tracing::info!("request_hw_cycle sent TracksFinished");
         }
     }
 
@@ -1645,16 +1642,7 @@ impl Engine {
 
     #[cfg(unix)]
     pub(crate) async fn handle_hw_finished(&mut self) {
-        tracing::info!("handle_hw_finished enter");
         if !self.awaiting_hwfinished {
-            tracing::info!(
-                playing = self.playing,
-                transport_running = self.transport_running,
-                transport_sample = self.transport_sample,
-                session_transport_sample = self.session_transport_sample,
-                cycle_samples = self.current_cycle_samples(),
-                "HWFinished ignored because engine was not awaiting it"
-            );
             return;
         }
         tracing::debug!(
@@ -1747,10 +1735,8 @@ impl Engine {
         if self.transport_running {
             if self.transport_panic_flush_pending {
                 self.transport_panic_flush_pending = false;
-                tracing::info!("transport advance skipped for panic flush cycle");
             } else if self.transport_restart_pending {
                 self.transport_restart_pending = false;
-                tracing::info!("transport advance skipped for restart cycle");
             } else {
                 let before = self.transport_sample;
                 let next = self.transport_sample.saturating_add(cycle_samples);
@@ -3855,7 +3841,7 @@ impl Engine {
                 }
                 Message::HWFinished => {
                     if !self.awaiting_hwfinished {
-                        tracing::info!(
+                        tracing::debug!(
                             playing = self.playing,
                             transport_running = self.transport_running,
                             transport_sample = self.transport_sample,
@@ -3873,7 +3859,6 @@ impl Engine {
                         cycle_samples = self.current_cycle_samples(),
                         "HWFinished handling"
                     );
-                    tracing::info!("HWFinished enter");
                     self.handling_hwfinished = true;
                     self.awaiting_hwfinished = false;
                     #[cfg(unix)]
@@ -3957,10 +3942,8 @@ impl Engine {
                     if self.transport_running {
                         if self.transport_panic_flush_pending {
                             self.transport_panic_flush_pending = false;
-                            tracing::info!("transport advance skipped for panic flush cycle");
                         } else if self.transport_restart_pending {
                             self.transport_restart_pending = false;
-                            tracing::info!("transport advance skipped for restart cycle");
                         } else {
                             let before = self.transport_sample;
                             let next = self.transport_sample.saturating_add(cycle_samples);
@@ -4034,7 +4017,6 @@ impl Engine {
                             self.awaiting_hwfinished = true;
                         }
                     }
-                    tracing::info!("HWFinished exit");
                     self.handling_hwfinished = false;
                 }
                 Message::HWMidiEvents(events) => {

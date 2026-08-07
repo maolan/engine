@@ -328,7 +328,6 @@ impl Lv2Processor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
-        tracing::info!("LV2 snapshot_state: sending request to host");
         header.request_type.store(1, Ordering::Release);
         header.request_status.store(0, Ordering::Release);
         if let Err(e) = events.signal_host() {
@@ -343,7 +342,6 @@ impl Lv2Processor {
 
         let status = header.request_status.load(Ordering::Acquire);
         let size = header.scratch_size.load(Ordering::Acquire) as usize;
-        tracing::info!(status, size, "LV2 snapshot_state: host responded");
         if status != 1 {
             header.request_type.store(0, Ordering::Release);
             return Err("State save failed in host".to_string());
@@ -511,7 +509,6 @@ impl Lv2Processor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
-        tracing::info!("LV2 control_ports: sending request to host");
         header.request_type.store(
             maolan_plugin_protocol::protocol::REQUEST_LV2_CONTROL_PORTS,
             Ordering::Release,
@@ -529,7 +526,6 @@ impl Lv2Processor {
 
         let status = header.request_status.load(Ordering::Acquire);
         let size = header.scratch_size.load(Ordering::Acquire) as usize;
-        tracing::info!(status, size, "LV2 control_ports: host responded");
         if status != 1 {
             header.request_type.store(0, Ordering::Release);
             return Err("LV2 control port enumeration failed in host".to_string());
@@ -537,10 +533,6 @@ impl Lv2Processor {
 
         let scratch = unsafe { scratch_ptr(ptr) };
         let result = Self::deserialize_lv2_control_ports(scratch, size);
-        match &result {
-            Ok(ports) => tracing::info!(count = ports.len(), "LV2 control_ports: deserialized"),
-            Err(e) => tracing::error!("LV2 control_ports: deserialize failed: {e}"),
-        }
         header.request_type.store(0, Ordering::Release);
         result
     }

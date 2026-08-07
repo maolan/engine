@@ -69,7 +69,6 @@ impl TrackData {
 
     #[cfg(unix)]
     pub fn unload_lv2_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
-        tracing::info!(track = %self.name, instance_id, "unload_lv2_plugin_instance start");
         let Some(index) = self
             .lv2_plugins
             .iter()
@@ -81,7 +80,6 @@ impl TrackData {
             ));
         };
         self.remove_lv2_instance(index);
-        tracing::info!(track = %self.name, instance_id, "unload_lv2_plugin_instance done");
         Ok(())
     }
 
@@ -105,7 +103,6 @@ impl TrackData {
 
     #[cfg(unix)]
     pub(crate) fn remove_lv2_instance(&mut self, index: usize) {
-        tracing::info!(track = %self.name, index, "remove_lv2_instance start");
         let removed = self.lv2_plugins.remove(index);
         let removed_id = removed.id;
         for port in removed.processor.audio_inputs() {
@@ -119,7 +116,6 @@ impl TrackData {
                 && conn.to_node != PluginGraphNode::Lv2PluginInstance(removed_id)
         });
         self.invalidate_audio_route_cache();
-        tracing::info!(track = %self.name, removed_id, "remove_lv2_instance done");
     }
 
     pub(crate) fn prune_plugin_midi_connections(&mut self, node: PluginGraphNode) {
@@ -1979,12 +1975,13 @@ impl TrackData {
             }
             self.rt.record_tap_midi_in.extend(buffer.iter().cloned());
             let monitor = midi_input_monitor.get(lane).copied().unwrap_or(false);
+            let channel_filter = midi_lane_channels.get(lane).copied().flatten();
             if clip_playback_active && !monitor {
                 buffer.clear();
             } else if (monitor || self.rt.record_tap_enabled)
-                && let Some(Some(channel)) = midi_lane_channels.get(lane)
+                && let Some(channel) = channel_filter
             {
-                buffer.retain(|event| Self::event_matches_midi_channel(event, *channel));
+                buffer.retain(|event| Self::event_matches_midi_channel(event, channel));
             }
             buffer.sort_by_key(|event| event.frame);
             input.mark_finished();

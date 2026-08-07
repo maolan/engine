@@ -444,7 +444,6 @@ impl Engine {
         track_name: &str,
         instance_id: usize,
     ) -> bool {
-        tracing::info!(%track_name, instance_id, "Engine handling TrackUnloadLv2PluginInstance");
         if self
             .reject_if_track_frozen(track_name, "LV2 plugin unloading")
             .await
@@ -471,7 +470,6 @@ impl Engine {
             self.notify_clients(Err(e)).await;
             return true;
         }
-        tracing::info!(%track_name, instance_id, "Engine TrackUnloadLv2PluginInstance complete");
         false
     }
 

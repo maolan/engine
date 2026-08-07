@@ -309,7 +309,6 @@ impl HwDriver {
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
-        info!("wasapi run_cycle start");
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
         if let Some(rx) = &self.input_rx {
@@ -378,7 +377,6 @@ impl HwDriver {
             }
         }
 
-        info!("wasapi run_cycle rendered");
         self.queue_output_period(interleaved)
     }
 
@@ -389,14 +387,11 @@ impl HwDriver {
             }
             match self.output_tx.try_send(interleaved) {
                 Ok(()) => {
-                    info!("wasapi queue_output_period sent");
                     return Ok(());
                 }
                 Err(TrySendError::Full(buffer)) => {
                     interleaved = buffer;
-                    info!("wasapi queue_output_period waiting for tick");
                     self.wait_for_cycle_tick()?;
-                    info!("wasapi queue_output_period tick done");
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err("WASAPI output thread disconnected".to_string());
@@ -413,11 +408,9 @@ impl HwDriver {
             }
             match self.cycle_tick_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => {
-                    info!("wasapi cycle tick received");
                     return Ok(());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    info!("wasapi cycle tick timeout");
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -924,29 +917,15 @@ fn fill_output_available(
             .map_err(|e| format!("Failed to query WASAPI output padding: {e}"))?;
         client.actual_buffer_frames.saturating_sub(padding as usize)
     };
-    let pending_before = pending.len();
     if available_frames == 0 {
-        tracing::info!(
-            available_frames,
-            pending_before,
-            "fill_output_available: no space"
-        );
         return Ok(0);
     }
 
-    let mut periods_received = 0usize;
     while pending.len() < available_frames.saturating_mul(client.channels) {
         match output_rx.try_recv() {
             Ok(period) => {
-                let period_len = period.len();
                 pending.extend(period);
-                periods_received += 1;
-                let tick_sent = cycle_tick_tx.try_send(()).is_ok();
-                tracing::info!(
-                    period_len,
-                    tick_sent,
-                    "fill_output_available: received period"
-                );
+                let _ = cycle_tick_tx.try_send(());
             }
             Err(_) => break,
         }
@@ -959,7 +938,6 @@ fn fill_output_available(
             .map_err(|e| format!("Failed to get WASAPI output buffer: {e}"))?
     };
     let dst = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<f32>(), sample_count) };
-    let pending_after = pending.len();
     let mut underrun = false;
     for sample in dst.iter_mut() {
         if let Some(src) = pending.pop_front() {
@@ -974,15 +952,6 @@ fn fill_output_available(
             .ReleaseBuffer(available_frames as u32, 0)
             .map_err(|e| format!("Failed to release WASAPI output buffer: {e}"))?;
     }
-    tracing::info!(
-        available_frames,
-        channels = client.channels,
-        pending_before,
-        pending_after,
-        periods_received,
-        underrun,
-        "fill_output_available: wrote buffer"
-    );
     if underrun {
         debug!(available_frames, "WASAPI output underrun");
     }

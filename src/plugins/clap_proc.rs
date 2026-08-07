@@ -357,7 +357,6 @@ impl ClapProcessor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
-        tracing::info!("CLAP fetch_parameter_infos: sending request to host");
         header
             .request_type
             .store(REQUEST_CLAP_PARAMETERS, Ordering::Release);
@@ -374,7 +373,6 @@ impl ClapProcessor {
 
         let status = header.request_status.load(Ordering::Acquire);
         let size = header.scratch_size.load(Ordering::Acquire) as usize;
-        tracing::info!(status, size, "CLAP fetch_parameter_infos: host responded");
         if status != 1 {
             header.request_type.store(0, Ordering::Release);
             return Err("CLAP parameter enumeration failed in host".to_string());
@@ -382,13 +380,6 @@ impl ClapProcessor {
 
         let scratch = unsafe { scratch_ptr(ptr) };
         let result = Self::deserialize_clap_parameters(scratch, size);
-        match &result {
-            Ok(params) => tracing::info!(
-                count = params.len(),
-                "CLAP fetch_parameter_infos: deserialized"
-            ),
-            Err(e) => tracing::error!("CLAP fetch_parameter_infos: deserialize failed: {e}"),
-        }
         header.request_type.store(0, Ordering::Release);
         result
     }
@@ -815,6 +806,7 @@ impl ClapProcessor {
                         _pad: 0,
                     };
                     if !midi_ring.push(midi_event) {
+                        tracing::warn!(port = port_idx, "clap_proc MIDI ring full");
                         break;
                     }
                 }

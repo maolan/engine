@@ -22,10 +22,16 @@ impl MidiHub {
         if self.inputs.iter().any(|input| input.path == path) {
             return Ok(());
         }
+        // FreeBSD's umidi driver often requires O_RDWR for the input stream to
+        // flow, even though we only read from this node.
+        #[cfg(target_os = "freebsd")]
+        let open_flags = libc::O_RDWR | libc::O_NONBLOCK;
+        #[cfg(not(target_os = "freebsd"))]
+        let open_flags = libc::O_RDONLY | libc::O_NONBLOCK;
         let file = File::options()
             .read(true)
-            .write(false)
-            .custom_flags(libc::O_RDONLY | libc::O_NONBLOCK)
+            .write(true)
+            .custom_flags(open_flags)
             .open(path)
             .map_err(|e| format!("Failed to open MIDI device '{path}': {e}"))?;
         self.inputs
@@ -44,6 +50,24 @@ impl MidiHub {
         if self.outputs.iter().any(|output| output.path == path) {
             return Ok(());
         }
+        // On FreeBSD a umidi node is typically bidirectional and is opened
+        // O_RDWR for input. Reuse that descriptor instead of trying to open
+        // the same node a second time, which returns EBUSY.
+        #[cfg(target_os = "freebsd")]
+        let file = if let Some(input) = self.inputs.iter().find(|input| input.path == path) {
+            input
+                .file
+                .try_clone()
+                .map_err(|e| format!("Failed to clone MIDI output '{path}': {e}"))?
+        } else {
+            File::options()
+                .read(false)
+                .write(true)
+                .custom_flags(libc::O_WRONLY | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|e| format!("Failed to open MIDI output '{path}': {e}"))?
+        };
+        #[cfg(not(target_os = "freebsd"))]
         let file = File::options()
             .read(false)
             .write(true)
@@ -535,29 +559,6 @@ impl MidiInputDevice {
                 Ok(0) => break,
                 Ok(read) => {
                     for byte in &buf[..read] {
-                        if is_note_or_controller_status(*byte) {
-                            if let Some(data) = self.parser.feed(*byte) {
-                                out.push(HwMidiEvent {
-                                    device: self.path.clone(),
-                                    event: MidiEvent::new(0, data),
-                                });
-                            }
-                            for _ in 0..2 {
-                                let mut data = [0_u8; 1];
-                                match self.file.read(&mut data) {
-                                    Ok(1) => {
-                                        if let Some(msg) = self.parser.feed(data[0]) {
-                                            out.push(HwMidiEvent {
-                                                device: self.path.clone(),
-                                                event: MidiEvent::new(0, msg),
-                                            });
-                                        }
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            continue;
-                        }
                         if let Some(data) = self.parser.feed(*byte) {
                             out.push(HwMidiEvent {
                                 device: self.path.clone(),
@@ -567,9 +568,7 @@ impl MidiInputDevice {
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    break;
-                }
+                Err(_) => break,
             }
         }
     }
@@ -649,10 +648,6 @@ impl MidiParser {
     }
 }
 
-fn is_note_or_controller_status(byte: u8) -> bool {
-    matches!(byte & 0xF0, 0x80 | 0x90 | 0xB0)
-}
-
 fn status_data_len(status: u8) -> usize {
     match status {
         0x80..=0x8F | 0x90..=0x9F | 0xA0..=0xAF | 0xB0..=0xBF | 0xE0..=0xEF => 2,
@@ -665,7 +660,11 @@ fn status_data_len(status: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::MidiParser;
+    use super::{MidiInputDevice, MidiParser};
+    use crate::midi::io::MidiEvent;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
 
     #[test]
     fn parser_collects_sysex_message() {
@@ -691,5 +690,29 @@ mod tests {
             }
         }
         assert_eq!(out, vec![vec![0xF8], vec![0xF0, 0x7D, 0x01, 0xF7]]);
+    }
+
+    #[test]
+    fn input_device_parses_note_on_from_pipe() {
+        let mut fds = [0_i32; 2];
+        let rc = unsafe { nix::libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe failed");
+
+        let rc = unsafe { nix::libc::fcntl(fds[0], nix::libc::F_SETFL, nix::libc::O_NONBLOCK) };
+        assert!(rc >= 0, "fcntl failed");
+
+        let file = unsafe { File::from_raw_fd(fds[0]) };
+        let mut device = MidiInputDevice::new("/dev/test".to_string(), file);
+
+        let mut write_file = unsafe { File::from_raw_fd(fds[1]) };
+        write_file.write_all(&[0x90, 0x40, 0x7F]).unwrap();
+        drop(write_file);
+
+        let mut out = Vec::new();
+        device.read_events_into(&mut out);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].device, "/dev/test");
+        assert_eq!(out[0].event, MidiEvent::new(0, vec![0x90, 0x40, 0x7F]));
     }
 }

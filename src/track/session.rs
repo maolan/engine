@@ -143,14 +143,6 @@ impl TrackData {
                 true
             }
         });
-        if !activated.is_empty() {
-            tracing::info!(
-                "process_session_clips track={} cycle_start={} activated={}",
-                self.name,
-                cycle_start,
-                activated.len()
-            );
-        }
         for launch in activated {
             let exists = match launch.kind {
                 Kind::Audio => {

@@ -852,15 +852,6 @@ impl Engine {
                     return;
                 };
                 let launch_at_sample = quantize(quantize_reference_sample, launch_quantization);
-                tracing::info!(
-                    "Session launch track={} scene={} clip_id={} kind={:?} launch_at={} transport_running={}",
-                    track_name,
-                    scene_index,
-                    clip_id,
-                    kind,
-                    launch_at_sample,
-                    self.transport_running
-                );
                 track.schedule_session_launch(crate::track::PendingSessionLaunch {
                     scene_index,
                     clip_id,
@@ -1522,14 +1513,6 @@ impl Engine {
             return false;
         };
 
-        tracing::info!(
-            "Action::SessionPlay pressed, transport_sample={} playing={} transport_running={} clip_enabled={} session_enabled={}",
-            self.transport_sample,
-            self.playing,
-            self.transport_running,
-            self.clip_playback_enabled,
-            self.session_clip_playback_enabled
-        );
         self.playing = true;
         self.transport_running = false;
         self.transport_restart_pending = true;
