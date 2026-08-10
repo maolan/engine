@@ -9,7 +9,19 @@ use std::time::{Duration, Instant};
 /// Poll interval used while waiting for the plugin host to signal readiness.
 const HOST_READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+pub fn hide_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub fn hide_console_window(_cmd: &mut Command) {}
 
 pub fn unique_instance_id(format: &str) -> String {
     let n = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
@@ -63,6 +75,7 @@ pub fn spawn_host(
     }
 
     append_parent_log_level(&mut cmd);
+    hide_console_window(&mut cmd);
 
     let mut child = cmd
         .spawn()

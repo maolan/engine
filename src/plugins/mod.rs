@@ -83,6 +83,7 @@ pub fn scan_plugins<T: DeserializeOwned>(format: &str) -> Result<Vec<T>, String>
         .arg("--path")
         .arg("--system");
     ipc::append_parent_log_level(&mut cmd);
+    ipc::hide_console_window(&mut cmd);
 
     let output = cmd
         .output()
