@@ -3774,6 +3774,9 @@ impl Engine {
             self.poll_node_worker_results().await;
             self.poll_jack_hw_finished().await;
             self.poll_stopped_plugin_parameter_echoes().await;
+            if !self.playing && !self.transport_running {
+                self.publish_clap_state_dirty().await;
+            }
             self.on_executor_tick().await;
             let Some(message) = message else {
                 continue;
