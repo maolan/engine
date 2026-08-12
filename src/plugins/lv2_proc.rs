@@ -95,13 +95,9 @@ impl Lv2Processor {
         output_count: usize,
         host_binary: PathBuf,
     ) -> Result<Self, String> {
-        let audio_inputs = (0..input_count.max(1))
-            .map(|_| Arc::new(AudioIO::new(buffer_size)))
-            .collect::<Vec<_>>();
-        let audio_outputs = (0..output_count.max(1))
-            .map(|_| Arc::new(AudioIO::new(buffer_size)))
-            .collect::<Vec<_>>();
-
+        // Keep the passed counts as defaults and as the argv sent to the host,
+        // but the actual LV2 audio port counts come from the host after it has
+        // instantiated the plugin.
         let instance_id = ipc::unique_instance_id("lv2");
         let sample_rate_str = sample_rate.to_string();
         let buffer_size_str = buffer_size.to_string();
@@ -138,6 +134,15 @@ impl Lv2Processor {
         };
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
+        let host_input_count = header.num_input_channels.load(Ordering::Acquire) as usize;
+        let host_output_count = header.num_output_channels.load(Ordering::Acquire) as usize;
+        let audio_inputs = (0..host_input_count)
+            .map(|_| Arc::new(AudioIO::new(buffer_size)))
+            .collect::<Vec<_>>();
+        let audio_outputs = (0..host_output_count)
+            .map(|_| Arc::new(AudioIO::new(buffer_size)))
+            .collect::<Vec<_>>();
+
         let midi_in_count = header.midi_in_port_count.load(Ordering::Acquire) as usize;
         let midi_out_count = header.midi_out_port_count.load(Ordering::Acquire) as usize;
         let midi_input_ports: Vec<_> = (0..midi_in_count)
@@ -154,8 +159,8 @@ impl Lv2Processor {
             name,
             audio_inputs,
             audio_outputs,
-            main_audio_inputs: input_count.max(1),
-            main_audio_outputs: output_count.max(1),
+            main_audio_inputs: host_input_count,
+            main_audio_outputs: host_output_count,
             midi_input_ports,
             midi_output_ports,
             param_values,
