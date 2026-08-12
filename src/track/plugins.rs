@@ -1794,19 +1794,27 @@ impl TrackData {
     #[cfg(unix)]
     pub(crate) fn lv2_midi_output_io(
         &self,
-        _instance_id: usize,
-        _port: usize,
+        instance_id: usize,
+        port: usize,
     ) -> Result<Arc<MIDIIO>, String> {
-        Err("LV2 MIDI output ports not yet implemented".to_string())
+        self.lv2_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| instance.processor.midi_output_ports().get(port).cloned())
+            .ok_or_else(|| format!("LV2 instance {instance_id} MIDI output port {port} missing"))
     }
 
     #[cfg(unix)]
     pub(crate) fn lv2_midi_input_io(
         &self,
-        _instance_id: usize,
-        _port: usize,
+        instance_id: usize,
+        port: usize,
     ) -> Result<Arc<MIDIIO>, String> {
-        Err("LV2 MIDI input ports not yet implemented".to_string())
+        self.lv2_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| instance.processor.midi_input_ports().get(port).cloned())
+            .ok_or_else(|| format!("LV2 instance {instance_id} MIDI input port {port} missing"))
     }
 
     #[cfg(unix)]
