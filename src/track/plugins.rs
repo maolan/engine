@@ -371,10 +371,35 @@ impl TrackData {
             processor.gui_set_floating_mode(true)?;
             return processor.gui_show();
         }
+        let available: Vec<_> = self.clap_plugins.iter().map(|i| i.id).collect();
         Err(format!(
-            "Track '{}' does not have CLAP instance id: {}",
-            self.name, instance_id
+            "Track '{}' does not have CLAP instance id: {} (available: {:?})",
+            self.name, instance_id, available
         ))
+    }
+
+    pub fn clip_show_clap_gui(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let track_name = self.name.clone();
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .clap_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Clip {clip_idx} on track '{}' does not have CLAP instance id: {instance_id}",
+                    track_name
+                )
+            })?;
+        let processor = instance.processor.clone();
+        processor.gui_set_parent_x11(0)?;
+        processor.gui_set_floating_mode(true)?;
+        processor.gui_show()
     }
 
     pub fn show_vst3_gui(&self, instance_id: usize) -> Result<(), String> {
@@ -383,10 +408,34 @@ impl TrackData {
             processor.gui_set_floating_mode(true)?;
             return processor.gui_show();
         }
+        let available: Vec<_> = self.vst3_plugins.iter().map(|i| i.id).collect();
         Err(format!(
-            "Track '{}' does not have VST3 instance id: {}",
-            self.name, instance_id
+            "Track '{}' does not have VST3 instance id: {} (available: {:?})",
+            self.name, instance_id, available
         ))
+    }
+
+    pub fn clip_show_vst3_gui(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let track_name = self.name.clone();
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .vst3_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Clip {clip_idx} on track '{}' does not have VST3 instance id: {instance_id}",
+                    track_name
+                )
+            })?;
+        let processor = instance.processor.clone();
+        processor.gui_set_floating_mode(true)?;
+        processor.gui_show()
     }
 
     #[cfg(unix)]
@@ -396,10 +445,31 @@ impl TrackData {
             processor.gui_set_floating_mode(true)?;
             return processor.gui_show();
         }
+        let available: Vec<_> = self.lv2_plugins.iter().map(|i| i.id).collect();
         Err(format!(
-            "Track '{}' does not have LV2 instance id: {}",
-            self.name, instance_id
+            "Track '{}' does not have LV2 instance id: {} (available: {:?})",
+            self.name, instance_id, available
         ))
+    }
+
+    #[cfg(unix)]
+    pub fn clip_show_lv2_gui(&mut self, clip_idx: usize, instance_id: usize) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let track_name = self.name.clone();
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .lv2_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Clip {clip_idx} on track '{}' does not have LV2 instance id: {instance_id}",
+                    track_name
+                )
+            })?;
+        let processor = instance.processor.clone();
+        processor.gui_set_floating_mode(true)?;
+        processor.gui_show()
     }
 
     pub fn set_clap_plugin_bypassed(

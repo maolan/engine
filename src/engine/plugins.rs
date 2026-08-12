@@ -1845,6 +1845,56 @@ impl Engine {
         false
     }
 
+    pub(crate) async fn handle_clip_show_clap_gui(&mut self, a: Action) -> bool {
+        let Action::ClipShowClapGui {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().clip_show_clap_gui(clip_idx, instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    pub(crate) async fn handle_clip_show_vst3_gui(&mut self, a: Action) -> bool {
+        let Action::ClipShowVst3Gui {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().clip_show_vst3_gui(clip_idx, instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
     #[cfg(unix)]
     pub(crate) async fn handle_track_show_lv2_gui(&mut self, a: Action) -> bool {
         let Action::TrackShowLv2Gui {
@@ -1863,6 +1913,32 @@ impl Engine {
             }
         };
         if let Err(e) = track.lock().show_lv2_gui(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+
+        false
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn handle_clip_show_lv2_gui(&mut self, a: Action) -> bool {
+        let Action::ClipShowLv2Gui {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().clip_show_lv2_gui(clip_idx, instance_id) {
             self.notify_clients(Err(e)).await;
             return true;
         }

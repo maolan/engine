@@ -3145,6 +3145,11 @@ impl Engine {
                     return;
                 }
             }
+            Action::ClipShowClapGui { .. } => {
+                if Self::box_bool(self.handle_clip_show_clap_gui(a.clone())).await {
+                    return;
+                }
+            }
             Action::TrackLoadVst3Plugin {
                 ref track_name,
                 ref plugin_id,
@@ -3185,6 +3190,11 @@ impl Engine {
             }
             Action::TrackShowVst3Gui { .. } => {
                 if Self::box_bool(self.handle_track_show_vst3_gui(a.clone())).await {
+                    return;
+                }
+            }
+            Action::ClipShowVst3Gui { .. } => {
+                if Self::box_bool(self.handle_clip_show_vst3_gui(a.clone())).await {
                     return;
                 }
             }
@@ -3232,6 +3242,12 @@ impl Engine {
             #[cfg(unix)]
             Action::TrackShowLv2Gui { .. } => {
                 if Self::box_bool(self.handle_track_show_lv2_gui(a.clone())).await {
+                    return;
+                }
+            }
+            #[cfg(unix)]
+            Action::ClipShowLv2Gui { .. } => {
+                if Self::box_bool(self.handle_clip_show_lv2_gui(a.clone())).await {
                     return;
                 }
             }

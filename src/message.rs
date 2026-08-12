@@ -1197,6 +1197,11 @@ pub enum Action {
         track_name: String,
         instance_id: usize,
     },
+    ClipShowClapGui {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
     TrackLoadVst3Plugin {
         track_name: String,
         plugin_id: String,
@@ -1212,6 +1217,11 @@ pub enum Action {
     },
     TrackShowVst3Gui {
         track_name: String,
+        instance_id: usize,
+    },
+    ClipShowVst3Gui {
+        track_name: String,
+        clip_idx: usize,
         instance_id: usize,
     },
     #[cfg(unix)]
@@ -1232,6 +1242,11 @@ pub enum Action {
     },
     TrackShowLv2Gui {
         track_name: String,
+        instance_id: usize,
+    },
+    ClipShowLv2Gui {
+        track_name: String,
+        clip_idx: usize,
         instance_id: usize,
     },
     TrackSetPluginResourceDir {
