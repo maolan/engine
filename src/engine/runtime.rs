@@ -67,7 +67,16 @@ impl Engine {
         }
     }
 
+    pub(crate) fn meter_db_to_linear(db: f32) -> f32 {
+        if db <= -90.0 {
+            0.0
+        } else {
+            10.0_f32.powf(db / 20.0)
+        }
+    }
+
     pub(crate) const METER_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
+    pub(crate) const METER_DECAY_AFTER_STOP: Duration = Duration::from_secs(1);
     pub(crate) const SESSION_RUNTIME_REPORT_INTERVAL: Duration = Duration::from_millis(50);
     pub(crate) const TRACK_PROCESS_TIMEOUT: Duration = Duration::from_millis(250);
     #[cfg(unix)]
@@ -241,6 +250,7 @@ impl Engine {
             last_meter_snapshot_publish: None,
             last_session_report_publish: None,
             track_meter_linear_by_track: HashMap::new(),
+            meter_decay_after_stop: None,
             meter_snapshot_producer,
             transport_snapshot_producer,
             session_runtime_snapshot_producer,
@@ -1303,6 +1313,10 @@ impl Engine {
             }
         }
 
+        if self.meter_decay_after_stop.is_some() {
+            return;
+        }
+
         // Loudness must be fed every cycle so integrated LUFS is accurate.
         self.feed_hw_out_loudness_meter();
 
@@ -1937,6 +1951,10 @@ impl Engine {
         if !self.should_publish_track_meters() {
             return;
         }
+        if self.meter_decay_after_stop.is_some() {
+            self.update_meter_decay_after_stop();
+            return;
+        }
         let tracks: Vec<(String, crate::state::TrackHandle)> = self
             .state_snapshot
             .load_full()
@@ -2211,11 +2229,94 @@ impl Engine {
         self.last_hw_out_meter_publish = None;
         self.last_track_meter_publish = None;
         self.last_meter_snapshot_publish = None;
-        self.hw_out_peak_hold_linear.fill(0.0);
         #[cfg(unix)]
         {
             self.last_hw_out_meter_linear.clear();
         }
+
+        let tracks: Vec<(String, crate::state::TrackHandle)> = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .iter()
+            .map(|(name, track)| (name.clone(), track.clone()))
+            .collect();
+        let mut track_linear = Vec::with_capacity(tracks.len());
+        for (name, track) in tracks {
+            let linear = self
+                .track_meter_linear_by_track
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| track.lock().output_meter_linear());
+            track_linear.push((name, linear));
+        }
+        let hw_out_linear = if self.hw_out_peak_hold_linear.is_empty() {
+            self.latest_hw_out_meter_db
+                .iter()
+                .copied()
+                .map(Self::meter_db_to_linear)
+                .collect()
+        } else {
+            self.hw_out_peak_hold_linear.clone()
+        };
+        self.meter_decay_after_stop = Some(MeterDecay {
+            started_at: Instant::now(),
+            hw_out_linear,
+            track_linear,
+        });
+        self.update_meter_decay_after_stop();
+        self.publish_meter_snapshot();
+    }
+
+    pub(crate) fn update_meter_decay_after_stop(&mut self) {
+        let Some(decay) = self.meter_decay_after_stop.as_ref() else {
+            return;
+        };
+        let elapsed = decay.started_at.elapsed();
+        if elapsed >= Self::METER_DECAY_AFTER_STOP {
+            self.finish_meter_decay_after_stop();
+            return;
+        }
+
+        let remaining = 1.0 - (elapsed.as_secs_f32() / Self::METER_DECAY_AFTER_STOP.as_secs_f32());
+        let hw_out_linear = decay
+            .hw_out_linear
+            .iter()
+            .copied()
+            .map(|value| value * remaining)
+            .collect::<Vec<_>>();
+        self.latest_hw_out_meter_db = Arc::new(
+            hw_out_linear
+                .iter()
+                .copied()
+                .map(Self::meter_linear_to_db)
+                .collect(),
+        );
+        self.hw_out_peak_hold_linear = hw_out_linear;
+
+        let mut track_linear_by_track = HashMap::with_capacity(decay.track_linear.len());
+        let mut snapshot = Vec::with_capacity(decay.track_linear.len());
+        for (name, start_linear) in &decay.track_linear {
+            let linear = start_linear
+                .iter()
+                .copied()
+                .map(|value| value * remaining)
+                .collect::<Vec<_>>();
+            let output_db = linear
+                .iter()
+                .copied()
+                .map(Self::meter_linear_to_db)
+                .collect::<Vec<_>>();
+            track_linear_by_track.insert(name.clone(), linear);
+            snapshot.push((name.clone(), output_db));
+        }
+        self.track_meter_linear_by_track = track_linear_by_track;
+        self.latest_track_meter_snapshot = Arc::new(snapshot);
+    }
+
+    pub(crate) fn finish_meter_decay_after_stop(&mut self) {
+        self.meter_decay_after_stop = None;
+        self.hw_out_peak_hold_linear.fill(0.0);
         let hw_channels = self.latest_hw_out_meter_db.len();
         self.latest_hw_out_meter_db = Arc::new(vec![-90.0; hw_channels]);
 
@@ -2250,6 +2351,7 @@ impl Engine {
             return;
         }
         self.last_meter_snapshot_publish = Some(now);
+        self.update_meter_decay_after_stop();
         self.publish_meter_snapshot();
     }
 
@@ -2782,6 +2884,7 @@ impl Engine {
                 }
             }
             Action::RequestMeterSnapshot => {
+                self.update_meter_decay_after_stop();
                 self.notify_clients(Ok(Action::MeterSnapshot {
                     hw_out_db: self.latest_hw_out_meter_db.clone(),
                     hw_out_lufs: self.latest_hw_out_lufs,

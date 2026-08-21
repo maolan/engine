@@ -1381,6 +1381,7 @@ impl Engine {
             self.awaiting_hwfinished,
             self.handling_hwfinished
         );
+        self.meter_decay_after_stop = None;
         self.playing = true;
         self.transport_running = true;
         self.transport_restart_pending = true;

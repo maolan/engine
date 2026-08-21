@@ -247,6 +247,12 @@ pub(crate) enum MidiLearnSlot {
     Session(crate::message::SessionMidiLearnTarget),
 }
 
+struct MeterDecay {
+    started_at: Instant,
+    hw_out_linear: Vec<f32>,
+    track_linear: Vec<(String, Vec<f32>)>,
+}
+
 pub struct Engine {
     clients: Vec<Sender<Message>>,
     rx: Receiver<Message>,
@@ -333,6 +339,7 @@ pub struct Engine {
     last_meter_snapshot_publish: Option<Instant>,
     last_session_report_publish: Option<Instant>,
     track_meter_linear_by_track: HashMap<String, Vec<f32>>,
+    meter_decay_after_stop: Option<MeterDecay>,
     meter_snapshot_producer:
         crate::triple_buffer::TripleBufferProducer<crate::meter::MeterSnapshot>,
     transport_snapshot_producer:
@@ -474,6 +481,49 @@ mod tests {
             .tracks
             .insert(track.name.clone(), Arc::new(track));
         engine.publish_state_snapshot();
+    }
+
+    #[test]
+    fn reset_meters_after_stop_decays_to_silence_over_one_second() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        engine.hw_out_peak_hold_linear = vec![1.0];
+        engine
+            .track_meter_linear_by_track
+            .insert("track".to_string(), vec![1.0]);
+
+        engine.reset_meters_after_stop();
+
+        assert!(engine.meter_decay_after_stop.is_some());
+        assert!(engine.latest_hw_out_meter_db[0] > -0.1);
+        assert!(engine.latest_track_meter_snapshot[0].1[0] > -0.1);
+
+        engine
+            .meter_decay_after_stop
+            .as_mut()
+            .expect("meter decay")
+            .started_at = Instant::now() - Duration::from_millis(500);
+        engine.update_meter_decay_after_stop();
+
+        assert!(engine.latest_hw_out_meter_db[0] < -5.5 && engine.latest_hw_out_meter_db[0] > -6.5);
+        assert!(
+            engine.latest_track_meter_snapshot[0].1[0] < -5.5
+                && engine.latest_track_meter_snapshot[0].1[0] > -6.5
+        );
+
+        engine
+            .meter_decay_after_stop
+            .as_mut()
+            .expect("meter decay")
+            .started_at = Instant::now() - Duration::from_millis(1_100);
+        engine.update_meter_decay_after_stop();
+
+        assert!(engine.meter_decay_after_stop.is_none());
+        assert_eq!(engine.latest_hw_out_meter_db.as_slice(), &[-90.0]);
+        assert_eq!(engine.latest_track_meter_snapshot[0].1.as_slice(), &[-90.0]);
     }
 
     #[tokio::test]
