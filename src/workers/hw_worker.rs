@@ -80,6 +80,10 @@ impl<B: Backend> HwWorker<B> {
             unsafe {
                 libc::pthread_set_name_np(thread, c_name.as_ptr());
             }
+            #[cfg(target_os = "macos")]
+            unsafe {
+                let _ = libc::pthread_setname_np(c_name.as_ptr());
+            }
 
             let param = unsafe {
                 let mut p = std::mem::zeroed::<libc::sched_param>();

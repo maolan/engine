@@ -35,6 +35,8 @@ pub fn parse_automation_lanes(
 
 #[cfg(target_os = "linux")]
 use crate::hw::alsa::{HwDriver, MidiHub};
+#[cfg(target_os = "macos")]
+use crate::hw::coreaudio::{HwDriver, MidiHub};
 #[cfg(unix)]
 use crate::hw::jack::JackRuntime;
 #[cfg(target_os = "freebsd")]

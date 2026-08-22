@@ -11,6 +11,9 @@ pub fn channel_balance_gain(ch_count: usize, channel_idx: usize, balance: f32) -
     }
 }
 
+// Fallback meter for the native drivers. macOS has no native driver yet, but
+// the helper stays available to tests so its coverage does not vary by platform.
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn output_meter_linear(port_count: usize, gain: f32, balance: f32) -> Vec<f32> {
     (0..port_count)
         .map(|channel_idx| 0.0 * gain * channel_balance_gain(port_count, channel_idx, balance))

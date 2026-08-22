@@ -1,6 +1,8 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::hw::alsa::MidiHub;
+#[cfg(target_os = "macos")]
+use crate::hw::coreaudio::MidiHub;
 #[cfg(target_os = "freebsd")]
 use crate::hw::oss::MidiHub;
 #[cfg(target_os = "openbsd")]
