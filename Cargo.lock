@@ -485,7 +485,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "maolan-engine"
-version = "0.2.62"
+version = "0.2.63"
 dependencies = [
  "alsa",
  "arc-swap",
@@ -498,6 +498,7 @@ dependencies = [
  "midly",
  "nix",
  "num_cpus",
+ "nvtree",
  "oxideav-basic",
  "oxideav-core",
  "oxideav-flac",
@@ -637,6 +638,12 @@ dependencies = [
  "hermit-abi",
  "libc",
 ]
+
+[[package]]
+name = "nvtree"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6c6b57855e3bad4ab9449abb49c72351fd72e261232c6e856e8424137bd4a95"
 
 [[package]]
 name = "objc2"

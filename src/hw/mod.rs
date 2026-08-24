@@ -4,6 +4,8 @@ pub mod common;
 pub mod config;
 pub mod convert_policy;
 pub mod error_fmt;
+#[cfg(target_os = "freebsd")]
+pub mod freebsd;
 #[cfg(unix)]
 pub mod jack;
 pub mod latency;

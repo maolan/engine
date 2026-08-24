@@ -1,5 +1,9 @@
 mod audio;
 pub mod audio_codec;
+#[cfg(target_os = "freebsd")]
+pub mod audio_devices {
+    pub use crate::hw::freebsd::{AudioDeviceDescriptor, discover_freebsd_audio_devices};
+}
 pub mod client;
 pub mod connectable;
 mod engine;
