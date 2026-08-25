@@ -253,6 +253,12 @@ struct MeterDecay {
     track_linear: Vec<(String, Vec<f32>)>,
 }
 
+struct AudioPreviewPlayback {
+    samples: Arc<Vec<f32>>,
+    channels: usize,
+    cursor: usize,
+}
+
 pub struct Engine {
     clients: Vec<Sender<Message>>,
     rx: Receiver<Message>,
@@ -374,6 +380,7 @@ pub struct Engine {
     pending_midi_learn: Option<(String, crate::message::TrackMidiLearnTarget, Option<String>)>,
     pending_global_midi_learn: Option<crate::message::GlobalMidiLearnTarget>,
     pending_session_midi_learn: Option<crate::message::SessionMidiLearnTarget>,
+    audio_preview: Option<AudioPreviewPlayback>,
     global_midi_learn_play_pause: Option<crate::message::MidiLearnBinding>,
     global_midi_learn_stop: Option<crate::message::MidiLearnBinding>,
     global_midi_learn_record_toggle: Option<crate::message::MidiLearnBinding>,

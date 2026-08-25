@@ -1486,6 +1486,12 @@ pub enum Message {
     HWMidiEvents(Vec<HwMidiEvent>),
     HWMidiOutEvents(Vec<HwMidiEvent>),
     ClearHWMidiOutEvents,
+    StartAudioPreview {
+        samples: Arc<Vec<f32>>,
+        channels: usize,
+        start_sample: usize,
+    },
+    StopAudioPreview,
     HWSetPlaying(bool),
     HWSetOutputGainBalance {
         gain: f32,

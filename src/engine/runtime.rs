@@ -272,6 +272,7 @@ impl Engine {
             pending_midi_learn: None,
             pending_global_midi_learn: None,
             pending_session_midi_learn: None,
+            audio_preview: None,
             global_midi_learn_play_pause: None,
             global_midi_learn_stop: None,
             global_midi_learn_record_toggle: None,
@@ -1184,6 +1185,7 @@ impl Engine {
             );
             return;
         }
+        self.mix_audio_preview_into_hw_outputs();
         tracing::debug!(
             playing = self.playing,
             transport_running = self.transport_running,
@@ -1221,6 +1223,46 @@ impl Engine {
                     error!("Error sending TracksFinished {e}");
                 }
             }
+        }
+    }
+
+    fn mix_audio_preview_into_hw_outputs(&mut self) {
+        let cycle_samples = self.current_cycle_samples();
+        if cycle_samples == 0 {
+            return;
+        }
+        let plan = self.executor.plan().clone();
+        let Some(preview) = self.audio_preview.as_mut() else {
+            return;
+        };
+        let channels = preview.channels.max(1);
+        let total_frames = preview.samples.len() / channels;
+        if preview.cursor >= total_frames {
+            self.audio_preview = None;
+            return;
+        }
+
+        for &(buffer, channel) in &plan.hw_out_map {
+            // Safety: request_hw_cycle runs after all render-plan producers
+            // completed for this hardware cycle and before the hardware
+            // backend reads the output arena.
+            let dst = unsafe { &mut *plan.buffer_ptr(buffer) };
+            let frames = cycle_samples.min(dst.len());
+            dst[..frames].fill(0.0);
+            let source_channel = channel.min(channels - 1);
+            for (frame, out) in dst.iter_mut().take(frames).enumerate() {
+                let source_frame = preview.cursor + frame;
+                if source_frame >= total_frames {
+                    break;
+                }
+                let sample_index = source_frame * channels + source_channel;
+                *out = preview.samples.get(sample_index).copied().unwrap_or(0.0);
+            }
+        }
+
+        preview.cursor = preview.cursor.saturating_add(cycle_samples);
+        if preview.cursor >= total_frames {
+            self.audio_preview = None;
         }
     }
 
@@ -1804,7 +1846,7 @@ impl Engine {
         // hardware cycle. Requesting here would replay stale arena buffers.
         if self.hw_worker.is_some()
             && !cycle_started
-            && self.playing
+            && (self.playing || self.audio_preview.is_some())
             && self.executor.cycle_complete()
         {
             self.request_hw_cycle().await;
@@ -4121,7 +4163,7 @@ impl Engine {
                     // hardware cycle. Requesting here would replay stale arena buffers.
                     if self.hw_worker.is_some()
                         && !cycle_started
-                        && self.playing
+                        && (self.playing || self.audio_preview.is_some())
                         && self.executor.cycle_complete()
                     {
                         self.request_hw_cycle().await;
@@ -4184,6 +4226,25 @@ impl Engine {
                             .or_default()
                             .push(hw_event.event);
                     }
+                }
+                Message::StartAudioPreview {
+                    samples,
+                    channels,
+                    start_sample,
+                } => {
+                    self.audio_preview = Some(AudioPreviewPlayback {
+                        samples,
+                        channels: channels.max(1),
+                        cursor: start_sample,
+                    });
+                    self.meter_decay_after_stop = None;
+                    self.set_hw_playing(true).await;
+                    if !self.awaiting_hwfinished && self.executor.cycle_complete() {
+                        self.request_hw_cycle().await;
+                    }
+                }
+                Message::StopAudioPreview => {
+                    self.audio_preview = None;
                 }
                 _ => {}
             }
