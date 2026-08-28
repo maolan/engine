@@ -749,6 +749,7 @@ pub struct TrackData {
     pub child_tracks: Vec<Arc<Track>>,
     pub automation_lanes: serde_json::Value,
     pub automation_mode: AtomicU8,
+    pub mixosc_addr: Option<String>,
     pub frozen: AtomicBool,
     midi_lane_channels: ArcSwap<Vec<Option<u8>>>,
     primary_audio_ins: usize,

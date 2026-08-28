@@ -91,6 +91,7 @@ impl Engine {
             audio_outs: 1,
             midi_outs: 0,
             folder: false,
+            mixosc_addr: None,
         }))
         .await;
         self.notify_clients(Ok(Action::TrackLevel(

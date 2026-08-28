@@ -1630,25 +1630,34 @@ impl Engine {
         inverse_actions
     }
 
-    pub(crate) async fn handle_add_track(
-        &mut self,
-        name: String,
-        audio_ins: usize,
-        midi_ins: usize,
-        audio_outs: usize,
-        midi_outs: usize,
-        folder: bool,
-    ) {
+    pub(crate) async fn handle_add_track(&mut self, action: Action) {
+        let Action::AddTrack {
+            name,
+            audio_ins,
+            midi_ins,
+            audio_outs,
+            midi_outs,
+            folder,
+            mixosc_addr,
+        } = action
+        else {
+            self.notify_clients(Err("Expected AddTrack action".to_string()))
+                .await;
+            return;
+        };
         let tracks = &mut self.state.lock().tracks;
         if tracks.contains_key(&name) {
             self.notify_clients(Err(format!("Track {} already exists", name)))
                 .await;
             return;
         }
-        if !folder && !self.history_suspended && audio_ins + midi_ins + audio_outs + midi_outs == 0
+        if !folder
+            && mixosc_addr.is_none()
+            && !self.history_suspended
+            && audio_ins + midi_ins + audio_outs + midi_outs == 0
         {
             self.notify_clients(Err(
-                "Track must have at least one audio or MIDI input/output".to_string(),
+                "Track must have at one audio/MIDI I/O or a MixOSC mixer".to_string(),
             ))
             .await;
             return;
@@ -1685,6 +1694,7 @@ impl Engine {
                 t.set_clip_playback_enabled(self.clip_playback_enabled);
                 t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
                 t.set_session_base_dir(self.session_dir.clone());
+                t.mixosc_addr = mixosc_addr;
             }
         } else {
             self.notify_clients(Err(

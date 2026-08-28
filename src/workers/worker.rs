@@ -1,8 +1,8 @@
 use crate::{
     executor::NodeJob,
     message::{
-        Action, Message, OfflineAutomationLane, OfflineAutomationPoint, OfflineAutomationTarget,
-        OfflineBounceWork, ProcessTask,
+        Action, Message, OfflineAutomationLane, OfflineAutomationTarget, OfflineBounceWork,
+        ProcessTask,
     },
     midi::io::MidiEvent,
     render_plan::Op,
@@ -31,29 +31,6 @@ pub struct Worker {
 }
 
 impl Worker {
-    fn automation_lane_value_at(points: &[OfflineAutomationPoint], sample: usize) -> Option<f32> {
-        if points.is_empty() {
-            return None;
-        }
-        if sample <= points[0].sample {
-            return Some(points[0].value.clamp(0.0, 1.0));
-        }
-        if sample >= points[points.len().saturating_sub(1)].sample {
-            return Some(points[points.len().saturating_sub(1)].value.clamp(0.0, 1.0));
-        }
-        for segment in points.windows(2) {
-            let left = &segment[0];
-            let right = &segment[1];
-            if sample < left.sample || sample > right.sample {
-                continue;
-            }
-            let span = right.sample.saturating_sub(left.sample).max(1) as f32;
-            let t = (sample.saturating_sub(left.sample) as f32 / span).clamp(0.0, 1.0);
-            return Some((left.value + (right.value - left.value) * t).clamp(0.0, 1.0));
-        }
-        None
-    }
-
     fn apply_freeze_automation_at_sample(
         track: &mut crate::track::TrackData,
         sample: usize,
@@ -66,7 +43,7 @@ impl Worker {
             ) {
                 continue;
             }
-            let Some(value) = Self::automation_lane_value_at(&lane.points, sample) else {
+            let Some(value) = lane.value_at(sample) else {
                 continue;
             };
             match lane.target {
@@ -110,6 +87,10 @@ impl Worker {
                     let hi = max.max(min);
                     let param_value = (lo + value as f64 * (hi - lo)).clamp(lo, hi);
                     let _ = track.set_clap_parameter_at(instance_id, param_id, param_value, 0);
+                }
+                OfflineAutomationTarget::MixOsc { .. } => {
+                    // MixOSC values are sent to external hardware in real time,
+                    // not rendered into frozen audio.
                 }
             }
         }
@@ -820,8 +801,10 @@ mod tests {
 
     #[test]
     fn automation_lane_value_at_interpolates_between_points() {
-        let value = Worker::automation_lane_value_at(
-            &[
+        let lane = OfflineAutomationLane {
+            target: OfflineAutomationTarget::Volume,
+            visible: true,
+            points: vec![
                 OfflineAutomationPoint {
                     sample: 10,
                     value: 0.25,
@@ -831,9 +814,8 @@ mod tests {
                     value: 0.75,
                 },
             ],
-            15,
-        )
-        .expect("value");
+        };
+        let value = lane.value_at(15).expect("value");
 
         assert!((value - 0.5).abs() < 1.0e-6);
     }

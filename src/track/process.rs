@@ -47,6 +47,7 @@ impl TrackData {
             child_tracks: Vec::new(),
             automation_lanes: serde_json::Value::Array(vec![]),
             automation_mode: AtomicU8::new(crate::message::TrackAutomationMode::Read.as_u8()),
+            mixosc_addr: None,
             frozen: AtomicBool::new(false),
             midi_lane_channels: ArcSwap::from_pointee(vec![None; io.midi_ins]),
             primary_audio_ins: io.audio_ins,

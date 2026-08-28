@@ -120,6 +120,10 @@ pub enum OfflineAutomationTarget {
         min: f64,
         max: f64,
     },
+    MixOsc {
+        addr: String,
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -128,6 +132,35 @@ pub struct OfflineAutomationLane {
     #[serde(default)]
     pub visible: bool,
     pub points: Vec<OfflineAutomationPoint>,
+}
+
+impl OfflineAutomationLane {
+    /// Linearly interpolates the lane value at `sample`, clamped to [0, 1].
+    /// Returns `None` when the lane has no points.
+    pub fn value_at(&self, sample: usize) -> Option<f32> {
+        let points = &self.points;
+        if points.is_empty() {
+            return None;
+        }
+        if sample <= points[0].sample {
+            return Some(points[0].value.clamp(0.0, 1.0));
+        }
+        let last = points.len().saturating_sub(1);
+        if sample >= points[last].sample {
+            return Some(points[last].value.clamp(0.0, 1.0));
+        }
+        for segment in points.windows(2) {
+            let left = &segment[0];
+            let right = &segment[1];
+            if sample < left.sample || sample > right.sample {
+                continue;
+            }
+            let span = right.sample.saturating_sub(left.sample).max(1) as f32;
+            let t = (sample.saturating_sub(left.sample) as f32 / span).clamp(0.0, 1.0);
+            return Some((left.value + (right.value - left.value) * t).clamp(0.0, 1.0));
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -581,6 +614,7 @@ pub enum Action {
         audio_outs: usize,
         midi_outs: usize,
         folder: bool,
+        mixosc_addr: Option<String>,
     },
     TrackAddAudioInput(String),
     TrackAddAudioOutput(String),

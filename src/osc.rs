@@ -243,6 +243,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let audio_outs = args.next_int()? as usize;
             let midi_outs = args.next_int()? as usize;
             let folder = args.next_bool()?;
+            let mixosc_addr = args.next_string().ok().filter(|s| !s.is_empty());
             Ok(Action::AddTrack {
                 name,
                 audio_ins,
@@ -250,6 +251,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
                 audio_outs,
                 midi_outs,
                 folder,
+                mixosc_addr,
             })
         }
         "/track/remove" => {
@@ -2635,7 +2637,7 @@ mod tests {
     fn parses_track_add() {
         let packet = osc_packet_with_args(
             "/track/add",
-            "siiiii",
+            "siiiiis",
             &[
                 OscArg::String("vox".to_string()),
                 OscArg::Int(2),
@@ -2643,6 +2645,7 @@ mod tests {
                 OscArg::Int(2),
                 OscArg::Int(0),
                 OscArg::Int(0),
+                OscArg::String("".to_string()),
             ],
         );
         assert!(matches!(
@@ -2654,6 +2657,7 @@ mod tests {
                 audio_outs: 2,
                 midi_outs: 0,
                 folder: false,
+                mixosc_addr: None,
             } if name == "vox"
         ));
     }

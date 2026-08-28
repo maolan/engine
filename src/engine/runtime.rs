@@ -17,6 +17,7 @@ use crate::{
     state::State,
     workers::worker::Worker,
 };
+use mixosc::parameters::{OscValue, build_set};
 use std::{
     collections::{HashMap, VecDeque},
     net::{SocketAddr, UdpSocket},
@@ -181,6 +182,7 @@ impl Engine {
             osc_server: None,
             osc_reply_socket: None,
             osc_reply_target: None,
+            mixosc_socket: None,
             pending_hw_midi_events: vec![],
             pending_hw_midi_events_by_device: HashMap::new(),
             pending_hw_midi_out_events: vec![],
@@ -283,6 +285,7 @@ impl Engine {
             midi_cc_gate: HashMap::new(),
             modulators: Vec::new(),
             modulator_values: None,
+            mixosc_last_values: HashMap::new(),
             #[cfg(target_os = "windows")]
             _windows_timer_guard: crate::enable_windows_high_resolution_timer(),
             node_result_notify: Arc::new(Notify::new()),
@@ -556,6 +559,73 @@ impl Engine {
         }
 
         echoes
+    }
+
+    /// Evaluates MixOSC automation lanes for tracks bound to a mixer and sends
+    /// the current values over UDP/OSC. Called once per hardware cycle.
+    pub(crate) fn apply_mixosc_automation(&mut self, sample: usize) {
+        if !self.playing {
+            return;
+        }
+
+        let socket = match self.mixosc_socket.as_ref() {
+            Some(socket) => socket,
+            None => match UdpSocket::bind("0.0.0.0:0") {
+                Ok(socket) => {
+                    self.mixosc_socket = Some(socket);
+                    self.mixosc_socket.as_ref().unwrap()
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "Failed to bind MixOSC output socket");
+                    return;
+                }
+            },
+        };
+
+        let state = self.state_snapshot.load_full();
+        for (track_name, track) in state.tracks.iter() {
+            let track_lock = track.lock();
+            let Some(track_addr) = track_lock.mixosc_addr.as_ref() else {
+                continue;
+            };
+            let lanes: Vec<crate::message::OfflineAutomationLane> =
+                crate::engine::parse_automation_lanes(&track_lock.automation_lanes);
+            for lane in lanes {
+                if !lane.visible {
+                    continue;
+                }
+                let crate::message::OfflineAutomationTarget::MixOsc {
+                    addr: ref lane_addr,
+                    path: ref lane_path,
+                } = lane.target
+                else {
+                    continue;
+                };
+                if lane_addr != track_addr {
+                    continue;
+                }
+                let Some(value) = lane.value_at(sample) else {
+                    continue;
+                };
+                let key = (track_addr.clone(), lane_path.clone());
+                if let Some(last) = self.mixosc_last_values.get(&key)
+                    && (last - value).abs() < f32::EPSILON
+                {
+                    continue;
+                }
+                self.mixosc_last_values.insert(key, value);
+                let packet = build_set(lane_path, OscValue::Float(value));
+                if let Err(err) = socket.send_to(&packet, track_addr) {
+                    tracing::debug!(
+                        %err,
+                        %track_name,
+                        %track_addr,
+                        %lane_path,
+                        "Failed to send MixOSC packet"
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn session_end_sample(&self) -> usize {
@@ -1841,6 +1911,7 @@ impl Engine {
                 self.notify_clients(Ok(action)).await;
             }
         }
+        self.apply_mixosc_automation(self.active_transport_sample());
         let cycle_started = self.start_plan_cycle().await;
         // If a plan cycle is still running, its completion will request the
         // hardware cycle. Requesting here would replay stale arena buffers.
@@ -2844,23 +2915,8 @@ impl Engine {
                 self.handle_quit(a.clone()).await;
                 return;
             }
-            Action::AddTrack {
-                ref name,
-                audio_ins,
-                midi_ins,
-                audio_outs,
-                midi_outs,
-                folder,
-            } => {
-                self.handle_add_track(
-                    name.clone(),
-                    audio_ins,
-                    midi_ins,
-                    audio_outs,
-                    midi_outs,
-                    folder,
-                )
-                .await;
+            Action::AddTrack { .. } => {
+                self.handle_add_track(a.clone()).await;
             }
             Action::TrackAddAudioInput(..) => {
                 if Self::box_bool(self.handle_track_add_audio_input(a.clone())).await {
@@ -4158,6 +4214,7 @@ impl Engine {
                             self.notify_clients(Ok(action)).await;
                         }
                     }
+                    self.apply_mixosc_automation(self.active_transport_sample());
                     let cycle_started = self.start_plan_cycle().await;
                     // If a plan cycle is still running, its completion will request the
                     // hardware cycle. Requesting here would replay stale arena buffers.

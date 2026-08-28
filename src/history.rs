@@ -233,6 +233,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 audio_outs: track_lock.primary_audio_outs(),
                 midi_outs: track_lock.midi.outs.len(),
                 folder: track_lock.is_folder,
+                mixosc_addr: track_lock.mixosc_addr.clone(),
             })
         }
 
@@ -1436,6 +1437,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 audio_outs: track.primary_audio_outs(),
                 midi_outs: track.midi.outs.len(),
                 folder: track.is_folder,
+                mixosc_addr: track.mixosc_addr.clone(),
             });
             if let Some(parent_name) = track.parent_track.as_ref() {
                 actions.push(Action::TrackSetParent {
@@ -2950,6 +2952,7 @@ mod tests {
                 midi_ins: 1,
                 midi_outs: 1,
                 folder: false,
+                mixosc_addr: None,
             }) if name == "t"
         ));
         assert!(

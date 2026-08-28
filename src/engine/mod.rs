@@ -277,6 +277,7 @@ pub struct Engine {
     osc_server: Option<OscServer>,
     osc_reply_socket: Option<UdpSocket>,
     osc_reply_target: Option<SocketAddr>,
+    mixosc_socket: Option<UdpSocket>,
     pending_hw_midi_events: Vec<MidiEvent>,
     pending_hw_midi_events_by_device: HashMap<String, Vec<MidiEvent>>,
     pending_hw_midi_out_events: Vec<MidiEvent>,
@@ -391,6 +392,7 @@ pub struct Engine {
     midi_cc_gate: HashMap<(String, u8, u8), bool>,
     modulators: Vec<crate::modulator::Modulator>,
     modulator_values: Option<Arc<std::collections::HashMap<usize, f32>>>,
+    mixosc_last_values: HashMap<(String, String), f32>,
     /// Wakes the dispatcher immediately when a node worker pushes a result,
     /// instead of waiting for the 1 ms periodic tick. This is critical on
     /// Windows, where the default timer quantum coarsens short waits.
