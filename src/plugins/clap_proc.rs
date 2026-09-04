@@ -611,7 +611,11 @@ impl ClapProcessor {
         Ok(())
     }
 
-    pub fn set_resource_directory(&self, dir: &std::path::Path) -> Result<(), String> {
+    pub fn set_resource_directory(
+        &self,
+        dir: &std::path::Path,
+        shared: bool,
+    ) -> Result<(), String> {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
             _ => return Err("CLAP processor not initialized".to_string()),
@@ -620,7 +624,7 @@ impl ClapProcessor {
         let header = unsafe { header_mut(ptr) };
         let path_str = dir.to_string_lossy().to_string();
         unsafe {
-            write_resource_directory_to_scratch(ptr, &path_str)
+            write_resource_directory_to_scratch(ptr, &path_str, shared)
                 .map_err(|e| format!("Failed to write resource directory: {e}"))?;
         }
         std::sync::atomic::fence(Ordering::SeqCst);
@@ -645,9 +649,7 @@ impl ClapProcessor {
         Ok(())
     }
 
-    pub fn file_references(
-        &self,
-    ) -> Result<Vec<maolan_plugin_protocol::protocol::FileReference>, String> {
+    pub fn collect_resources(&self) -> Result<(), String> {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
             _ => return Err("CLAP processor not initialized".to_string()),
@@ -655,64 +657,64 @@ impl ClapProcessor {
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
-        header.request_type.store(6, Ordering::Release);
-        header.request_status.store(0, Ordering::Release);
-        if let Err(e) = events.signal_host() {
-            header.request_type.store(0, Ordering::Release);
-            return Err(format!("Failed to signal host for file references: {e}"));
-        }
-
-        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
-            header.request_type.store(0, Ordering::Release);
-            return Err(format!("Host did not respond to file references: {e}"));
-        }
-
-        let status = header.request_status.load(Ordering::Acquire);
-        if status != 1 {
-            header.request_type.store(0, Ordering::Release);
-            return Err("File references enumeration failed in host".to_string());
-        }
-
-        let paths = unsafe { read_file_references_from_scratch(ptr) }
-            .ok_or("Failed to read file references from scratch")?;
-        header.request_type.store(0, Ordering::Release);
-        Ok(paths)
-    }
-
-    pub fn update_file_reference(&self, index: u32, path: &str) -> Result<(), String> {
-        let (mapping, events) = match (&self.mapping, &self.events) {
-            (Some(m), Some(e)) => (m, e),
-            _ => return Err("CLAP processor not initialized".to_string()),
-        };
-        let ptr = mapping.as_ptr();
-        let header = unsafe { header_mut(ptr) };
-        unsafe {
-            write_file_reference_update_to_scratch(ptr, index, path)
-                .map_err(|e| format!("Failed to write file-reference update: {e}"))?;
-        }
-
-        header.request_type.store(7, Ordering::Release);
+        header
+            .request_type
+            .store(REQUEST_COLLECT_RESOURCES, Ordering::Release);
         header.request_status.store(0, Ordering::Release);
         if let Err(e) = events.signal_host() {
             header.request_type.store(0, Ordering::Release);
             return Err(format!(
-                "Failed to signal host for file-reference update: {e}"
+                "Failed to signal host for resource collection: {e}"
             ));
         }
 
         if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
-            return Err(format!(
-                "Host did not respond to file-reference update: {e}"
-            ));
+            return Err(format!("Host did not respond to resource collection: {e}"));
         }
 
         let status = header.request_status.load(Ordering::Acquire);
         header.request_type.store(0, Ordering::Release);
         if status != 1 {
-            return Err("File-reference update failed in host".to_string());
+            return Err("Resource collection failed in host".to_string());
         }
         Ok(())
+    }
+
+    pub fn resource_files(
+        &self,
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::ResourceFile>, String> {
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(m), Some(e)) => (m, e),
+            _ => return Err("CLAP processor not initialized".to_string()),
+        };
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+
+        header
+            .request_type
+            .store(REQUEST_RESOURCE_FILES, Ordering::Release);
+        header.request_status.store(0, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for resource files: {e}"));
+        }
+
+        if let Err(e) = wait_for_host_request_complete(header, events, Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to resource files: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        if status != 1 {
+            header.request_type.store(0, Ordering::Release);
+            return Err("Resource files enumeration failed in host".to_string());
+        }
+
+        let files = unsafe { read_resource_files_from_scratch(ptr) }
+            .ok_or("Failed to read resource files from scratch")?;
+        header.request_type.store(0, Ordering::Release);
+        Ok(files)
     }
 
     pub fn process_with_audio_buffers(

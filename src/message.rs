@@ -1288,17 +1288,16 @@ pub enum Action {
         instance_id: usize,
         format: String,
         directory: String,
+        shared: bool,
     },
-    TrackClapFileReferences {
+    TrackClapCollectResources {
         track_name: String,
         instance_id: usize,
-        refs: Vec<(u32, String)>,
     },
-    TrackUpdateClapFileReference {
+    TrackClapResourceFiles {
         track_name: String,
         instance_id: usize,
-        index: u32,
-        path: String,
+        files: Vec<(u32, String)>,
     },
     ClipSetPluginResourceDir {
         track_name: String,
@@ -1306,19 +1305,18 @@ pub enum Action {
         instance_id: usize,
         format: String,
         directory: String,
+        shared: bool,
     },
-    ClipClapFileReferences {
+    ClipClapCollectResources {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-        refs: Vec<(u32, String)>,
     },
-    ClipUpdateClapFileReference {
+    ClipClapResourceFiles {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-        index: u32,
-        path: String,
+        files: Vec<(u32, String)>,
     },
     TrackGetVst3Graph {
         track_name: String,

@@ -407,25 +407,32 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let format = args.next_string()?;
             let instance_id = args.next_int()? as usize;
             let directory = args.next_string()?;
+            let shared = if args.is_empty() {
+                true
+            } else {
+                args.next_int()? != 0
+            };
             Ok(Action::TrackSetPluginResourceDir {
                 track_name,
                 instance_id,
                 format,
                 directory,
+                shared,
             })
         }
-        "/plugin/update_file_reference" => {
+        "/plugin/collect_resources" => {
             let track_name = args.next_string()?;
-            let _format = args.next_string()?;
+            let format = args.next_string()?;
             let instance_id = args.next_int()? as usize;
-            let index = args.next_int()? as u32;
-            let path = args.next_string()?;
-            Ok(Action::TrackUpdateClapFileReference {
-                track_name,
-                instance_id,
-                index,
-                path,
-            })
+            match format.as_str() {
+                "clap" => Ok(Action::TrackClapCollectResources {
+                    track_name,
+                    instance_id,
+                }),
+                _ => Err(format!(
+                    "Unsupported plugin format for collect_resources: {format}"
+                )),
+            }
         }
         "/plugin/snapshot_all_states" => {
             let track_name = args.next_string()?;
@@ -760,28 +767,35 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let clip_idx = args.next_int()? as usize;
             let instance_id = args.next_int()? as usize;
             let directory = args.next_string()?;
+            let shared = if args.is_empty() {
+                true
+            } else {
+                args.next_int()? != 0
+            };
             Ok(Action::ClipSetPluginResourceDir {
                 track_name,
                 clip_idx,
                 instance_id,
                 format,
                 directory,
+                shared,
             })
         }
-        "/clip_plugin/update_file_reference" => {
+        "/clip_plugin/collect_resources" => {
             let track_name = args.next_string()?;
-            let _format = args.next_string()?;
+            let format = args.next_string()?;
             let clip_idx = args.next_int()? as usize;
             let instance_id = args.next_int()? as usize;
-            let index = args.next_int()? as u32;
-            let path = args.next_string()?;
-            Ok(Action::ClipUpdateClapFileReference {
-                track_name,
-                clip_idx,
-                instance_id,
-                index,
-                path,
-            })
+            match format.as_str() {
+                "clap" => Ok(Action::ClipClapCollectResources {
+                    track_name,
+                    clip_idx,
+                    instance_id,
+                }),
+                _ => Err(format!(
+                    "Unsupported plugin format for collect_resources: {format}"
+                )),
+            }
         }
 
         // MIDI learn
@@ -3267,25 +3281,40 @@ mod tests {
         );
         assert!(matches!(
             parse_osc_request(&packet).unwrap(),
-            Action::TrackSetPluginResourceDir { track_name, instance_id, directory, .. }
-                if track_name == "drums" && instance_id == 0 && directory == "/tmp/res"
+            Action::TrackSetPluginResourceDir { track_name, instance_id, directory, shared, .. }
+                if track_name == "drums" && instance_id == 0 && directory == "/tmp/res" && shared
         ));
 
         let packet = osc_packet_with_args(
-            "/plugin/update_file_reference",
-            "ssiis",
+            "/plugin/set_resource_dir",
+            "ssisi",
             &[
                 OscArg::String("drums".to_string()),
                 OscArg::String("clap".to_string()),
                 OscArg::Int(0),
-                OscArg::Int(2),
-                OscArg::String("/tmp/sample.wav".to_string()),
+                OscArg::String("/tmp/res".to_string()),
+                OscArg::Int(0),
             ],
         );
         assert!(matches!(
             parse_osc_request(&packet).unwrap(),
-            Action::TrackUpdateClapFileReference { track_name, instance_id, index, path, .. }
-                if track_name == "drums" && instance_id == 0 && index == 2 && path == "/tmp/sample.wav"
+            Action::TrackSetPluginResourceDir { track_name, instance_id, directory, shared, .. }
+                if track_name == "drums" && instance_id == 0 && directory == "/tmp/res" && !shared
+        ));
+
+        let packet = osc_packet_with_args(
+            "/plugin/collect_resources",
+            "ssi",
+            &[
+                OscArg::String("drums".to_string()),
+                OscArg::String("clap".to_string()),
+                OscArg::Int(0),
+            ],
+        );
+        assert!(matches!(
+            parse_osc_request(&packet).unwrap(),
+            Action::TrackClapCollectResources { track_name, instance_id }
+                if track_name == "drums" && instance_id == 0
         ));
     }
 
@@ -3396,26 +3425,24 @@ mod tests {
         );
         assert!(matches!(
             parse_osc_request(&packet).unwrap(),
-            Action::ClipSetPluginResourceDir { track_name, clip_idx, instance_id, directory, .. }
-                if track_name == "drums" && clip_idx == 1 && instance_id == 0 && directory == "/tmp/res"
+            Action::ClipSetPluginResourceDir { track_name, clip_idx, instance_id, directory, shared, .. }
+                if track_name == "drums" && clip_idx == 1 && instance_id == 0 && directory == "/tmp/res" && shared
         ));
 
         let packet = osc_packet_with_args(
-            "/clip_plugin/update_file_reference",
-            "ssiiis",
+            "/clip_plugin/collect_resources",
+            "ssii",
             &[
                 OscArg::String("drums".to_string()),
                 OscArg::String("clap".to_string()),
                 OscArg::Int(1),
                 OscArg::Int(0),
-                OscArg::Int(0),
-                OscArg::String("/tmp/sample.wav".to_string()),
             ],
         );
         assert!(matches!(
             parse_osc_request(&packet).unwrap(),
-            Action::ClipUpdateClapFileReference { track_name, clip_idx, instance_id, index, path, .. }
-                if track_name == "drums" && clip_idx == 1 && instance_id == 0 && index == 0 && path == "/tmp/sample.wav"
+            Action::ClipClapCollectResources { track_name, clip_idx, instance_id }
+                if track_name == "drums" && clip_idx == 1 && instance_id == 0
         ));
     }
 

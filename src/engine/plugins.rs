@@ -688,6 +688,7 @@ impl Engine {
             instance_id,
             ref format,
             ref directory,
+            shared,
         } = a
         else {
             return false;
@@ -702,11 +703,15 @@ impl Engine {
         };
         let dir = std::path::Path::new(directory);
         let result = if format.eq_ignore_ascii_case("CLAP") {
-            track.lock().set_clap_plugin_resource_dir(instance_id, dir)
+            track
+                .lock()
+                .set_clap_plugin_resource_dir(instance_id, dir, shared)
         } else if format.eq_ignore_ascii_case("LV2") {
             #[cfg(unix)]
             {
-                track.lock().set_lv2_plugin_resource_dir(instance_id, dir)
+                track
+                    .lock()
+                    .set_lv2_plugin_resource_dir(instance_id, dir, shared)
             }
             #[cfg(not(unix))]
             Err("LV2 is not supported on this platform".to_string())
@@ -730,6 +735,7 @@ impl Engine {
             instance_id,
             ref format,
             ref directory,
+            shared,
         } = a
         else {
             return false;
@@ -745,11 +751,11 @@ impl Engine {
         let dir = std::path::Path::new(directory);
         let mut track = track.lock();
         let result = if format.eq_ignore_ascii_case("CLAP") {
-            track.clip_set_clap_plugin_resource_dir(clip_idx, instance_id, dir)
+            track.clip_set_clap_plugin_resource_dir(clip_idx, instance_id, dir, shared)
         } else if format.eq_ignore_ascii_case("LV2") {
             #[cfg(unix)]
             {
-                track.clip_set_lv2_plugin_resource_dir(clip_idx, instance_id, dir)
+                track.clip_set_lv2_plugin_resource_dir(clip_idx, instance_id, dir, shared)
             }
             #[cfg(not(unix))]
             Err("LV2 is not supported on this platform".to_string())
@@ -766,12 +772,11 @@ impl Engine {
         false
     }
 
-    pub(crate) async fn handle_clip_clap_file_references(&mut self, a: Action) -> bool {
-        let Action::ClipClapFileReferences {
+    pub(crate) async fn handle_clip_clap_collect_resources(&mut self, a: Action) -> bool {
+        let Action::ClipClapCollectResources {
             ref track_name,
             clip_idx,
             instance_id,
-            refs: _,
         } = a
         else {
             return false;
@@ -779,23 +784,23 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => {
                 let mut track = track.lock();
-                let refs = track
-                    .clip_clap_file_references(clip_idx, instance_id)
+                let files = track
+                    .clip_clap_collect_resources(clip_idx, instance_id)
                     .unwrap_or_else(|e| {
                         tracing::warn!(
                             track_name = %track_name,
                             clip_idx,
                             instance_id,
                             error = %e,
-                            "Failed to enumerate clip CLAP file references"
+                            "Failed to collect clip CLAP resources"
                         );
                         Vec::new()
                     });
-                self.notify_clients(Ok(Action::ClipClapFileReferences {
+                self.notify_clients(Ok(Action::ClipClapResourceFiles {
                     track_name: track_name.clone(),
                     clip_idx,
                     instance_id,
-                    refs,
+                    files,
                 }))
                 .await;
             }
@@ -1322,25 +1327,24 @@ impl Engine {
         false
     }
 
-    pub(crate) async fn handle_track_clap_file_references(&mut self, a: Action) -> bool {
-        let Action::TrackClapFileReferences {
+    pub(crate) async fn handle_track_clap_collect_resources(&mut self, a: Action) -> bool {
+        let Action::TrackClapCollectResources {
             ref track_name,
             instance_id,
-            refs: _,
         } = a
         else {
             return false;
         };
         match self.track_handle_or_err(track_name) {
             Ok(track) => {
-                let refs = track.lock().clap_file_references(instance_id).unwrap_or_else(|e| {
-                            tracing::warn!(track_name = %track_name, instance_id, error = %e, "Failed to enumerate CLAP file references");
+                let files = track.lock().clap_collect_resources(instance_id).unwrap_or_else(|e| {
+                            tracing::warn!(track_name = %track_name, instance_id, error = %e, "Failed to collect CLAP resources");
                             Vec::new()
                         });
-                self.notify_clients(Ok(Action::TrackClapFileReferences {
+                self.notify_clients(Ok(Action::TrackClapResourceFiles {
                     track_name: track_name.clone(),
                     instance_id,
-                    refs,
+                    files,
                 }))
                 .await;
             }
@@ -1348,66 +1352,6 @@ impl Engine {
                 self.notify_clients(Err(e)).await;
             }
         };
-        false
-    }
-
-    pub(crate) async fn handle_track_update_clap_file_reference(&mut self, a: Action) -> bool {
-        let Action::TrackUpdateClapFileReference {
-            ref track_name,
-            instance_id,
-            index,
-            ref path,
-        } = a
-        else {
-            return false;
-        };
-
-        let track = match self.track_handle_or_err(track_name) {
-            Ok(track) => track,
-            Err(e) => {
-                self.notify_clients(Err(e)).await;
-                return true;
-            }
-        };
-        if let Err(e) = track
-            .lock()
-            .update_clap_file_reference(instance_id, index, path)
-        {
-            self.notify_clients(Err(e)).await;
-            return true;
-        }
-
-        false
-    }
-
-    pub(crate) async fn handle_clip_update_clap_file_reference(&mut self, a: Action) -> bool {
-        let Action::ClipUpdateClapFileReference {
-            ref track_name,
-            clip_idx,
-            instance_id,
-            index,
-            ref path,
-        } = a
-        else {
-            return false;
-        };
-
-        let track = match self.track_handle_or_err(track_name) {
-            Ok(track) => track,
-            Err(e) => {
-                self.notify_clients(Err(e)).await;
-                return true;
-            }
-        };
-        if let Err(e) =
-            track
-                .lock()
-                .clip_update_clap_file_reference(clip_idx, instance_id, index, path)
-        {
-            self.notify_clients(Err(e)).await;
-            return true;
-        }
-
         false
     }
 

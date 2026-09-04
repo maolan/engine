@@ -784,9 +784,10 @@ impl TrackData {
         &self,
         instance_id: usize,
         dir: &std::path::Path,
+        shared: bool,
     ) -> Result<(), String> {
         if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.set_resource_directory(dir);
+            return instance.processor.set_resource_directory(dir, shared);
         }
         Err(format!(
             "Track '{}' does not have CLAP instance id: {}",
@@ -798,25 +799,27 @@ impl TrackData {
         &self,
         instance_id: usize,
         dir: &std::path::Path,
+        shared: bool,
     ) -> Result<(), String> {
         #[cfg(unix)]
         if let Some(instance) = self.lv2_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.set_resource_directory(dir);
+            return instance.processor.set_resource_directory(dir, shared);
         }
         #[cfg(not(unix))]
-        let _ = dir;
+        let _ = (dir, shared);
         Err(format!(
             "Track '{}' does not have LV2 instance id: {}",
             self.name, instance_id
         ))
     }
 
-    pub fn clap_file_references(
+    pub fn clap_collect_resources(
         &self,
         instance_id: usize,
-    ) -> Result<Vec<maolan_plugin_protocol::protocol::FileReference>, String> {
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::ResourceFile>, String> {
         if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.file_references();
+            instance.processor.collect_resources()?;
+            return instance.processor.resource_files();
         }
         Err(format!(
             "Track '{}' does not have CLAP instance id: {}",
@@ -824,14 +827,12 @@ impl TrackData {
         ))
     }
 
-    pub fn update_clap_file_reference(
+    pub fn clap_resource_files(
         &self,
         instance_id: usize,
-        index: u32,
-        path: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::ResourceFile>, String> {
         if let Some(instance) = self.clap_plugins.iter().find(|i| i.id == instance_id) {
-            return instance.processor.update_file_reference(index, path);
+            return instance.processor.resource_files();
         }
         Err(format!(
             "Track '{}' does not have CLAP instance id: {}",
@@ -844,6 +845,7 @@ impl TrackData {
         clip_idx: usize,
         instance_id: usize,
         dir: &std::path::Path,
+        shared: bool,
     ) -> Result<(), String> {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
@@ -852,7 +854,7 @@ impl TrackData {
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
-        instance.processor.set_resource_directory(dir)
+        instance.processor.set_resource_directory(dir, shared)
     }
 
     pub fn clip_set_lv2_plugin_resource_dir(
@@ -860,6 +862,7 @@ impl TrackData {
         _clip_idx: usize,
         _instance_id: usize,
         _dir: &std::path::Path,
+        _shared: bool,
     ) -> Result<(), String> {
         #[cfg(unix)]
         {
@@ -870,17 +873,17 @@ impl TrackData {
                 .iter()
                 .find(|instance| instance.id == _instance_id)
                 .ok_or_else(|| format!("Clip LV2 instance {} not found", _instance_id))?;
-            instance.processor.set_resource_directory(_dir)
+            instance.processor.set_resource_directory(_dir, _shared)
         }
         #[cfg(not(unix))]
         Err("LV2 is not supported on this platform".to_string())
     }
 
-    pub fn clip_clap_file_references(
+    pub fn clip_clap_collect_resources(
         &mut self,
         clip_idx: usize,
         instance_id: usize,
-    ) -> Result<Vec<maolan_plugin_protocol::protocol::FileReference>, String> {
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::ResourceFile>, String> {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
         let instance = runtime
@@ -888,16 +891,15 @@ impl TrackData {
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
-        instance.processor.file_references()
+        instance.processor.collect_resources()?;
+        instance.processor.resource_files()
     }
 
-    pub fn clip_update_clap_file_reference(
+    pub fn clip_clap_resource_files(
         &mut self,
         clip_idx: usize,
         instance_id: usize,
-        index: u32,
-        path: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<maolan_plugin_protocol::protocol::ResourceFile>, String> {
         let channels = self.audio.ins.len().max(1);
         let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
         let instance = runtime
@@ -905,7 +907,7 @@ impl TrackData {
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
-        instance.processor.update_file_reference(index, path)
+        instance.processor.resource_files()
     }
 
     pub fn drain_plugin_parameter_echoes(&mut self) -> Vec<crate::message::Action> {

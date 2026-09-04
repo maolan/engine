@@ -3457,16 +3457,8 @@ impl Engine {
                     return;
                 }
             }
-            Action::TrackClapFileReferences { .. } => {
-                if Self::box_bool(self.handle_track_clap_file_references(a.clone())).await {
-                    return;
-                }
-            }
-            Action::TrackUpdateClapFileReference { .. } => {
-                if self
-                    .handle_track_update_clap_file_reference(a.clone())
-                    .await
-                {
+            Action::TrackClapCollectResources { .. } => {
+                if Self::box_bool(self.handle_track_clap_collect_resources(a.clone())).await {
                     return;
                 }
             }
@@ -3475,13 +3467,8 @@ impl Engine {
                     return;
                 }
             }
-            Action::ClipClapFileReferences { .. } => {
-                if Self::box_bool(self.handle_clip_clap_file_references(a.clone())).await {
-                    return;
-                }
-            }
-            Action::ClipUpdateClapFileReference { .. } => {
-                if Self::box_bool(self.handle_clip_update_clap_file_reference(a.clone())).await {
+            Action::ClipClapCollectResources { .. } => {
+                if Self::box_bool(self.handle_clip_clap_collect_resources(a.clone())).await {
                     return;
                 }
             }

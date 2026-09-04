@@ -578,7 +578,11 @@ impl Lv2Processor {
         result
     }
 
-    pub fn set_resource_directory(&self, dir: &std::path::Path) -> Result<(), String> {
+    pub fn set_resource_directory(
+        &self,
+        dir: &std::path::Path,
+        shared: bool,
+    ) -> Result<(), String> {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
             _ => return Err("LV2 processor not initialized".to_string()),
@@ -587,7 +591,7 @@ impl Lv2Processor {
         let header = unsafe { header_mut(ptr) };
         let path_str = dir.to_string_lossy().to_string();
         unsafe {
-            write_resource_directory_to_scratch(ptr, &path_str)
+            write_resource_directory_to_scratch(ptr, &path_str, shared)
                 .map_err(|e| format!("Failed to write resource directory: {e}"))?;
         }
         std::sync::atomic::fence(Ordering::SeqCst);
