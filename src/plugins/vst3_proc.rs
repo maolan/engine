@@ -617,15 +617,30 @@ impl Vst3Processor {
     }
 
     pub fn gui_show(&self) -> Result<(), String> {
-        if let Some(ref mapping) = self.mapping
-            && let Some(ref events) = self.events
-        {
-            let header = unsafe { header_mut(mapping.as_ptr()) };
-            header.request_type.store(3, Ordering::Release);
-            let _ = events.signal_host();
-            return Ok(());
+        let (mapping, events) = match (&self.mapping, &self.events) {
+            (Some(mapping), Some(events)) => (mapping, events),
+            _ => return Err("No active host to show GUI".to_string()),
+        };
+
+        let header = unsafe { header_mut(mapping.as_ptr()) };
+        header.request_status.store(0, Ordering::Release);
+        header.request_type.store(3, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for VST3 GUI show: {e}"));
         }
-        Err("No active host to show GUI".to_string())
+
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Host did not respond to VST3 GUI show: {e}"));
+        }
+
+        let status = header.request_status.load(Ordering::Acquire);
+        header.request_type.store(0, Ordering::Release);
+        if status != 1 {
+            return Err("VST3 GUI show failed in host".to_string());
+        }
+        Ok(())
     }
 
     pub fn gui_hide(&self) {

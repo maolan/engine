@@ -811,11 +811,25 @@ impl Lv2Processor {
             && let Some(ref events) = self.events
         {
             let header = unsafe { header_mut(mapping.as_ptr()) };
+            header.request_status.store(0, Ordering::Release);
             header.request_type.store(3, Ordering::Release);
-            let _ = events.signal_host();
-            return Ok(());
+            events
+                .signal_host()
+                .map_err(|e| format!("Failed to signal host for LV2 GUI: {e}"))?;
+            if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+                header.request_type.store(0, Ordering::Release);
+                return Err(format!("Host did not respond to LV2 GUI request: {e}"));
+            }
+            let status = header.request_status.load(Ordering::Acquire);
+            header.request_type.store(0, Ordering::Release);
+            if status == 1 {
+                Ok(())
+            } else {
+                Err("LV2 GUI show failed in host".to_string())
+            }
+        } else {
+            Err("No active host to show GUI".to_string())
         }
-        Err("No active host to show GUI".to_string())
     }
 
     pub fn gui_hide(&self) {

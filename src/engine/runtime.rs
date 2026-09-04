@@ -3482,6 +3482,12 @@ impl Engine {
                     return;
                 }
             }
+            Action::ClipGetClapParameters { .. } => {
+                if Self::box_bool(self.handle_clip_get_clap_parameters(a.clone())).await {
+                    return;
+                }
+            }
+            Action::ClipClapParameters { .. } => {}
             Action::TrackSetClapParameterAt { .. } => {
                 if Self::box_bool(self.handle_track_set_clap_parameter_at(a.clone())).await {
                     return;
@@ -3544,6 +3550,11 @@ impl Engine {
                     return;
                 }
             }
+            Action::ClipSetVst3Parameter { .. } => {
+                if Self::box_bool(self.handle_clip_set_vst3_parameter(a.clone())).await {
+                    return;
+                }
+            }
             Action::TrackSetPluginBypassed { .. } => {
                 if Self::box_bool(self.handle_track_set_plugin_bypassed(a.clone())).await {
                     return;
@@ -3555,6 +3566,12 @@ impl Engine {
                 }
             }
             Action::TrackVst3Parameters { .. } => {}
+            Action::ClipGetVst3Parameters { .. } => {
+                if Self::box_bool(self.handle_clip_get_vst3_parameters(a.clone())).await {
+                    return;
+                }
+            }
+            Action::ClipVst3Parameters { .. } => {}
             #[cfg(unix)]
             Action::TrackSetLv2ControlValue { .. } => {
                 if Self::box_bool(self.handle_track_set_lv2_control_value(a.clone())).await {
@@ -3562,8 +3579,20 @@ impl Engine {
                 }
             }
             #[cfg(unix)]
+            Action::ClipSetLv2ControlValue { .. } => {
+                if Self::box_bool(self.handle_clip_set_lv2_control_value(a.clone())).await {
+                    return;
+                }
+            }
+            #[cfg(unix)]
             Action::TrackGetLv2PluginControls { .. } => {
                 if Self::box_bool(self.handle_track_get_lv2_plugin_controls(a.clone())).await {
+                    return;
+                }
+            }
+            #[cfg(unix)]
+            Action::ClipGetLv2PluginControls { .. } => {
+                if Self::box_bool(self.handle_clip_get_lv2_plugin_controls(a.clone())).await {
                     return;
                 }
             }

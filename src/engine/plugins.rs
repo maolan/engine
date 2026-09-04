@@ -885,6 +885,37 @@ impl Engine {
         false
     }
 
+    pub(crate) async fn handle_clip_get_clap_parameters(&mut self, a: Action) -> bool {
+        let Action::ClipGetClapParameters {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().clip_get_clap_parameters(clip_idx, instance_id) {
+                Ok(parameters) => {
+                    self.notify_clients(Ok(Action::ClipClapParameters {
+                        track_name: track_name.clone(),
+                        clip_idx,
+                        instance_id,
+                        parameters,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
     pub(crate) async fn handle_track_set_clap_parameter_at(&mut self, a: Action) -> bool {
         let Action::TrackSetClapParameterAt {
             ref track_name,
@@ -1441,6 +1472,44 @@ impl Engine {
         false
     }
 
+    pub(crate) async fn handle_clip_set_vst3_parameter(&mut self, a: Action) -> bool {
+        let Action::ClipSetVst3Parameter {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            param_id,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "VST3 parameter changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) =
+                    track
+                        .lock()
+                        .clip_set_vst3_parameter(clip_idx, instance_id, param_id, value)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
     pub(crate) async fn handle_track_get_vst3_parameters(&mut self, a: Action) -> bool {
         let Action::TrackGetVst3Parameters {
             ref track_name,
@@ -1454,6 +1523,37 @@ impl Engine {
                 Ok(parameters) => {
                     self.notify_clients(Ok(Action::TrackVst3Parameters {
                         track_name: track_name.clone(),
+                        instance_id,
+                        parameters,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    pub(crate) async fn handle_clip_get_vst3_parameters(&mut self, a: Action) -> bool {
+        let Action::ClipGetVst3Parameters {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().clip_get_vst3_parameters(clip_idx, instance_id) {
+                Ok(parameters) => {
+                    self.notify_clients(Ok(Action::ClipVst3Parameters {
+                        track_name: track_name.clone(),
+                        clip_idx,
                         instance_id,
                         parameters,
                     }))
@@ -1484,6 +1584,42 @@ impl Engine {
                 Ok(controls) => {
                     self.notify_clients(Ok(Action::TrackLv2PluginControls {
                         track_name: track_name.clone(),
+                        instance_id,
+                        controls,
+                        instance_access_handle: None,
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn handle_clip_get_lv2_plugin_controls(&mut self, a: Action) -> bool {
+        let Action::ClipGetLv2PluginControls {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track
+                .lock()
+                .clip_get_lv2_plugin_controls(clip_idx, instance_id)
+            {
+                Ok(controls) => {
+                    self.notify_clients(Ok(Action::ClipLv2PluginControls {
+                        track_name: track_name.clone(),
+                        clip_idx,
                         instance_id,
                         controls,
                         instance_access_handle: None,
@@ -1785,6 +1921,7 @@ impl Engine {
             self.notify_clients(Err(e)).await;
             return true;
         }
+        self.notify_clients(Ok(a.clone())).await;
 
         false
     }
@@ -1835,6 +1972,7 @@ impl Engine {
             self.notify_clients(Err(e)).await;
             return true;
         }
+        self.notify_clients(Ok(a.clone())).await;
 
         false
     }
@@ -1860,6 +1998,7 @@ impl Engine {
             self.notify_clients(Err(e)).await;
             return true;
         }
+        self.notify_clients(Ok(a.clone())).await;
 
         false
     }
@@ -1886,6 +2025,7 @@ impl Engine {
             self.notify_clients(Err(e)).await;
             return true;
         }
+        self.notify_clients(Ok(a.clone())).await;
 
         false
     }
@@ -1929,6 +2069,38 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => {
                 if let Err(e) = track.lock().set_lv2_control_value(
+                    instance_id,
+                    index as usize,
+                    f64::from(value),
+                ) {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn handle_clip_set_lv2_control_value(&mut self, a: Action) -> bool {
+        let Action::ClipSetLv2ControlValue {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            index,
+            value,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track.lock().clip_set_lv2_control_value(
+                    clip_idx,
                     instance_id,
                     index as usize,
                     f64::from(value),

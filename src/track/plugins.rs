@@ -102,6 +102,22 @@ impl TrackData {
     }
 
     #[cfg(unix)]
+    pub fn clip_get_lv2_plugin_controls(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Vec<crate::message::Lv2ControlPortInfo>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .lv2_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip LV2 instance {} not found", instance_id))?;
+        instance.processor.control_ports()
+    }
+
+    #[cfg(unix)]
     pub(crate) fn remove_lv2_instance(&mut self, index: usize) {
         let removed = self.lv2_plugins.remove(index);
         let removed_id = removed.id;
@@ -263,6 +279,26 @@ impl TrackData {
                 "Track '{}' does not have LV2 instance id: {}",
                 self.name, instance_id
             ));
+        };
+        instance.processor.set_parameter(index as u32, param_value)
+    }
+
+    #[cfg(unix)]
+    pub fn clip_set_lv2_control_value(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        index: usize,
+        param_value: f64,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let Some(instance) = runtime
+            .lv2_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+        else {
+            return Err(format!("Clip LV2 instance {} not found", instance_id));
         };
         instance.processor.set_parameter(index as u32, param_value)
     }
@@ -517,6 +553,21 @@ impl TrackData {
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
         instance.processor.set_parameter(param_id, value)
+    }
+
+    pub fn clip_get_clap_parameters(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Vec<crate::clap::ClapParameterInfo>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .clap_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
+        Ok(instance.processor.parameter_infos())
     }
 
     pub fn set_clap_parameter_at(
@@ -1186,6 +1237,24 @@ impl TrackData {
         instance.processor.set_parameter(param_id, value as f64)
     }
 
+    pub fn clip_set_vst3_parameter(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        param_id: u32,
+        value: f32,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .vst3_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip VST3 instance {} not found", instance_id))?;
+
+        instance.processor.set_parameter(param_id, value as f64)
+    }
+
     pub fn get_vst3_parameters(
         &self,
         instance_id: usize,
@@ -1195,6 +1264,22 @@ impl TrackData {
             .iter()
             .find(|i| i.id == instance_id)
             .ok_or_else(|| format!("VST3 instance {} not found", instance_id))?;
+
+        Ok(instance.processor.parameter_infos())
+    }
+
+    pub fn clip_get_vst3_parameters(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Vec<crate::vst3::port::ParameterInfo>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .vst3_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip VST3 instance {} not found", instance_id))?;
 
         Ok(instance.processor.parameter_infos())
     }

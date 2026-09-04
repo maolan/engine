@@ -1138,6 +1138,17 @@ pub enum Action {
         param_id: u32,
         value: f64,
     },
+    ClipGetClapParameters {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    ClipClapParameters {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        parameters: Vec<ClapParameterInfo>,
+    },
     TrackSetClapParameterAt {
         track_name: String,
         instance_id: usize,
@@ -1332,6 +1343,13 @@ pub enum Action {
         param_id: u32,
         value: f32,
     },
+    ClipSetVst3Parameter {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        param_id: u32,
+        value: f32,
+    },
     TrackSetPluginBypassed {
         track_name: String,
         instance_id: usize,
@@ -1344,6 +1362,17 @@ pub enum Action {
     },
     TrackVst3Parameters {
         track_name: String,
+        instance_id: usize,
+        parameters: Vec<crate::vst3::port::ParameterInfo>,
+    },
+    ClipGetVst3Parameters {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    ClipVst3Parameters {
+        track_name: String,
+        clip_idx: usize,
         instance_id: usize,
         parameters: Vec<crate::vst3::port::ParameterInfo>,
     },
