@@ -1,8 +1,8 @@
 use crate::audio::io::AudioIO;
+use crate::hw::windows_midi::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use crate::hw::{common, options::HwOptions, traits};
 use crate::message::HwMidiEvent;
 use crate::midi::io::MidiEvent;
-use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::Write;
@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
@@ -345,36 +345,35 @@ impl HwDriver {
         let gain = self.output_gain_linear;
         let balance = self.output_balance;
         let mut interleaved = vec![0.0_f32; frames.saturating_mul(channels)];
-        if self.playing {
-            if let Some(slot) = &self.plan_slot {
-                let plan = slot.load();
-                crate::hw::ports::write_interleaved_from_arena(
-                    &plan,
-                    frames,
-                    gain,
-                    balance,
-                    |ch, frame, sample| {
-                        let idx = frame * channels + ch;
-                        if let Some(dst) = interleaved.get_mut(idx) {
-                            *dst = sample;
-                        }
-                    },
-                );
-            }
+        if self.playing
+            && let Some(slot) = &self.plan_slot
+        {
+            let plan = slot.load();
+            crate::hw::ports::write_interleaved_from_arena(
+                &plan,
+                frames,
+                gain,
+                balance,
+                |ch, frame, sample| {
+                    let idx = frame * channels + ch;
+                    if let Some(dst) = interleaved.get_mut(idx) {
+                        *dst = sample;
+                    }
+                },
+            );
         }
 
-        if let Ok(path) = std::env::var("MAOLAN_WASAPI_DUMP") {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
+        if let Ok(path) = std::env::var("MAOLAN_WASAPI_DUMP")
+            && let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-            {
-                let mut bytes = Vec::with_capacity(interleaved.len() * 4);
-                for sample in &interleaved {
-                    bytes.extend_from_slice(&sample.to_le_bytes());
-                }
-                let _ = file.write_all(&bytes);
+        {
+            let mut bytes = Vec::with_capacity(interleaved.len() * 4);
+            for sample in &interleaved {
+                bytes.extend_from_slice(&sample.to_le_bytes());
             }
+            let _ = file.write_all(&bytes);
         }
 
         self.queue_output_period(interleaved)
@@ -456,10 +455,12 @@ fn start_output_stream(
                 requested_rate,
                 period_frames,
                 mode,
-                output_rx,
-                cycle_tick_tx,
-                ready_tx.clone(),
-                shutdown_event,
+                OutputThreadChannels {
+                    output_rx,
+                    cycle_tick_tx,
+                    ready_tx: ready_tx.clone(),
+                    shutdown_event,
+                },
             );
             if let Err(err) = &result {
                 error!("WASAPI output thread failed: {err}");
@@ -547,16 +548,26 @@ fn start_input_stream(
     }
 }
 
+struct OutputThreadChannels {
+    output_rx: Receiver<Vec<f32>>,
+    cycle_tick_tx: SyncSender<()>,
+    ready_tx: SyncSender<Result<StreamInfo, String>>,
+    shutdown_event: HANDLE,
+}
+
 fn run_output_thread(
     requested_device: String,
     requested_rate: u32,
     period_frames: usize,
     mode: WasapiMode,
-    output_rx: Receiver<Vec<f32>>,
-    cycle_tick_tx: SyncSender<()>,
-    ready_tx: SyncSender<Result<StreamInfo, String>>,
-    shutdown_event: HANDLE,
+    channels: OutputThreadChannels,
 ) -> Result<(), String> {
+    let OutputThreadChannels {
+        output_rx,
+        cycle_tick_tx,
+        ready_tx,
+        shutdown_event,
+    } = channels;
     let _com = ComApartment::new()?;
     let device = select_device(eRender, &requested_device)?;
     let client = open_client(&device, eRender, requested_rate, period_frames, mode)?;
@@ -1187,7 +1198,7 @@ pub fn list_midi_output_devices() -> Vec<String> {
 
 struct MidiInputDevice {
     device: String,
-    connection: MidiInputConnection<()>,
+    connection: MidiInputConnection,
 }
 
 struct MidiOutputDevice {
@@ -1209,34 +1220,27 @@ impl MidiHub {
         }
 
         let index = parse_prefixed_index(device, MIDI_IN_PREFIX)?;
-        let mut midi_in = MidiInput::new("maolan-midi-in")
+        let midi_in = MidiInput::new("maolan-midi-in")
             .map_err(|e| format!("Failed to initialize MIDI input: {e}"))?;
-        midi_in.ignore(Ignore::None);
         let ports = midi_in.ports();
         let port = ports
             .get(index)
-            .ok_or_else(|| format!("MIDI input device index out of range: {index}"))?
-            .clone();
+            .ok_or_else(|| format!("MIDI input device index out of range: {index}"))?;
 
         let event_device = device.to_string();
         let queue = self.input_events.clone();
         let connection = midi_in
-            .connect(
-                &port,
-                "maolan-midi-input",
-                move |_stamp, data, _| {
-                    if data.is_empty() {
-                        return;
-                    }
-                    if let Ok(mut events) = queue.lock() {
-                        events.push(HwMidiEvent {
-                            device: event_device.clone(),
-                            event: MidiEvent::new(0, data.to_vec()),
-                        });
-                    }
-                },
-                (),
-            )
+            .connect(port, "maolan-midi-input", move |data: &[u8]| {
+                if data.is_empty() {
+                    return;
+                }
+                if let Ok(mut events) = queue.lock() {
+                    events.push(HwMidiEvent {
+                        device: event_device.clone(),
+                        event: MidiEvent::new(0, data.to_vec()),
+                    });
+                }
+            })
             .map_err(|e| format!("Failed to open MIDI input '{device}': {e}"))?;
 
         self.inputs.push(MidiInputDevice {
@@ -1257,10 +1261,9 @@ impl MidiHub {
         let ports = midi_out.ports();
         let port = ports
             .get(index)
-            .ok_or_else(|| format!("MIDI output device index out of range: {index}"))?
-            .clone();
+            .ok_or_else(|| format!("MIDI output device index out of range: {index}"))?;
         let connection = midi_out
-            .connect(&port, "maolan-midi-output")
+            .connect(port, "maolan-midi-output")
             .map_err(|e| format!("Failed to open MIDI output '{device}': {e}"))?;
 
         self.outputs.push(MidiOutputDevice {

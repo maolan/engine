@@ -1,12 +1,12 @@
 use std::io::{self, Write};
 use std::path::Path;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::CodecParameters as SymphoniaCodecParameters;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Frame, MediaType, Packet, RuntimeContext, SampleFormat,
@@ -85,33 +85,42 @@ fn decode_with_symphonia(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
 
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
-    let decoder_opts = DecoderOptions::default();
+    let decoder_opts = AudioDecoderOptions::default();
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)
+    let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
+        .probe(&hint, mss, format_opts, metadata_opts)
         .map_err(|e| {
             io::Error::other(format!(
                 "Symphonia failed to probe format for '{}': {e}",
                 path.display()
             ))
         })?;
-    let mut format = probed.format;
 
     let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .default_track(TrackType::Audio)
         .or_else(|| format.tracks().first())
         .ok_or_else(|| {
             io::Error::other(format!("No usable audio track in '{}'", path.display()))
         })?;
 
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(48_000);
+    let codec_params: &AudioCodecParameters = track
+        .codec_params
+        .as_ref()
+        .and_then(SymphoniaCodecParameters::audio)
+        .ok_or_else(|| {
+            io::Error::other(format!("No usable audio track in '{}'", path.display()))
+        })?;
+
+    let channels = codec_params
+        .channels
+        .as_ref()
+        .map(|c| c.count())
+        .unwrap_or(1);
+    let sample_rate = codec_params.sample_rate.unwrap_or(48_000);
     let track_id = track.id;
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &decoder_opts)
+        .make_audio_decoder(codec_params, &decoder_opts)
         .map_err(|e| {
             io::Error::other(format!(
                 "Symphonia failed to create decoder for '{}': {e}",
@@ -119,12 +128,12 @@ fn decode_with_symphonia(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
             ))
         })?;
 
-    let mut sample_buf = None;
     let mut samples = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
@@ -136,7 +145,7 @@ fn decode_with_symphonia(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -147,13 +156,9 @@ fn decode_with_symphonia(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
             ))
         })?;
 
-        if sample_buf.is_none() {
-            let spec = *decoded.spec();
-            sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
-        }
-        let buf = sample_buf.as_mut().unwrap();
-        buf.copy_interleaved_ref(decoded);
-        samples.extend_from_slice(buf.samples());
+        let mut packet_samples = Vec::new();
+        decoded.copy_to_vec_interleaved(&mut packet_samples);
+        samples.extend_from_slice(&packet_samples);
     }
 
     if samples.is_empty() {
