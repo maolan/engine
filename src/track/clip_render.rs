@@ -74,8 +74,8 @@ impl TrackData {
     #[cfg(unix)]
     pub(crate) fn clip_pitch_key(clip: &crate::audio::clip::AudioClip) -> String {
         format!(
-            "{}:{}:{}:{}:{}",
-            clip.name, clip.start, clip.end, clip.offset, clip.input_channel
+            "{}:{}:{}:{}:{}:{}",
+            clip.name, clip.start, clip.end, clip.offset, clip.input_channel, clip.reversed
         )
     }
 
@@ -90,12 +90,13 @@ impl TrackData {
             .and_then(|value| serde_json::to_string(value).ok())
             .unwrap_or_default();
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
             clip.name,
             clip.start,
             clip.end,
             clip.offset,
             clip.input_channel,
+            clip.reversed,
             input_count,
             output_count,
             graph
@@ -684,21 +685,39 @@ impl TrackData {
             } else {
                 continue;
             };
-            let start_clip_idx = absolute_from
-                .saturating_sub(clip_start)
-                .saturating_add(clip.offset);
-            if start_clip_idx >= total_frames {
+            let local_start = absolute_from.saturating_sub(clip_start);
+            let start_clip_idx = local_start.saturating_add(clip.offset);
+            if !clip.reversed && start_clip_idx >= total_frames {
                 continue;
             }
-            let max_copy = total_frames.saturating_sub(start_clip_idx);
-            if channels == 1 {
-                let len = request_len.min(max_copy).min(block.len());
-                let src_start = start_clip_idx;
-                block[..len].copy_from_slice(&buffer.samples[src_start..src_start + len]);
+            if clip.reversed {
+                let source_end = clip.offset.saturating_add(clip_len).min(total_frames);
+                if source_end <= clip.offset || local_start >= clip_len {
+                    continue;
+                }
+                let len = request_len
+                    .min(clip_len.saturating_sub(local_start))
+                    .min(source_end)
+                    .min(block.len());
+                for (i, sample) in block.iter_mut().enumerate().take(len) {
+                    let Some(clip_idx) = source_end.checked_sub(local_start.saturating_add(i) + 1)
+                    else {
+                        break;
+                    };
+                    *sample = buffer.samples[clip_idx * channels + source_channel];
+                }
             } else {
-                for i in 0..request_len.min(max_copy).min(block.len()) {
-                    let clip_idx = start_clip_idx + i;
-                    block[i] = buffer.samples[clip_idx * channels + source_channel];
+                let max_copy = total_frames.saturating_sub(start_clip_idx);
+                if channels == 1 {
+                    let len = request_len.min(max_copy).min(block.len());
+                    let src_start = start_clip_idx;
+                    block[..len].copy_from_slice(&buffer.samples[src_start..src_start + len]);
+                } else {
+                    for (i, sample) in block.iter_mut().enumerate().take(request_len.min(max_copy))
+                    {
+                        let clip_idx = start_clip_idx + i;
+                        *sample = buffer.samples[clip_idx * channels + source_channel];
+                    }
                 }
             }
         }
@@ -766,8 +785,21 @@ impl TrackData {
             }
             let from = (*segment_start).max(clip_start);
             let to = (*segment_end).min(clip_end);
-            let source_from = from.saturating_sub(clip_start).saturating_add(clip.offset);
-            let source_to = to.saturating_sub(clip_start).saturating_add(clip.offset);
+            let local_from = from.saturating_sub(clip_start);
+            let local_to = to.saturating_sub(clip_start);
+            let (source_from, source_to) = if clip.reversed {
+                (
+                    clip.offset
+                        .saturating_add(clip_len.saturating_sub(local_to)),
+                    clip.offset
+                        .saturating_add(clip_len.saturating_sub(local_from)),
+                )
+            } else {
+                (
+                    local_from.saturating_add(clip.offset),
+                    local_to.saturating_add(clip.offset),
+                )
+            };
             for (source_sample, data) in events.iter() {
                 if *source_sample < source_from {
                     continue;
@@ -778,8 +810,15 @@ impl TrackData {
                 if *source_sample >= source_to && !boundary_note_off {
                     break;
                 }
-                let absolute_sample =
-                    clip_start.saturating_add(source_sample.saturating_sub(clip.offset));
+                let local_sample = source_sample.saturating_sub(clip.offset);
+                let absolute_sample = if clip.reversed {
+                    if local_sample >= clip_len {
+                        continue;
+                    }
+                    clip_start.saturating_add(clip_len.saturating_sub(local_sample + 1))
+                } else {
+                    clip_start.saturating_add(local_sample)
+                };
                 let mut frame_idx = out_offset.saturating_add(absolute_sample - *segment_start);
                 if boundary_note_off {
                     frame_idx = frame_idx.min(frames.saturating_sub(1));

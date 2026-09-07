@@ -1409,6 +1409,7 @@ fn parse_add_clip(mut args: OscArgs<'_>) -> Result<Action, String> {
         offset,
         input_channel,
         muted,
+        reversed: false,
         peaks_file: None,
         kind,
         fade_enabled,

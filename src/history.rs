@@ -21,6 +21,7 @@ pub(crate) fn audio_clip_to_data(
         offset: clip.offset,
         input_channel: clip.input_channel,
         muted: clip.muted,
+        reversed: clip.reversed,
         peaks_file: clip.peaks_file.clone(),
         fade_enabled: clip.fade_enabled,
         fade_in_samples: clip.fade_in_samples,
@@ -49,6 +50,7 @@ pub(crate) fn midi_clip_to_data(
         offset: clip.offset,
         input_channel: clip.input_channel,
         muted: clip.muted,
+        reversed: clip.reversed,
         grouped_clips: clip.grouped_clips.iter().map(midi_clip_to_data).collect(),
     }
 }
@@ -179,6 +181,7 @@ pub fn should_record(action: &Action) -> bool {
         | Action::SetClipFade { .. }
         | Action::SetClipBounds { .. }
         | Action::SetClipMuted { .. }
+        | Action::SetClipReversed { .. }
         | Action::SetClipSourceName { .. }
         | Action::SetClipPluginGraphJson { .. }
         | Action::SetClipPitchCorrection { .. }
@@ -481,6 +484,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                             offset: clip.offset,
                             input_channel: clip.input_channel,
                             muted: clip.muted,
+                            reversed: clip.reversed,
                             peaks_file: clip.peaks_file.clone(),
                             kind: Kind::Audio,
                             fade_enabled: clip.fade_enabled,
@@ -519,6 +523,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                             offset: clip.offset,
                             input_channel: clip.input_channel,
                             muted: clip.muted,
+                            reversed: clip.reversed,
                             peaks_file: None,
                             kind: Kind::MIDI,
                             fade_enabled: true,
@@ -756,6 +761,25 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 clip_index: *clip_index,
                 kind: *kind,
                 muted,
+            })
+        }
+        Action::SetClipReversed {
+            track_name,
+            clip_index,
+            kind,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let reversed = match kind {
+                Kind::Audio => track_lock.audio.clips().get(*clip_index).cloned()?.reversed,
+                Kind::MIDI => track_lock.midi.clips().get(*clip_index).cloned()?.reversed,
+            };
+            Some(Action::SetClipReversed {
+                track_name: track_name.clone(),
+                clip_index: *clip_index,
+                kind: *kind,
+                reversed,
             })
         }
         Action::SetClipSourceName {
@@ -1567,6 +1591,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     offset: clip.offset,
                     input_channel: clip.input_channel,
                     muted: clip.muted,
+                    reversed: clip.reversed,
                     peaks_file: clip.peaks_file.clone(),
                     kind: Kind::Audio,
                     fade_enabled: clip.fade_enabled,
@@ -1595,6 +1620,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                     offset: clip.offset,
                     input_channel: clip.input_channel,
                     muted: clip.muted,
+                    reversed: clip.reversed,
                     peaks_file: None,
                     kind: Kind::MIDI,
                     fade_enabled: true,
@@ -2128,6 +2154,7 @@ mod tests {
                 offset: 0,
                 input_channel: 0,
                 muted: false,
+                reversed: false,
                 peaks_file: None,
                 kind: Kind::Audio,
                 fade_enabled: false,

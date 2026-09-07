@@ -678,6 +678,7 @@ impl Engine {
                     let max_lane = track.audio.ins.len().saturating_sub(1);
                     clip.input_channel = request.input_channel.min(max_lane);
                     clip.muted = request.muted;
+                    clip.reversed = request.reversed;
                     clip.peaks_file = request.peaks_file;
                     clip.fade_enabled = request.fade_enabled;
                     clip.fade_in_samples = request.fade_in_samples;
@@ -707,6 +708,7 @@ impl Engine {
                     let max_lane = track.midi.ins.len().saturating_sub(1);
                     clip.input_channel = request.input_channel.min(max_lane);
                     clip.muted = request.muted;
+                    clip.reversed = request.reversed;
                     track.midi.push_clip(clip);
                 }
             }
@@ -732,6 +734,7 @@ impl Engine {
         clip.offset = data.offset;
         clip.input_channel = data.input_channel;
         clip.muted = data.muted;
+        clip.reversed = data.reversed;
         clip.peaks_file = data.peaks_file.clone();
         clip.fade_enabled = data.fade_enabled;
         clip.fade_in_samples = data.fade_in_samples;
@@ -768,6 +771,7 @@ impl Engine {
         clip.offset = data.offset;
         clip.input_channel = data.input_channel;
         clip.muted = data.muted;
+        clip.reversed = data.reversed;
         clip.grouped_clips = data
             .grouped_clips
             .iter()
@@ -1225,6 +1229,44 @@ impl Engine {
             Kind::MIDI => {
                 track.midi.update_clip(clip_index, |clip| {
                     clip.muted = muted;
+                });
+            }
+        }
+    }
+
+    pub(crate) fn set_clip_reversed(
+        &self,
+        track_name: &str,
+        clip_index: usize,
+        kind: Kind,
+        reversed: bool,
+    ) {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
+            return;
+        };
+        let track = track.lock();
+        match kind {
+            Kind::Audio => {
+                track.audio.update_clip(clip_index, |clip| {
+                    clip.reversed = reversed;
+                    clip.pitch_correction_preview_name = None;
+                    clip.pitch_correction_source_name = None;
+                    clip.pitch_correction_source_offset = None;
+                    clip.pitch_correction_source_length = None;
+                    clip.pitch_correction_points.clear();
+                    clip.pitch_correction_frame_likeness = None;
+                    clip.pitch_correction_inertia_ms = None;
+                    clip.pitch_correction_formant_compensation = None;
+                });
+                #[cfg(unix)]
+                {
+                    let mut track = track;
+                    track.rt.clip_pitch_shifters.clear();
+                }
+            }
+            Kind::MIDI => {
+                track.midi.update_clip(clip_index, |clip| {
+                    clip.reversed = reversed;
                 });
             }
         }
@@ -2605,6 +2647,7 @@ impl Engine {
             offset,
             input_channel,
             muted,
+            reversed,
             ref peaks_file,
             kind,
             fade_enabled,
@@ -2633,6 +2676,7 @@ impl Engine {
             offset,
             input_channel,
             muted,
+            reversed,
             peaks_file: peaks_file.clone(),
             kind,
             fade_enabled,

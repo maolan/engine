@@ -7,6 +7,7 @@ pub struct MIDIClip {
     pub offset: usize,
     pub input_channel: usize,
     pub muted: bool,
+    pub reversed: bool,
     pub grouped_clips: Vec<MIDIClip>,
 }
 
@@ -20,6 +21,7 @@ impl MIDIClip {
             offset: 0,
             input_channel: 0,
             muted: false,
+            reversed: false,
             grouped_clips: Vec::new(),
         }
     }
@@ -39,6 +41,7 @@ mod tests {
         assert_eq!(clip.offset, 0);
         assert_eq!(clip.input_channel, 0);
         assert!(!clip.muted);
+        assert!(!clip.reversed);
         assert!(clip.grouped_clips.is_empty());
     }
 }

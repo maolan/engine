@@ -10,6 +10,7 @@ pub struct AudioClip {
     pub offset: usize,
     pub input_channel: usize,
     pub muted: bool,
+    pub reversed: bool,
     pub peaks_file: Option<String>,
     pub fade_enabled: bool,
     pub fade_in_samples: usize,
@@ -36,6 +37,7 @@ impl AudioClip {
             offset: 0,
             input_channel: 0,
             muted: false,
+            reversed: false,
             peaks_file: None,
             fade_enabled: true,
             fade_in_samples: 240,
@@ -68,6 +70,7 @@ mod tests {
         assert_eq!(clip.offset, 0);
         assert_eq!(clip.input_channel, 0);
         assert!(!clip.muted);
+        assert!(!clip.reversed);
         assert_eq!(clip.peaks_file, None);
         assert!(clip.fade_enabled);
         assert_eq!(clip.fade_in_samples, 240);

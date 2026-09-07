@@ -210,6 +210,8 @@ pub struct AudioClipData {
     pub offset: usize,
     pub input_channel: usize,
     pub muted: bool,
+    #[serde(default)]
+    pub reversed: bool,
     pub peaks_file: Option<String>,
     pub fade_enabled: bool,
     pub fade_in_samples: usize,
@@ -236,6 +238,8 @@ pub struct MidiClipData {
     pub offset: usize,
     pub input_channel: usize,
     pub muted: bool,
+    #[serde(default)]
+    pub reversed: bool,
     pub grouped_clips: Vec<MidiClipData>,
 }
 
@@ -629,6 +633,7 @@ pub enum Action {
         offset: usize,
         input_channel: usize,
         muted: bool,
+        reversed: bool,
         peaks_file: Option<String>,
         kind: Kind,
         fade_enabled: bool,
@@ -696,6 +701,12 @@ pub enum Action {
         clip_index: usize,
         kind: Kind,
         muted: bool,
+    },
+    SetClipReversed {
+        track_name: String,
+        clip_index: usize,
+        kind: Kind,
+        reversed: bool,
     },
     SetClipPluginGraphJson {
         track_name: String,
@@ -1582,6 +1593,7 @@ mod tests {
             offset: 3,
             input_channel: 1,
             muted: true,
+            reversed: false,
             peaks_file: Some("peaks/group.json".to_string()),
             fade_enabled: false,
             fade_in_samples: 10,
@@ -1631,6 +1643,7 @@ mod tests {
             offset: 2,
             input_channel: 3,
             muted: true,
+            reversed: false,
             grouped_clips: vec![MidiClipData {
                 name: "child.mid".to_string(),
                 start: 0,

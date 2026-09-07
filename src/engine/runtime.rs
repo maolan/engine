@@ -3729,6 +3729,14 @@ impl Engine {
             } => {
                 self.set_clip_muted(track_name, clip_index, kind, muted);
             }
+            Action::SetClipReversed {
+                ref track_name,
+                clip_index,
+                kind,
+                reversed,
+            } => {
+                self.set_clip_reversed(track_name, clip_index, kind, reversed);
+            }
             Action::SetClipPluginGraphJson {
                 ref track_name,
                 clip_index,
