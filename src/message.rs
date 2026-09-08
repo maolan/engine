@@ -212,6 +212,8 @@ pub struct AudioClipData {
     pub muted: bool,
     #[serde(default)]
     pub reversed: bool,
+    #[serde(default)]
+    pub gain_db: f32,
     pub peaks_file: Option<String>,
     pub fade_enabled: bool,
     pub fade_in_samples: usize,
@@ -634,6 +636,7 @@ pub enum Action {
         input_channel: usize,
         muted: bool,
         reversed: bool,
+        gain_db: f32,
         peaks_file: Option<String>,
         kind: Kind,
         fade_enabled: bool,
@@ -707,6 +710,12 @@ pub enum Action {
         clip_index: usize,
         kind: Kind,
         reversed: bool,
+    },
+    SetClipGainDb {
+        track_name: String,
+        clip_index: usize,
+        kind: Kind,
+        gain_db: f32,
     },
     SetClipPluginGraphJson {
         track_name: String,
@@ -1594,6 +1603,7 @@ mod tests {
             input_channel: 1,
             muted: true,
             reversed: false,
+            gain_db: 0.0,
             peaks_file: Some("peaks/group.json".to_string()),
             fade_enabled: false,
             fade_in_samples: 10,

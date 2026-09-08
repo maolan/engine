@@ -721,6 +721,14 @@ impl TrackData {
                 }
             }
         }
+        if clip.gain_db != 0.0 {
+            let gain = 10.0f32.powf(clip.gain_db / 20.0);
+            for channel in &mut input_blocks {
+                for sample in channel {
+                    *sample *= gain;
+                }
+            }
+        }
         Self::apply_audio_clip_fades(clip, clip_start, clip_len, absolute_from, &mut input_blocks);
         Some(if has_clip_plugins {
             self.process_clip_plugin_runtime_segment(

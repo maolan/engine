@@ -218,6 +218,7 @@ pub(crate) struct ClipAddRequest<'a> {
     input_channel: usize,
     muted: bool,
     reversed: bool,
+    gain_db: f32,
     peaks_file: Option<String>,
     kind: Kind,
     fade_enabled: bool,

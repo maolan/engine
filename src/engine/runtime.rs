@@ -1162,6 +1162,7 @@ impl Engine {
             | Action::SetStepRecording(_)
             | Action::StepRecordMidiNote { .. }
             | Action::SetClipIdentity { .. }
+            | Action::SetClipGainDb { .. }
             | Action::SetSessionPath(_)
             | Action::ClearHistory
             | Action::BeginSessionRestore
@@ -3736,6 +3737,14 @@ impl Engine {
                 reversed,
             } => {
                 self.set_clip_reversed(track_name, clip_index, kind, reversed);
+            }
+            Action::SetClipGainDb {
+                ref track_name,
+                clip_index,
+                kind,
+                gain_db,
+            } => {
+                self.set_clip_gain_db(track_name, clip_index, kind, gain_db);
             }
             Action::SetClipPluginGraphJson {
                 ref track_name,

@@ -679,6 +679,7 @@ impl Engine {
                     clip.input_channel = request.input_channel.min(max_lane);
                     clip.muted = request.muted;
                     clip.reversed = request.reversed;
+                    clip.gain_db = request.gain_db;
                     clip.peaks_file = request.peaks_file;
                     clip.fade_enabled = request.fade_enabled;
                     clip.fade_in_samples = request.fade_in_samples;
@@ -735,6 +736,7 @@ impl Engine {
         clip.input_channel = data.input_channel;
         clip.muted = data.muted;
         clip.reversed = data.reversed;
+        clip.gain_db = data.gain_db;
         clip.peaks_file = data.peaks_file.clone();
         clip.fade_enabled = data.fade_enabled;
         clip.fade_in_samples = data.fade_in_samples;
@@ -754,6 +756,7 @@ impl Engine {
             .map(Self::audio_clip_from_data)
             .collect();
         for child in &mut clip.grouped_clips {
+            child.gain_db = 0.0;
             child.fade_enabled = false;
             child.fade_in_samples = 0;
             child.fade_out_samples = 0;
@@ -1231,6 +1234,24 @@ impl Engine {
                     clip.muted = muted;
                 });
             }
+        }
+    }
+
+    pub(crate) fn set_clip_gain_db(
+        &self,
+        track_name: &str,
+        clip_index: usize,
+        kind: Kind,
+        gain_db: f32,
+    ) {
+        let Some(track) = self.state.lock().tracks.get(track_name).cloned() else {
+            return;
+        };
+        let track = track.lock();
+        if kind == Kind::Audio {
+            track.audio.update_clip(clip_index, |clip| {
+                clip.gain_db = gain_db.clamp(-48.0, 24.0);
+            });
         }
     }
 
@@ -2648,6 +2669,7 @@ impl Engine {
             input_channel,
             muted,
             reversed,
+            gain_db,
             ref peaks_file,
             kind,
             fade_enabled,
@@ -2677,6 +2699,7 @@ impl Engine {
             input_channel,
             muted,
             reversed,
+            gain_db,
             peaks_file: peaks_file.clone(),
             kind,
             fade_enabled,
