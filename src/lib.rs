@@ -1,5 +1,12 @@
 mod audio;
 pub mod audio_codec;
+#[cfg(target_os = "macos")]
+pub mod audio_devices {
+    pub use crate::hw::coreaudio::{
+        AudioDeviceDescriptor, default_input_device_id, default_output_device_id,
+        discover_coreaudio_audio_devices,
+    };
+}
 #[cfg(target_os = "freebsd")]
 pub mod audio_devices {
     pub use crate::hw::freebsd::{AudioDeviceDescriptor, discover_freebsd_audio_devices};

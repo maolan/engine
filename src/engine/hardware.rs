@@ -1,8 +1,14 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::hw::alsa::{HwDriver, HwOptions, MidiHub};
+#[cfg(target_os = "macos")]
+use crate::hw::coreaudio::HwDriver;
+#[cfg(target_os = "macos")]
+use crate::hw::coremidi::MidiHub;
 #[cfg(unix)]
 use crate::hw::jack::JackRuntime;
+#[cfg(target_os = "macos")]
+use crate::hw::options::HwOptions;
 #[cfg(target_os = "windows")]
 use crate::hw::options::HwOptions;
 #[cfg(target_os = "freebsd")]
@@ -17,6 +23,8 @@ use crate::hw::traits::HwWorkerDriver;
 use crate::hw::wasapi::{self, HwDriver};
 #[cfg(target_os = "linux")]
 use crate::workers::alsa_worker::HwWorker;
+#[cfg(target_os = "macos")]
+use crate::workers::coreaudio_worker::HwWorker;
 #[cfg(target_os = "freebsd")]
 use crate::workers::oss_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
@@ -29,7 +37,7 @@ use crate::{
     hw::{config, traits::HwDevice},
     message::{Action, Message},
 };
-#[cfg(unix)]
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
 use std::fs::read_dir;
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
@@ -42,7 +50,7 @@ impl Engine {
         devices
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
     pub(crate) fn discover_midi_hw_devices_from_dir(path: &str, prefixes: &[&str]) -> Vec<String> {
         let devices = read_dir(path)
             .map(|rd| {
@@ -74,6 +82,12 @@ impl Engine {
             devices.extend(wasapi::list_midi_output_devices());
             Self::finalize_midi_hw_devices(devices)
         };
+        #[cfg(target_os = "macos")]
+        let devices = {
+            let mut devices = crate::hw::coremidi::list_midi_input_devices();
+            devices.extend(crate::hw::coremidi::list_midi_output_devices());
+            Self::finalize_midi_hw_devices(devices)
+        };
         devices
     }
 
@@ -84,7 +98,12 @@ impl Engine {
         bits: i32,
         hw_opts: HwOptions,
     ) -> Result<HwDriver, String> {
-        #[cfg(any(target_os = "windows", target_os = "freebsd", target_os = "linux"))]
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "macos"
+        ))]
         {
             HwDriver::new_with_options(device, _input_device, sample_rate_hz, bits, hw_opts)
                 .map_err(|e| e.to_string())
@@ -99,6 +118,8 @@ impl Engine {
     pub(crate) fn hw_profile_backend_label(_device: &str) -> &'static str {
         #[cfg(target_os = "windows")]
         let label = "WASAPI";
+        #[cfg(target_os = "macos")]
+        let label = "CoreAudio";
         #[cfg(target_os = "linux")]
         let label = "ALSA";
         #[cfg(target_os = "freebsd")]

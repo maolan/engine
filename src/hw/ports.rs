@@ -1,16 +1,18 @@
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 use crate::audio::io::AudioIO;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 use std::sync::Arc;
 
-#[cfg(unix)]
+/// Legacy-port helpers only used by the fd-based backends (ALSA/OSS/sndio).
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 pub fn has_audio_connections(port: &Arc<AudioIO>) -> bool {
     port.connection_count
         .load(std::sync::atomic::Ordering::Relaxed)
         > 0
 }
 
-#[cfg(unix)]
+/// Legacy-port helpers only used by the fd-based backends (ALSA/OSS/sndio).
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 pub fn fill_ports_from_interleaved_buffer(
     ports: &[Arc<AudioIO>],
     _frames: usize,
@@ -112,7 +114,8 @@ pub fn clear_hw_arena_buffers(plan: &crate::render_plan::RenderPlan) {
     }
 }
 
-#[cfg(unix)]
+/// Legacy-port helpers only used by the fd-based backends (ALSA/OSS/sndio).
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 pub fn write_interleaved_from_ports(
     ports: &[Arc<AudioIO>],
     frames: usize,
@@ -139,6 +142,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
     fn fill_ports_from_interleaved_marks_ports_finished_without_legacy_writes() {
         let connected = Arc::new(AudioIO::new(4));
         let disconnected = Arc::new(AudioIO::new(4));
@@ -210,6 +214,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
     fn write_interleaved_from_ports_writes_silence_without_plan() {
         let left = Arc::new(AudioIO::new(3));
         let right = Arc::new(AudioIO::new(3));

@@ -76,6 +76,11 @@ impl<B: Backend> HwWorker<B> {
             unsafe {
                 let _ = libc::pthread_setname_np(thread, c_name.as_ptr());
             }
+            #[cfg(target_os = "macos")]
+            unsafe {
+                // macOS names the current thread and takes no thread handle.
+                let _ = libc::pthread_setname_np(c_name.as_ptr());
+            }
             #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
             unsafe {
                 libc::pthread_set_name_np(thread, c_name.as_ptr());

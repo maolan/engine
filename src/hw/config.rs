@@ -1,4 +1,6 @@
 pub const HW_PROFILE_ENV: &str = "MAOLAN_HW_PROFILE";
+#[cfg(target_os = "macos")]
+pub const COREAUDIO_ASSIST_AUTONOMOUS_ENV: &str = "MAOLAN_COREAUDIO_ASSIST_AUTONOMOUS";
 #[cfg(target_os = "freebsd")]
 pub const OSS_ASSIST_AUTONOMOUS_ENV: &str = "MAOLAN_OSS_ASSIST_AUTONOMOUS";
 #[cfg(target_os = "linux")]
