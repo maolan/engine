@@ -2785,13 +2785,13 @@ mod tests {
             &[
                 OscArg::String("drums".to_string()),
                 OscArg::String("clap".to_string()),
-                OscArg::String("rs.maolan.widener".to_string()),
+                OscArg::String("rs.maolan.stereo".to_string()),
             ],
         );
         assert!(matches!(
             parse_osc_request(&packet).unwrap(),
             Action::TrackLoadClapPlugin { track_name, plugin_id, instance_id: None }
-                if track_name == "drums" && plugin_id == "rs.maolan.widener"
+                if track_name == "drums" && plugin_id == "rs.maolan.stereo"
         ));
 
         let packet = osc_packet_with_args(
