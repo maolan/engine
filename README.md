@@ -31,9 +31,3 @@ Plugins are never loaded directly into the DAW. If a plugin crashes, only its ho
 | VST3 hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
 | LV2 hosting | ✅ OOP | ✅ OOP | ✅ OOP | N/A |
 | GUI embedding | X11 | — | — | HWND (`SetParent`) |
-
-This crate is under active development alongside the main Maolan application:
-
-- Repository: <https://github.com/maolan/maolan>
-
-Platform integrations depend on system libraries and host/plugin compatibility.
