@@ -11,7 +11,7 @@ It provides:
 - Track routing and plugin graph routing
 - Offline bounce and export helpers
 - **Out-of-process (OOP) plugin hosting** for CLAP, VST3, and LV2 (Unix) — each plugin runs in a separate OS process for crash isolation
-- Platform audio backends for Linux, FreeBSD, and Windows (WASAPI)
+- Platform audio backends for Linux, FreeBSD, macOS (CoreAudio), and Windows (WASAPI)
 
 ## Architecture
 
@@ -24,13 +24,13 @@ Plugins are never loaded directly into the DAW. If a plugin crashes, only its ho
 
 ## Platform support
 
-| Feature | Linux | FreeBSD | Windows |
-|---------|-------|-------|---------|---------|
-| Audio backend | ALSA, JACK |  | ALSA, JACK | WASAPI |
+| Feature | Linux | FreeBSD | macOS | Windows |
+|---------|-------|---------|-------|---------|
+| Audio backend | ALSA, JACK | OSS, JACK | CoreAudio | WASAPI |
 | CLAP hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
 | VST3 hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
-| LV2 hosting | ✅ OOP | ❌ | ✅ OOP | N/A |
-| GUI embedding | X11 | — | X11 | HWND (`SetParent`) |
+| LV2 hosting | ✅ OOP | ✅ OOP | ✅ OOP | N/A |
+| GUI embedding | X11 | — | — | HWND (`SetParent`) |
 
 This crate is under active development alongside the main Maolan application:
 
