@@ -775,7 +775,6 @@ pub enum Action {
     RequestMeterSnapshot,
     MeterSnapshot {
         hw_out_db: Arc<Vec<f32>>,
-        hw_out_lufs: Option<crate::loudness::LoudnessValues>,
         track_meters: Arc<Vec<(String, Vec<f32>)>>,
     },
     RequestTrackList,

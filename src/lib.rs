@@ -19,8 +19,6 @@ pub mod executor;
 pub mod history;
 mod hw;
 pub mod kind;
-pub mod loudness;
-pub use loudness::LoudnessValues;
 pub mod message;
 pub mod meter;
 pub mod midi;

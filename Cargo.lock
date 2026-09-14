@@ -2200,13 +2200,12 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "alsa",
  "arc-swap",
  "basedrop",
  "byteorder",
- "ebur128",
  "jack",
  "maolan-plugin-protocol",
  "midly",

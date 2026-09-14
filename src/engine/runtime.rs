@@ -265,8 +265,6 @@ impl Engine {
             pending_node_jobs: VecDeque::new(),
             latest_hw_out_meter_db: Arc::new(Vec::new()),
             latest_track_meter_snapshot: Arc::new(Vec::new()),
-            hw_out_loudness_meter: None,
-            latest_hw_out_lufs: None,
             history: History::default(),
             history_group: None,
             history_suspended: false,
@@ -1432,9 +1430,6 @@ impl Engine {
             return;
         }
 
-        // Loudness must be fed every cycle so integrated LUFS is accurate.
-        self.feed_hw_out_loudness_meter();
-
         let should_notify_interval = self.should_publish_hw_out_meters();
         if !should_notify_interval {
             return;
@@ -1462,39 +1457,6 @@ impl Engine {
         if should_notify {
             self.maybe_notify_hw_out_meter(meter_db).await;
         }
-    }
-
-    fn feed_hw_out_loudness_meter(&mut self) {
-        let Some(info) = self.hw_driver_info else {
-            return;
-        };
-        let plan = self.executor.plan();
-        let channels = plan.hw_out_map.len();
-        if channels == 0 {
-            return;
-        }
-        let sample_rate = info.sample_rate as u32;
-
-        let needs_recreate = self
-            .hw_out_loudness_meter
-            .as_ref()
-            .is_none_or(|m| m.channels() != channels || m.sample_rate() != sample_rate);
-        if needs_recreate {
-            self.hw_out_loudness_meter =
-                crate::loudness::LoudnessMeter::new(channels, sample_rate).ok();
-        }
-
-        if let Some(meter) = self.hw_out_loudness_meter.as_mut() {
-            let interleaved = crate::hw::common::interleaved_hw_out_samples(plan);
-            meter.feed_interleaved(&interleaved);
-        }
-    }
-
-    fn update_hw_out_lufs_readout(&mut self) {
-        self.latest_hw_out_lufs = self
-            .hw_out_loudness_meter
-            .as_ref()
-            .map(|meter| meter.values());
     }
 
     pub(crate) fn preload_track_clips_spawn(&self) {
@@ -2472,16 +2434,11 @@ impl Engine {
     }
 
     pub(crate) fn publish_meter_snapshot(&mut self) {
-        // Query LUFS at the same cadence as the VU meter snapshot rather than
-        // every audio cycle, which keeps the CPU cost low.
-        self.update_hw_out_lufs_readout();
-
         let snapshot = self.meter_snapshot_producer.write_buffer();
         snapshot.hw_out_db.clear();
         snapshot
             .hw_out_db
             .extend(self.latest_hw_out_meter_db.iter().copied());
-        snapshot.hw_out_lufs = self.latest_hw_out_lufs;
         snapshot.track_meters.clear();
         snapshot
             .track_meters
@@ -2988,7 +2945,6 @@ impl Engine {
                 self.update_meter_decay_after_stop();
                 self.notify_clients(Ok(Action::MeterSnapshot {
                     hw_out_db: self.latest_hw_out_meter_db.clone(),
-                    hw_out_lufs: self.latest_hw_out_lufs,
                     track_meters: self.latest_track_meter_snapshot.clone(),
                 }))
                 .await;
