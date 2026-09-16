@@ -30,10 +30,12 @@ mod instances;
 mod plugins;
 mod process;
 mod session;
+mod streaming;
 mod track_routing;
 #[cfg(unix)]
 pub use instances::Lv2Instance;
 pub use instances::{ClapInstance, Vst3Instance};
+pub(crate) use streaming::{DEFAULT_RING_BUFFER_MULTIPLIER, set_ring_buffer_multiplier};
 
 type MidiClipEvents = Arc<Vec<(usize, Vec<u8>)>>;
 
@@ -68,9 +70,11 @@ pub(crate) struct TrackIoCounts {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AudioClipBuffer {
-    channels: usize,
-    samples: Vec<f32>,
+pub(crate) enum AudioClipBuffer {
+    /// Whole file decoded into memory (fast path for session WAV files).
+    Buffered { channels: usize, samples: Vec<f32> },
+    /// Incrementally decoded by a producer thread into per-channel rings.
+    Streaming(Arc<streaming::StreamingClipBuffer>),
 }
 
 #[cfg(unix)]
@@ -1167,7 +1171,7 @@ mod tests {
         track.audio.push_clip(clip);
         track.rt.audio_clip_cache.insert(
             "clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.8, 0.0, 0.0, 0.0],
             }),
@@ -1198,7 +1202,7 @@ mod tests {
         track.audio.push_clip(clip);
         track.rt.audio_clip_cache.insert(
             "clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.8, 0.0, 0.0, 0.0],
             }),
@@ -1252,7 +1256,7 @@ mod tests {
         track.audio.push_clip(clip);
         track.rt.audio_clip_cache.insert(
             "clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.8, 0.0, 0.0, 0.0],
             }),
@@ -1808,14 +1812,14 @@ mod tests {
         track.audio.push_clip(group);
         track.rt.audio_clip_cache.insert(
             "active".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.6, 0.0, 0.0, 0.0],
             }),
         );
         track.rt.audio_clip_cache.insert(
             "muted".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.9, 0.0, 0.0, 0.0],
             }),
@@ -2259,7 +2263,7 @@ mod tests {
 
         track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.8, 0.0, 0.0, 0.0],
             }),
@@ -2295,7 +2299,7 @@ mod tests {
 
         track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.5; 16],
             }),
@@ -2336,7 +2340,7 @@ mod tests {
 
         track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.1, 0.2, 0.3, 0.4],
             }),
@@ -2379,7 +2383,7 @@ mod tests {
 
         track.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.1, 0.2, 0.3, 0.4],
             }),
@@ -2427,14 +2431,14 @@ mod tests {
 
         track.rt.audio_clip_cache.insert(
             "clip1".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.5, 0.0, 0.0, 0.0],
             }),
         );
         track.rt.audio_clip_cache.insert(
             "clip2".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.3, 0.0, 0.0, 0.0],
             }),
@@ -2639,14 +2643,14 @@ mod tests {
 
         track.rt.audio_clip_cache.insert(
             "clip1".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.1; 8],
             }),
         );
         track.rt.audio_clip_cache.insert(
             "clip2".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.7; 8],
             }),
@@ -2700,7 +2704,7 @@ mod tests {
         child.audio.push_clip(clip);
         child.rt.audio_clip_cache.insert(
             "session_clip".to_string(),
-            Arc::new(AudioClipBuffer {
+            Arc::new(AudioClipBuffer::Buffered {
                 channels: 1,
                 samples: vec![0.1, 0.2, 0.3, 0.4],
             }),

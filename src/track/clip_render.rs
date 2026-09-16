@@ -33,20 +33,59 @@ impl TrackData {
         if samples.is_empty() {
             return None;
         }
-        Some(AudioClipBuffer { channels, samples })
+        Some(AudioClipBuffer::Buffered { channels, samples })
     }
 
+    /// Load a clip's audio, choosing between the in-memory `Buffered` fast
+    /// path and the streaming producer based on the source file.
+    ///
+    /// WAV files already at the engine sample rate take the `Buffered` fast
+    /// path (DAW session files are pre-resampled at import time). Everything
+    /// else (mp3/flac/ogg at any rate, or WAV at a foreign rate) uses a
+    /// streaming producer that decodes incrementally and resamples to the
+    /// engine rate. If streaming setup fails, fall back to the whole-file
+    /// `Buffered` decode.
     pub(crate) fn clip_buffer(&mut self, clip_name: &str) -> Option<Arc<AudioClipBuffer>> {
         if let Some(cached) = self.rt.audio_clip_cache.get(clip_name) {
             return Some(cached.clone());
         }
         let path = self.resolve_clip_path(clip_name);
+        let engine_rate = self.sample_rate.round().max(1.0) as u32;
+        let is_wav = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
+        let probed = crate::audio_codec::probe_audio_file(&path).ok();
+        let use_buffered = probed
+            .as_ref()
+            .is_none_or(|info| is_wav && info.sample_rate == engine_rate);
+
         let load_started = std::time::Instant::now();
-        let loaded = Self::load_audio_clip_buffer(&path)?;
+        let loaded = if use_buffered {
+            Self::load_audio_clip_buffer(&path)
+        } else {
+            let period_frames = self.process_block_size().max(1);
+            let multiplier = streaming::ring_buffer_multiplier();
+            match streaming::StreamingClipBuffer::start(
+                &path,
+                engine_rate as usize,
+                period_frames,
+                multiplier,
+            ) {
+                Ok(stream) => Some(AudioClipBuffer::Streaming(Arc::new(stream))),
+                Err(e) => {
+                    tracing::warn!(
+                        "Streaming setup failed for '{}' ({e}); falling back to buffered decode",
+                        path.display()
+                    );
+                    Self::load_audio_clip_buffer(&path)
+                }
+            }
+        }?;
         let elapsed = load_started.elapsed().as_secs_f64() * 1000.0;
         if elapsed > 20.0 {
             tracing::warn!(
-                "Slow load_audio_clip_buffer for '{}' ({}) took {:.1}ms",
+                "Slow clip_buffer load for '{}' ({}) took {:.1}ms",
                 clip_name,
                 path.display(),
                 elapsed
@@ -57,6 +96,13 @@ impl TrackData {
             .audio_clip_cache
             .insert(clip_name.to_string(), loaded.clone());
         Some(loaded)
+    }
+
+    /// Whole-file fallback for clips that need random access (pitch
+    /// correction, reversed playback) but were loaded as streaming buffers.
+    fn buffered_fallback(&self, playback_name: &str) -> Option<Arc<AudioClipBuffer>> {
+        let path = self.resolve_clip_path(playback_name);
+        Self::load_audio_clip_buffer(&path).map(Arc::new)
     }
 
     pub(crate) fn clip_playback_name(clip: &crate::audio::clip::AudioClip) -> &str {
@@ -552,13 +598,28 @@ impl TrackData {
 
         #[cfg(unix)]
         if !clip.pitch_correction_points.is_empty() {
+            // Pitch correction needs random access into the decoded samples;
+            // a streaming buffer falls back to a whole-file buffered decode.
+            let buffered = match buffer.as_ref() {
+                AudioClipBuffer::Buffered { .. } => Some(buffer.clone()),
+                AudioClipBuffer::Streaming(_) => self.buffered_fallback(playback_name),
+            };
+            let buffer = buffered?;
+            let AudioClipBuffer::Buffered {
+                channels: buffer_channels,
+                samples,
+            } = buffer.as_ref()
+            else {
+                return None;
+            };
+            let buffer_channels = *buffer_channels;
             let input_count = self.audio.ins.len().max(1);
-            let effective_channels = if buffer.channels == 1 {
+            let effective_channels = if buffer_channels == 1 {
                 1
             } else {
-                input_count.min(buffer.channels).max(1)
+                input_count.min(buffer_channels).max(1)
             };
-            let total_frames = buffer.samples.len() / buffer.channels.max(1);
+            let total_frames = samples.len() / buffer_channels.max(1);
             if total_frames == 0 {
                 return None;
             }
@@ -600,21 +661,19 @@ impl TrackData {
                         for (ch, channel_input) in
                             input.iter_mut().enumerate().take(effective_channels)
                         {
-                            let source_channel = if buffer.channels == 1 { 0 } else { ch };
-                            if buffer.channels == 1 {
+                            let source_channel = if buffer_channels == 1 { 0 } else { ch };
+                            if buffer_channels == 1 {
                                 let src_start = block_start.min(total_frames);
                                 let src_end = (block_start + block_size).min(total_frames);
                                 let len = src_end.saturating_sub(src_start);
-                                channel_input[..len]
-                                    .copy_from_slice(&buffer.samples[src_start..src_end]);
+                                channel_input[..len].copy_from_slice(&samples[src_start..src_end]);
                             } else {
                                 for (i, sample) in
                                     channel_input.iter_mut().enumerate().take(block_size)
                                 {
                                     let source_frame = block_start.saturating_add(i);
                                     *sample = if source_frame < total_frames {
-                                        buffer.samples
-                                            [source_frame * buffer.channels + source_channel]
+                                        samples[source_frame * buffer_channels + source_channel]
                                     } else {
                                         0.0
                                     };
@@ -655,72 +714,106 @@ impl TrackData {
             });
         }
 
-        let channels = buffer.channels.max(1);
-        let total_frames = buffer.samples.len() / channels;
-        tracing::debug!(
-            "render_audio_clip_segment buffer '{}' channels={} total_frames={} first_sample={} max_abs={}",
-            playback_name,
-            channels,
-            total_frames,
-            buffer.samples.first().copied().unwrap_or(0.0),
+        // Reversed playback reads the source backwards, which the streaming
+        // delay line cannot do; fall back to a whole-file buffered decode.
+        let buffer = if clip.reversed && matches!(buffer.as_ref(), AudioClipBuffer::Streaming(_)) {
+            self.buffered_fallback(playback_name)?
+        } else {
             buffer
-                .samples
-                .iter()
-                .map(|s| s.abs())
-                .fold(0.0_f32, |a, b| a.max(b))
-        );
-        if total_frames == 0 {
-            return None;
-        }
-        let mut input_blocks = vec![vec![0.0; request_len]; self.audio.ins.len().max(1)];
-        for (in_channel, block) in input_blocks
-            .iter_mut()
-            .enumerate()
-            .take(self.audio.ins.len().max(1))
-        {
-            let source_channel = if channels == 1 {
-                0
-            } else if in_channel < channels {
-                in_channel
-            } else {
-                continue;
-            };
-            let local_start = absolute_from.saturating_sub(clip_start);
-            let start_clip_idx = local_start.saturating_add(clip.offset);
-            if !clip.reversed && start_clip_idx >= total_frames {
-                continue;
-            }
-            if clip.reversed {
-                let source_end = clip.offset.saturating_add(clip_len).min(total_frames);
-                if source_end <= clip.offset || local_start >= clip_len {
-                    continue;
-                }
-                let len = request_len
-                    .min(clip_len.saturating_sub(local_start))
-                    .min(source_end)
-                    .min(block.len());
-                for (i, sample) in block.iter_mut().enumerate().take(len) {
-                    let Some(clip_idx) = source_end.checked_sub(local_start.saturating_add(i) + 1)
-                    else {
-                        break;
+        };
+
+        let mut input_blocks = match buffer.as_ref() {
+            AudioClipBuffer::Streaming(stream) => {
+                let clip_channels = stream.channels().max(1);
+                let input_count = self.audio.ins.len().max(1);
+                let local_start = absolute_from.saturating_sub(clip_start);
+                let source_from = clip.offset.saturating_add(local_start);
+                let mut stream_blocks = vec![vec![0.0_f32; request_len]; clip_channels];
+                stream.read_frames(source_from, request_len, &mut stream_blocks);
+                let mut blocks = vec![vec![0.0_f32; request_len]; input_count];
+                for (in_channel, block) in blocks.iter_mut().enumerate() {
+                    let source_channel = if clip_channels == 1 {
+                        0
+                    } else if in_channel < clip_channels {
+                        in_channel
+                    } else {
+                        continue;
                     };
-                    *sample = buffer.samples[clip_idx * channels + source_channel];
+                    block.copy_from_slice(&stream_blocks[source_channel]);
                 }
-            } else {
-                let max_copy = total_frames.saturating_sub(start_clip_idx);
-                if channels == 1 {
-                    let len = request_len.min(max_copy).min(block.len());
-                    let src_start = start_clip_idx;
-                    block[..len].copy_from_slice(&buffer.samples[src_start..src_start + len]);
-                } else {
-                    for (i, sample) in block.iter_mut().enumerate().take(request_len.min(max_copy))
-                    {
-                        let clip_idx = start_clip_idx + i;
-                        *sample = buffer.samples[clip_idx * channels + source_channel];
+                blocks
+            }
+            AudioClipBuffer::Buffered { channels, samples } => {
+                let channels = (*channels).max(1);
+                let total_frames = samples.len() / channels;
+                tracing::debug!(
+                    "render_audio_clip_segment buffer '{}' channels={} total_frames={} first_sample={} max_abs={}",
+                    playback_name,
+                    channels,
+                    total_frames,
+                    samples.first().copied().unwrap_or(0.0),
+                    samples
+                        .iter()
+                        .map(|s| s.abs())
+                        .fold(0.0_f32, |a, b| a.max(b))
+                );
+                if total_frames == 0 {
+                    return None;
+                }
+                let mut input_blocks = vec![vec![0.0; request_len]; self.audio.ins.len().max(1)];
+                for (in_channel, block) in input_blocks
+                    .iter_mut()
+                    .enumerate()
+                    .take(self.audio.ins.len().max(1))
+                {
+                    let source_channel = if channels == 1 {
+                        0
+                    } else if in_channel < channels {
+                        in_channel
+                    } else {
+                        continue;
+                    };
+                    let local_start = absolute_from.saturating_sub(clip_start);
+                    let start_clip_idx = local_start.saturating_add(clip.offset);
+                    if !clip.reversed && start_clip_idx >= total_frames {
+                        continue;
+                    }
+                    if clip.reversed {
+                        let source_end = clip.offset.saturating_add(clip_len).min(total_frames);
+                        if source_end <= clip.offset || local_start >= clip_len {
+                            continue;
+                        }
+                        let len = request_len
+                            .min(clip_len.saturating_sub(local_start))
+                            .min(source_end)
+                            .min(block.len());
+                        for (i, sample) in block.iter_mut().enumerate().take(len) {
+                            let Some(clip_idx) =
+                                source_end.checked_sub(local_start.saturating_add(i) + 1)
+                            else {
+                                break;
+                            };
+                            *sample = samples[clip_idx * channels + source_channel];
+                        }
+                    } else {
+                        let max_copy = total_frames.saturating_sub(start_clip_idx);
+                        if channels == 1 {
+                            let len = request_len.min(max_copy).min(block.len());
+                            let src_start = start_clip_idx;
+                            block[..len].copy_from_slice(&samples[src_start..src_start + len]);
+                        } else {
+                            for (i, sample) in
+                                block.iter_mut().enumerate().take(request_len.min(max_copy))
+                            {
+                                let clip_idx = start_clip_idx + i;
+                                *sample = samples[clip_idx * channels + source_channel];
+                            }
+                        }
                     }
                 }
+                input_blocks
             }
-        }
+        };
         if clip.gain_db != 0.0 {
             let gain = 10.0f32.powf(clip.gain_db / 20.0);
             for channel in &mut input_blocks {
@@ -1222,6 +1315,19 @@ impl TrackData {
             self.audio.clips().len()
         );
         if frames == 0 || inputs.is_empty() {
+            if !self.audio.clips().is_empty() {
+                // Clip (disk) audio is mixed into the track's input lanes; a
+                // track with audio clips but no input ports can never sound.
+                static NO_INPUT_LANES_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !NO_INPUT_LANES_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "Track '{}' has {} audio clip(s) but no audio input lanes; clip audio is dropped",
+                        self.name,
+                        self.audio.clips().len()
+                    );
+                }
+            }
             return;
         }
 

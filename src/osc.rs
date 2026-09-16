@@ -2251,6 +2251,11 @@ fn parse_open_audio_device(mut args: OscArgs<'_>) -> Result<Action, String> {
         .get("input_device")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let ring_buffer_multiplier = value
+        .get("ring_buffer_multiplier")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(crate::track::DEFAULT_RING_BUFFER_MULTIPLIER);
     Ok(Action::OpenAudioDevice {
         device: get_string("device")?,
         input_device,
@@ -2264,6 +2269,11 @@ fn parse_open_audio_device(mut args: OscArgs<'_>) -> Result<Action, String> {
         input_channels: get_usize("input_channels")?,
         output_channels: get_usize("output_channels")?,
         bytes_per_frame: get_usize("bytes_per_frame")?,
+        ring_buffer_multiplier,
+        auto_open_midi_devices: value
+            .get("auto_open_midi_devices")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     })
 }
 

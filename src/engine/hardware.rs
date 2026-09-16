@@ -21,6 +21,7 @@ use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 use crate::hw::traits::HwWorkerDriver;
 #[cfg(target_os = "windows")]
 use crate::hw::wasapi::{self, HwDriver};
+use crate::track::set_ring_buffer_multiplier;
 #[cfg(target_os = "linux")]
 use crate::workers::alsa_worker::HwWorker;
 #[cfg(target_os = "macos")]
@@ -255,6 +256,8 @@ impl Engine {
                     input_channels,
                     output_channels,
                     bytes_per_frame: 0,
+                    ring_buffer_multiplier: request.ring_buffer_multiplier,
+                    auto_open_midi_devices: self.auto_open_midi_devices,
                 }))
                 .await;
                 self.awaiting_hwfinished = true;
@@ -519,7 +522,9 @@ impl Engine {
             self.ensure_hw_worker_running().await;
             self.request_hw_cycle().await;
         }
-        self.open_discovered_midi_hw_devices().await;
+        if self.auto_open_midi_devices {
+            self.open_discovered_midi_hw_devices().await;
+        }
     }
 
     pub(crate) fn hw_input_audio_port(&self, from_port: usize) -> Option<Arc<AudioIO>> {
@@ -567,11 +572,15 @@ impl Engine {
             period_frames,
             nperiods,
             sync_mode,
+            ring_buffer_multiplier,
+            auto_open_midi_devices,
             ..
         } = action
         else {
             return (false, None);
         };
+        set_ring_buffer_multiplier(ring_buffer_multiplier);
+        self.auto_open_midi_devices = auto_open_midi_devices;
         #[cfg(unix)]
         {
             let request = AudioOpenRequest {
@@ -583,6 +592,7 @@ impl Engine {
                 period_frames,
                 nperiods,
                 sync_mode,
+                ring_buffer_multiplier,
             };
             if self.maybe_open_jack_runtime(request).await.is_some() {
                 return (true, None);
@@ -621,6 +631,8 @@ impl Engine {
                 input_channels: info.input_channels,
                 output_channels: info.output_channels,
                 bytes_per_frame: info.frame_size_bytes,
+                ring_buffer_multiplier,
+                auto_open_midi_devices: self.auto_open_midi_devices,
             };
             return (false, Some(effective_action));
         }

@@ -1473,6 +1473,14 @@ pub enum Action {
         input_channels: usize,
         output_channels: usize,
         bytes_per_frame: usize,
+        /// Ring capacity multiplier for streaming clip playback, in periods
+        /// per channel ring. 0 means the default (8); clamped to 2..=32.
+        ring_buffer_multiplier: usize,
+        /// Whether opening the audio device should also auto-open every
+        /// discovered MIDI hardware device. Applications that never use
+        /// MIDI (e.g. the audio player) should pass false so they don't
+        /// grab MIDI nodes other programs may need.
+        auto_open_midi_devices: bool,
     },
     JackAddAudioInputPort,
     JackRemoveAudioInputPort(usize),

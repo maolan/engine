@@ -210,6 +210,7 @@ pub(crate) struct AudioOpenRequest<'a> {
     period_frames: usize,
     nperiods: usize,
     sync_mode: bool,
+    ring_buffer_multiplier: usize,
 }
 
 pub(crate) struct ClipAddRequest<'a> {
@@ -279,6 +280,9 @@ pub struct Engine {
     #[cfg(unix)]
     jack_runtime: Option<JackRuntime>,
     midi_hub: Option<MidiHub>,
+    /// Whether `finalize_open_audio_device` auto-opens discovered MIDI
+    /// hardware devices. Set from `Action::OpenAudioDevice`.
+    auto_open_midi_devices: bool,
     hw_worker: Option<WorkerData>,
     osc_server: Option<OscServer>,
     osc_reply_socket: Option<UdpSocket>,

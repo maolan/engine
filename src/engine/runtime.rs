@@ -180,6 +180,7 @@ impl Engine {
             #[cfg(unix)]
             jack_runtime: None,
             midi_hub: Some(MidiHub::default()),
+            auto_open_midi_devices: true,
             hw_worker: None,
             osc_server: None,
             osc_reply_socket: None,
