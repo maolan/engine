@@ -2530,6 +2530,7 @@ impl TrackData {
         frames: usize,
         track_inputs: &[&mut [f32]],
     ) -> Vec<(usize, Vec<f32>)> {
+        self.apply_transport_sample_snapshot();
         let track_input_events = self.rt.folder_input_midi_events.clone();
         let order = self.plugin_process_order();
         let mut processed = HashSet::<(PluginKind, usize)>::new();

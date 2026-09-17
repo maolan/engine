@@ -478,6 +478,12 @@ impl Worker {
                     ProcessTask::Plugin { track, .. } => track,
                 };
                 let mut t = track.lock();
+                // The dispatcher may skip `prepare_task_track` entirely
+                // (generation fast path), so the worker marks the track as
+                // processing for the whole task; task bodies clear the flag
+                // at the end. Plugin-mutation handlers rely on this flag to
+                // reject changes while a task holds the track.
+                t.audio.set_processing(true);
                 match task {
                     ProcessTask::Track(_) => {
                         let audio_out_count = t.audio.outs.len();

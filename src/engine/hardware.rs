@@ -350,6 +350,7 @@ impl Engine {
 
         if let Some(play_sync) = decision.play_sync {
             self.playing = matches!(play_sync, JackTransportPlaySync::Start);
+            self.bump_prepare_generation();
             self.transport_running = self.playing;
             if matches!(play_sync, JackTransportPlaySync::Start) {
                 self.transport_restart_pending = false;
@@ -368,6 +369,7 @@ impl Engine {
 
         if let Some(sample) = decision.position_sync {
             self.transport_sample = sample;
+            self.bump_prepare_generation();
             self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                 .await;
         }

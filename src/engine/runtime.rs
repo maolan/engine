@@ -60,6 +60,7 @@ impl Engine {
         self.tempo_bpm = bpm;
         self.tsig_num = num;
         self.tsig_denom = den;
+        self.bump_prepare_generation();
     }
 
     pub(crate) fn meter_linear_to_db(peak: f32) -> f32 {
@@ -203,6 +204,8 @@ impl Engine {
             transport_restart_pending: false,
             notified_loop_wrap_sample: None,
             transport_sample: 0,
+            transport_sample_snapshot: Arc::new(crate::track::TransportSampleSnapshot::new()),
+            prepare_generation: 1,
             hw_input_latency_frames: 0,
             hw_output_latency_frames: 0,
             loop_enabled: false,
@@ -1522,24 +1525,68 @@ impl Engine {
         }
     }
 
+    /// Pushes the current transport state into the task's track before the
+    /// task is dispatched.
+    ///
+    /// The transport sample itself is NOT pushed here: it travels through the
+    /// shared lock-free `transport_sample_snapshot`, which is mirrored from
+    /// `transport_sample`/`session_transport_sample` on every dispatch (also
+    /// on the generation fast path) and read by the worker at task start.
+    /// Only the session-vs-main choice and the remaining pushed fields are
+    /// generation-gated.
+    ///
+    /// INVARIANT: `self.prepare_generation` must be bumped (via
+    /// `bump_prepare_generation`) at every mutation of any field pushed
+    /// here — `session_clip_playback_enabled`, `playing`,
+    /// `loop_enabled`, `loop_range_samples`, `tempo_bpm`, `tsig_num`,
+    /// `tsig_denom`, `clip_playback_enabled`, and `record_enabled`. A missed
+    /// bump leaves tracks holding stale transport state until some other
+    /// bump; an extra bump only costs one redundant push per track. A
+    /// per-cycle advance of `transport_sample`/`session_transport_sample`
+    /// does NOT bump the generation; the mirrored snapshot carries it.
+    ///
+    /// The atomic loads/stores below and the stores inside the lock all run
+    /// on the dispatcher thread; workers only reach `last_prepare_generation`
+    /// through this same path, so a stale comparison (e.g. a track added
+    /// mid-generation) self-heals on the next dispatch.
     pub(crate) fn prepare_task_track(&self, task: &ProcessTask) {
         let track = match task {
             ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => t,
             ProcessTask::Plugin { track, .. } => track,
         };
+        // Mirror the dispatcher-thread transport positions into the shared
+        // snapshot before this dispatch's tasks can run. Release stores; the
+        // worker's Acquire load at task start is ordered by the node-job
+        // channel handoff.
+        self.transport_sample_snapshot
+            .mirror(self.transport_sample, self.session_transport_sample);
+        if track.transport_sample_snapshot().is_none() {
+            // First dispatch after an explicit detach (offline bounce or
+            // freeze render repositioned the track): re-attach. Cheap atomic
+            // check on the fast path.
+            track.attach_transport_sample_snapshot(self.transport_sample_snapshot.clone());
+        }
+        if track.last_prepare_generation() == self.prepare_generation {
+            // Already pushed for this generation; skip the track lock. The
+            // RT worker marks the track `processing` at task start, so the
+            // `set_processing(true)` below (and the lock) are unnecessary
+            // here.
+            return;
+        }
         let mut t = track.lock();
-        let transport_sample = if self.session_clip_playback_enabled && self.playing {
-            self.session_transport_sample
-        } else {
-            self.transport_sample
-        };
-        t.set_transport_sample(transport_sample);
+        self.transport_sample_snapshot
+            .set_use_session(self.session_clip_playback_enabled && self.playing);
         t.set_loop_config(self.loop_enabled, self.loop_range_samples);
         t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
         t.set_clip_playback_enabled(self.clip_playback_enabled && self.playing);
         t.set_session_clip_playback_enabled(self.session_clip_playback_enabled && self.playing);
         t.set_record_tap_enabled(self.playing && self.record_enabled);
         t.audio.set_processing(true);
+        t.mark_prepare_pushed(self.prepare_generation);
+    }
+
+    pub(crate) fn bump_prepare_generation(&mut self) {
+        self.prepare_generation += 1;
     }
 
     /// Dispatch queued node jobs to ready workers, buffering the rest until
@@ -1835,6 +1882,8 @@ impl Engine {
                 let normalized = self.normalize_transport_sample(next);
                 let wrapped = normalized != next;
                 self.transport_sample = normalized;
+                // The per-cycle advance reaches tracks through the mirrored
+                // lock-free snapshot, so no generation bump is needed here.
                 tracing::debug!(
                     before,
                     delta = cycle_samples,
@@ -2642,6 +2691,7 @@ impl Engine {
             }
             Action::JumpToEnd => {
                 self.transport_sample = self.normalize_transport_sample(self.session_end_sample());
+                self.bump_prepare_generation();
                 self.publish_transport_snapshot();
                 self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                     .await;
@@ -2658,12 +2708,14 @@ impl Engine {
             Action::SessionMidiLearnTriggered { .. } => {}
             Action::SetClipPlaybackEnabled(enabled) => {
                 self.clip_playback_enabled = enabled;
+                self.bump_prepare_generation();
                 for track in self.state_snapshot.load_full().tracks.values() {
                     track.lock().set_clip_playback_enabled(enabled);
                 }
             }
             Action::SetSessionClipPlaybackEnabled(enabled) => {
                 self.session_clip_playback_enabled = enabled;
+                self.bump_prepare_generation();
                 for track in self.state_snapshot.load_full().tracks.values() {
                     track.lock().set_session_clip_playback_enabled(enabled);
                 }
@@ -2675,6 +2727,7 @@ impl Engine {
             }
             Action::SetLoopEnabled(enabled) => {
                 self.loop_enabled = enabled && self.loop_range_samples.is_some();
+                self.bump_prepare_generation();
                 self.notified_loop_wrap_sample = None;
             }
             Action::SetLoopRange(..) => {
@@ -2712,6 +2765,7 @@ impl Engine {
             }
             Action::SetTempo(bpm) => {
                 self.tempo_bpm = bpm.max(1.0);
+                self.bump_prepare_generation();
                 self.publish_transport_snapshot();
             }
             Action::SetTimeSignature {
@@ -2720,6 +2774,7 @@ impl Engine {
             } => {
                 self.tsig_num = numerator.max(1);
                 self.tsig_denom = denominator.max(1);
+                self.bump_prepare_generation();
                 self.publish_transport_snapshot();
             }
             Action::SetTempoMap {
@@ -4162,6 +4217,9 @@ impl Engine {
                             let normalized = self.normalize_transport_sample(next);
                             let wrapped = normalized != next;
                             self.transport_sample = normalized;
+                            // The per-cycle advance reaches tracks through
+                            // the mirrored lock-free snapshot; see
+                            // `handle_hw_finished`.
                             tracing::debug!(
                                 before,
                                 delta = cycle_samples,

@@ -1388,6 +1388,7 @@ impl Engine {
         );
         self.meter_decay_after_stop = None;
         self.playing = true;
+        self.bump_prepare_generation();
         self.transport_running = true;
         self.transport_restart_pending = true;
         self.notified_loop_wrap_sample = None;
@@ -1426,6 +1427,7 @@ impl Engine {
 
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = false;
+        self.bump_prepare_generation();
         for track in self.state_snapshot.load_full().tracks.values() {
             let mut t = track.lock();
             t.set_clip_playback_enabled(false);
@@ -1435,6 +1437,7 @@ impl Engine {
         self.publish_transport_snapshot();
         if !self.playing {
             self.playing = true;
+            self.bump_prepare_generation();
             self.transport_restart_pending = true;
             self.notified_loop_wrap_sample = None;
             self.publish_transport_snapshot();
@@ -1466,6 +1469,7 @@ impl Engine {
         };
 
         self.playing = false;
+        self.bump_prepare_generation();
         self.transport_running = false;
         self.transport_panic_flush_pending = false;
         self.transport_restart_pending = false;
@@ -1473,6 +1477,7 @@ impl Engine {
         self.clip_playback_enabled = true;
         self.session_clip_playback_enabled = false;
         self.session_transport_sample = 0;
+        self.bump_prepare_generation();
         self.session_scene_queue = None;
         self.session_scene_queue_length_samples = 0;
         self.session_current_scene = None;
@@ -1526,6 +1531,7 @@ impl Engine {
         self.clip_playback_enabled = false;
         self.session_clip_playback_enabled = true;
         self.session_transport_sample = 0;
+        self.bump_prepare_generation();
         self.session_scene_queue = None;
         self.session_scene_queue_length_samples = 0;
         self.session_current_scene = None;
@@ -1570,6 +1576,7 @@ impl Engine {
         };
 
         self.transport_sample = self.normalize_transport_sample(sample);
+        self.bump_prepare_generation();
         self.notified_loop_wrap_sample = None;
         self.publish_transport_snapshot();
         {
@@ -1731,12 +1738,14 @@ impl Engine {
             }
         });
         self.loop_enabled = self.loop_range_samples.is_some();
+        self.bump_prepare_generation();
         self.notified_loop_wrap_sample = None;
         if self.loop_enabled
             && let Some((loop_start, loop_end)) = self.loop_range_samples
             && self.transport_sample >= loop_end
         {
             self.transport_sample = loop_start;
+            self.bump_prepare_generation();
             self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                 .await;
         }
@@ -1783,6 +1792,7 @@ impl Engine {
         };
 
         self.record_enabled = enabled;
+        self.bump_prepare_generation();
         if !enabled {
             if self.awaiting_hwfinished {
                 self.append_recorded_cycle();

@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -564,6 +564,72 @@ pub struct PlayingSessionClip {
     pub active_midi_notes: HashSet<(u8, u8)>,
 }
 
+/// Lock-free snapshot of the engine transport position, shared between the
+/// engine dispatcher (sole writer) and all tracks (readers).
+///
+/// `Engine::prepare_task_track` mirrors the engine's `transport_sample` and
+/// `session_transport_sample` fields into the snapshot on every dispatch,
+/// without bumping `prepare_generation` and without taking any track lock;
+/// RT task entry points then copy the snapshot into `TrackRt::transport_sample`
+/// at task start. This replaces the old per-generation `set_transport_sample`
+/// push, so a per-cycle transport advance no longer invalidates the
+/// generation fast path.
+///
+/// Ordering: the dispatcher stores with `Release` before enqueueing the
+/// cycle's node jobs; the worker loads with `Acquire` at task start. The
+/// node-job channel push/pop provides the happens-before edge, so the worker
+/// observes the sample mirrored for the dispatch in which its job was
+/// enqueued — the same "value at dispatch time" semantics the old per-task
+/// push had.
+#[derive(Debug)]
+pub struct TransportSampleSnapshot {
+    main: AtomicU64,
+    session: AtomicU64,
+    use_session: AtomicBool,
+}
+
+impl TransportSampleSnapshot {
+    pub fn new() -> Self {
+        Self {
+            main: AtomicU64::new(0),
+            session: AtomicU64::new(0),
+            use_session: AtomicBool::new(false),
+        }
+    }
+
+    /// Mirrors the engine's transport positions into the snapshot. Called by
+    /// the dispatcher on every task dispatch.
+    pub fn mirror(&self, main: usize, session: usize) {
+        self.main.store(main as u64, Ordering::Release);
+        self.session.store(session as u64, Ordering::Release);
+    }
+
+    /// Selects which mirrored position `load` returns. The dispatcher stores
+    /// this only when the pushed transport generation changes (the choice is
+    /// derived from `session_clip_playback_enabled`/`playing`, which already
+    /// bump the generation).
+    pub fn set_use_session(&self, use_session: bool) {
+        self.use_session.store(use_session, Ordering::Release);
+    }
+
+    /// Current transport position in samples, as last mirrored by the
+    /// dispatcher.
+    pub fn load(&self) -> usize {
+        let source = if self.use_session.load(Ordering::Acquire) {
+            &self.session
+        } else {
+            &self.main
+        };
+        source.load(Ordering::Acquire) as usize
+    }
+}
+
+impl Default for TransportSampleSnapshot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-cycle (real-time) state of a [`Track`].
 #[derive(Debug)]
 pub struct TrackRt {
@@ -780,6 +846,18 @@ pub struct TrackData {
     pub metronome_enabled: AtomicBool,
     pub session_base_dir: Option<PathBuf>,
     metronome_source: ArcSwapOption<AudioIO>,
+    /// Last `Engine::prepare_generation` whose transport state was pushed
+    /// into this track by `Engine::prepare_task_track`. When it equals the
+    /// engine's current generation the dispatcher skips both the push and
+    /// the track lock. See `Engine::prepare_task_track` for the invariant.
+    pub(crate) last_prepare_generation: AtomicU64,
+    /// Lock-free transport-position snapshot handed out by the engine
+    /// (`Engine::prepare_task_track`). While `Some`, RT task entry points
+    /// copy the snapshot into `rt.transport_sample` at task start instead of
+    /// relying on the per-generation push. Explicit per-block repositioning
+    /// (offline bounce, freeze render) detaches it so the manually set
+    /// `rt.transport_sample` wins; the next dispatch re-attaches it.
+    transport_sample_snapshot: ArcSwapOption<TransportSampleSnapshot>,
 }
 
 pub struct TrackGuard<'a> {

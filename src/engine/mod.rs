@@ -305,6 +305,20 @@ pub struct Engine {
     transport_restart_pending: bool,
     notified_loop_wrap_sample: Option<usize>,
     transport_sample: usize,
+    /// Lock-free transport-position snapshot shared with all tracks. The
+    /// dispatcher mirrors `transport_sample`/`session_transport_sample` into
+    /// it on every task dispatch (see `Engine::prepare_task_track` and
+    /// [`crate::track::TransportSampleSnapshot`]); a per-cycle advance thus
+    /// reaches tracks without a generation bump or track lock.
+    transport_sample_snapshot: Arc<crate::track::TransportSampleSnapshot>,
+    /// Generation counter for the per-dispatch transport-state push performed
+    /// by `prepare_task_track`. Bumped (via `bump_prepare_generation`) at
+    /// every mutation of any value pushed there, so tracks whose
+    /// `last_prepare_generation` equals this value can skip the push and
+    /// the track lock for the rest of the generation. The transport sample
+    /// itself is excluded: it reaches tracks through the mirrored
+    /// `transport_sample_snapshot` without a bump.
+    prepare_generation: u64,
 
     hw_input_latency_frames: usize,
 
@@ -420,6 +434,7 @@ mod tests {
     use super::*;
     use crate::audio::clip::AudioClip;
     use crate::message::PluginKind;
+    use crate::message::ProcessTask;
     use crate::midi::clip::MIDIClip;
     use crate::track::Track;
     use std::path::Path;
@@ -479,6 +494,116 @@ mod tests {
         let (client_tx, client_rx) = channel(16);
         engine.clients.push(client_tx);
         (engine, client_rx)
+    }
+
+    #[test]
+    fn prepare_task_track_pushes_transport_state_and_marks_generation() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
+        engine.transport_sample = 1234;
+        engine.tempo_bpm = 133.0;
+        engine.tsig_num = 7;
+        engine.tsig_denom = 8;
+
+        let task = ProcessTask::Track(handle.clone());
+        engine.prepare_task_track(&task);
+
+        assert_eq!(handle.last_prepare_generation(), engine.prepare_generation);
+        let t = handle.lock();
+        // The transport sample travels through the shared lock-free snapshot
+        // rather than a pushed field; the track picks it up at task start.
+        t.apply_transport_sample_snapshot();
+        assert_eq!(t.rt.transport_sample, 1234);
+        assert_eq!(t.rt.tempo_bpm, 133.0);
+        assert_eq!(t.rt.tsig_num, 7);
+        assert_eq!(t.rt.tsig_denom, 8);
+    }
+
+    #[test]
+    fn prepare_task_track_skips_push_until_generation_bumps() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
+        engine.tempo_bpm = 133.0;
+        let generation_before = engine.prepare_generation;
+
+        let task = ProcessTask::Track(handle.clone());
+        engine.prepare_task_track(&task);
+        assert_eq!(handle.last_prepare_generation(), generation_before);
+
+        // No generation bump: a changed pushed field (tempo) must NOT reach
+        // the track (the dispatcher takes the early-exit path), but the
+        // lock-free transport snapshot still tracks the engine fields.
+        engine.transport_sample = 999;
+        engine.tempo_bpm = 200.0;
+        engine.prepare_task_track(&task);
+        assert_eq!(handle.last_prepare_generation(), generation_before);
+        {
+            let t = handle.lock();
+            t.apply_transport_sample_snapshot();
+            assert_eq!(t.rt.transport_sample, 999);
+            assert_eq!(t.rt.tempo_bpm, 133.0);
+        }
+
+        // A transport mutation that affects pushed fields bumps the
+        // generation, so the next prepare pushes again.
+        engine.bump_prepare_generation();
+        assert_ne!(engine.prepare_generation, generation_before);
+        engine.prepare_task_track(&task);
+        assert_eq!(handle.last_prepare_generation(), engine.prepare_generation);
+        let t = handle.lock();
+        t.apply_transport_sample_snapshot();
+        assert_eq!(t.rt.transport_sample, 999);
+        assert_eq!(t.rt.tempo_bpm, 200.0);
+    }
+
+    #[test]
+    fn transport_sample_advance_updates_snapshot_without_generation_bump() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
+        let task = ProcessTask::Track(handle.clone());
+        engine.prepare_task_track(&task);
+        let generation = engine.prepare_generation;
+
+        // Simulate the per-cycle advance in `handle_hw_finished`: the sample
+        // moves but the generation must stay constant, and the track must
+        // observe the advanced sample at task start.
+        engine.transport_sample = engine.transport_sample.saturating_add(256);
+        engine.prepare_task_track(&task);
+
+        assert_eq!(engine.prepare_generation, generation);
+        assert_eq!(handle.last_prepare_generation(), generation);
+        let t = handle.lock();
+        t.apply_transport_sample_snapshot();
+        assert_eq!(t.rt.transport_sample, 256);
+    }
+
+    #[test]
+    fn transport_snapshot_uses_session_sample_when_session_playback_active() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
+        let task = ProcessTask::Track(handle.clone());
+        engine.transport_sample = 100;
+        engine.session_transport_sample = 1_000;
+        engine.prepare_task_track(&task);
+        handle.lock().apply_transport_sample_snapshot();
+        assert_eq!(handle.lock().rt.transport_sample, 100);
+
+        // Enabling session clip playback changes the pushed choice and bumps
+        // the generation; the snapshot now follows the session position.
+        engine.playing = true;
+        engine.session_clip_playback_enabled = true;
+        engine.bump_prepare_generation();
+        let generation = engine.prepare_generation;
+        engine.prepare_task_track(&task);
+        handle.lock().apply_transport_sample_snapshot();
+        assert_eq!(handle.lock().rt.transport_sample, 1_000);
+
+        // A per-cycle session advance must not bump the generation.
+        engine.session_transport_sample = 1_256;
+        engine.prepare_task_track(&task);
+        assert_eq!(engine.prepare_generation, generation);
+        handle.lock().apply_transport_sample_snapshot();
+        assert_eq!(handle.lock().rt.transport_sample, 1_256);
     }
 
     fn insert_track(engine: &mut Engine, track: Track) {

@@ -73,6 +73,8 @@ impl TrackData {
             metronome_enabled: AtomicBool::new(false),
             session_base_dir: None,
             metronome_source: ArcSwapOption::empty(),
+            last_prepare_generation: AtomicU64::new(0),
+            transport_sample_snapshot: ArcSwapOption::empty(),
         }
     }
 
@@ -371,6 +373,7 @@ impl TrackData {
         source_buffers: &[(usize, &[f32], usize)],
         metronome_output: Option<&mut [f32]>,
     ) -> usize {
+        self.apply_transport_sample_snapshot();
         if !self.output_enabled() {
             let frames = self.compute_process_frames();
             for out in audio_outputs.iter_mut() {
@@ -467,6 +470,7 @@ impl TrackData {
         audio_inputs: &mut [&mut [f32]],
         metronome_output: Option<&mut [f32]>,
     ) {
+        self.apply_transport_sample_snapshot();
         let frames = audio_inputs
             .first()
             .map(|audio_in| audio_in.len())
@@ -607,6 +611,7 @@ impl TrackData {
         audio_inputs: &[&[f32]],
         audio_outputs: &mut [&mut [f32]],
     ) {
+        self.apply_transport_sample_snapshot();
         let frames = self.compute_process_frames();
         let track_input_events = self.rt.folder_input_midi_events.clone();
 
@@ -785,6 +790,7 @@ impl TrackData {
         audio_outputs: &mut [&mut [f32]],
         source_buffers: &[(usize, &[f32], usize)],
     ) {
+        self.apply_transport_sample_snapshot();
         let track_input_events = self.rt.folder_input_midi_events.clone();
         let midi_node_events = self.rt.folder_plugin_midi_node_events.clone();
 
@@ -1063,7 +1069,28 @@ impl TrackData {
         self.output_enabled.load(Ordering::Relaxed)
     }
     pub fn set_transport_sample(&mut self, sample: usize) {
+        // Explicit repositioning (offline bounce worker) takes precedence
+        // over the shared snapshot until the next dispatch re-attaches it.
+        self.transport_sample_snapshot.store(None);
         self.rt.with_rt(|rt| rt.transport_sample = sample);
+    }
+
+    pub(crate) fn transport_sample_snapshot(&self) -> Option<Arc<TransportSampleSnapshot>> {
+        self.transport_sample_snapshot.load_full()
+    }
+
+    pub(crate) fn attach_transport_sample_snapshot(&self, snapshot: Arc<TransportSampleSnapshot>) {
+        self.transport_sample_snapshot.store(Some(snapshot));
+    }
+
+    /// RT task entry point: copy the shared transport snapshot into
+    /// `rt.transport_sample` for the current cycle. No-op when detached
+    /// (explicit per-block repositioning such as freeze render).
+    pub(crate) fn apply_transport_sample_snapshot(&self) {
+        if let Some(snapshot) = self.transport_sample_snapshot.load_full() {
+            let sample = snapshot.load();
+            self.rt.with_rt(|rt| rt.transport_sample = sample);
+        }
     }
     pub fn set_loop_config(&mut self, enabled: bool, range: Option<(usize, usize)>) {
         self.rt.with_rt(|rt| {
@@ -1093,6 +1120,15 @@ impl TrackData {
     }
     pub fn set_record_tap_enabled(&mut self, enabled: bool) {
         self.rt.with_rt(|rt| rt.record_tap_enabled = enabled);
+    }
+
+    pub(crate) fn last_prepare_generation(&self) -> u64 {
+        self.last_prepare_generation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_prepare_pushed(&self, generation: u64) {
+        self.last_prepare_generation
+            .store(generation, Ordering::Relaxed);
     }
 
     pub fn set_midi_lane_channel(&mut self, lane: usize, channel: Option<u8>) {
@@ -1319,6 +1355,11 @@ impl TrackData {
             .max(1);
 
         let saved_transport = self.rt.transport_sample;
+        // Reposition the transport per rendered block below; detach the
+        // shared snapshot so `process_render_block_with_audio_buffers_and_metronome`
+        // does not override it, and restore it afterwards.
+        let saved_snapshot = self.transport_sample_snapshot.load_full();
+        self.transport_sample_snapshot.store(None);
         let saved_disk_monitor = self.disk_monitor();
         let saved_input_monitor = self.input_monitor();
         let saved_midi_disk_monitor = self.midi_disk_monitor();
@@ -1427,6 +1468,7 @@ impl TrackData {
         }
 
         self.rt.transport_sample = saved_transport;
+        self.transport_sample_snapshot.store(saved_snapshot);
         self.disk_monitor.store(saved_disk_monitor);
         self.input_monitor.store(saved_input_monitor);
         self.midi_disk_monitor.store(saved_midi_disk_monitor);
