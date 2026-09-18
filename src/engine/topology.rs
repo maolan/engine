@@ -2683,6 +2683,8 @@ impl Engine {
             pitch_correction_frame_likeness,
             pitch_correction_inertia_ms,
             pitch_correction_formant_compensation,
+            pitch_correction_detector: _,
+            pitch_correction_mode: _,
             ref plugin_graph_json,
         } = action
         else {

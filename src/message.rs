@@ -200,6 +200,33 @@ pub struct TimeSignaturePoint {
     pub denominator: u16,
 }
 
+/// Which pitch detector produced the clip's correction points. Only carried
+/// through clip data so the GUI's detector choice survives engine
+/// round-trips; the engine itself does not run detection.
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PitchCorrectionDetector {
+    #[default]
+    Classic,
+    Neural,
+}
+
+/// How pitch-corrected audio is produced for a clip. `Shift` pitch-shifts
+/// the original recording (live in the engine or offline preview via
+/// timestretch); `Resynth` re-synthesizes the clip offline through a neural
+/// vocoder and always renders a preview.
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PitchCorrectionMode {
+    #[default]
+    Shift,
+    Resynth,
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AudioClipData {
     #[serde(default)]
@@ -226,6 +253,10 @@ pub struct AudioClipData {
     pub pitch_correction_frame_likeness: Option<f32>,
     pub pitch_correction_inertia_ms: Option<u16>,
     pub pitch_correction_formant_compensation: Option<bool>,
+    #[serde(default)]
+    pub pitch_correction_detector: PitchCorrectionDetector,
+    #[serde(default)]
+    pub pitch_correction_mode: PitchCorrectionMode,
     pub plugin_graph_json: Option<serde_json::Value>,
     pub grouped_clips: Vec<AudioClipData>,
 }
@@ -650,6 +681,8 @@ pub enum Action {
         pitch_correction_frame_likeness: Option<f32>,
         pitch_correction_inertia_ms: Option<u16>,
         pitch_correction_formant_compensation: Option<bool>,
+        pitch_correction_detector: PitchCorrectionDetector,
+        pitch_correction_mode: PitchCorrectionMode,
         plugin_graph_json: Option<serde_json::Value>,
     },
     AddGroupedClip {
@@ -1629,6 +1662,8 @@ mod tests {
             pitch_correction_frame_likeness: Some(0.5),
             pitch_correction_inertia_ms: Some(123),
             pitch_correction_formant_compensation: Some(false),
+            pitch_correction_detector: super::PitchCorrectionDetector::Neural,
+            pitch_correction_mode: super::PitchCorrectionMode::Resynth,
             plugin_graph_json: Some(json!({"plugins":[],"connections":[{"kind":"Audio"}]})),
             grouped_clips: vec![AudioClipData {
                 name: "child.wav".to_string(),

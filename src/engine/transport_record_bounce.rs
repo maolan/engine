@@ -487,6 +487,8 @@ impl Engine {
             pitch_correction_frame_likeness: None,
             pitch_correction_inertia_ms: None,
             pitch_correction_formant_compensation: None,
+            pitch_correction_detector: Default::default(),
+            pitch_correction_mode: Default::default(),
             plugin_graph_json: Some(Self::default_clip_plugin_graph_json(audio_ins, audio_outs)),
         }))
         .await;
@@ -639,6 +641,8 @@ impl Engine {
             pitch_correction_frame_likeness: None,
             pitch_correction_inertia_ms: None,
             pitch_correction_formant_compensation: None,
+            pitch_correction_detector: Default::default(),
+            pitch_correction_mode: Default::default(),
             plugin_graph_json: None,
         }))
         .await;

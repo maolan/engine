@@ -1424,6 +1424,8 @@ fn parse_add_clip(mut args: OscArgs<'_>) -> Result<Action, String> {
         pitch_correction_frame_likeness: None,
         pitch_correction_inertia_ms: None,
         pitch_correction_formant_compensation: None,
+        pitch_correction_detector: Default::default(),
+        pitch_correction_mode: Default::default(),
         plugin_graph_json: None,
     })
 }
