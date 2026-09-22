@@ -66,19 +66,58 @@ pub fn ring_buffer_multiplier() -> usize {
 }
 
 /// Frames decoded per producer iteration.
-const DECODE_CHUNK_FRAMES: usize = 4096;
+pub(crate) const DECODE_CHUNK_FRAMES: usize = 4096;
+
+/// Hard cap on live streaming producer threads across the engine. Sessions
+/// with very many clips would otherwise spawn one thread (and one set of
+/// rings) per clip at preload time; beyond this cap new streaming-class
+/// clips fall back to a whole-file buffered decode instead.
+pub(crate) const MAX_STREAMING_PRODUCERS: usize = 128;
+
+/// Number of currently live streaming producer threads.
+static LIVE_PRODUCERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Try to reserve one streaming producer slot. Returns `false` when the cap
+/// is reached; callers must then fall back to a buffered decode.
+pub(crate) fn try_acquire_producer_slot() -> bool {
+    let mut live = LIVE_PRODUCERS.load(Ordering::Relaxed);
+    loop {
+        if live >= MAX_STREAMING_PRODUCERS {
+            return false;
+        }
+        match LIVE_PRODUCERS.compare_exchange_weak(
+            live,
+            live + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(current) => live = current,
+        }
+    }
+}
+
+/// Return a streaming producer slot claimed with [`try_acquire_producer_slot`].
+pub(crate) fn release_producer_slot() {
+    LIVE_PRODUCERS.fetch_sub(1, Ordering::Relaxed);
+}
 
 /// Shared producer control state.
-struct ProducerControl {
-    stop: Arc<AtomicBool>,
+pub(crate) struct ProducerControl {
+    pub(crate) stop: Arc<AtomicBool>,
     /// 0 = no seek pending, otherwise `requested_source_frame + 1`.
-    seek_request: Arc<AtomicUsize>,
-    eof: Arc<AtomicBool>,
+    pub(crate) seek_request: Arc<AtomicUsize>,
+    pub(crate) eof: Arc<AtomicBool>,
 }
 
 pub struct StreamingClipBuffer {
     pub channels: usize,
     pub engine_sample_rate: usize,
+    /// Total source frames reported by the container probe, if known.
+    total_frames: Option<u64>,
+    /// Source file path; used by `read_window` to open an independent
+    /// decoder without disturbing the real-time rings.
+    path: PathBuf,
     rings: Vec<Mutex<Consumer<f32>>>,
     eof: Arc<AtomicBool>,
     underruns: AtomicUsize,
@@ -116,6 +155,15 @@ impl StreamingClipBuffer {
     ) -> io::Result<Self> {
         let info = probe_audio_file(path)?;
         let channels = info.channels.max(1);
+        // Guard against unbounded producer threads in sessions with very
+        // many clips (see `preload_audio_clip_cache`); beyond the cap the
+        // caller falls back to a whole-file buffered decode.
+        if !try_acquire_producer_slot() {
+            return Err(io::Error::other(format!(
+                "Streaming producer cap reached; not starting stream for '{}'",
+                path.display()
+            )));
+        }
         let capacity = multiplier.max(1).saturating_mul(period_frames.max(1));
         let mut rings = Vec::with_capacity(channels);
         let mut producers = Vec::with_capacity(channels);
@@ -150,10 +198,15 @@ impl StreamingClipBuffer {
                     done_tx,
                 );
             })
-            .map_err(|e| io::Error::other(format!("Failed to spawn streaming producer: {e}")))?;
+            .map_err(|e| {
+                release_producer_slot();
+                io::Error::other(format!("Failed to spawn streaming producer: {e}"))
+            })?;
         Ok(Self {
             channels,
             engine_sample_rate: engine_rate,
+            total_frames: info.frames,
+            path: path.to_path_buf(),
             rings,
             eof: control.eof.clone(),
             underruns: AtomicUsize::new(0),
@@ -176,6 +229,52 @@ impl StreamingClipBuffer {
 
     pub fn underruns(&self) -> usize {
         self.underruns.load(Ordering::Relaxed)
+    }
+
+    /// Total decoded frames in the source file, if the container probe
+    /// reported a duration.
+    pub fn total_frames(&self) -> Option<u64> {
+        self.total_frames
+    }
+
+    /// Random access read for offline features (pitch correction, reversed
+    /// playback): returns exactly `len` frames per channel starting at
+    /// source frame `start`, silence-padded past EOF.
+    ///
+    /// This runs on the calling thread with an independent incremental
+    /// decoder (decode-and-discard up to `start`, then read `len` frames)
+    /// and never touches the SPSC rings, so the real-time read position and
+    /// the producer are undisturbed.
+    pub fn read_window(&self, start: usize, len: usize) -> io::Result<Vec<Vec<f32>>> {
+        let channels = self.channels.max(1);
+        let mut window = vec![vec![0.0_f32; len]; channels];
+        if len == 0 {
+            return Ok(window);
+        }
+        let mut decoder = StreamingDecoder::new(&self.path)?;
+        let mut position = 0usize;
+        let mut filled = 0usize;
+        while filled < len {
+            let Some(chunk) = decoder.next_chunk(DECODE_CHUNK_FRAMES)? else {
+                break;
+            };
+            let frames = chunk.len() / channels;
+            if position + frames <= start {
+                // Whole chunk lands before the window; discard it.
+                position += frames;
+                continue;
+            }
+            let chunk_from = start.saturating_sub(position);
+            let take = (frames - chunk_from).min(len - filled);
+            for (channel, plane) in window.iter_mut().enumerate() {
+                for i in 0..take {
+                    plane[filled + i] = chunk[(chunk_from + i) * channels + channel];
+                }
+            }
+            filled += take;
+            position += frames;
+        }
+        Ok(window)
     }
 
     /// Read up to `len` frames starting at source frame `from_frame` into
@@ -298,6 +397,7 @@ fn producer_main(
         );
     }
     control.eof.store(true, Ordering::Release);
+    release_producer_slot();
     let _ = done.send(());
 }
 
@@ -715,6 +815,43 @@ mod tests {
             buffer.underruns() > 0 || read < 512,
             "expected an underrun to be recorded"
         );
+    }
+
+    #[test]
+    fn streaming_read_window_at_middle_and_eof() {
+        let path = tone_flac("maolan_stream_window", 48_000, 0.2, 440.0);
+        let info = probe_audio_file(&path).expect("probe");
+        let total = info.frames.expect("flac probe frames") as usize;
+        let (_decoded, channels, _) =
+            crate::audio_codec::decode_audio_to_f32_interleaved_sync(&path).expect("decode");
+        let buffer =
+            StreamingClipBuffer::start(&path, 48_000, 64, 4).expect("start streaming buffer");
+
+        let middle_at = total / 2;
+        let middle = buffer.read_window(middle_at, 512).expect("middle window");
+        assert_eq!(middle.len(), channels);
+        assert!(
+            middle.iter().flatten().all(|s| s.is_finite()),
+            "non-finite samples in window"
+        );
+        let peak = middle.iter().flatten().fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!(
+            peak > 0.1,
+            "middle window must contain signal (peak {peak})"
+        );
+
+        let eof_window = buffer
+            .read_window(total.saturating_sub(128), 512)
+            .expect("eof window");
+        assert!(
+            eof_window
+                .iter()
+                .flatten()
+                .skip(128 * channels)
+                .all(|&s| s == 0.0),
+            "expected silence past EOF"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -29,6 +29,7 @@ mod clip_render;
 mod instances;
 mod plugins;
 mod process;
+mod seekable_streaming;
 mod session;
 mod streaming;
 mod track_routing;
@@ -71,10 +72,14 @@ pub(crate) struct TrackIoCounts {
 
 #[derive(Debug, Clone)]
 pub(crate) enum AudioClipBuffer {
-    /// Whole file decoded into memory (fast path for session WAV files).
+    /// Whole file decoded into memory (fallback when streaming setup fails,
+    /// and used directly by tests/fixtures).
     Buffered { channels: usize, samples: Vec<f32> },
     /// Incrementally decoded by a producer thread into per-channel rings.
     Streaming(Arc<streaming::StreamingClipBuffer>),
+    /// Engine-rate PCM/WAV file served by a producer thread that can seek
+    /// to any frame in O(1); reads/writes go through per-channel rings.
+    SeekableStreaming(Arc<seekable_streaming::SeekableStreamingClipBuffer>),
 }
 
 #[cfg(unix)]

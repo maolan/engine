@@ -8,7 +8,85 @@ use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
 use serde_json::Value;
 use std::{collections::HashSet, path::Path, sync::Arc};
 
+/// Decoding strategy chosen for an audio clip file (see
+/// [`TrackData::choose_clip_strategy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipStrategy {
+    /// Engine-rate PCM/WAV: O(1)-seekable streaming producer.
+    SeekableWav,
+    /// Anything else: incremental decode + resample streaming producer.
+    Streaming,
+}
+
+/// Channel count of any `AudioClipBuffer` variant.
+fn buffer_channel_count(buffer: &AudioClipBuffer) -> usize {
+    match buffer {
+        AudioClipBuffer::Buffered { channels, .. } => (*channels).max(1),
+        AudioClipBuffer::Streaming(stream) => stream.channels().max(1),
+        AudioClipBuffer::SeekableStreaming(stream) => stream.channels().max(1),
+    }
+}
+
+/// Effective channel count for clip processing: mono stays mono, otherwise
+/// the track input count wins over the buffer channel count.
+#[cfg(unix)]
+fn effective_channels_for(buffer_channels: usize, input_count: usize) -> usize {
+    if buffer_channels == 1 {
+        1
+    } else {
+        input_count.min(buffer_channels).max(1)
+    }
+}
+
+/// Read exactly `len` frames per channel starting at source frame `start`
+/// from any clip buffer, silence-padded past EOF. For the streaming
+/// variants this is a `read_window` call on the streaming buffer that never
+/// disturbs the real-time rings; for `Buffered` it slices the in-memory
+/// samples.
+fn clip_sample_window(
+    buffer: &AudioClipBuffer,
+    start: usize,
+    len: usize,
+) -> Option<(usize, Vec<Vec<f32>>)> {
+    match buffer {
+        AudioClipBuffer::Buffered { channels, samples } => {
+            let channels = (*channels).max(1);
+            let total_frames = samples.len() / channels;
+            let mut window = vec![vec![0.0_f32; len]; channels];
+            for (channel, plane) in window.iter_mut().enumerate() {
+                for (i, sample) in plane.iter_mut().enumerate() {
+                    let frame = start.saturating_add(i);
+                    if frame < total_frames {
+                        *sample = samples[frame * channels + channel];
+                    }
+                }
+            }
+            Some((channels, window))
+        }
+        AudioClipBuffer::Streaming(stream) => stream
+            .read_window(start, len)
+            .ok()
+            .map(|w| (stream.channels(), w)),
+        AudioClipBuffer::SeekableStreaming(stream) => stream
+            .read_window(start, len)
+            .ok()
+            .map(|w| (stream.channels(), w)),
+    }
+}
+
 impl TrackData {
+    /// Decoding strategy for an audio clip file.
+    pub(crate) fn choose_clip_strategy(
+        is_wav: bool,
+        probed: Option<&crate::audio_codec::AudioFileInfo>,
+        engine_rate: u32,
+    ) -> ClipStrategy {
+        match probed {
+            Some(info) if is_wav && info.sample_rate == engine_rate => ClipStrategy::SeekableWav,
+            _ => ClipStrategy::Streaming,
+        }
+    }
+
     pub(crate) fn invalidate_midi_clip_cache(&mut self, clip_name: &str) {
         self.rt.midi_clip_cache.remove(clip_name);
     }
@@ -36,15 +114,12 @@ impl TrackData {
         Some(AudioClipBuffer::Buffered { channels, samples })
     }
 
-    /// Load a clip's audio, choosing between the in-memory `Buffered` fast
-    /// path and the streaming producer based on the source file.
-    ///
-    /// WAV files already at the engine sample rate take the `Buffered` fast
-    /// path (DAW session files are pre-resampled at import time). Everything
-    /// else (mp3/flac/ogg at any rate, or WAV at a foreign rate) uses a
-    /// streaming producer that decodes incrementally and resamples to the
-    /// engine rate. If streaming setup fails, fall back to the whole-file
-    /// `Buffered` decode.
+    /// Load a clip's audio. Every audio clip streams: engine-rate PCM/WAV
+    /// files take the seekable streaming path (O(1) frame seeks, no decode
+    /// cost), everything else (mp3/flac/ogg at any rate, or WAV at a foreign
+    /// rate) uses the incremental streaming decoder with resampling. If
+    /// streaming setup fails, fall back to the whole-file `Buffered` decode
+    /// so the clip still plays.
     pub(crate) fn clip_buffer(&mut self, clip_name: &str) -> Option<Arc<AudioClipBuffer>> {
         if let Some(cached) = self.rt.audio_clip_cache.get(clip_name) {
             return Some(cached.clone());
@@ -56,31 +131,29 @@ impl TrackData {
             .and_then(|e| e.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
         let probed = crate::audio_codec::probe_audio_file(&path).ok();
-        let use_buffered = probed
-            .as_ref()
-            .is_none_or(|info| is_wav && info.sample_rate == engine_rate);
 
         let load_started = std::time::Instant::now();
-        let loaded = if use_buffered {
-            Self::load_audio_clip_buffer(&path)
-        } else {
-            let period_frames = self.process_block_size().max(1);
-            let multiplier = streaming::ring_buffer_multiplier();
-            match streaming::StreamingClipBuffer::start(
-                &path,
-                engine_rate as usize,
-                period_frames,
-                multiplier,
-            ) {
-                Ok(stream) => Some(AudioClipBuffer::Streaming(Arc::new(stream))),
-                Err(e) => {
-                    tracing::warn!(
-                        "Streaming setup failed for '{}' ({e}); falling back to buffered decode",
-                        path.display()
-                    );
-                    Self::load_audio_clip_buffer(&path)
+        let loaded = match Self::choose_clip_strategy(is_wav, probed.as_ref(), engine_rate) {
+            ClipStrategy::SeekableWav => {
+                let period_frames = self.process_block_size().max(1);
+                let multiplier = streaming::ring_buffer_multiplier();
+                match seekable_streaming::SeekableStreamingClipBuffer::start(
+                    &path,
+                    engine_rate as usize,
+                    period_frames,
+                    multiplier,
+                ) {
+                    Ok(stream) => Some(AudioClipBuffer::SeekableStreaming(Arc::new(stream))),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Seekable streaming setup failed for '{}' ({e}); trying compressed streaming",
+                            path.display()
+                        );
+                        self.start_compressed_stream(&path, engine_rate as usize)
+                    }
                 }
             }
+            ClipStrategy::Streaming => self.start_compressed_stream(&path, engine_rate as usize),
         }?;
         let elapsed = load_started.elapsed().as_secs_f64() * 1000.0;
         if elapsed > 20.0 {
@@ -98,11 +171,24 @@ impl TrackData {
         Some(loaded)
     }
 
-    /// Whole-file fallback for clips that need random access (pitch
-    /// correction, reversed playback) but were loaded as streaming buffers.
-    fn buffered_fallback(&self, playback_name: &str) -> Option<Arc<AudioClipBuffer>> {
-        let path = self.resolve_clip_path(playback_name);
-        Self::load_audio_clip_buffer(&path).map(Arc::new)
+    /// Whole-file decode fallback used when streaming setup fails.
+    pub(crate) fn start_compressed_stream(
+        &self,
+        path: &Path,
+        engine_rate: usize,
+    ) -> Option<AudioClipBuffer> {
+        let period_frames = self.process_block_size().max(1);
+        let multiplier = streaming::ring_buffer_multiplier();
+        match streaming::StreamingClipBuffer::start(path, engine_rate, period_frames, multiplier) {
+            Ok(stream) => Some(AudioClipBuffer::Streaming(Arc::new(stream))),
+            Err(e) => {
+                tracing::warn!(
+                    "Streaming setup failed for '{}' ({e}); falling back to buffered decode",
+                    path.display()
+                );
+                Self::load_audio_clip_buffer(path)
+            }
+        }
     }
 
     pub(crate) fn clip_playback_name(clip: &crate::audio::clip::AudioClip) -> &str {
@@ -599,31 +685,12 @@ impl TrackData {
         #[cfg(unix)]
         if !clip.pitch_correction_points.is_empty() {
             // Pitch correction needs random access into the decoded samples;
-            // a streaming buffer falls back to a whole-file buffered decode.
-            let buffered = match buffer.as_ref() {
-                AudioClipBuffer::Buffered { .. } => Some(buffer.clone()),
-                AudioClipBuffer::Streaming(_) => self.buffered_fallback(playback_name),
-            };
-            let buffer = buffered?;
-            let AudioClipBuffer::Buffered {
-                channels: buffer_channels,
-                samples,
-            } = buffer.as_ref()
-            else {
-                return None;
-            };
-            let buffer_channels = *buffer_channels;
+            // read just the needed window from the clip's buffer instead of
+            // decoding the whole file into memory.
             let input_count = self.audio.ins.len().max(1);
-            let effective_channels = if buffer_channels == 1 {
-                1
-            } else {
-                input_count.min(buffer_channels).max(1)
-            };
-            let total_frames = samples.len() / buffer_channels.max(1);
-            if total_frames == 0 {
-                return None;
-            }
             let source_offset = clip.pitch_correction_source_offset.unwrap_or(clip.offset);
+            let source_from =
+                source_offset.saturating_add(absolute_from.saturating_sub(clip_start));
             let inertia_samples = ((self.sample_rate as u64
                 * clip.pitch_correction_inertia_ms.unwrap_or(100) as u64)
                 / 1000) as usize;
@@ -637,15 +704,22 @@ impl TrackData {
                         .or_insert_with(|| ClipPitchShifter {
                             shifter: LivePitchShifter::new(
                                 self.sample_rate.round().max(1.0) as usize,
-                                effective_channels,
+                                effective_channels_for(buffer_channel_count(&buffer), input_count),
                                 formant,
                             )
                             .expect("pitch shifter"),
                         });
                 shifter.shifter.set_formant_preserved(formant);
                 let block_size = shifter.shifter.block_size();
-                let source_from =
-                    source_offset.saturating_add(absolute_from.saturating_sub(clip_start));
+                // The shifter reads blocks of `block_size` frames starting
+                // anywhere in `[source_from, source_from + request_len)`, so
+                // a window of `request_len + block_size` frames covers every
+                // block it can request. Window frame 0 is file frame
+                // `source_from`.
+                let window_len = request_len.saturating_add(block_size);
+                let (buffer_channels, window) =
+                    clip_sample_window(&buffer, source_from, window_len)?;
+                let effective_channels = effective_channels_for(buffer_channels, input_count);
                 shifter
                     .shifter
                     .render(source_from, request_len, |block_start, input| {
@@ -662,27 +736,18 @@ impl TrackData {
                             input.iter_mut().enumerate().take(effective_channels)
                         {
                             let source_channel = if buffer_channels == 1 { 0 } else { ch };
-                            if buffer_channels == 1 {
-                                let src_start = block_start.min(total_frames);
-                                let src_end = (block_start + block_size).min(total_frames);
-                                let len = src_end.saturating_sub(src_start);
-                                channel_input[..len].copy_from_slice(&samples[src_start..src_end]);
-                            } else {
-                                for (i, sample) in
-                                    channel_input.iter_mut().enumerate().take(block_size)
-                                {
-                                    let source_frame = block_start.saturating_add(i);
-                                    *sample = if source_frame < total_frames {
-                                        samples[source_frame * buffer_channels + source_channel]
-                                    } else {
-                                        0.0
-                                    };
-                                }
+                            let plane = window.get(source_channel);
+                            for (i, sample) in channel_input.iter_mut().enumerate().take(block_size)
+                            {
+                                let rel = block_start.saturating_sub(source_from).saturating_add(i);
+                                *sample = plane.and_then(|p| p.get(rel)).copied().unwrap_or(0.0);
                             }
                         }
                         scale
                     })
             };
+            let effective_channels =
+                effective_channels_for(buffer_channel_count(&buffer), input_count);
             let mut input_blocks = vec![vec![0.0; request_len]; input_count];
             for (in_channel, block) in input_blocks.iter_mut().enumerate().take(input_count) {
                 let source_channel = if effective_channels == 1 {
@@ -715,15 +780,109 @@ impl TrackData {
         }
 
         // Reversed playback reads the source backwards, which the streaming
-        // delay line cannot do; fall back to a whole-file buffered decode.
-        let buffer = if clip.reversed && matches!(buffer.as_ref(), AudioClipBuffer::Streaming(_)) {
-            self.buffered_fallback(playback_name)?
-        } else {
-            buffer
-        };
+        // rings cannot do; read the needed window and walk it in reverse.
+        if clip.reversed && !matches!(buffer.as_ref(), AudioClipBuffer::Buffered { .. }) {
+            let clip_channels = buffer_channel_count(&buffer);
+            let total_frames = match buffer.as_ref() {
+                AudioClipBuffer::Streaming(stream) => stream
+                    .total_frames()
+                    .map(|t| t as usize)
+                    .unwrap_or(usize::MAX),
+                AudioClipBuffer::SeekableStreaming(stream) => stream
+                    .total_frames()
+                    .map(|t| t as usize)
+                    .unwrap_or(usize::MAX),
+                AudioClipBuffer::Buffered { .. } => unreachable!(),
+            };
+            let source_end = clip.offset.saturating_add(clip_len).min(total_frames);
+            let local_start = absolute_from.saturating_sub(clip_start);
+            let mut input_blocks = vec![vec![0.0_f32; request_len]; self.audio.ins.len().max(1)];
+            if source_end > clip.offset && local_start < clip_len {
+                // Window covers [clip.offset, source_end); frame k of the
+                // window is file frame clip.offset + k, read backwards.
+                let window = clip_sample_window(
+                    &buffer,
+                    clip.offset,
+                    source_end.saturating_sub(clip.offset),
+                )?
+                .1;
+                let window_frames = window.first().map(|p| p.len()).unwrap_or(0);
+                for (in_channel, block) in input_blocks.iter_mut().enumerate() {
+                    let source_channel = if clip_channels == 1 {
+                        0
+                    } else if in_channel < clip_channels {
+                        in_channel
+                    } else {
+                        continue;
+                    };
+                    let plane = window.get(source_channel);
+                    for (i, sample) in block.iter_mut().enumerate().take(request_len) {
+                        // Mirror of the Buffered reversed index:
+                        // clip_idx = source_end - (local_start + i) - 1.
+                        let Some(window_idx) = usize::try_from(
+                            (window_frames as i64)
+                                .saturating_sub(local_start as i64 + i as i64 + 1),
+                        )
+                        .ok() else {
+                            break;
+                        };
+                        *sample = plane
+                            .and_then(|p| p.get(window_idx))
+                            .copied()
+                            .unwrap_or(0.0);
+                    }
+                }
+            }
+            if clip.gain_db != 0.0 {
+                let gain = 10.0f32.powf(clip.gain_db / 20.0);
+                for channel in &mut input_blocks {
+                    for sample in channel {
+                        *sample *= gain;
+                    }
+                }
+            }
+            Self::apply_audio_clip_fades(
+                clip,
+                clip_start,
+                clip_len,
+                absolute_from,
+                &mut input_blocks,
+            );
+            return Some(if has_clip_plugins {
+                self.process_clip_plugin_runtime_segment(
+                    clip,
+                    &input_blocks,
+                    absolute_from,
+                    request_len,
+                )
+                .unwrap_or(input_blocks)
+            } else {
+                input_blocks
+            });
+        }
 
         let mut input_blocks = match buffer.as_ref() {
             AudioClipBuffer::Streaming(stream) => {
+                let clip_channels = stream.channels().max(1);
+                let input_count = self.audio.ins.len().max(1);
+                let local_start = absolute_from.saturating_sub(clip_start);
+                let source_from = clip.offset.saturating_add(local_start);
+                let mut stream_blocks = vec![vec![0.0_f32; request_len]; clip_channels];
+                stream.read_frames(source_from, request_len, &mut stream_blocks);
+                let mut blocks = vec![vec![0.0_f32; request_len]; input_count];
+                for (in_channel, block) in blocks.iter_mut().enumerate() {
+                    let source_channel = if clip_channels == 1 {
+                        0
+                    } else if in_channel < clip_channels {
+                        in_channel
+                    } else {
+                        continue;
+                    };
+                    block.copy_from_slice(&stream_blocks[source_channel]);
+                }
+                blocks
+            }
+            AudioClipBuffer::SeekableStreaming(stream) => {
                 let clip_channels = stream.channels().max(1);
                 let input_count = self.audio.ins.len().max(1);
                 let local_start = absolute_from.saturating_sub(clip_start);
@@ -1064,6 +1223,11 @@ impl TrackData {
     }
 
     pub(crate) fn preload_audio_clip_cache(&mut self) {
+        // Every clip now streams, so each preloaded clip spawns a producer
+        // thread. A global cap (`streaming::MAX_STREAMING_PRODUCERS`) bounds
+        // the total thread count across the engine; clips beyond the cap
+        // fall back to a whole-file buffered decode when loaded, trading RAM
+        // for thread count rather than spawning unbounded producers.
         let missing: Vec<String> = self
             .audio
             .clips()
@@ -1463,5 +1627,68 @@ impl TrackData {
             *events = self.allocate_mpe_events(std::mem::take(events));
             events.sort_by_key(|event| event.frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_codec::{AudioDither, AudioEncodeFormat, encode_audio_to_file, write_wav_f32};
+
+    fn probe(path: &Path) -> Option<crate::audio_codec::AudioFileInfo> {
+        crate::audio_codec::probe_audio_file(path).ok()
+    }
+
+    #[test]
+    fn clip_strategy_engine_rate_wav_uses_seekable_streaming() {
+        let path = std::env::temp_dir().join(format!(
+            "maolan_strategy_engine_wav_{}.wav",
+            std::process::id()
+        ));
+        let samples: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.01).sin()).collect();
+        write_wav_f32(&path, &samples, 1, 48_000).expect("write wav");
+        let probed = probe(&path);
+        assert_eq!(
+            TrackData::choose_clip_strategy(true, probed.as_ref(), 48_000),
+            ClipStrategy::SeekableWav
+        );
+        // A foreign engine rate must not take the seekable path.
+        assert_eq!(
+            TrackData::choose_clip_strategy(true, probed.as_ref(), 44_100),
+            ClipStrategy::Streaming
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clip_strategy_flac_uses_compressed_streaming() {
+        let path =
+            std::env::temp_dir().join(format!("maolan_strategy_flac_{}.flac", std::process::id()));
+        let samples: Vec<f32> = (0..4410).map(|i| (i as f32 * 0.01).sin()).collect();
+        encode_audio_to_file(
+            &path,
+            &samples,
+            1,
+            48_000,
+            AudioEncodeFormat::Flac(16),
+            AudioDither::None,
+        )
+        .expect("write flac");
+        let probed = probe(&path);
+        assert_eq!(
+            TrackData::choose_clip_strategy(false, probed.as_ref(), 48_000),
+            ClipStrategy::Streaming
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clip_strategy_probe_failure_uses_streaming() {
+        let path = Path::new("/nonexistent/definitely-missing-file.wav");
+        assert_eq!(
+            TrackData::choose_clip_strategy(true, None, 48_000),
+            ClipStrategy::Streaming
+        );
+        let _ = path;
     }
 }
