@@ -577,8 +577,247 @@ pub enum SessionAction {
     StopAllClips,
 }
 
+/// Engine state reports and unsolicited events. Formerly `Action` variants
+/// the engine echoed back wrapped in `Ok(...)`; now delivered as
+/// `Message::Event`.
+///
+/// `TransportPosition` here is the engine's position *report*; the seek
+/// *command* remains `Action::TransportPosition`.
+#[derive(Clone, Debug)]
+pub enum Event {
+    TransportPositionAt {
+        sample: usize,
+        after_frames: usize,
+    },
+    HistoryState {
+        dirty: bool,
+    },
+    Log {
+        source: String,
+        message: String,
+    },
+    TrackClapStateDirty {
+        track_name: String,
+        instance_id: usize,
+    },
+    ClipClapStateDirty {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    SessionMidiLearnTriggered {
+        target: SessionMidiLearnTarget,
+    },
+    SessionRuntimeReport {
+        track_name: String,
+        scene_index: usize,
+        state: SessionSlotState,
+        play_position_samples: usize,
+        elapsed_samples: usize,
+    },
+    StepRecordMidiNote {
+        device: String,
+        channel: u8,
+        pitch: u8,
+        velocity: u8,
+    },
+    HWInfo {
+        channels: usize,
+        rate: usize,
+        input: bool,
+    },
+    TrackClapStateSnapshot {
+        track_name: String,
+        instance_id: usize,
+        plugin_id: String,
+        state: Box<crate::clap::ClapPluginState>,
+    },
+    ClipClapStateSnapshot {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        plugin_id: String,
+        state: Box<crate::clap::ClapPluginState>,
+    },
+    TrackVst3StateSnapshot {
+        track_name: String,
+        instance_id: usize,
+        state: Box<crate::vst3::state::Vst3PluginState>,
+    },
+    ClipVst3StateSnapshot {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        state: Box<crate::vst3::state::Vst3PluginState>,
+    },
+    #[cfg(unix)]
+    TrackLv2StateSnapshot {
+        track_name: String,
+        instance_id: usize,
+        state: Vec<u8>,
+    },
+    #[cfg(unix)]
+    ClipLv2StateSnapshot {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        state: Vec<u8>,
+    },
+    TrackSnapshotAllClapStatesDone {
+        track_name: String,
+    },
+    TrackClapResourceFiles {
+        track_name: String,
+        instance_id: usize,
+        files: Vec<(u32, String)>,
+    },
+    ClipClapResourceFiles {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        files: Vec<(u32, String)>,
+    },
+    TransportPosition(usize),
+    /// Result of an offline (freeze/export) bounce job. The inner `Action`
+    /// is the finished or canceled `TrackOfflineBounce` command (those stay
+    /// `Action` variants since the GUI also sends them).
+    OfflineBounceFinished(Box<Result<Action, String>>),
+}
+
+/// Answers to `Request*`/`Get*` queries. Formerly `Action` variants echoed
+/// in `Ok(...)`; now delivered as `Message::QueryReply`. The queries
+/// themselves remain `Action` variants.
+#[derive(Clone, Debug)]
+pub enum QueryReply {
+    TrackList(Vec<String>),
+    TransportState {
+        sample: usize,
+        tempo_bpm: f64,
+        playing: bool,
+        paused: bool,
+        tsig_num: u16,
+        tsig_denom: u16,
+    },
+    MeterSnapshot {
+        hw_out_db: Arc<Vec<f32>>,
+        track_meters: Arc<Vec<(String, Vec<f32>)>>,
+    },
+    ClapPlugins(Vec<ClapPluginInfo>),
+    ClapPluginsUnavailable {
+        error: String,
+    },
+    Vst3Plugins(Vec<Vst3PluginInfo>),
+    Vst3PluginsUnavailable {
+        error: String,
+    },
+    #[cfg(unix)]
+    Lv2Plugins(Vec<Lv2PluginInfo>),
+    #[cfg(unix)]
+    Lv2PluginsUnavailable {
+        error: String,
+    },
+    TrackPluginGraph {
+        track_name: String,
+        plugins: Vec<PluginGraphPlugin>,
+        connections: Vec<PluginGraphConnection>,
+        connectable_connections: Vec<ConnectableConnection>,
+    },
+    TrackVst3Graph {
+        track_name: String,
+        plugins: Vec<Vst3GraphPlugin>,
+        connections: Vec<Vst3GraphConnection>,
+    },
+    TrackClapParameters {
+        track_name: String,
+        instance_id: usize,
+        parameters: Vec<ClapParameterInfo>,
+    },
+    ClipClapParameters {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        parameters: Vec<ClapParameterInfo>,
+    },
+    TrackVst3Parameters {
+        track_name: String,
+        instance_id: usize,
+        parameters: Vec<crate::vst3::port::ParameterInfo>,
+    },
+    ClipVst3Parameters {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        parameters: Vec<crate::vst3::port::ParameterInfo>,
+    },
+    #[cfg(unix)]
+    TrackLv2PluginControls {
+        track_name: String,
+        instance_id: usize,
+        controls: Vec<Lv2ControlPortInfo>,
+        instance_access_handle: Option<usize>,
+    },
+    #[cfg(unix)]
+    ClipLv2PluginControls {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        controls: Vec<Lv2ControlPortInfo>,
+        instance_access_handle: Option<usize>,
+    },
+    TrackClapNoteNames {
+        track_name: String,
+        note_names: std::collections::HashMap<u8, String>,
+    },
+    #[cfg(unix)]
+    TrackLv2Midnam {
+        track_name: String,
+        note_names: std::collections::HashMap<u8, String>,
+    },
+    JackGraph(JackGraphInfo),
+    SessionDiagnosticsReport {
+        track_count: usize,
+        frozen_track_count: usize,
+        audio_clip_count: usize,
+        midi_clip_count: usize,
+        #[cfg(unix)]
+        lv2_instance_count: usize,
+        vst3_instance_count: usize,
+        clap_instance_count: usize,
+        pending_requests: usize,
+        workers_total: usize,
+        workers_ready: usize,
+        pending_hw_midi_events: usize,
+        playing: bool,
+        transport_running: bool,
+        transport_sample: usize,
+        tempo_bpm: f64,
+        sample_rate_hz: usize,
+        cycle_samples: usize,
+    },
+    MidiLearnMappingsReport {
+        lines: Vec<String>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum Action {
+    /// Seek command (jump the playhead). The engine's position *reports*
+    /// are `Event::TransportPosition` / `Event::TransportPositionAt`.
+    TransportPosition(usize),
+    /// Seek with a sub-cycle anchor (OSC command; the report twin lives in
+    /// `Event`).
+    TransportPositionAt {
+        sample: usize,
+        after_frames: usize,
+    },
+    /// Step-recording note input (OSC/hardware command; engine reports use
+    /// `Event::StepRecordMidiNote`).
+    StepRecordMidiNote {
+        device: String,
+        channel: u8,
+        pitch: u8,
+        velocity: u8,
+    },
     Quit,
     Log {
         source: String,
@@ -588,11 +827,6 @@ pub enum Action {
     Pause,
     Stop,
     SessionPlay,
-    TransportPosition(usize),
-    TransportPositionAt {
-        sample: usize,
-        after_frames: usize,
-    },
     JumpToEnd,
     SetLoopEnabled(bool),
     SetLoopRange(Option<(usize, usize)>),
@@ -806,21 +1040,8 @@ pub enum Action {
         output_db: Vec<f32>,
     },
     RequestMeterSnapshot,
-    MeterSnapshot {
-        hw_out_db: Arc<Vec<f32>>,
-        track_meters: Arc<Vec<(String, Vec<f32>)>>,
-    },
     RequestTrackList,
-    TrackList(Vec<String>),
     RequestTransportState,
-    TransportState {
-        sample: usize,
-        tempo_bpm: f64,
-        playing: bool,
-        paused: bool,
-        tsig_num: u16,
-        tsig_denom: u16,
-    },
     TrackToggleArm(String),
     TrackToggleMute(String),
     TrackTogglePhase(String),
@@ -868,9 +1089,6 @@ pub enum Action {
     SetSessionMidiLearnBinding {
         target: SessionMidiLearnTarget,
         binding: Option<MidiLearnBinding>,
-    },
-    SessionMidiLearnTriggered {
-        target: SessionMidiLearnTarget,
     },
     TrackSetFolder {
         track_name: String,
@@ -980,12 +1198,6 @@ pub enum Action {
         notes: Vec<(usize, MidiNoteData)>,
     },
     SetStepRecording(bool),
-    StepRecordMidiNote {
-        device: String,
-        channel: u8,
-        pitch: u8,
-        velocity: u8,
-    },
     SetMidiSysExEvents {
         track_name: String,
         clip_index: usize,
@@ -1023,12 +1235,6 @@ pub enum Action {
         instance_id: usize,
     },
     #[cfg(unix)]
-    TrackLv2StateSnapshot {
-        track_name: String,
-        instance_id: usize,
-        state: Vec<u8>,
-    },
-    #[cfg(unix)]
     TrackGetLv2PluginControls {
         track_name: String,
         instance_id: usize,
@@ -1040,35 +1246,11 @@ pub enum Action {
         instance_id: usize,
     },
     #[cfg(unix)]
-    TrackLv2PluginControls {
-        track_name: String,
-        instance_id: usize,
-        controls: Vec<Lv2ControlPortInfo>,
-        instance_access_handle: Option<usize>,
-    },
-    #[cfg(unix)]
-    ClipLv2PluginControls {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        controls: Vec<Lv2ControlPortInfo>,
-        instance_access_handle: Option<usize>,
-    },
-    #[cfg(unix)]
     TrackGetLv2Midnam {
         track_name: String,
     },
-    #[cfg(unix)]
-    TrackLv2Midnam {
-        track_name: String,
-        note_names: std::collections::HashMap<u8, String>,
-    },
     TrackGetClapNoteNames {
         track_name: String,
-    },
-    TrackClapNoteNames {
-        track_name: String,
-        note_names: std::collections::HashMap<u8, String>,
     },
     #[cfg(unix)]
     TrackSetLv2ControlValue {
@@ -1085,22 +1267,9 @@ pub enum Action {
         index: u32,
         value: f32,
     },
-    #[cfg(unix)]
-    ClipLv2StateSnapshot {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        state: Vec<u8>,
-    },
     TrackGetPluginGraph {
         track_name: String,
         include_state: bool,
-    },
-    TrackPluginGraph {
-        track_name: String,
-        plugins: Vec<PluginGraphPlugin>,
-        connections: Vec<PluginGraphConnection>,
-        connectable_connections: Vec<ConnectableConnection>,
     },
     TrackConnectPluginAudio {
         track_name: String,
@@ -1160,23 +1329,9 @@ pub enum Action {
     },
     #[cfg(unix)]
     ListLv2Plugins,
-    #[cfg(unix)]
-    Lv2Plugins(Vec<Lv2PluginInfo>),
-    #[cfg(unix)]
-    Lv2PluginsUnavailable {
-        error: String,
-    },
     ListVst3Plugins,
-    Vst3Plugins(Vec<Vst3PluginInfo>),
-    Vst3PluginsUnavailable {
-        error: String,
-    },
     ListClapPlugins,
     ListClapPluginsWithCapabilities,
-    ClapPlugins(Vec<ClapPluginInfo>),
-    ClapPluginsUnavailable {
-        error: String,
-    },
     TrackSetClapParameter {
         track_name: String,
         instance_id: usize,
@@ -1194,12 +1349,6 @@ pub enum Action {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-    },
-    ClipClapParameters {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        parameters: Vec<ClapParameterInfo>,
     },
     TrackSetClapParameterAt {
         track_name: String,
@@ -1224,38 +1373,11 @@ pub enum Action {
         track_name: String,
         instance_id: usize,
     },
-    TrackClapParameters {
-        track_name: String,
-        instance_id: usize,
-        parameters: Vec<ClapParameterInfo>,
-    },
     TrackClapSnapshotState {
         track_name: String,
         instance_id: usize,
     },
     ClipClapSnapshotState {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-    },
-    TrackClapStateSnapshot {
-        track_name: String,
-        instance_id: usize,
-        plugin_id: String,
-        state: crate::clap::ClapPluginState,
-    },
-    ClipClapStateSnapshot {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        plugin_id: String,
-        state: crate::clap::ClapPluginState,
-    },
-    TrackClapStateDirty {
-        track_name: String,
-        instance_id: usize,
-    },
-    ClipClapStateDirty {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
@@ -1272,9 +1394,6 @@ pub enum Action {
         state: crate::clap::ClapPluginState,
     },
     TrackSnapshotAllClapStates {
-        track_name: String,
-    },
-    TrackSnapshotAllClapStatesDone {
         track_name: String,
     },
     TrackLoadClapPlugin {
@@ -1357,11 +1476,6 @@ pub enum Action {
         track_name: String,
         instance_id: usize,
     },
-    TrackClapResourceFiles {
-        track_name: String,
-        instance_id: usize,
-        files: Vec<(u32, String)>,
-    },
     ClipSetPluginResourceDir {
         track_name: String,
         clip_idx: usize,
@@ -1375,19 +1489,8 @@ pub enum Action {
         clip_idx: usize,
         instance_id: usize,
     },
-    ClipClapResourceFiles {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        files: Vec<(u32, String)>,
-    },
     TrackGetVst3Graph {
         track_name: String,
-    },
-    TrackVst3Graph {
-        track_name: String,
-        plugins: Vec<Vst3GraphPlugin>,
-        connections: Vec<Vst3GraphConnection>,
     },
     TrackSetVst3Parameter {
         track_name: String,
@@ -1412,21 +1515,10 @@ pub enum Action {
         track_name: String,
         instance_id: usize,
     },
-    TrackVst3Parameters {
-        track_name: String,
-        instance_id: usize,
-        parameters: Vec<crate::vst3::port::ParameterInfo>,
-    },
     ClipGetVst3Parameters {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-    },
-    ClipVst3Parameters {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        parameters: Vec<crate::vst3::port::ParameterInfo>,
     },
     TrackVst3SnapshotState {
         track_name: String,
@@ -1436,17 +1528,6 @@ pub enum Action {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
-    },
-    TrackVst3StateSnapshot {
-        track_name: String,
-        instance_id: usize,
-        state: crate::vst3::state::Vst3PluginState,
-    },
-    ClipVst3StateSnapshot {
-        track_name: String,
-        clip_idx: usize,
-        instance_id: usize,
-        state: crate::vst3::state::Vst3PluginState,
     },
     TrackVst3RestoreState {
         track_name: String,
@@ -1520,7 +1601,6 @@ pub enum Action {
     JackAddAudioOutputPort,
     JackRemoveAudioOutputPort(usize),
     JackGetGraph,
-    JackGraph(JackGraphInfo),
     JackConnect {
         source: String,
         destination: String,
@@ -1534,48 +1614,10 @@ pub enum Action {
     RequestSessionDiagnostics,
     RequestMidiLearnMappingsReport,
     ClearAllMidiLearnBindings,
-    SessionDiagnosticsReport {
-        track_count: usize,
-        frozen_track_count: usize,
-        audio_clip_count: usize,
-        midi_clip_count: usize,
-        #[cfg(unix)]
-        lv2_instance_count: usize,
-        vst3_instance_count: usize,
-        clap_instance_count: usize,
-        pending_requests: usize,
-        workers_total: usize,
-        workers_ready: usize,
-        pending_hw_midi_events: usize,
-        playing: bool,
-        transport_running: bool,
-        transport_sample: usize,
-        tempo_bpm: f64,
-        sample_rate_hz: usize,
-        cycle_samples: usize,
-    },
-    MidiLearnMappingsReport {
-        lines: Vec<String>,
-    },
-    HWInfo {
-        channels: usize,
-        rate: usize,
-        input: bool,
-    },
     MarkHistorySavePoint,
-    HistoryState {
-        dirty: bool,
-    },
     Undo,
     Redo,
     Session(SessionAction),
-    SessionRuntimeReport {
-        track_name: String,
-        scene_index: usize,
-        state: SessionSlotState,
-        play_position_samples: usize,
-        elapsed_samples: usize,
-    },
     Panic,
 }
 
@@ -1597,6 +1639,10 @@ pub enum Message {
     },
     ProcessOfflineBounce(OfflineBounceWork),
     Channel(Sender<Self>),
+    /// Unsolicited state report / event broadcast to clients.
+    Event(Event),
+    /// Answer to a `Request*`/`Get*` query, delivered to clients.
+    QueryReply(QueryReply),
 
     Request(Action),
     OscRequest {

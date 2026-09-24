@@ -4,6 +4,7 @@ pub mod ipc;
 pub mod lv2_proc;
 pub mod types;
 pub mod vst3_proc;
+pub mod watchdog;
 
 pub use types::*;
 

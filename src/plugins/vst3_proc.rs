@@ -8,7 +8,6 @@ use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
 use maolan_plugin_protocol::ringbuf::RingBuffer;
 use maolan_plugin_protocol::shm::ShmMapping;
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr};
@@ -39,14 +38,11 @@ pub struct Vst3Processor {
     param_values: HashMap<u32, AtomicU64>,
     bypassed: Arc<AtomicBool>,
 
-    /// Host child process handle. Interior-mutable so `process_with_audio_buffers`
-    /// (which takes `&self`) can poll it with `try_wait`.
-    ///
-    /// Invariant: at any moment there is at most one accessor — either the
-    /// audio thread running this plugin's own plan task node (exactly one per
-    /// cycle), or control code running after the last `Arc` reference to this
-    /// processor is gone (`Drop`).
-    child: UnsafeCell<Option<Child>>,
+    /// Host child process handle. Control-side only: the audio thread never
+    /// touches it (crash detection is done by the single
+    /// `watchdog::ProcessWatchdog` from the PID), and `Drop` is the only
+    /// accessor, handing it to `ipc::drop_host`.
+    child: Option<Child>,
     /// Host stderr pipe; control-side only (`take_stderr`). RCU-published so
     /// no blocking primitive is involved.
     stderr: ArcSwapOption<ChildStderr>,
@@ -54,15 +50,9 @@ pub struct Vst3Processor {
     events: Option<EventPair>,
     shm_name: String,
 
-    crash_count: AtomicU32,
     last_latency_samples: AtomicUsize,
     latency_changed: AtomicBool,
 }
-
-// Safety: see the invariants on `child` and `stderr` above. Every other field
-// is either immutable after construction or synchronized on its own
-// (atomics / RCU).
-unsafe impl Sync for Vst3Processor {}
 
 pub type SharedVst3Processor = Arc<Vst3Processor>;
 
@@ -90,12 +80,11 @@ impl Vst3Processor {
             param_infos: Vec::new(),
             param_values: HashMap::new(),
             bypassed: Arc::new(AtomicBool::new(false)),
-            child: UnsafeCell::new(None),
+            child: None,
             stderr: ArcSwapOption::from(None),
             mapping: None,
             events: None,
             shm_name: String::new(),
-            crash_count: AtomicU32::new(0),
             last_latency_samples: AtomicUsize::new(0),
             latency_changed: AtomicBool::new(false),
         }
@@ -166,6 +155,12 @@ impl Vst3Processor {
             .map(|_| Arc::new(MIDIIO::new()))
             .collect();
 
+        let bypassed = Arc::new(AtomicBool::new(false));
+        // Register with the process-wide crash watchdog: if the host process
+        // exits, the shared bypass flag is flipped and the RT path bypasses.
+        crate::plugins::watchdog::ProcessWatchdog::global()
+            .watch(child.id(), Arc::clone(&bypassed));
+
         Ok(Self {
             path: plugin_path.to_string(),
             plugin_id: plugin_id.to_string(),
@@ -178,27 +173,15 @@ impl Vst3Processor {
             midi_output_ports,
             param_infos,
             param_values,
-            bypassed: Arc::new(AtomicBool::new(false)),
-            child: UnsafeCell::new(Some(child)),
+            bypassed,
+            child: Some(child),
             stderr: ArcSwapOption::from_pointee(stderr),
             mapping: Some(mapping),
             events: Some(events),
             shm_name,
-            crash_count: AtomicU32::new(0),
             last_latency_samples: AtomicUsize::new(0),
             latency_changed: AtomicBool::new(false),
         })
-    }
-
-    /// Access the host child process handle.
-    ///
-    /// # Safety
-    /// The caller must be the sole accessor of `child` at this time: either
-    /// the audio thread running this plugin's own plan task node (exactly one
-    /// per cycle), or control code running after the last `Arc` reference to
-    /// this processor is gone.
-    unsafe fn with_child<R>(&self, f: impl FnOnce(&mut Option<Child>) -> R) -> R {
-        f(unsafe { &mut *self.child.get() })
     }
 
     pub fn setup_audio_ports(&self) {
@@ -415,25 +398,6 @@ impl Vst3Processor {
         audio_outputs: &mut [&mut [f32]],
     ) -> Vec<MidiEvent> {
         if self.bypassed.load(Ordering::Relaxed) {
-            ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
-            return Vec::new();
-        }
-
-        // Safety: the sole RT accessor of `child` is this processor's own
-        // plan task node, which runs exactly once per cycle.
-        let crashed = unsafe {
-            self.with_child(|child| {
-                if let Some(c) = child.as_mut()
-                    && let Ok(Some(status)) = c.try_wait()
-                    && !status.success()
-                {
-                    self.crash_count.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-                false
-            })
-        };
-        if crashed {
             ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
@@ -681,9 +645,12 @@ impl Vst3Processor {
 
 impl Drop for Vst3Processor {
     fn drop(&mut self) {
+        if let Some(ref child) = self.child {
+            crate::plugins::watchdog::ProcessWatchdog::global().unwatch(child.id());
+        }
         let mapping = self.mapping.take();
         let events = self.events.take();
-        let child = self.child.get_mut().take();
+        let child = self.child.take();
         let shm_name = std::mem::take(&mut self.shm_name);
         ipc::drop_host(mapping, events, child, shm_name);
     }
@@ -878,6 +845,17 @@ mod tests {
             .expect("should create VST3 processor for crash test");
 
         processor.setup_audio_ports();
+
+        // Wait for the process-wide watchdog to observe the aborted host and
+        // flip the bypass flag (event-driven, should be near-instant).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !processor.is_bypassed() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            processor.is_bypassed(),
+            "watchdog should have bypassed the crashed processor"
+        );
 
         let input_buffers = [vec![1.0; 256]];
         let mut output_buffers = [vec![0.0; 256]];

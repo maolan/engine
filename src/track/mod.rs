@@ -684,6 +684,17 @@ pub struct TrackRt {
     folder_clip_playback_active: bool,
     folder_record_tap_input_snapshots: Vec<Vec<f32>>,
     plugin_delay_lines: HashMap<(usize, usize), crate::render_plan::DelayLine>,
+    /// Reusable render target for `render_audio_clip_segment` (grown on
+    /// demand, cleared per use). Passed down recursion as `out`; never
+    /// aliased across tasks because clip rendering for a track is sequential
+    /// under `&mut self`.
+    clip_render_scratch: Vec<Vec<f32>>,
+    /// Reusable accumulation buffer for grouped (take-lane) clips; taken
+    /// from `self.rt` only for the duration of one grouped render so nested
+    /// groups fall back to a fresh allocation.
+    clip_render_group_scratch: Vec<Vec<f32>>,
+    /// Reusable temporary for streaming clip decode (source channel planes).
+    clip_render_stream_scratch: Vec<Vec<f32>>,
 }
 
 impl TrackRt {
@@ -732,6 +743,9 @@ impl TrackRt {
             folder_clip_playback_active: false,
             folder_record_tap_input_snapshots: Vec::new(),
             plugin_delay_lines: HashMap::new(),
+            clip_render_scratch: Vec::new(),
+            clip_render_group_scratch: Vec::new(),
+            clip_render_stream_scratch: Vec::new(),
         }
     }
 
@@ -791,9 +805,23 @@ pub struct Track {
     inner: UnsafeCell<TrackData>,
 }
 
+/// Control-side MIDI-learn bindings for a track (dispatcher-read only;
+/// never touched by the render path).
+#[derive(Debug, Default)]
+pub struct TrackMidiLearnBindings {
+    pub volume: Option<crate::message::MidiLearnBinding>,
+    pub balance: Option<crate::message::MidiLearnBinding>,
+    pub mute: Option<crate::message::MidiLearnBinding>,
+    pub solo: Option<crate::message::MidiLearnBinding>,
+    pub arm: Option<crate::message::MidiLearnBinding>,
+    pub input_monitor: Option<crate::message::MidiLearnBinding>,
+    pub disk_monitor: Option<crate::message::MidiLearnBinding>,
+}
+
 #[derive(Debug)]
 pub struct TrackData {
     pub rt: TrackRtCell,
+    pub midi_learn: TrackMidiLearnBindings,
     pub name: String,
     // Atomic scalars (5b-iv-1): single-location control values written by the
     // dispatcher and read by the RT plan. Relaxed ordering is sufficient —
@@ -811,13 +839,6 @@ pub struct TrackData {
     midi_input_monitor: ArcSwap<Vec<bool>>,
     midi_disk_monitor: ArcSwap<Vec<bool>>,
     pub color: Option<crate::message::TrackColor>,
-    pub midi_learn_volume: Option<crate::message::MidiLearnBinding>,
-    pub midi_learn_balance: Option<crate::message::MidiLearnBinding>,
-    pub midi_learn_mute: Option<crate::message::MidiLearnBinding>,
-    pub midi_learn_solo: Option<crate::message::MidiLearnBinding>,
-    pub midi_learn_arm: Option<crate::message::MidiLearnBinding>,
-    pub midi_learn_input_monitor: Option<crate::message::MidiLearnBinding>,
-    pub midi_learn_disk_monitor: Option<crate::message::MidiLearnBinding>,
     pub is_folder: bool,
     pub folder_open: AtomicBool,
     pub parent_track: Option<String>,

@@ -141,20 +141,20 @@ impl Engine {
             self.notify_clients(Err(e)).await;
             return true;
         }
-        self.notify_clients(Ok(Action::Log {
+        self.notify_event(Event::Log {
             source: "engine".to_string(),
             message: format!("CLAP plugin loaded on track '{track_name}': {resolved_plugin_path}"),
-        }))
+        })
         .await;
         if let Some(instance) = track.clap_plugins.last()
             && let Some(stderr) = instance.processor.take_stderr()
         {
             let source = format!("clap:{resolved_plugin_path}");
             self.spawn_plugin_host_stderr_reader(stderr, source);
-            self.notify_clients(Ok(Action::Log {
+            self.notify_event(Event::Log {
                 source: "engine".to_string(),
                 message: format!("Attached stderr reader for CLAP plugin on track '{track_name}'"),
-            }))
+            })
             .await;
         }
         false
@@ -521,12 +521,12 @@ impl Engine {
             connectable = connectable_connections.len(),
             "TrackGetPluginGraph responding"
         );
-        self.notify_clients(Ok(Action::TrackPluginGraph {
+        self.notify_query_reply(QueryReply::TrackPluginGraph {
             track_name: track_name.clone(),
             plugins,
             connections,
             connectable_connections,
-        }))
+        })
         .await;
         true
     }
@@ -796,12 +796,12 @@ impl Engine {
                         );
                         Vec::new()
                     });
-                self.notify_clients(Ok(Action::ClipClapResourceFiles {
+                self.notify_event(Event::ClipClapResourceFiles {
                     track_name: track_name.clone(),
                     clip_idx,
                     instance_id,
                     files,
-                }))
+                })
                 .await;
             }
             Err(e) => {
@@ -897,12 +897,12 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().clip_get_clap_parameters(clip_idx, instance_id) {
                 Ok(parameters) => {
-                    self.notify_clients(Ok(Action::ClipClapParameters {
+                    self.notify_query_reply(QueryReply::ClipClapParameters {
                         track_name: track_name.clone(),
                         clip_idx,
                         instance_id,
                         parameters,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1045,12 +1045,12 @@ impl Engine {
                     .unwrap_or_default();
                 match track.lock().clap_snapshot_state(instance_id) {
                     Ok(state) => {
-                        self.notify_clients(Ok(Action::TrackClapStateSnapshot {
+                        self.notify_event(Event::TrackClapStateSnapshot {
                             track_name: track_name.clone(),
                             instance_id,
                             plugin_id,
-                            state,
-                        }))
+                            state: Box::new(state),
+                        })
                         .await;
                     }
                     Err(e) => {
@@ -1169,20 +1169,20 @@ impl Engine {
         for (instance_id, plugin_id) in instances {
             match track.lock().clap_snapshot_state(instance_id) {
                 Ok(state) => {
-                    self.notify_clients(Ok(Action::TrackClapStateSnapshot {
+                    self.notify_event(Event::TrackClapStateSnapshot {
                         track_name: track_name.clone(),
                         instance_id,
                         plugin_id,
-                        state,
-                    }))
+                        state: Box::new(state),
+                    })
                     .await;
                 }
                 Err(_e) => {}
             }
         }
-        self.notify_clients(Ok(Action::TrackSnapshotAllClapStatesDone {
+        self.notify_event(Event::TrackSnapshotAllClapStatesDone {
             track_name: track_name.clone(),
-        }))
+        })
         .await;
 
         false
@@ -1349,10 +1349,10 @@ impl Engine {
             }
         };
         track.lock().clear_plugins();
-        self.notify_clients(Ok(Action::Log {
+        self.notify_event(Event::Log {
             source: "engine".to_string(),
             message: format!("Cleared plugins from track '{track_name}'"),
-        }))
+        })
         .await;
 
         false
@@ -1372,11 +1372,11 @@ impl Engine {
                             tracing::warn!(track_name = %track_name, instance_id, error = %e, "Failed to collect CLAP resources");
                             Vec::new()
                         });
-                self.notify_clients(Ok(Action::TrackClapResourceFiles {
+                self.notify_event(Event::TrackClapResourceFiles {
                     track_name: track_name.clone(),
                     instance_id,
                     files,
-                }))
+                })
                 .await;
             }
             Err(e) => {
@@ -1397,11 +1397,11 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().get_clap_parameters(instance_id) {
                 Ok(parameters) => {
-                    self.notify_clients(Ok(Action::TrackClapParameters {
+                    self.notify_query_reply(QueryReply::TrackClapParameters {
                         track_name: track_name.clone(),
                         instance_id,
                         parameters,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1427,13 +1427,13 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().clip_clap_snapshot_state(clip_idx, instance_id) {
                 Ok((plugin_id, state)) => {
-                    self.notify_clients(Ok(Action::ClipClapStateSnapshot {
+                    self.notify_event(Event::ClipClapStateSnapshot {
                         track_name: track_name.clone(),
                         clip_idx,
                         instance_id,
                         plugin_id,
-                        state,
-                    }))
+                        state: Box::new(state),
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1457,11 +1457,11 @@ impl Engine {
                 let t = track.lock();
                 let plugins = t.vst3_graph_plugins();
                 let connections = t.vst3_graph_connections();
-                self.notify_clients(Ok(Action::TrackVst3Graph {
+                self.notify_query_reply(QueryReply::TrackVst3Graph {
                     track_name: track_name.clone(),
                     plugins,
                     connections,
-                }))
+                })
                 .await;
             }
             Err(e) => {
@@ -1521,11 +1521,11 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().get_vst3_parameters(instance_id) {
                 Ok(parameters) => {
-                    self.notify_clients(Ok(Action::TrackVst3Parameters {
+                    self.notify_query_reply(QueryReply::TrackVst3Parameters {
                         track_name: track_name.clone(),
                         instance_id,
                         parameters,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1551,12 +1551,12 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().clip_get_vst3_parameters(clip_idx, instance_id) {
                 Ok(parameters) => {
-                    self.notify_clients(Ok(Action::ClipVst3Parameters {
+                    self.notify_query_reply(QueryReply::ClipVst3Parameters {
                         track_name: track_name.clone(),
                         clip_idx,
                         instance_id,
                         parameters,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1582,12 +1582,12 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().get_lv2_plugin_controls(instance_id) {
                 Ok(controls) => {
-                    self.notify_clients(Ok(Action::TrackLv2PluginControls {
+                    self.notify_query_reply(QueryReply::TrackLv2PluginControls {
                         track_name: track_name.clone(),
                         instance_id,
                         controls,
                         instance_access_handle: None,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1617,13 +1617,13 @@ impl Engine {
                 .clip_get_lv2_plugin_controls(clip_idx, instance_id)
             {
                 Ok(controls) => {
-                    self.notify_clients(Ok(Action::ClipLv2PluginControls {
+                    self.notify_query_reply(QueryReply::ClipLv2PluginControls {
                         track_name: track_name.clone(),
                         clip_idx,
                         instance_id,
                         controls,
                         instance_access_handle: None,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1649,11 +1649,11 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().lv2_snapshot_state(instance_id) {
                 Ok(state) => {
-                    self.notify_clients(Ok(Action::TrackLv2StateSnapshot {
+                    self.notify_event(Event::TrackLv2StateSnapshot {
                         track_name: track_name.clone(),
                         instance_id,
                         state,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1680,12 +1680,12 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().clip_lv2_snapshot_state(clip_idx, instance_id) {
                 Ok(state) => {
-                    self.notify_clients(Ok(Action::ClipLv2StateSnapshot {
+                    self.notify_event(Event::ClipLv2StateSnapshot {
                         track_name: track_name.clone(),
                         clip_idx,
                         instance_id,
                         state,
-                    }))
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1710,11 +1710,11 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().vst3_snapshot_state(instance_id) {
                 Ok(state) => {
-                    self.notify_clients(Ok(Action::TrackVst3StateSnapshot {
+                    self.notify_event(Event::TrackVst3StateSnapshot {
                         track_name: track_name.clone(),
                         instance_id,
-                        state,
-                    }))
+                        state: Box::new(state),
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1740,12 +1740,12 @@ impl Engine {
         match self.track_handle_or_err(track_name) {
             Ok(track) => match track.lock().clip_vst3_snapshot_state(clip_idx, instance_id) {
                 Ok(state) => {
-                    self.notify_clients(Ok(Action::ClipVst3StateSnapshot {
+                    self.notify_event(Event::ClipVst3StateSnapshot {
                         track_name: track_name.clone(),
                         clip_idx,
                         instance_id,
-                        state,
-                    }))
+                        state: Box::new(state),
+                    })
                     .await;
                 }
                 Err(e) => {
@@ -1772,10 +1772,10 @@ impl Engine {
             }
         };
         let note_names = track.lock().get_clap_note_names();
-        self.notify_clients(Ok(Action::TrackClapNoteNames {
+        self.notify_query_reply(QueryReply::TrackClapNoteNames {
             track_name: track_name.clone(),
             note_names,
-        }))
+        })
         .await;
 
         false
@@ -1795,10 +1795,10 @@ impl Engine {
             }
         };
         let note_names = track.lock().get_lv2_midnam();
-        self.notify_clients(Ok(Action::TrackLv2Midnam {
+        self.notify_query_reply(QueryReply::TrackLv2Midnam {
             track_name: track_name.clone(),
             note_names,
-        }))
+        })
         .await;
 
         false
@@ -1812,11 +1812,12 @@ impl Engine {
 
         match crate::plugins::scan_plugins::<crate::plugins::types::Lv2PluginInfo>("lv2") {
             Ok(plugins) => {
-                self.notify_clients(Ok(Action::Lv2Plugins(plugins))).await;
+                self.notify_query_reply(QueryReply::Lv2Plugins(plugins))
+                    .await;
             }
             Err(e) => {
                 tracing::error!("LV2 plugin scan failed: {e}");
-                self.notify_clients(Ok(Action::Lv2PluginsUnavailable { error: e }))
+                self.notify_query_reply(QueryReply::Lv2PluginsUnavailable { error: e })
                     .await;
             }
         }
@@ -1830,11 +1831,12 @@ impl Engine {
 
         match crate::plugins::scan_plugins::<crate::plugins::types::Vst3PluginInfo>("vst3") {
             Ok(plugins) => {
-                self.notify_clients(Ok(Action::Vst3Plugins(plugins))).await;
+                self.notify_query_reply(QueryReply::Vst3Plugins(plugins))
+                    .await;
             }
             Err(e) => {
                 tracing::error!("VST3 plugin scan failed: {e}");
-                self.notify_clients(Ok(Action::Vst3PluginsUnavailable { error: e }))
+                self.notify_query_reply(QueryReply::Vst3PluginsUnavailable { error: e })
                     .await;
             }
         }
@@ -1848,11 +1850,12 @@ impl Engine {
 
         match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap") {
             Ok(plugins) => {
-                self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
+                self.notify_query_reply(QueryReply::ClapPlugins(plugins))
+                    .await;
             }
             Err(e) => {
                 tracing::error!("CLAP plugin scan failed: {e}");
-                self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
+                self.notify_query_reply(QueryReply::ClapPluginsUnavailable { error: e })
                     .await;
             }
         }
@@ -1866,11 +1869,12 @@ impl Engine {
 
         match crate::plugins::scan_plugins::<crate::plugins::types::ClapPluginInfo>("clap") {
             Ok(plugins) => {
-                self.notify_clients(Ok(Action::ClapPlugins(plugins))).await;
+                self.notify_query_reply(QueryReply::ClapPlugins(plugins))
+                    .await;
             }
             Err(e) => {
                 tracing::error!("CLAP plugin scan failed: {e}");
-                self.notify_clients(Ok(Action::ClapPluginsUnavailable { error: e }))
+                self.notify_query_reply(QueryReply::ClapPluginsUnavailable { error: e })
                     .await;
             }
         }
@@ -2139,5 +2143,496 @@ impl Engine {
             }
         };
         false
+    }
+}
+
+impl Engine {
+    pub(crate) async fn handle_plugin_request(&mut self, a: Action) -> bool {
+        match a {
+            Action::TrackClearPlugins { .. } => {
+                if Self::box_bool(self.handle_track_clear_plugins(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackSetLv2PluginState { .. } => {
+                if Self::box_bool(self.handle_track_set_lv2_plugin_state(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::ClipSetLv2PluginState { ref track_name, .. } => {
+                self.notify_clients(Err(format!(
+                    "Track '{}': clip LV2 plugin state changes are not supported",
+                    track_name
+                )))
+                .await;
+            }
+            Action::TrackGetClapNoteNames { .. } => {
+                if Self::box_bool(self.handle_track_get_clap_note_names(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackGetLv2Midnam { .. } => {
+                if Self::box_bool(self.handle_track_get_lv2_midnam(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackGetPluginGraph { .. } => {
+                if Self::box_bool(self.handle_track_get_plugin_graph(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackConnectPluginAudio { .. } => {
+                if Self::box_bool(self.handle_track_connect_plugin_audio(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackConnectPluginMidi { .. } => {
+                if Self::box_bool(self.handle_track_connect_plugin_midi(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackDisconnectPluginAudio { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_plugin_audio(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackDisconnectPluginMidi { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_plugin_midi(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackConnectAudio { .. } => {
+                if Self::box_bool(self.handle_track_connect_audio(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackDisconnectAudio { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_audio(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackConnectMidi { .. } => {
+                if Self::box_bool(self.handle_track_connect_midi(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackDisconnectMidi { .. } => {
+                if Self::box_bool(self.handle_track_disconnect_midi(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::ListLv2Plugins => {
+                if Self::box_bool(self.handle_list_lv2_plugins(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ListVst3Plugins => {
+                if Self::box_bool(self.handle_list_vst3_plugins(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ListClapPlugins => {
+                if Self::box_bool(self.handle_list_clap_plugins(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ListClapPluginsWithCapabilities => {
+                if self
+                    .handle_list_clap_plugins_with_capabilities(a.clone())
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::TrackLoadClapPlugin {
+                ref track_name,
+                ref plugin_id,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_load_clap_plugin(
+                        track_name.as_str(),
+                        plugin_id.as_str(),
+                        instance_id,
+                    )
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::TrackUnloadClapPlugin {
+                ref track_name,
+                ref plugin_id,
+            } => {
+                if self
+                    .handle_track_unload_clap_plugin(track_name.as_str(), plugin_id.as_str())
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::TrackUnloadClapPluginInstance {
+                ref track_name,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_unload_clap_plugin_instance(track_name.as_str(), instance_id)
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::TrackShowClapGui { .. } => {
+                if Self::box_bool(self.handle_track_show_clap_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipShowClapGui { .. } => {
+                if Self::box_bool(self.handle_clip_show_clap_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackLoadVst3Plugin {
+                ref track_name,
+                ref plugin_id,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_load_vst3_plugin(
+                        track_name.as_str(),
+                        plugin_id.as_str(),
+                        instance_id,
+                    )
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::TrackUnloadVst3Plugin {
+                ref track_name,
+                ref plugin_id,
+            } => {
+                if self
+                    .handle_track_unload_vst3_plugin(track_name.as_str(), plugin_id.as_str())
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::TrackUnloadVst3PluginInstance {
+                ref track_name,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_unload_vst3_plugin_instance(track_name.as_str(), instance_id)
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::TrackShowVst3Gui { .. } => {
+                if Self::box_bool(self.handle_track_show_vst3_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipShowVst3Gui { .. } => {
+                if Self::box_bool(self.handle_clip_show_vst3_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackLoadLv2Plugin {
+                ref track_name,
+                ref plugin_uri,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_load_lv2_plugin(
+                        track_name.as_str(),
+                        plugin_uri.as_str(),
+                        instance_id,
+                    )
+                    .await
+                {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackUnloadLv2Plugin {
+                ref track_name,
+                ref plugin_uri,
+            } => {
+                if self
+                    .handle_track_unload_lv2_plugin(track_name.as_str(), plugin_uri.as_str())
+                    .await
+                {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackUnloadLv2PluginInstance {
+                ref track_name,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_unload_lv2_plugin_instance(track_name.as_str(), instance_id)
+                    .await
+                {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackShowLv2Gui { .. } => {
+                if Self::box_bool(self.handle_track_show_lv2_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::ClipShowLv2Gui { .. } => {
+                if Self::box_bool(self.handle_clip_show_lv2_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetPluginResourceDir { .. } => {
+                if Self::box_bool(self.handle_track_set_plugin_resource_dir(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackClapCollectResources { .. } => {
+                if Self::box_bool(self.handle_track_clap_collect_resources(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipSetPluginResourceDir { .. } => {
+                if Self::box_bool(self.handle_clip_set_plugin_resource_dir(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipClapCollectResources { .. } => {
+                if Self::box_bool(self.handle_clip_clap_collect_resources(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetClapParameter { .. } => {
+                if Self::box_bool(self.handle_track_set_clap_parameter(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipSetClapParameter { .. } => {
+                if Self::box_bool(self.handle_clip_set_clap_parameter(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipGetClapParameters { .. } => {
+                if Self::box_bool(self.handle_clip_get_clap_parameters(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetClapParameterAt { .. } => {
+                if Self::box_bool(self.handle_track_set_clap_parameter_at(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackBeginClapParameterEdit { .. } => {
+                if Self::box_bool(self.handle_track_begin_clap_parameter_edit(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackEndClapParameterEdit { .. } => {
+                if Self::box_bool(self.handle_track_end_clap_parameter_edit(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackGetClapParameters { .. } => {
+                if Self::box_bool(self.handle_track_get_clap_parameters(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackClapSnapshotState { .. } => {
+                if Self::box_bool(self.handle_track_clap_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipClapSnapshotState { .. } => {
+                if Self::box_bool(self.handle_clip_clap_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackClapRestoreState { .. } => {
+                if Self::box_bool(self.handle_track_clap_restore_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipClapRestoreState { .. } => {
+                if Self::box_bool(self.handle_clip_clap_restore_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSnapshotAllClapStates { .. } => {
+                if Self::box_bool(self.handle_track_snapshot_all_clap_states(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackGetVst3Graph { .. } => {
+                if Self::box_bool(self.handle_track_get_vst3_graph(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetVst3Parameter { .. } => {
+                if Self::box_bool(self.handle_track_set_vst3_parameter(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipSetVst3Parameter { .. } => {
+                if Self::box_bool(self.handle_clip_set_vst3_parameter(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetPluginBypassed { .. } => {
+                if Self::box_bool(self.handle_track_set_plugin_bypassed(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackGetVst3Parameters { .. } => {
+                if Self::box_bool(self.handle_track_get_vst3_parameters(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipGetVst3Parameters { .. } => {
+                if Self::box_bool(self.handle_clip_get_vst3_parameters(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackSetLv2ControlValue { .. } => {
+                if Self::box_bool(self.handle_track_set_lv2_control_value(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::ClipSetLv2ControlValue { .. } => {
+                if Self::box_bool(self.handle_clip_set_lv2_control_value(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackGetLv2PluginControls { .. } => {
+                if Self::box_bool(self.handle_track_get_lv2_plugin_controls(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::ClipGetLv2PluginControls { .. } => {
+                if Self::box_bool(self.handle_clip_get_lv2_plugin_controls(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::TrackLv2SnapshotState { .. } => {
+                if Self::box_bool(self.handle_track_lv2_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            Action::ClipLv2SnapshotState { .. } => {
+                if Self::box_bool(self.handle_clip_lv2_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackVst3SnapshotState { .. } => {
+                if Self::box_bool(self.handle_track_vst3_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipVst3SnapshotState { .. } => {
+                if Self::box_bool(self.handle_clip_vst3_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackVst3RestoreState { .. } => {
+                if Self::box_bool(self.handle_track_vst3_restore_state(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackConnectVst3Audio { .. } => {
+                if Self::box_bool(self.handle_track_connect_vst3_audio(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackDisconnectVst3Audio { .. }
+                if Self::box_bool(self.handle_track_disconnect_vst3_audio(a.clone())).await =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+impl Engine {
+    pub(crate) fn spawn_plugin_host_stderr_reader(
+        &self,
+        stderr: std::process::ChildStderr,
+        source: String,
+    ) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line
+                    && !line.is_empty()
+                {
+                    let _ = tx.blocking_send(Message::Request(Action::Log {
+                        source: source.clone(),
+                        message: line,
+                    }));
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn publish_clap_state_dirty(&mut self) {
+        let tracks: Vec<(String, crate::state::TrackHandle)> = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .iter()
+            .map(|(name, track)| (name.clone(), track.clone()))
+            .collect();
+        for (track_name, track) in &tracks {
+            let dirty = track.lock().take_dirty_clap_instances();
+            for instance_id in dirty {
+                self.notify_event(Event::TrackClapStateDirty {
+                    track_name: track_name.clone(),
+                    instance_id,
+                })
+                .await;
+            }
+        }
+    }
+}
+
+impl Engine {
+    pub(crate) async fn poll_stopped_plugin_parameter_echoes(&mut self) {
+        if self.transport.playing || self.transport.transport_running {
+            return;
+        }
+
+        let state = self.state_snapshot.load_full();
+        let mut updates = Vec::new();
+        for track in state.tracks.values() {
+            updates.extend(track.lock().drain_plugin_parameter_echoes());
+        }
+        drop(state);
+
+        for action in updates {
+            self.notify_clients(Ok(action)).await;
+        }
     }
 }

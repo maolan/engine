@@ -640,7 +640,8 @@ impl Engine {
             note_off_events.extend(self.note_off_events_for_track(&track_name));
         }
         if !note_off_events.is_empty() {
-            self.pending_hw_midi_out_events_by_device
+            self.hw_midi
+                .pending_hw_midi_out_events_by_device
                 .extend(note_off_events);
         }
     }
@@ -1483,16 +1484,21 @@ impl Engine {
             }
         }
         self.state.lock().tracks.remove(name);
-        self.audio_recordings.remove(name);
-        self.midi_recordings.remove(name);
-        self.midi_hw_in_routes.retain(|r| r.to_track != *name);
-        self.midi_hw_out_routes.retain(|r| r.from_track != *name);
+        self.recording.audio_recordings.remove(name);
+        self.recording.midi_recordings.remove(name);
+        self.hw_midi
+            .midi_hw_in_routes
+            .retain(|r| r.to_track != *name);
+        self.hw_midi
+            .midi_hw_out_routes
+            .retain(|r| r.from_track != *name);
         if self
+            .midi_learn
             .pending_midi_learn
             .as_ref()
             .is_some_and(|(track_name, _, _)| track_name == name)
         {
-            self.pending_midi_learn = None;
+            self.midi_learn.pending_midi_learn = None;
         }
     }
 
@@ -1507,82 +1513,13 @@ impl Engine {
             && !self.history_suspended
             && let Action::RemoveTrack(track_name) = action_to_process
         {
-            for route in self
-                .midi_hw_in_routes
-                .iter()
-                .filter(|route| &route.to_track == track_name)
-            {
-                extra_inverse_actions.push(Action::Connect {
-                    from_track: format!("midi:hw:in:{}", route.device),
-                    from_port: 0,
-                    to_track: route.to_track.clone(),
-                    to_port: route.to_port,
-                    kind: Kind::MIDI,
-                });
-            }
-            for route in self
-                .midi_hw_out_routes
-                .iter()
-                .filter(|route| &route.from_track == track_name)
-            {
-                extra_inverse_actions.push(Action::Connect {
-                    from_track: route.from_track.clone(),
-                    from_port: route.from_port,
-                    to_track: format!("midi:hw:out:{}", route.device),
-                    to_port: 0,
-                    kind: Kind::MIDI,
-                });
-            }
+            self.undo_remove_track_extras(track_name, &mut extra_inverse_actions);
         }
         if record_history
             && !self.history_suspended
             && matches!(action_to_process, Action::ClearAllMidiLearnBindings)
         {
-            if let Some(binding) = self.global_midi_learn_play_pause.clone() {
-                extra_inverse_actions.push(Action::SetGlobalMidiLearnBinding {
-                    target: crate::message::GlobalMidiLearnTarget::PlayPause,
-                    binding: Some(binding),
-                });
-            }
-            if let Some(binding) = self.global_midi_learn_stop.clone() {
-                extra_inverse_actions.push(Action::SetGlobalMidiLearnBinding {
-                    target: crate::message::GlobalMidiLearnTarget::Stop,
-                    binding: Some(binding),
-                });
-            }
-            if let Some(binding) = self.global_midi_learn_record_toggle.clone() {
-                extra_inverse_actions.push(Action::SetGlobalMidiLearnBinding {
-                    target: crate::message::GlobalMidiLearnTarget::RecordToggle,
-                    binding: Some(binding),
-                });
-            }
-            for (key, binding) in self.session_midi_learn_slots.clone() {
-                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
-                    target: crate::message::SessionMidiLearnTarget::Slot {
-                        track_name: key.0,
-                        scene_index: key.1,
-                    },
-                    binding: Some(binding),
-                });
-            }
-            for (scene_index, binding) in self.session_midi_learn_scenes.clone() {
-                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
-                    target: crate::message::SessionMidiLearnTarget::Scene(scene_index),
-                    binding: Some(binding),
-                });
-            }
-            for (track_name, binding) in self.session_midi_learn_stop_track.clone() {
-                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
-                    target: crate::message::SessionMidiLearnTarget::StopTrack(track_name),
-                    binding: Some(binding),
-                });
-            }
-            if let Some(binding) = self.session_midi_learn_stop_all.clone() {
-                extra_inverse_actions.push(Action::SetSessionMidiLearnBinding {
-                    target: crate::message::SessionMidiLearnTarget::StopAll,
-                    binding: Some(binding),
-                });
-            }
+            self.undo_clear_midi_learn_extras(&mut extra_inverse_actions);
         }
         let mut inverse_actions = if record_history
             && !suppress_timing_history
@@ -1597,97 +1534,13 @@ impl Engine {
             None
         };
         if record_history && !suppress_timing_history && !self.history_suspended {
-            match action_to_process {
-                Action::SetTempo(_) => {
-                    inverse_actions = Some(vec![Action::SetTempo(self.tempo_bpm)]);
-                }
-                Action::SetLoopEnabled(_) => {
-                    inverse_actions = Some(vec![Action::SetLoopEnabled(self.loop_enabled)]);
-                }
-                Action::SetLoopRange(_) => {
-                    inverse_actions = Some(vec![
-                        Action::SetLoopRange(self.loop_range_samples),
-                        Action::SetLoopEnabled(self.loop_enabled),
-                    ]);
-                }
-                Action::SetPunchEnabled(_) => {
-                    inverse_actions = Some(vec![Action::SetPunchEnabled(self.punch_enabled)]);
-                }
-                Action::SetPunchRange(_) => {
-                    inverse_actions = Some(vec![
-                        Action::SetPunchRange(self.punch_range_samples),
-                        Action::SetPunchEnabled(self.punch_enabled),
-                    ]);
-                }
-                Action::SetMetronomeEnabled(_) => {
-                    inverse_actions =
-                        Some(vec![Action::SetMetronomeEnabled(self.metronome_enabled)]);
-                }
-                Action::SetTimeSignature { .. } => {
-                    inverse_actions = Some(vec![Action::SetTimeSignature {
-                        numerator: self.tsig_num,
-                        denominator: self.tsig_denom,
-                    }]);
-                }
-                Action::SetTempoMap { .. } => {
-                    inverse_actions = Some(vec![Action::SetTempoMap {
-                        tempo_points: self.tempo_points.clone(),
-                        time_signature_points: self.time_signature_points.clone(),
-                    }]);
-                }
-                Action::SetClipPlaybackEnabled(_) => {
-                    inverse_actions = Some(vec![Action::SetClipPlaybackEnabled(
-                        self.clip_playback_enabled,
-                    )]);
-                }
-                Action::SetRecordEnabled(_) => {
-                    inverse_actions = Some(vec![Action::SetRecordEnabled(self.record_enabled)]);
-                }
-                Action::SetGlobalMidiLearnBinding { target, .. } => {
-                    let binding = match target {
-                        crate::message::GlobalMidiLearnTarget::PlayPause => {
-                            self.global_midi_learn_play_pause.clone()
-                        }
-                        crate::message::GlobalMidiLearnTarget::Stop => {
-                            self.global_midi_learn_stop.clone()
-                        }
-                        crate::message::GlobalMidiLearnTarget::RecordToggle => {
-                            self.global_midi_learn_record_toggle.clone()
-                        }
-                    };
-                    inverse_actions = Some(vec![Action::SetGlobalMidiLearnBinding {
-                        target: *target,
-                        binding,
-                    }]);
-                }
-                Action::SetModulators(_) => {
-                    inverse_actions = Some(vec![Action::SetModulators(self.modulators.clone())]);
-                }
-                Action::SetSessionMidiLearnBinding { target, .. } => {
-                    let binding = match target {
-                        crate::message::SessionMidiLearnTarget::Slot {
-                            track_name,
-                            scene_index,
-                        } => self
-                            .session_midi_learn_slots
-                            .get(&(track_name.clone(), *scene_index))
-                            .cloned(),
-                        crate::message::SessionMidiLearnTarget::Scene(scene_index) => {
-                            self.session_midi_learn_scenes.get(scene_index).cloned()
-                        }
-                        crate::message::SessionMidiLearnTarget::StopTrack(track_name) => {
-                            self.session_midi_learn_stop_track.get(track_name).cloned()
-                        }
-                        crate::message::SessionMidiLearnTarget::StopAll => {
-                            self.session_midi_learn_stop_all.clone()
-                        }
-                    };
-                    inverse_actions = Some(vec![Action::SetSessionMidiLearnBinding {
-                        target: target.clone(),
-                        binding,
-                    }]);
-                }
-                _ => {}
+            let engine_state_inverse = self
+                .undo_engine_state_inverse_transport(action_to_process)
+                .or_else(|| self.undo_engine_state_inverse_recording(action_to_process))
+                .or_else(|| self.undo_engine_state_inverse_midi(action_to_process))
+                .or_else(|| self.undo_engine_state_inverse_automation(action_to_process));
+            if let Some(engine_state_inverse) = engine_state_inverse {
+                inverse_actions = Some(engine_state_inverse);
             }
         }
         inverse_actions
@@ -1754,9 +1607,13 @@ impl Engine {
             tracks.insert(name.clone(), Arc::new(track));
             if let Some(track) = tracks.get(&name) {
                 let mut t = track.lock();
-                t.set_clip_playback_enabled(self.clip_playback_enabled);
-                t.set_transport_timing(self.tempo_bpm, self.tsig_num, self.tsig_denom);
-                t.set_session_base_dir(self.session_dir.clone());
+                t.set_clip_playback_enabled(self.transport.clip_playback_enabled);
+                t.set_transport_timing(
+                    self.transport.tempo_bpm,
+                    self.transport.tsig_num,
+                    self.transport.tsig_denom,
+                );
+                t.set_session_base_dir(self.session.session_dir.clone());
                 t.mixosc_addr = mixosc_addr;
             }
         } else {
@@ -1784,7 +1641,12 @@ impl Engine {
                 {
                     inv.append(&mut actions);
                 }
-                for route in self.midi_hw_in_routes.iter().filter(|r| &r.to_track == n) {
+                for route in self
+                    .hw_midi
+                    .midi_hw_in_routes
+                    .iter()
+                    .filter(|r| &r.to_track == n)
+                {
                     inv.push(Action::Connect {
                         from_track: format!("midi:hw:in:{}", route.device),
                         from_port: 0,
@@ -1794,6 +1656,7 @@ impl Engine {
                     });
                 }
                 for route in self
+                    .hw_midi
                     .midi_hw_out_routes
                     .iter()
                     .filter(|r| &r.from_track == n)
@@ -1977,8 +1840,8 @@ impl Engine {
                         from_device: from_device.to_string(),
                         to_device: to_device.to_string(),
                     };
-                    if !self.midi_hw_thru_routes.iter().any(|r| r == &route) {
-                        self.midi_hw_thru_routes.push(route);
+                    if !self.hw_midi.midi_hw_thru_routes.iter().any(|r| r == &route) {
+                        self.hw_midi.midi_hw_thru_routes.push(route);
                     }
                 } else if let Some(device) = from_hw_in_device {
                     if let Some(t_t) = to_track_handle {
@@ -1995,8 +1858,8 @@ impl Engine {
                             to_track: to_track.to_string(),
                             to_port,
                         };
-                        if !self.midi_hw_in_routes.iter().any(|r| r == &route) {
-                            self.midi_hw_in_routes.push(route);
+                        if !self.hw_midi.midi_hw_in_routes.iter().any(|r| r == &route) {
+                            self.hw_midi.midi_hw_in_routes.push(route);
                         }
                     } else {
                         self.notify_clients(Err(format!(
@@ -2020,8 +1883,8 @@ impl Engine {
                             from_port,
                             device: device.to_string(),
                         };
-                        if !self.midi_hw_out_routes.iter().any(|r| r == &route) {
-                            self.midi_hw_out_routes.push(route);
+                        if !self.hw_midi.midi_hw_out_routes.iter().any(|r| r == &route) {
+                            self.hw_midi.midi_hw_out_routes.push(route);
                         }
                     } else {
                         self.notify_clients(Err(format!(
@@ -2140,10 +2003,11 @@ impl Engine {
             let to_hw_out_device = Self::midi_hw_out_device(to_track);
 
             if let (Some(from_device), Some(to_device)) = (from_hw_in_device, to_hw_out_device) {
-                let before = self.midi_hw_thru_routes.len();
-                self.midi_hw_thru_routes
+                let before = self.hw_midi.midi_hw_thru_routes.len();
+                self.hw_midi
+                    .midi_hw_thru_routes
                     .retain(|r| !(r.from_device == from_device && r.to_device == to_device));
-                if self.midi_hw_thru_routes.len() < before {
+                if self.hw_midi.midi_hw_thru_routes.len() < before {
                     self.notify_clients(Ok(action.clone())).await;
                 } else {
                     self.notify_clients(Err(format!(
@@ -2156,11 +2020,11 @@ impl Engine {
             }
 
             if let Some(device) = from_hw_in_device {
-                let before = self.midi_hw_in_routes.len();
-                self.midi_hw_in_routes.retain(|r| {
+                let before = self.hw_midi.midi_hw_in_routes.len();
+                self.hw_midi.midi_hw_in_routes.retain(|r| {
                     !(r.device == device && r.to_track == *to_track && r.to_port == to_port)
                 });
-                if self.midi_hw_in_routes.len() < before {
+                if self.hw_midi.midi_hw_in_routes.len() < before {
                     self.notify_clients(Ok(action.clone())).await;
                 } else {
                     self.notify_clients(Err(format!(
@@ -2173,11 +2037,11 @@ impl Engine {
             }
 
             if let Some(device) = to_hw_out_device {
-                let before = self.midi_hw_out_routes.len();
-                self.midi_hw_out_routes.retain(|r| {
+                let before = self.hw_midi.midi_hw_out_routes.len();
+                self.hw_midi.midi_hw_out_routes.retain(|r| {
                     !(r.from_track == *from_track && r.from_port == from_port && r.device == device)
                 });
-                if self.midi_hw_out_routes.len() < before {
+                if self.hw_midi.midi_hw_out_routes.len() < before {
                     self.notify_clients(Ok(action.clone())).await;
                 } else {
                     self.notify_clients(Err(format!(
@@ -2348,6 +2212,7 @@ impl Engine {
 
                 // Remove MIDI hardware routes.
                 for route in self
+                    .hw_midi
                     .midi_hw_in_routes
                     .iter()
                     .filter(|r| r.to_track == track_name)
@@ -2360,9 +2225,12 @@ impl Engine {
                         kind: Kind::MIDI,
                     });
                 }
-                self.midi_hw_in_routes.retain(|r| r.to_track != track_name);
+                self.hw_midi
+                    .midi_hw_in_routes
+                    .retain(|r| r.to_track != track_name);
 
                 for route in self
+                    .hw_midi
                     .midi_hw_out_routes
                     .iter()
                     .filter(|r| r.from_track == track_name)
@@ -2375,7 +2243,8 @@ impl Engine {
                         kind: Kind::MIDI,
                     });
                 }
-                self.midi_hw_out_routes
+                self.hw_midi
+                    .midi_hw_out_routes
                     .retain(|r| r.from_track != track_name);
 
                 // Remove track-to-track MIDI connections where this track is the source.
@@ -2626,27 +2495,31 @@ impl Engine {
             }
         }
 
-        if let Some(recording) = self.audio_recordings.remove(old_name) {
-            self.audio_recordings.insert(new_name.clone(), recording);
+        if let Some(recording) = self.recording.audio_recordings.remove(old_name) {
+            self.recording
+                .audio_recordings
+                .insert(new_name.clone(), recording);
         }
-        if let Some(recording) = self.midi_recordings.remove(old_name) {
-            self.midi_recordings.insert(new_name.clone(), recording);
+        if let Some(recording) = self.recording.midi_recordings.remove(old_name) {
+            self.recording
+                .midi_recordings
+                .insert(new_name.clone(), recording);
         }
 
-        for route in &mut self.midi_hw_in_routes {
+        for route in &mut self.hw_midi.midi_hw_in_routes {
             if route.to_track == *old_name {
                 route.to_track = new_name.clone();
             }
         }
-        for route in &mut self.midi_hw_out_routes {
+        for route in &mut self.hw_midi.midi_hw_out_routes {
             if route.from_track == *old_name {
                 route.from_track = new_name.clone();
             }
         }
-        if let Some((armed_track, target, device)) = self.pending_midi_learn.clone()
+        if let Some((armed_track, target, device)) = self.midi_learn.pending_midi_learn.clone()
             && armed_track == *old_name
         {
-            self.pending_midi_learn = Some((new_name.clone(), target, device));
+            self.midi_learn.pending_midi_learn = Some((new_name.clone(), target, device));
         }
 
         self.notify_clients(Ok(Action::RenameTrack {
@@ -3134,7 +3007,7 @@ impl Engine {
         if let Some(track) = self.state.lock().tracks.get(name).cloned() {
             track.lock().arm();
             let armed = track.lock().armed();
-            if !armed && self.audio_recordings.contains_key(name) {
+            if !armed && self.recording.audio_recordings.contains_key(name) {
                 self.flush_track_recording(name).await;
             }
         } else {
@@ -3282,6 +3155,1983 @@ impl Engine {
         );
 
         false
+    }
+}
+
+impl Engine {
+    /// Topology request arms: tracks, routing/connections, clips, toggles.
+    pub(crate) async fn handle_topology_request(&mut self, a: Action) -> bool {
+        match a {
+            Action::AddTrack { .. } => {
+                self.handle_add_track(a.clone()).await;
+            }
+            Action::TrackAddAudioInput(..) => {
+                if Self::box_bool(self.handle_track_add_audio_input(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackAddAudioOutput(..) => {
+                if Self::box_bool(self.handle_track_add_audio_output(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackRemoveAudioInput(..) => {
+                if Self::box_bool(self.handle_track_remove_audio_input(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackRemoveAudioOutput(..) => {
+                if Self::box_bool(self.handle_track_remove_audio_output(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::RenameTrack { .. } => {
+                if Self::box_bool(self.handle_rename_track(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackLevel(ref name, level) => {
+                if name == "hw:out" {
+                    self.meters.hw_out_level_db = level;
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
+                    track.lock().set_level(level);
+                }
+            }
+            Action::TrackBalance(ref name, balance) => {
+                if name == "hw:out" {
+                    self.meters.hw_out_balance = balance.clamp(-1.0, 1.0);
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
+                    track.lock().set_balance(balance);
+                }
+            }
+            Action::TrackToggleMute(ref name) => {
+                if name == "hw:out" {
+                    self.meters.hw_out_muted = !self.meters.hw_out_muted;
+                } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
+                    track.lock().mute();
+                }
+            }
+            Action::TrackTogglePhase(ref name) => {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
+                    track.lock().invert_phase();
+                }
+            }
+            Action::TrackToggleSolo(ref name) => {
+                if name == "hw:out" {
+                    return true;
+                }
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
+                    track.lock().solo();
+                }
+            }
+            Action::TrackToggleMaster(ref name) => {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
+                    track.lock().toggle_master();
+                }
+            }
+            Action::TrackToggleInputMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
+                    track.lock().toggle_input_monitor(lane);
+                }
+            }
+            Action::TrackToggleDiskMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
+                    track.lock().toggle_disk_monitor(lane);
+                }
+            }
+            Action::TrackToggleMidiInputMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
+                    track.lock().toggle_midi_input_monitor(lane);
+                }
+            }
+            Action::TrackToggleMidiDiskMonitor {
+                ref track_name,
+                lane,
+            } => {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
+                    track.lock().toggle_midi_disk_monitor(lane);
+                }
+            }
+            Action::TrackSetColor {
+                ref track_name,
+                color,
+            } => {
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
+                    track.lock().color = color;
+                }
+            }
+            Action::TrackSetFolder { .. } => {
+                if Self::box_bool(self.handle_track_set_folder(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetParent {
+                ref track_name,
+                ref parent_name,
+            } => {
+                self.handle_track_set_parent(track_name.as_str(), parent_name.as_deref())
+                    .await;
+            }
+            Action::TrackToggleFolder { .. } => {
+                if Self::box_bool(self.handle_track_toggle_folder(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetMidiLaneChannel { .. } => {
+                if Self::box_bool(self.handle_track_set_midi_lane_channel(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetMpeZone { .. } => {
+                if Self::box_bool(self.handle_track_set_mpe_zone(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackSetMpePitchBendSensitivity { .. } => {
+                if Self::box_bool(self.handle_track_set_mpe_pitch_bend_sensitivity(a.clone())).await
+                {
+                    return true;
+                }
+            }
+            Action::TrackSetFrozen { .. } => {
+                if Self::box_bool(self.handle_track_set_frozen(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::TrackClearDefaultPassthrough { .. } => {
+                if Self::box_bool(self.handle_track_clear_default_passthrough(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::ClipMove { .. } => {
+                self.handle_clip_move(a.clone()).await;
+            }
+            Action::AddClip { .. } => {
+                if Self::box_bool(self.handle_add_clip(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::AddGroupedClip { .. } => {
+                if Self::box_bool(self.handle_add_grouped_clip(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::RemoveClip {
+                ref track_name,
+                kind,
+                ref clip_indices,
+            } => {
+                self.remove_clips_from_track(track_name, kind, clip_indices);
+            }
+            Action::MoveClipToUnused {
+                ref track_name,
+                kind,
+                ref clip_indices,
+            } => {
+                self.move_clips_to_unused(track_name, kind, clip_indices);
+            }
+            Action::DeleteUnusedClips { ref clip_ids } => {
+                self.delete_unused_clips(clip_ids);
+            }
+            Action::SetUnusedClips {
+                ref audio,
+                ref midi,
+            } => {
+                self.set_unused_clips(audio.clone(), midi.clone());
+            }
+            Action::RenameClip {
+                ref track_name,
+                kind,
+                clip_index,
+                ref new_name,
+            } => {
+                self.rename_clip_references(track_name, kind, clip_index, new_name);
+            }
+            Action::SetClipIdentity {
+                ref track_name,
+                kind,
+                clip_index,
+                ref new_id,
+                ref new_name,
+            } => {
+                self.set_clip_identity(track_name, kind, clip_index, new_id, new_name);
+            }
+            Action::SetClipSourceName {
+                ref track_name,
+                kind,
+                clip_index,
+                ref name,
+            } => {
+                self.set_clip_source_name(track_name, clip_index, kind, name.clone());
+            }
+            Action::SetClipFade { .. } => {
+                if Self::box_bool(self.handle_set_clip_fade(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::SetClipBounds {
+                ref track_name,
+                clip_index,
+                kind,
+                start,
+                length,
+                offset,
+            } => {
+                self.set_clip_bounds(track_name, clip_index, kind, start, length, offset);
+            }
+            Action::SyncClipBounds {
+                ref track_name,
+                clip_index,
+                kind,
+                start,
+                length,
+                offset,
+            } => {
+                self.set_clip_bounds(track_name, clip_index, kind, start, length, offset);
+            }
+            Action::SetClipMuted {
+                ref track_name,
+                clip_index,
+                kind,
+                muted,
+            } => {
+                self.set_clip_muted(track_name, clip_index, kind, muted);
+            }
+            Action::SetClipReversed {
+                ref track_name,
+                clip_index,
+                kind,
+                reversed,
+            } => {
+                self.set_clip_reversed(track_name, clip_index, kind, reversed);
+            }
+            Action::SetClipGainDb {
+                ref track_name,
+                clip_index,
+                kind,
+                gain_db,
+            } => {
+                self.set_clip_gain_db(track_name, clip_index, kind, gain_db);
+            }
+            Action::SetClipPluginGraphJson {
+                ref track_name,
+                clip_index,
+                ref plugin_graph_json,
+            } => {
+                self.set_clip_plugin_graph_json(track_name, clip_index, plugin_graph_json.clone());
+            }
+            Action::SetClipPitchCorrection { .. } => {
+                if Self::box_bool(self.handle_set_clip_pitch_correction(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::Connect {
+                ref from_track,
+                from_port,
+                ref to_track,
+                to_port,
+                kind,
+            } => {
+                self.handle_connect(
+                    from_track.as_str(),
+                    from_port,
+                    to_track.as_str(),
+                    to_port,
+                    kind,
+                )
+                .await;
+            }
+            Action::Disconnect { .. } => {
+                self.handle_disconnect(a.clone()).await;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+impl Engine {
+    pub(crate) fn preload_track_clips_spawn(&self) {
+        let tracks: Vec<_> = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .values()
+            .cloned()
+            .collect();
+        for track in tracks {
+            tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+            });
+        }
+    }
+
+    /// Preload all track clips and wait for completion. Used on transport
+    /// play paths: the audio cycle must not start until clip caches are
+    /// populated, otherwise the preload tasks' `&mut Track` access races the
+    /// RT worker and cold-cache reads do disk I/O on the audio path.
+    ///
+    /// Returns an owned future rather than borrowing `self`: `Engine` is not
+    /// `Sync` (it owns JackRuntime/MidiHub directly since Phase 6), so an
+    /// `async fn(&self)` future would be non-`Send`.
+    pub(crate) fn preload_track_clips(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let tracks: Vec<_> = self
+            .state_snapshot
+            .load_full()
+            .tracks
+            .values()
+            .cloned()
+            .collect();
+        Self::preload_track_handles(tracks)
+    }
+
+    async fn preload_track_handles(tracks: Vec<crate::state::TrackHandle>) {
+        if tracks.is_empty() {
+            return;
+        }
+        let mut handles = Vec::with_capacity(tracks.len());
+        for track in tracks {
+            handles.push(tokio::task::spawn_blocking(move || {
+                track.lock().preload_clips();
+            }));
+        }
+        for handle in handles {
+            if let Err(e) = handle.await {
+                tracing::warn!("Clip preload task panicked: {e}");
+            }
+        }
+    }
+}
+
+use crate::history::create_inverse_action;
+use crate::message::{ClipMoveFrom, ClipMoveTo};
+use std::collections::HashSet;
+
+// ---------- Undo/history support (colocated in Phase 4; formerly the crate::history matches) ----------
+
+/// Whether `action` is an undoable command owned by this feature
+/// (colocated from `crate::history::should_record` in Phase 4).
+pub(crate) fn undo_should_record(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::AddTrack { .. }
+            | Action::RemoveTrack(_)
+            | Action::RenameTrack { .. }
+            | Action::TrackLevel(_, _)
+            | Action::TrackBalance(_, _)
+            | Action::TrackToggleArm(_)
+            | Action::TrackToggleMute(_)
+            | Action::TrackTogglePhase(_)
+            | Action::TrackToggleSolo(_)
+            | Action::TrackToggleInputMonitor { .. }
+            | Action::TrackToggleDiskMonitor { .. }
+            | Action::TrackToggleMidiInputMonitor { .. }
+            | Action::TrackToggleMidiDiskMonitor { .. }
+            | Action::TrackSetColor { .. }
+            | Action::TrackSetFrozen { .. }
+            | Action::TrackSetFolder { .. }
+            | Action::TrackSetParent { .. }
+            | Action::TrackToggleFolder { .. }
+            | Action::TrackToggleMaster(_)
+            | Action::TrackAddAudioInput(_)
+            | Action::TrackAddAudioOutput(_)
+            | Action::TrackRemoveAudioInput(_)
+            | Action::TrackRemoveAudioOutput(_)
+            | Action::AddClip { .. }
+            | Action::AddGroupedClip { .. }
+            | Action::RemoveClip { .. }
+            | Action::MoveClipToUnused { .. }
+            | Action::RenameClip { .. }
+            | Action::SetClipIdentity { .. }
+            | Action::ClipMove { .. }
+            | Action::SetClipFade { .. }
+            | Action::SetClipBounds { .. }
+            | Action::SetClipMuted { .. }
+            | Action::SetClipReversed { .. }
+            | Action::SetClipSourceName { .. }
+            | Action::SetClipPluginGraphJson { .. }
+            | Action::SetClipPitchCorrection { .. }
+            | Action::Connect { .. }
+            | Action::Disconnect { .. }
+            | Action::TrackConnectVst3Audio { .. }
+            | Action::TrackDisconnectVst3Audio { .. }
+            | Action::TrackLoadClapPlugin { .. }
+            | Action::TrackUnloadClapPlugin { .. }
+            | Action::TrackUnloadClapPluginInstance { .. }
+            | Action::TrackLoadVst3Plugin { .. }
+            | Action::TrackUnloadVst3PluginInstance { .. }
+            | Action::TrackSetClapParameter { .. }
+            | Action::ClipSetClapParameter { .. }
+            | Action::TrackSetVst3Parameter { .. }
+            | Action::TrackSetPluginBypassed { .. }
+            | Action::TrackConnectPluginAudio { .. }
+            | Action::TrackDisconnectPluginAudio { .. }
+            | Action::TrackConnectPluginMidi { .. }
+            | Action::TrackDisconnectPluginMidi { .. }
+            | Action::TrackConnectAudio { .. }
+            | Action::TrackDisconnectAudio { .. }
+            | Action::TrackConnectMidi { .. }
+            | Action::TrackDisconnectMidi { .. }
+            | Action::TrackUnloadLv2PluginInstance { .. }
+            | Action::TrackSetLv2ControlValue { .. }
+    ) || {
+        #[cfg(unix)]
+        {
+            matches!(action, Action::TrackLoadLv2Plugin { .. })
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+/// State-based inverse constructor for this feature's commands
+/// (colocated from `crate::history::create_inverse_action` in Phase 4).
+pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
+    match action {
+        Action::AddTrack { name, .. } => Some(Action::RemoveTrack(name.clone())),
+
+        Action::RemoveTrack(name) => {
+            let track = state.tracks.get(name)?;
+            let track_lock = track.lock();
+            Some(Action::AddTrack {
+                name: track_lock.name.clone(),
+                audio_ins: track_lock.primary_audio_ins(),
+                midi_ins: track_lock.midi.ins.len(),
+                audio_outs: track_lock.primary_audio_outs(),
+                midi_outs: track_lock.midi.outs.len(),
+                folder: track_lock.is_folder,
+                mixosc_addr: track_lock.mixosc_addr.clone(),
+            })
+        }
+
+        Action::RenameTrack { old_name, new_name } => Some(Action::RenameTrack {
+            old_name: new_name.clone(),
+            new_name: old_name.clone(),
+        }),
+
+        Action::TrackLevel(name, _new_level) => {
+            let track = state.tracks.get(name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackLevel(name.clone(), track_lock.level()))
+        }
+
+        Action::TrackBalance(name, _new_balance) => {
+            let track = state.tracks.get(name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackBalance(name.clone(), track_lock.balance()))
+        }
+
+        Action::TrackToggleArm(name) => Some(Action::TrackToggleArm(name.clone())),
+
+        Action::TrackToggleMute(name) => Some(Action::TrackToggleMute(name.clone())),
+
+        Action::TrackTogglePhase(name) => Some(Action::TrackTogglePhase(name.clone())),
+
+        Action::TrackToggleSolo(name) => Some(Action::TrackToggleSolo(name.clone())),
+
+        Action::TrackToggleInputMonitor { track_name, lane } => {
+            Some(Action::TrackToggleInputMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
+        }
+
+        Action::TrackToggleDiskMonitor { track_name, lane } => {
+            Some(Action::TrackToggleDiskMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
+        }
+
+        Action::TrackToggleMidiInputMonitor { track_name, lane } => {
+            Some(Action::TrackToggleMidiInputMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
+        }
+
+        Action::TrackToggleMidiDiskMonitor { track_name, lane } => {
+            Some(Action::TrackToggleMidiDiskMonitor {
+                track_name: track_name.clone(),
+                lane: *lane,
+            })
+        }
+
+        Action::TrackSetColor {
+            track_name,
+            color: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetColor {
+                track_name: track_name.clone(),
+                color: track_lock.color,
+            })
+        }
+
+        Action::TrackSetFrozen { track_name, .. } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetFrozen {
+                track_name: track_name.clone(),
+                frozen: track_lock.frozen(),
+            })
+        }
+
+        Action::TrackSetFolder {
+            track_name,
+            is_folder: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetFolder {
+                track_name: track_name.clone(),
+                is_folder: track_lock.is_folder,
+            })
+        }
+
+        Action::TrackSetParent {
+            track_name,
+            parent_name: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            Some(Action::TrackSetParent {
+                track_name: track_name.clone(),
+                parent_name: track_lock.parent_track.clone(),
+            })
+        }
+
+        Action::TrackToggleFolder { track_name } => Some(Action::TrackToggleFolder {
+            track_name: track_name.clone(),
+        }),
+
+        Action::TrackToggleMaster(track_name) => {
+            Some(Action::TrackToggleMaster(track_name.clone()))
+        }
+
+        Action::TrackAddAudioInput(name) => Some(Action::TrackRemoveAudioInput(name.clone())),
+
+        Action::TrackAddAudioOutput(name) => Some(Action::TrackRemoveAudioOutput(name.clone())),
+
+        Action::TrackRemoveAudioInput(name) => Some(Action::TrackAddAudioInput(name.clone())),
+
+        Action::TrackRemoveAudioOutput(name) => Some(Action::TrackAddAudioOutput(name.clone())),
+
+        Action::AddClip {
+            track_name, kind, ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let clip_index = match kind {
+                Kind::Audio => track_lock.audio.clips().len(),
+                Kind::MIDI => track_lock.midi.clips().len(),
+            };
+            Some(Action::RemoveClip {
+                track_name: track_name.clone(),
+                kind: *kind,
+                clip_indices: vec![clip_index],
+            })
+        }
+
+        Action::AddGroupedClip {
+            track_name, kind, ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let clip_index = match kind {
+                Kind::Audio => track_lock.audio.clips().len(),
+                Kind::MIDI => track_lock.midi.clips().len(),
+            };
+            Some(Action::RemoveClip {
+                track_name: track_name.clone(),
+                kind: *kind,
+                clip_indices: vec![clip_index],
+            })
+        }
+
+        Action::RemoveClip {
+            track_name,
+            kind,
+            clip_indices,
+        }
+        | Action::MoveClipToUnused {
+            track_name,
+            kind,
+            clip_indices,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+
+            if clip_indices.len() != 1 {
+                return None;
+            }
+
+            let clip_idx = clip_indices[0];
+            match kind {
+                Kind::Audio => {
+                    let clip = track_lock.audio.clips().get(clip_idx).cloned()?;
+                    if clip.grouped_clips.is_empty() {
+                        let length = clip.end.saturating_sub(clip.start);
+                        Some(Action::AddClip {
+                            clip_id: clip.id.clone(),
+                            name: clip.name.clone(),
+                            track_name: track_name.clone(),
+                            start: clip.start,
+                            length,
+                            offset: clip.offset,
+                            input_channel: clip.input_channel,
+                            muted: clip.muted,
+                            reversed: clip.reversed,
+                            gain_db: clip.gain_db,
+                            peaks_file: clip.peaks_file.clone(),
+                            kind: Kind::Audio,
+                            fade_enabled: clip.fade_enabled,
+                            fade_in_samples: clip.fade_in_samples,
+                            fade_out_samples: clip.fade_out_samples,
+                            source_name: clip.pitch_correction_source_name.clone(),
+                            source_offset: clip.pitch_correction_source_offset,
+                            source_length: clip.pitch_correction_source_length,
+                            preview_name: clip.pitch_correction_preview_name.clone(),
+                            pitch_correction_points: clip.pitch_correction_points.clone(),
+                            pitch_correction_frame_likeness: clip.pitch_correction_frame_likeness,
+                            pitch_correction_inertia_ms: clip.pitch_correction_inertia_ms,
+                            pitch_correction_formant_compensation: clip
+                                .pitch_correction_formant_compensation,
+                            pitch_correction_detector: Default::default(),
+                            pitch_correction_mode: Default::default(),
+                            plugin_graph_json: clip.plugin_graph_json.clone(),
+                        })
+                    } else {
+                        Some(Action::AddGroupedClip {
+                            track_name: track_name.clone(),
+                            kind: Kind::Audio,
+                            audio_clip: Some(audio_clip_to_data(&clip)),
+                            midi_clip: None,
+                        })
+                    }
+                }
+                Kind::MIDI => {
+                    let clip = track_lock.midi.clips().get(clip_idx).cloned()?;
+                    if clip.grouped_clips.is_empty() {
+                        let length = clip.end.saturating_sub(clip.start);
+                        Some(Action::AddClip {
+                            clip_id: clip.id.clone(),
+                            name: clip.name.clone(),
+                            track_name: track_name.clone(),
+                            start: clip.start,
+                            length,
+                            offset: clip.offset,
+                            input_channel: clip.input_channel,
+                            muted: clip.muted,
+                            reversed: clip.reversed,
+                            gain_db: 0.0,
+                            peaks_file: None,
+                            kind: Kind::MIDI,
+                            fade_enabled: true,
+                            fade_in_samples: 240,
+                            fade_out_samples: 240,
+                            source_name: None,
+                            source_offset: None,
+                            source_length: None,
+                            preview_name: None,
+                            pitch_correction_points: vec![],
+                            pitch_correction_frame_likeness: None,
+                            pitch_correction_inertia_ms: None,
+                            pitch_correction_formant_compensation: None,
+                            pitch_correction_detector: Default::default(),
+                            pitch_correction_mode: Default::default(),
+                            plugin_graph_json: None,
+                        })
+                    } else {
+                        Some(Action::AddGroupedClip {
+                            track_name: track_name.clone(),
+                            kind: Kind::MIDI,
+                            audio_clip: None,
+                            midi_clip: Some(midi_clip_to_data(&clip)),
+                        })
+                    }
+                }
+            }
+        }
+
+        Action::RenameClip {
+            track_name,
+            kind,
+            clip_index,
+            new_name: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let old_name = match kind {
+                Kind::Audio => track_lock
+                    .audio
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
+                Kind::MIDI => track_lock
+                    .midi
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
+            };
+            Some(Action::RenameClip {
+                track_name: track_name.clone(),
+                kind: *kind,
+                clip_index: *clip_index,
+                new_name: old_name,
+            })
+        }
+
+        Action::SetClipIdentity {
+            track_name,
+            kind,
+            clip_index,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let (old_id, old_name) = match kind {
+                Kind::Audio => {
+                    let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
+                    (clip.id.clone(), clip.name.clone())
+                }
+                Kind::MIDI => {
+                    let clip = track_lock.midi.clips().get(*clip_index).cloned()?;
+                    (clip.id.clone(), clip.name.clone())
+                }
+            };
+            Some(Action::SetClipIdentity {
+                track_name: track_name.clone(),
+                kind: *kind,
+                clip_index: *clip_index,
+                new_id: old_id,
+                new_name: old_name,
+            })
+        }
+
+        Action::ClipMove {
+            kind,
+            from,
+            to,
+            copy,
+        } => {
+            let (original_start, original_input_channel) = {
+                let source_track = state.tracks.get(&from.track_name)?;
+                let source_lock = source_track.lock();
+                match kind {
+                    Kind::Audio => {
+                        let clip = source_lock.audio.clips().get(from.clip_index).cloned()?;
+                        (clip.start, clip.input_channel)
+                    }
+                    Kind::MIDI => {
+                        let clip = source_lock.midi.clips().get(from.clip_index).cloned()?;
+                        (clip.start, clip.input_channel)
+                    }
+                }
+            };
+
+            if *copy {
+                let dest_track = state.tracks.get(&to.track_name)?;
+                let dest_lock = dest_track.lock();
+                let clip_idx = match kind {
+                    Kind::Audio => dest_lock.audio.clips().len(),
+                    Kind::MIDI => dest_lock.midi.clips().len(),
+                };
+                Some(Action::RemoveClip {
+                    track_name: to.track_name.clone(),
+                    kind: *kind,
+                    clip_indices: vec![clip_idx],
+                })
+            } else {
+                let dest_track = state.tracks.get(&to.track_name)?;
+                let dest_lock = dest_track.lock();
+                let dest_len = match kind {
+                    Kind::Audio => {
+                        if dest_lock.audio.clips().is_empty() {
+                            return None;
+                        }
+                        dest_lock.audio.clips().len()
+                    }
+                    Kind::MIDI => {
+                        if dest_lock.midi.clips().is_empty() {
+                            return None;
+                        }
+                        dest_lock.midi.clips().len()
+                    }
+                };
+                let moved_clip_index = if from.track_name == to.track_name {
+                    dest_len.saturating_sub(1)
+                } else {
+                    dest_len
+                };
+                Some(Action::ClipMove {
+                    kind: *kind,
+                    from: ClipMoveFrom {
+                        track_name: to.track_name.clone(),
+                        clip_index: moved_clip_index,
+                    },
+                    to: ClipMoveTo {
+                        track_name: from.track_name.clone(),
+                        sample_offset: original_start,
+                        input_channel: original_input_channel,
+                    },
+                    copy: false,
+                })
+            }
+        }
+
+        Action::SetClipFade {
+            track_name,
+            clip_index,
+            kind,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            match kind {
+                Kind::Audio => {
+                    let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
+                    Some(Action::SetClipFade {
+                        track_name: track_name.clone(),
+                        clip_index: *clip_index,
+                        kind: *kind,
+                        fade_enabled: clip.fade_enabled,
+                        fade_in_samples: clip.fade_in_samples,
+                        fade_out_samples: clip.fade_out_samples,
+                    })
+                }
+                Kind::MIDI => Some(Action::SetClipFade {
+                    track_name: track_name.clone(),
+                    clip_index: *clip_index,
+                    kind: *kind,
+                    fade_enabled: true,
+                    fade_in_samples: 240,
+                    fade_out_samples: 240,
+                }),
+            }
+        }
+
+        Action::SetClipBounds {
+            track_name,
+            clip_index,
+            kind,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            match kind {
+                Kind::Audio => {
+                    let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
+                    Some(Action::SetClipBounds {
+                        track_name: track_name.clone(),
+                        clip_index: *clip_index,
+                        kind: *kind,
+                        start: clip.start,
+                        length: clip.end.saturating_sub(clip.start).max(1),
+                        offset: clip.offset,
+                    })
+                }
+                Kind::MIDI => {
+                    let clip = track_lock.midi.clips().get(*clip_index).cloned()?;
+                    Some(Action::SetClipBounds {
+                        track_name: track_name.clone(),
+                        clip_index: *clip_index,
+                        kind: *kind,
+                        start: clip.start,
+                        length: clip.end.saturating_sub(clip.start).max(1),
+                        offset: clip.offset,
+                    })
+                }
+            }
+        }
+
+        Action::SetClipMuted {
+            track_name,
+            clip_index,
+            kind,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let muted = match kind {
+                Kind::Audio => track_lock.audio.clips().get(*clip_index).cloned()?.muted,
+                Kind::MIDI => track_lock.midi.clips().get(*clip_index).cloned()?.muted,
+            };
+            Some(Action::SetClipMuted {
+                track_name: track_name.clone(),
+                clip_index: *clip_index,
+                kind: *kind,
+                muted,
+            })
+        }
+
+        Action::SetClipReversed {
+            track_name,
+            clip_index,
+            kind,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let reversed = match kind {
+                Kind::Audio => track_lock.audio.clips().get(*clip_index).cloned()?.reversed,
+                Kind::MIDI => track_lock.midi.clips().get(*clip_index).cloned()?.reversed,
+            };
+            Some(Action::SetClipReversed {
+                track_name: track_name.clone(),
+                clip_index: *clip_index,
+                kind: *kind,
+                reversed,
+            })
+        }
+
+        Action::SetClipSourceName {
+            track_name,
+            clip_index,
+            kind,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let name = match kind {
+                Kind::Audio => track_lock
+                    .audio
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
+                Kind::MIDI => track_lock
+                    .midi
+                    .clips()
+                    .get(*clip_index)
+                    .cloned()?
+                    .name
+                    .clone(),
+            };
+            Some(Action::SetClipSourceName {
+                track_name: track_name.clone(),
+                kind: *kind,
+                clip_index: *clip_index,
+                name,
+            })
+        }
+
+        Action::SetClipPitchCorrection {
+            track_name,
+            clip_index,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let clip = track_lock.audio.clips().get(*clip_index).cloned()?;
+            Some(Action::SetClipPitchCorrection {
+                track_name: track_name.clone(),
+                clip_index: *clip_index,
+                preview_name: clip.pitch_correction_preview_name.clone(),
+                source_name: clip.pitch_correction_source_name.clone(),
+                source_offset: clip.pitch_correction_source_offset,
+                source_length: clip.pitch_correction_source_length,
+                pitch_correction_points: clip.pitch_correction_points.clone(),
+                pitch_correction_frame_likeness: clip.pitch_correction_frame_likeness,
+                pitch_correction_inertia_ms: clip.pitch_correction_inertia_ms,
+                pitch_correction_formant_compensation: clip.pitch_correction_formant_compensation,
+            })
+        }
+
+        Action::SetClipPluginGraphJson {
+            track_name,
+            clip_index,
+            plugin_graph_json: _,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track_lock = track.lock();
+            let plugin_graph_json = track_lock
+                .audio
+                .clips()
+                .get(*clip_index)
+                .map(|clip| clip.plugin_graph_json.clone())
+                .unwrap_or_default();
+            Some(Action::SetClipPluginGraphJson {
+                track_name: track_name.clone(),
+                clip_index: *clip_index,
+                plugin_graph_json,
+            })
+        }
+
+        Action::Connect {
+            from_track,
+            from_port,
+            to_track,
+            to_port,
+            kind,
+        } => Some(Action::Disconnect {
+            from_track: from_track.clone(),
+            from_port: *from_port,
+            to_track: to_track.clone(),
+            to_port: *to_port,
+            kind: *kind,
+        }),
+
+        Action::Disconnect {
+            from_track,
+            from_port,
+            to_track,
+            to_port,
+            kind,
+        } => Some(Action::Connect {
+            from_track: from_track.clone(),
+            from_port: *from_port,
+            to_track: to_track.clone(),
+            to_port: *to_port,
+            kind: *kind,
+        }),
+
+        Action::TrackConnectVst3Audio {
+            track_name,
+            from_node,
+            from_port,
+            to_node,
+            to_port,
+        } => Some(Action::TrackDisconnectVst3Audio {
+            track_name: track_name.clone(),
+            from_node: from_node.clone(),
+            from_port: *from_port,
+            to_node: to_node.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackDisconnectVst3Audio {
+            track_name,
+            from_node,
+            from_port,
+            to_node,
+            to_port,
+        } => Some(Action::TrackConnectVst3Audio {
+            track_name: track_name.clone(),
+            from_node: from_node.clone(),
+            from_port: *from_port,
+            to_node: to_node.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackConnectPluginAudio {
+            track_name,
+            from_node,
+            from_port,
+            to_node,
+            to_port,
+        } => Some(Action::TrackDisconnectPluginAudio {
+            track_name: track_name.clone(),
+            from_node: from_node.clone(),
+            from_port: *from_port,
+            to_node: to_node.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackDisconnectPluginAudio {
+            track_name,
+            from_node,
+            from_port,
+            to_node,
+            to_port,
+        } => Some(Action::TrackConnectPluginAudio {
+            track_name: track_name.clone(),
+            from_node: from_node.clone(),
+            from_port: *from_port,
+            to_node: to_node.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackConnectPluginMidi {
+            track_name,
+            from_node,
+            from_port,
+            to_node,
+            to_port,
+        } => Some(Action::TrackDisconnectPluginMidi {
+            track_name: track_name.clone(),
+            from_node: from_node.clone(),
+            from_port: *from_port,
+            to_node: to_node.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackDisconnectPluginMidi {
+            track_name,
+            from_node,
+            from_port,
+            to_node,
+            to_port,
+        } => Some(Action::TrackConnectPluginMidi {
+            track_name: track_name.clone(),
+            from_node: from_node.clone(),
+            from_port: *from_port,
+            to_node: to_node.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackConnectAudio {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackDisconnectAudio {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackDisconnectAudio {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackConnectAudio {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackConnectMidi {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackDisconnectMidi {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackDisconnectMidi {
+            track_name,
+            from,
+            from_port,
+            to,
+            to_port,
+        } => Some(Action::TrackConnectMidi {
+            track_name: track_name.clone(),
+            from: from.clone(),
+            from_port: *from_port,
+            to: to.clone(),
+            to_port: *to_port,
+        }),
+
+        Action::TrackLoadClapPlugin { track_name, .. } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            Some(Action::TrackUnloadClapPluginInstance {
+                track_name: track_name.clone(),
+                instance_id: track.next_clap_instance_id.load(Ordering::Relaxed),
+            })
+        }
+
+        Action::TrackUnloadClapPlugin {
+            track_name,
+            plugin_id,
+        } => Some(Action::TrackLoadClapPlugin {
+            track_name: track_name.clone(),
+            plugin_id: plugin_id.clone(),
+            instance_id: None,
+        }),
+
+        Action::TrackLoadVst3Plugin { track_name, .. } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            Some(Action::TrackUnloadVst3PluginInstance {
+                track_name: track_name.clone(),
+                instance_id: track.next_vst3_instance_id.load(Ordering::Relaxed),
+            })
+        }
+
+        Action::TrackLoadLv2Plugin { track_name, .. } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            Some(Action::TrackUnloadLv2PluginInstance {
+                track_name: track_name.clone(),
+                instance_id: track.next_lv2_instance_id.load(Ordering::Relaxed),
+            })
+        }
+
+        Action::TrackSetClapParameter {
+            track_name,
+            instance_id,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let snapshot = track.clap_snapshot_state(*instance_id).ok()?;
+            Some(Action::TrackClapRestoreState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: snapshot,
+            })
+        }
+
+        Action::ClipSetClapParameter {
+            track_name,
+            clip_idx,
+            instance_id,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let mut track = track.lock();
+            let (_, snapshot) = track
+                .clip_clap_snapshot_state(*clip_idx, *instance_id)
+                .ok()?;
+            Some(Action::ClipClapRestoreState {
+                track_name: track_name.clone(),
+                clip_idx: *clip_idx,
+                instance_id: *instance_id,
+                state: snapshot,
+            })
+        }
+
+        Action::TrackSetVst3Parameter {
+            track_name,
+            instance_id,
+            ..
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let snapshot = track.vst3_snapshot_state(*instance_id).ok()?;
+            Some(Action::TrackVst3RestoreState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: snapshot,
+            })
+        }
+
+        Action::TrackSetPluginBypassed {
+            track_name,
+            instance_id,
+            format,
+            bypassed,
+        } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let current_bypassed = match format.as_str() {
+                "CLAP" => track
+                    .clap_plugins
+                    .iter()
+                    .find(|i| i.id == *instance_id)
+                    .map(|i| i.processor.is_bypassed()),
+                "VST3" => track
+                    .vst3_plugins
+                    .iter()
+                    .find(|i| i.id == *instance_id)
+                    .map(|i| i.processor.is_bypassed()),
+                #[cfg(unix)]
+                "LV2" => track
+                    .lv2_plugins
+                    .iter()
+                    .find(|i| i.id == *instance_id)
+                    .map(|i| i.processor.is_bypassed()),
+                _ => None,
+            };
+            Some(Action::TrackSetPluginBypassed {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                format: format.clone(),
+                bypassed: current_bypassed.unwrap_or(!*bypassed),
+            })
+        }
+
+        Action::TrackSetLv2ControlValue { .. } => None,
+        _ => None,
+    }
+}
+
+/// Multi-action inverse constructor for this feature's commands
+/// (colocated from `crate::history::create_inverse_actions` in Phase 4).
+pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec<Action>> {
+    if let Action::ClearAllMidiLearnBindings = action {
+        let mut actions = Vec::<Action>::new();
+        for (track_name, track) in &state.tracks {
+            let t = track.lock();
+            let mut push_if_some =
+                |target: crate::message::TrackMidiLearnTarget,
+                 binding: Option<crate::message::MidiLearnBinding>| {
+                    if binding.is_some() {
+                        actions.push(Action::TrackSetMidiLearnBinding {
+                            track_name: track_name.clone(),
+                            target,
+                            binding,
+                        });
+                    }
+                };
+            push_if_some(
+                crate::message::TrackMidiLearnTarget::Volume,
+                t.midi_learn.volume.clone(),
+            );
+            push_if_some(
+                crate::message::TrackMidiLearnTarget::Balance,
+                t.midi_learn.balance.clone(),
+            );
+            push_if_some(
+                crate::message::TrackMidiLearnTarget::Mute,
+                t.midi_learn.mute.clone(),
+            );
+            push_if_some(
+                crate::message::TrackMidiLearnTarget::Solo,
+                t.midi_learn.solo.clone(),
+            );
+            push_if_some(
+                crate::message::TrackMidiLearnTarget::Arm,
+                t.midi_learn.arm.clone(),
+            );
+            push_if_some(
+                crate::message::TrackMidiLearnTarget::InputMonitor,
+                t.midi_learn.input_monitor.clone(),
+            );
+            push_if_some(
+                crate::message::TrackMidiLearnTarget::DiskMonitor,
+                t.midi_learn.disk_monitor.clone(),
+            );
+        }
+        return Some(actions);
+    }
+
+    if let Action::TrackUnloadClapPlugin {
+        track_name,
+        plugin_id,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let instance = track
+            .clap_plugins
+            .iter()
+            .find(|p| p.processor.plugin_id() == plugin_id)?;
+        let id = instance.id;
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
+        return Some(vec![
+            Action::TrackLoadClapPlugin {
+                track_name: track_name.clone(),
+                plugin_id: plugin_id.clone(),
+                instance_id: Some(id),
+            },
+            Action::TrackClapRestoreState {
+                track_name: track_name.clone(),
+                instance_id: id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
+    if let Action::TrackUnloadClapPluginInstance {
+        track_name,
+        instance_id,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let instance = track.clap_plugins.iter().find(|p| p.id == *instance_id)?;
+        let plugin_id = instance.processor.plugin_id().to_string();
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
+        return Some(vec![
+            Action::TrackLoadClapPlugin {
+                track_name: track_name.clone(),
+                plugin_id,
+                instance_id: Some(*instance_id),
+            },
+            Action::TrackClapRestoreState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
+    if let Action::TrackUnloadVst3PluginInstance {
+        track_name,
+        instance_id,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let instance = track.vst3_plugins.iter().find(|p| p.id == *instance_id)?;
+        let plugin_id = instance.processor.plugin_id().to_string();
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
+        return Some(vec![
+            Action::TrackLoadVst3Plugin {
+                track_name: track_name.clone(),
+                plugin_id,
+                instance_id: Some(*instance_id),
+            },
+            Action::TrackVst3RestoreState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
+    if let Action::TrackUnloadLv2PluginInstance {
+        track_name,
+        instance_id,
+    } = action
+    {
+        let track = state.tracks.get(track_name)?;
+        let track = track.lock();
+        let instance = track.lv2_plugins.iter().find(|p| p.id == *instance_id)?;
+        let uri = instance.processor.uri().to_string();
+        let state_snapshot = instance.processor.snapshot_state().ok()?;
+        return Some(vec![
+            Action::TrackLoadLv2Plugin {
+                track_name: track_name.clone(),
+                plugin_uri: uri,
+                instance_id: Some(*instance_id),
+            },
+            Action::TrackSetLv2PluginState {
+                track_name: track_name.clone(),
+                instance_id: *instance_id,
+                state: state_snapshot,
+            },
+        ]);
+    }
+
+    if let Action::RemoveTrack(track_name) = action {
+        let mut actions = Vec::new();
+        {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            actions.push(Action::AddTrack {
+                name: track.name.clone(),
+                audio_ins: track.primary_audio_ins(),
+                midi_ins: track.midi.ins.len(),
+                audio_outs: track.primary_audio_outs(),
+                midi_outs: track.midi.outs.len(),
+                folder: track.is_folder,
+                mixosc_addr: track.mixosc_addr.clone(),
+            });
+            if let Some(parent_name) = track.parent_track.as_ref() {
+                actions.push(Action::TrackSetParent {
+                    track_name: track.name.clone(),
+                    parent_name: Some(parent_name.clone()),
+                });
+            }
+            for _ in track.primary_audio_ins()..track.audio.ins.len() {
+                actions.push(Action::TrackAddAudioInput(track.name.clone()));
+            }
+            for _ in track.primary_audio_outs()..track.audio.outs.len() {
+                actions.push(Action::TrackAddAudioOutput(track.name.clone()));
+            }
+
+            let level = track.level();
+            if level != 0.0 {
+                actions.push(Action::TrackLevel(track.name.clone(), level));
+            }
+            let balance = track.balance();
+            if balance != 0.0 {
+                actions.push(Action::TrackBalance(track.name.clone(), balance));
+            }
+            if track.armed() {
+                actions.push(Action::TrackToggleArm(track.name.clone()));
+            }
+            if track.muted() {
+                actions.push(Action::TrackToggleMute(track.name.clone()));
+            }
+            if track.soloed() {
+                actions.push(Action::TrackToggleSolo(track.name.clone()));
+            }
+            for (lane, &monitor) in track.input_monitor().iter().enumerate() {
+                if monitor {
+                    actions.push(Action::TrackToggleInputMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
+            }
+            for (lane, &monitor) in track.disk_monitor().iter().enumerate() {
+                if !monitor {
+                    actions.push(Action::TrackToggleDiskMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
+            }
+            for (lane, &monitor) in track.midi_input_monitor().iter().enumerate() {
+                if monitor {
+                    actions.push(Action::TrackToggleMidiInputMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
+            }
+            for (lane, &monitor) in track.midi_disk_monitor().iter().enumerate() {
+                if !monitor {
+                    actions.push(Action::TrackToggleMidiDiskMonitor {
+                        track_name: track.name.clone(),
+                        lane,
+                    });
+                }
+            }
+            if let Some(color) = track.color {
+                actions.push(Action::TrackSetColor {
+                    track_name: track.name.clone(),
+                    color: Some(color),
+                });
+            }
+            if track.midi_learn.volume.is_some() {
+                actions.push(Action::TrackSetMidiLearnBinding {
+                    track_name: track.name.clone(),
+                    target: crate::message::TrackMidiLearnTarget::Volume,
+                    binding: track.midi_learn.volume.clone(),
+                });
+            }
+            if track.midi_learn.balance.is_some() {
+                actions.push(Action::TrackSetMidiLearnBinding {
+                    track_name: track.name.clone(),
+                    target: crate::message::TrackMidiLearnTarget::Balance,
+                    binding: track.midi_learn.balance.clone(),
+                });
+            }
+            if track.midi_learn.mute.is_some() {
+                actions.push(Action::TrackSetMidiLearnBinding {
+                    track_name: track.name.clone(),
+                    target: crate::message::TrackMidiLearnTarget::Mute,
+                    binding: track.midi_learn.mute.clone(),
+                });
+            }
+            if track.midi_learn.solo.is_some() {
+                actions.push(Action::TrackSetMidiLearnBinding {
+                    track_name: track.name.clone(),
+                    target: crate::message::TrackMidiLearnTarget::Solo,
+                    binding: track.midi_learn.solo.clone(),
+                });
+            }
+            if track.midi_learn.arm.is_some() {
+                actions.push(Action::TrackSetMidiLearnBinding {
+                    track_name: track.name.clone(),
+                    target: crate::message::TrackMidiLearnTarget::Arm,
+                    binding: track.midi_learn.arm.clone(),
+                });
+            }
+            if track.midi_learn.input_monitor.is_some() {
+                actions.push(Action::TrackSetMidiLearnBinding {
+                    track_name: track.name.clone(),
+                    target: crate::message::TrackMidiLearnTarget::InputMonitor,
+                    binding: track.midi_learn.input_monitor.clone(),
+                });
+            }
+            if track.midi_learn.disk_monitor.is_some() {
+                actions.push(Action::TrackSetMidiLearnBinding {
+                    track_name: track.name.clone(),
+                    target: crate::message::TrackMidiLearnTarget::DiskMonitor,
+                    binding: track.midi_learn.disk_monitor.clone(),
+                });
+            }
+            for clip in track.audio.clips().iter() {
+                let length = clip.end.saturating_sub(clip.start).max(1);
+                actions.push(Action::AddClip {
+                    clip_id: clip.id.clone(),
+                    name: clip.name.clone(),
+                    track_name: track.name.clone(),
+                    start: clip.start,
+                    length,
+                    offset: clip.offset,
+                    input_channel: clip.input_channel,
+                    muted: clip.muted,
+                    reversed: clip.reversed,
+                    gain_db: clip.gain_db,
+                    peaks_file: clip.peaks_file.clone(),
+                    kind: Kind::Audio,
+                    fade_enabled: clip.fade_enabled,
+                    fade_in_samples: clip.fade_in_samples,
+                    fade_out_samples: clip.fade_out_samples,
+                    source_name: clip.pitch_correction_source_name.clone(),
+                    source_offset: clip.pitch_correction_source_offset,
+                    source_length: clip.pitch_correction_source_length,
+                    preview_name: clip.pitch_correction_preview_name.clone(),
+                    pitch_correction_points: clip.pitch_correction_points.clone(),
+                    pitch_correction_frame_likeness: clip.pitch_correction_frame_likeness,
+                    pitch_correction_inertia_ms: clip.pitch_correction_inertia_ms,
+                    pitch_correction_formant_compensation: clip
+                        .pitch_correction_formant_compensation,
+                    pitch_correction_detector: Default::default(),
+                    pitch_correction_mode: Default::default(),
+                    plugin_graph_json: clip.plugin_graph_json.clone(),
+                });
+            }
+            for clip in track.midi.clips().iter() {
+                let length = clip.end.saturating_sub(clip.start).max(1);
+                actions.push(Action::AddClip {
+                    clip_id: clip.id.clone(),
+                    name: clip.name.clone(),
+                    track_name: track.name.clone(),
+                    start: clip.start,
+                    length,
+                    offset: clip.offset,
+                    input_channel: clip.input_channel,
+                    muted: clip.muted,
+                    reversed: clip.reversed,
+                    gain_db: 0.0,
+                    peaks_file: None,
+                    kind: Kind::MIDI,
+                    fade_enabled: true,
+                    fade_in_samples: 240,
+                    fade_out_samples: 240,
+                    source_name: None,
+                    source_offset: None,
+                    source_length: None,
+                    preview_name: None,
+                    pitch_correction_points: vec![],
+                    pitch_correction_frame_likeness: None,
+                    pitch_correction_inertia_ms: None,
+                    pitch_correction_formant_compensation: None,
+                    pitch_correction_detector: Default::default(),
+                    pitch_correction_mode: Default::default(),
+                    plugin_graph_json: None,
+                });
+            }
+
+            for instance in &track.vst3_plugins {
+                let id = instance.id;
+                let plugin_id = instance.processor.plugin_id().to_string();
+                if let Ok(state) = instance.processor.snapshot_state() {
+                    actions.push(Action::TrackLoadVst3Plugin {
+                        track_name: track.name.clone(),
+                        plugin_id,
+                        instance_id: Some(id),
+                    });
+                    actions.push(Action::TrackVst3RestoreState {
+                        track_name: track.name.clone(),
+                        instance_id: id,
+                        state,
+                    });
+                }
+            }
+
+            for (id, plugin_id, state) in track.clap_snapshot_all_states() {
+                actions.push(Action::TrackLoadClapPlugin {
+                    track_name: track.name.clone(),
+                    plugin_id,
+                    instance_id: Some(id),
+                });
+                actions.push(Action::TrackClapRestoreState {
+                    track_name: track.name.clone(),
+                    instance_id: id,
+                    state,
+                });
+            }
+
+            #[cfg(unix)]
+            for instance in &track.lv2_plugins {
+                let id = instance.id;
+                let uri = instance.processor.uri().to_string();
+                if let Ok(state) = instance.processor.snapshot_state() {
+                    actions.push(Action::TrackLoadLv2Plugin {
+                        track_name: track.name.clone(),
+                        plugin_uri: uri,
+                        instance_id: Some(id),
+                    });
+                    actions.push(Action::TrackSetLv2PluginState {
+                        track_name: track.name.clone(),
+                        instance_id: id,
+                        state,
+                    });
+                }
+            }
+
+            for conn in &track.plugin_midi_connections {
+                actions.push(Action::TrackConnectPluginMidi {
+                    track_name: track.name.clone(),
+                    from_node: conn.from_node.clone(),
+                    from_port: conn.from_port,
+                    to_node: conn.to_node.clone(),
+                    to_port: conn.to_port,
+                });
+            }
+        }
+
+        let mut seen_audio = std::collections::HashSet::<(String, usize, String, usize)>::new();
+        let mut seen_midi = std::collections::HashSet::<(String, usize, String, usize)>::new();
+
+        // Parent/child wiring is restored by TrackSetParent, so don't also capture it as a
+        // generic Connect action (that would create duplicate connections on undo).
+        let (parent_name, child_names) = {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let parent = track.parent_track.clone();
+            let children: HashSet<String> = track
+                .child_tracks
+                .iter()
+                .map(|c| c.lock().name.clone())
+                .collect();
+            (parent, children)
+        };
+        let is_family =
+            |other: &str| parent_name.as_deref() == Some(other) || child_names.contains(other);
+
+        for (from_name, from_track_handle) in &state.tracks {
+            let from_track = from_track_handle.lock();
+            for (from_port, out) in from_track.audio.outs.iter().enumerate() {
+                let conns: Vec<Arc<AudioIO>> = out.connections().to_vec();
+                for conn in conns {
+                    for (to_name, to_track_handle) in &state.tracks {
+                        let to_track = to_track_handle.lock();
+                        for (to_port, to_in) in to_track.audio.ins.iter().enumerate() {
+                            let other_name = if from_name == track_name {
+                                to_name
+                            } else {
+                                from_name
+                            };
+                            if from_name != to_name
+                                && Arc::ptr_eq(&conn, to_in)
+                                && (from_name == track_name || to_name == track_name)
+                                && !is_family(other_name)
+                                && seen_audio.insert((
+                                    from_name.to_string(),
+                                    from_port,
+                                    to_name.to_string(),
+                                    to_port,
+                                ))
+                            {
+                                actions.push(Action::Connect {
+                                    from_track: from_name.to_string(),
+                                    from_port,
+                                    to_track: to_name.to_string(),
+                                    to_port,
+                                    kind: Kind::Audio,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (from_port, out) in from_track.midi.outs.iter().enumerate() {
+                let conns: Vec<Arc<MIDIIO>> = out.connections();
+                for conn in conns {
+                    for (to_name, to_track_handle) in &state.tracks {
+                        let to_track = to_track_handle.lock();
+                        for (to_port, to_in) in to_track.midi.ins.iter().enumerate() {
+                            let other_name = if from_name == track_name {
+                                to_name
+                            } else {
+                                from_name
+                            };
+                            if from_name != to_name
+                                && Arc::ptr_eq(&conn, to_in)
+                                && (from_name == track_name || to_name == track_name)
+                                && !is_family(other_name)
+                                && seen_midi.insert((
+                                    from_name.to_string(),
+                                    from_port,
+                                    to_name.to_string(),
+                                    to_port,
+                                ))
+                            {
+                                actions.push(Action::Connect {
+                                    from_track: from_name.to_string(),
+                                    from_port,
+                                    to_track: to_name.to_string(),
+                                    to_port,
+                                    kind: Kind::MIDI,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (to_name, to_track_handle) in &state.tracks {
+            if to_name != track_name {
+                continue;
+            }
+            let to_track = to_track_handle.lock();
+            for (to_port, to_in) in to_track.audio.ins.iter().enumerate() {
+                for (from_name, from_track_handle) in &state.tracks {
+                    let from_track = from_track_handle.lock();
+                    for (from_port, out) in from_track.audio.outs.iter().enumerate() {
+                        let conns: Vec<Arc<AudioIO>> = out.connections().to_vec();
+                        if from_name != to_name
+                            && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
+                            && !is_family(from_name)
+                            && seen_audio.insert((
+                                from_name.to_string(),
+                                from_port,
+                                to_name.to_string(),
+                                to_port,
+                            ))
+                        {
+                            actions.push(Action::Connect {
+                                from_track: from_name.to_string(),
+                                from_port,
+                                to_track: to_name.to_string(),
+                                to_port,
+                                kind: Kind::Audio,
+                            });
+                        }
+                    }
+                }
+            }
+            for (to_port, to_in) in to_track.midi.ins.iter().enumerate() {
+                for (from_name, from_track_handle) in &state.tracks {
+                    let from_track = from_track_handle.lock();
+                    for (from_port, out) in from_track.midi.outs.iter().enumerate() {
+                        let conns: Vec<Arc<MIDIIO>> = out.connections();
+                        if from_name != to_name
+                            && conns.iter().any(|conn| Arc::ptr_eq(conn, to_in))
+                            && !is_family(from_name)
+                            && seen_midi.insert((
+                                from_name.to_string(),
+                                from_port,
+                                to_name.to_string(),
+                                to_port,
+                            ))
+                        {
+                            actions.push(Action::Connect {
+                                from_track: from_name.to_string(),
+                                from_port,
+                                to_track: to_name.to_string(),
+                                to_port,
+                                kind: Kind::MIDI,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        return Some(actions);
+    }
+
+    if let Action::ClipMove {
+        kind: Kind::Audio,
+        from,
+        to,
+        copy,
+    } = action
+    {
+        let mut actions = vec![create_inverse_action(action, state)?];
+        if *copy {
+            let dest_track = state.tracks.get(&to.track_name)?;
+            let dest_track = dest_track.lock();
+            append_audio_clip_fade_restores(
+                &mut actions,
+                &to.track_name,
+                &dest_track.audio.clips(),
+            );
+        } else if from.track_name == to.track_name {
+            let track = state.tracks.get(&from.track_name)?;
+            let track = track.lock();
+            let mut clips = track.audio.clips().iter().cloned().collect::<Vec<_>>();
+            if from.clip_index < clips.len() {
+                let moved = clips.remove(from.clip_index);
+                clips.push(moved);
+            }
+            append_audio_clip_fade_restores(&mut actions, &from.track_name, &clips);
+        } else {
+            let source_track = state.tracks.get(&from.track_name)?;
+            let source_track = source_track.lock();
+            let mut source_clips = source_track
+                .audio
+                .clips()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if from.clip_index < source_clips.len() {
+                let moved = source_clips.remove(from.clip_index);
+                source_clips.push(moved);
+            }
+            append_audio_clip_fade_restores(&mut actions, &from.track_name, &source_clips);
+
+            let dest_track = state.tracks.get(&to.track_name)?;
+            let dest_track = dest_track.lock();
+            append_audio_clip_fade_restores(
+                &mut actions,
+                &to.track_name,
+                &dest_track.audio.clips(),
+            );
+        }
+        return Some(actions);
+    }
+
+    undo_inverse(action, state).map(|a| vec![a])
+}
+fn append_audio_clip_fade_restores(
+    actions: &mut Vec<Action>,
+    track_name: &str,
+    clips: &[Arc<crate::audio::clip::AudioClip>],
+) {
+    actions.extend(
+        clips
+            .iter()
+            .enumerate()
+            .map(|(clip_index, clip)| Action::SetClipFade {
+                track_name: track_name.to_string(),
+                clip_index,
+                kind: Kind::Audio,
+                fade_enabled: clip.fade_enabled,
+                fade_in_samples: clip.fade_in_samples,
+                fade_out_samples: clip.fade_out_samples,
+            }),
+    );
+}
+
+impl Engine {
+    /// Extra inverse actions for `RemoveTrack`: restore the track's hw MIDI
+    /// routes (colocated from `prepare_inverse_actions` in Phase 4).
+    fn undo_remove_track_extras(&self, track_name: &str, out: &mut Vec<Action>) {
+        for route in self
+            .hw_midi
+            .midi_hw_in_routes
+            .iter()
+            .filter(|route| route.to_track == track_name)
+        {
+            out.push(Action::Connect {
+                from_track: format!("midi:hw:in:{}", route.device),
+                from_port: 0,
+                to_track: route.to_track.clone(),
+                to_port: route.to_port,
+                kind: Kind::MIDI,
+            });
+        }
+        for route in self
+            .hw_midi
+            .midi_hw_out_routes
+            .iter()
+            .filter(|route| route.from_track == track_name)
+        {
+            out.push(Action::Connect {
+                from_track: route.from_track.clone(),
+                from_port: route.from_port,
+                to_track: format!("midi:hw:out:{}", route.device),
+                to_port: 0,
+                kind: Kind::MIDI,
+            });
+        }
     }
 }
 

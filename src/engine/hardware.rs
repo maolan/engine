@@ -260,7 +260,7 @@ impl Engine {
                     auto_open_midi_devices: self.auto_open_midi_devices,
                 }))
                 .await;
-                self.awaiting_hwfinished = true;
+                self.transport.awaiting_hwfinished = true;
             }
             Err(e) => {
                 error!("Failed to open JACK runtime: {e}");
@@ -339,28 +339,29 @@ impl Engine {
             jack_state,
             jack::TransportState::Rolling | jack::TransportState::Starting
         );
-        let normalized_frame = self.normalize_transport_sample(jack_frame);
+        let normalized_frame = self.transport.normalize_transport_sample(jack_frame);
         let decision = Self::jack_transport_sync_decision(
-            self.playing,
-            self.transport_sample,
+            self.transport.playing,
+            self.transport.transport_sample,
             jack_playing,
             normalized_frame,
             self.current_cycle_samples(),
         );
 
         if let Some(play_sync) = decision.play_sync {
-            self.playing = matches!(play_sync, JackTransportPlaySync::Start);
+            self.transport.playing = matches!(play_sync, JackTransportPlaySync::Start);
             self.bump_prepare_generation();
-            self.transport_running = self.playing;
+            self.transport.transport_running = self.transport.playing;
             if matches!(play_sync, JackTransportPlaySync::Start) {
-                self.transport_restart_pending = false;
-                self.transport_panic_flush_pending = false;
+                self.transport.transport_restart_pending = false;
+                self.transport.transport_panic_flush_pending = false;
                 self.notify_clients(Ok(Action::Play)).await;
             } else {
-                self.transport_panic_flush_pending = false;
-                self.transport_restart_pending = false;
+                self.transport.transport_panic_flush_pending = false;
+                self.transport.transport_restart_pending = false;
                 let panic_events = self.note_off_events_for_all_active_tracks();
-                self.pending_hw_midi_out_events_by_device
+                self.hw_midi
+                    .pending_hw_midi_out_events_by_device
                     .extend(panic_events);
                 self.flush_recordings().await;
                 self.notify_clients(Ok(Action::Stop)).await;
@@ -368,9 +369,9 @@ impl Engine {
         }
 
         if let Some(sample) = decision.position_sync {
-            self.transport_sample = sample;
+            self.transport.transport_sample = sample;
             self.bump_prepare_generation();
-            self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
+            self.notify_event(Event::TransportPosition(self.transport.transport_sample))
                 .await;
         }
     }
@@ -390,17 +391,17 @@ impl Engine {
         output_channels: usize,
         rate: usize,
     ) {
-        self.notify_clients(Ok(Action::HWInfo {
+        self.notify_event(Event::HWInfo {
             channels: input_channels,
             rate,
             input: true,
-        }))
+        })
         .await;
-        self.notify_clients(Ok(Action::HWInfo {
+        self.notify_event(Event::HWInfo {
             channels: output_channels,
             rate,
             input: false,
-        }))
+        })
         .await;
     }
 
@@ -415,7 +416,7 @@ impl Engine {
     }
 
     pub(crate) fn can_schedule_hw_cycle(&self) -> bool {
-        self.playing && (self.hw_worker.is_some() || self.jack_runtime_is_some())
+        self.transport.playing && (self.hw_worker.is_some() || self.jack_runtime_is_some())
     }
 
     pub(crate) async fn ensure_hw_worker_running(&mut self) {
@@ -476,8 +477,8 @@ impl Engine {
                 out_lat
             );
         }
-        self.hw_input_latency_frames = in_lat.0;
-        self.hw_output_latency_frames = out_lat.0;
+        self.transport.hw_input_latency_frames = in_lat.0;
+        self.transport.hw_output_latency_frames = out_lat.0;
         self.hw_input_ports = (0..in_channels)
             .filter_map(|idx| d.input_port(idx))
             .collect();
@@ -517,7 +518,7 @@ impl Engine {
 
     pub(crate) async fn finalize_open_audio_device(&mut self) {
         self.maybe_start_freebsd_sync_group();
-        if self.metronome_enabled {
+        if self.transport.metronome_enabled {
             self.ensure_metronome_track().await;
         }
         if self.hw_worker.is_none() && (self.hw_driver.is_some() || self.hw_driver_info.is_some()) {
@@ -675,7 +676,7 @@ impl Engine {
                 .graph_info()
             {
                 Ok(graph) => {
-                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                    self.notify_query_reply(QueryReply::JackGraph(graph)).await;
                 }
                 Err(e) => self.notify_clients(Err(e)).await,
             }
@@ -758,7 +759,7 @@ impl Engine {
                 .graph_info()
             {
                 Ok(graph) => {
-                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                    self.notify_query_reply(QueryReply::JackGraph(graph)).await;
                 }
                 Err(e) => self.notify_clients(Err(e)).await,
             }
@@ -809,7 +810,7 @@ impl Engine {
                 .graph_info()
             {
                 Ok(graph) => {
-                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                    self.notify_query_reply(QueryReply::JackGraph(graph)).await;
                 }
                 Err(e) => self.notify_clients(Err(e)).await,
             }
@@ -892,7 +893,7 @@ impl Engine {
                 .graph_info()
             {
                 Ok(graph) => {
-                    self.notify_clients(Ok(Action::JackGraph(graph))).await;
+                    self.notify_query_reply(QueryReply::JackGraph(graph)).await;
                 }
                 Err(e) => self.notify_clients(Err(e)).await,
             }
@@ -905,6 +906,138 @@ impl Engine {
                 "JACK backend is not available on this platform build".to_string()
             ))
             .await;
+        }
+        false
+    }
+}
+
+impl Engine {
+    /// Hardware request arms: JACK graph operations.
+    pub(crate) async fn handle_hardware_request(&mut self, a: Action) -> bool {
+        match a {
+            Action::JackAddAudioInputPort => {
+                if Self::box_bool(self.handle_jack_add_audio_input_port(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::JackRemoveAudioInputPort(_removed_port) => {
+                if self
+                    .handle_jack_remove_audio_input_port(_removed_port, a.clone())
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::JackAddAudioOutputPort => {
+                if Self::box_bool(self.handle_jack_add_audio_output_port(a.clone())).await {
+                    return true;
+                }
+            }
+            Action::JackRemoveAudioOutputPort(_removed_port) => {
+                if self
+                    .handle_jack_remove_audio_output_port(_removed_port, a.clone())
+                    .await
+                {
+                    return true;
+                }
+            }
+            Action::JackGetGraph => {
+                #[cfg(unix)]
+                {
+                    match self
+                        .jack_runtime
+                        .as_ref()
+                        .ok_or(
+                            "JACK runtime is not active; open the JACK backend first".to_string(),
+                        )
+                        .and_then(|jack| jack.graph_info())
+                    {
+                        Ok(graph) => self.notify_query_reply(QueryReply::JackGraph(graph)).await,
+                        Err(e) => self.notify_clients(Err(e)).await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    self.notify_clients(Err(
+                        "JACK backend is not available on this platform build".to_string(),
+                    ))
+                    .await;
+                }
+                return true;
+            }
+            Action::JackConnect {
+                ref source,
+                ref destination,
+            } => {
+                #[cfg(unix)]
+                {
+                    match self
+                        .jack_runtime
+                        .as_ref()
+                        .ok_or(
+                            "JACK runtime is not active; open the JACK backend first".to_string(),
+                        )
+                        .and_then(|jack| jack.connect_ports_by_name(source, destination))
+                        .and_then(|_| {
+                            self.jack_runtime
+                                .as_ref()
+                                .expect("JACK runtime was checked")
+                                .graph_info()
+                        }) {
+                        Ok(graph) => {
+                            self.notify_clients(Ok(a.clone())).await;
+                            self.notify_query_reply(QueryReply::JackGraph(graph)).await;
+                        }
+                        Err(e) => self.notify_clients(Err(e)).await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (source, destination);
+                    self.notify_clients(Err(
+                        "JACK backend is not available on this platform build".to_string(),
+                    ))
+                    .await;
+                }
+                return true;
+            }
+            Action::JackDisconnect {
+                ref source,
+                ref destination,
+            } => {
+                #[cfg(unix)]
+                {
+                    match self
+                        .jack_runtime
+                        .as_ref()
+                        .ok_or(
+                            "JACK runtime is not active; open the JACK backend first".to_string(),
+                        )
+                        .and_then(|jack| jack.disconnect_ports_by_name(source, destination))
+                        .and_then(|_| {
+                            self.jack_runtime
+                                .as_ref()
+                                .expect("JACK runtime was checked")
+                                .graph_info()
+                        }) {
+                        Ok(graph) => {
+                            self.notify_clients(Ok(a.clone())).await;
+                            self.notify_query_reply(QueryReply::JackGraph(graph)).await;
+                        }
+                        Err(e) => self.notify_clients(Err(e)).await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (source, destination);
+                    self.notify_clients(Err(
+                        "JACK backend is not available on this platform build".to_string(),
+                    ))
+                    .await;
+                }
+                return true;
+            }
+            _ => {}
         }
         false
     }

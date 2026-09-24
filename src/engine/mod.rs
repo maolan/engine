@@ -9,12 +9,21 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 
+mod automation;
+mod bounce;
+mod fields;
 mod hardware;
+pub(crate) mod history;
+mod lifecycle;
+mod meters;
 mod midi;
 mod plugins;
+mod queries;
+mod recording;
 mod runtime;
+mod session;
 mod topology;
-mod transport_record_bounce;
+mod transport;
 
 type HwDeviceInfo = (usize, usize, usize, ((usize, usize), (usize, usize)));
 
@@ -50,9 +59,9 @@ use crate::hw::wasapi::{HwDriver, MidiHub};
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
-    history::{History, UndoEntry},
+    history::UndoEntry,
     kind::Kind,
-    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
+    message::{Action, Event, HwMidiEvent, Message, MidiControllerData, MidiNoteData, QueryReply},
     midi::io::MidiEvent,
     osc::OscServer,
     state::{State, StateSlot},
@@ -148,7 +157,7 @@ pub(crate) struct HwDriverInfo {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RecordingSession {
+pub struct RecordingSession {
     start_sample: usize,
     samples: Vec<f32>,
     channels: usize,
@@ -162,33 +171,33 @@ pub(crate) struct RecordingSession {
 const RECORDING_STRIPE_FRAMES: usize = 256;
 
 #[derive(Debug, Clone)]
-pub(crate) struct MidiRecordingSession {
+pub struct MidiRecordingSession {
     start_sample: usize,
     events: Vec<(u64, Vec<u8>)>,
     file_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MidiHwInRoute {
+pub struct MidiHwInRoute {
     device: String,
     to_track: String,
     to_port: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MidiHwOutRoute {
+pub struct MidiHwOutRoute {
     from_track: String,
     from_port: usize,
     device: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MidiHwThruRoute {
+pub struct MidiHwThruRoute {
     from_device: String,
     to_device: String,
 }
 
-struct OfflineBounceJob {
+pub struct OfflineBounceJob {
     cancel: Arc<AtomicBool>,
 }
 
@@ -254,12 +263,6 @@ pub(crate) enum MidiLearnSlot {
     Session(crate::message::SessionMidiLearnTarget),
 }
 
-struct MeterDecay {
-    started_at: Instant,
-    hw_out_linear: Vec<f32>,
-    track_linear: Vec<(String, Vec<f32>)>,
-}
-
 struct AudioPreviewPlayback {
     samples: Arc<Vec<f32>>,
     channels: usize,
@@ -287,96 +290,13 @@ pub struct Engine {
     osc_server: Option<OscServer>,
     osc_reply_socket: Option<UdpSocket>,
     osc_reply_target: Option<SocketAddr>,
-    mixosc_socket: Option<UdpSocket>,
-    pending_hw_midi_events: Vec<MidiEvent>,
-    pending_hw_midi_events_by_device: HashMap<String, Vec<MidiEvent>>,
-    pending_hw_midi_out_events: Vec<MidiEvent>,
-    pending_hw_midi_out_events_by_device: Vec<HwMidiEvent>,
-    active_hw_notes_by_track: HashMap<String, std::collections::HashSet<(String, u8, u8)>>,
-    active_hw_notes_cycle_start: HashMap<String, std::collections::HashSet<(String, u8, u8)>>,
-    midi_hw_in_routes: Vec<MidiHwInRoute>,
-    midi_hw_out_routes: Vec<MidiHwOutRoute>,
-    midi_hw_thru_routes: Vec<MidiHwThruRoute>,
-    ready_workers: Vec<usize>,
-    pending_requests: VecDeque<Action>,
-    awaiting_hwfinished: bool,
-    handling_hwfinished: bool,
-    transport_panic_flush_pending: bool,
-    transport_restart_pending: bool,
-    notified_loop_wrap_sample: Option<usize>,
-    transport_sample: usize,
-    /// Lock-free transport-position snapshot shared with all tracks. The
-    /// dispatcher mirrors `transport_sample`/`session_transport_sample` into
-    /// it on every task dispatch (see `Engine::prepare_task_track` and
-    /// [`crate::track::TransportSampleSnapshot`]); a per-cycle advance thus
-    /// reaches tracks without a generation bump or track lock.
-    transport_sample_snapshot: Arc<crate::track::TransportSampleSnapshot>,
-    /// Generation counter for the per-dispatch transport-state push performed
-    /// by `prepare_task_track`. Bumped (via `bump_prepare_generation`) at
-    /// every mutation of any value pushed there, so tracks whose
-    /// `last_prepare_generation` equals this value can skip the push and
-    /// the track lock for the rest of the generation. The transport sample
-    /// itself is excluded: it reaches tracks through the mirrored
-    /// `transport_sample_snapshot` without a bump.
-    prepare_generation: u64,
-
-    hw_input_latency_frames: usize,
-
-    hw_output_latency_frames: usize,
-    loop_enabled: bool,
-    loop_range_samples: Option<(usize, usize)>,
-    metronome_enabled: bool,
-    tempo_bpm: f64,
-    tsig_num: u16,
-    tsig_denom: u16,
-    tempo_points: Vec<crate::message::TempoPoint>,
-    time_signature_points: Vec<crate::message::TimeSignaturePoint>,
-    punch_enabled: bool,
-    punch_range_samples: Option<(usize, usize)>,
-    audio_recordings: std::collections::HashMap<String, RecordingSession>,
-    midi_recordings: std::collections::HashMap<String, MidiRecordingSession>,
-    completed_audio_recordings: Vec<(String, RecordingSession)>,
-    completed_midi_recordings: Vec<(String, MidiRecordingSession)>,
-    playing: bool,
-    transport_running: bool,
-    clip_playback_enabled: bool,
-    session_clip_playback_enabled: bool,
-    session_transport_sample: usize,
-    /// Scene queued via [`crate::message::SessionAction::QueueScene`] as
-    /// (scene_index, launch_at_sample); `None` when no scene is queued.
-    session_scene_queue: Option<(usize, usize)>,
-    session_scene_queue_length_samples: usize,
-    /// Scene whose launch most recently fired; reported in the session
-    /// runtime snapshot so clients can highlight it as the current scene.
-    session_current_scene: Option<usize>,
-    session_current_scene_previous_scene: Option<usize>,
-    session_current_scene_start_sample: usize,
-    session_current_scene_length_samples: usize,
-    session_completed_clip_passes: Vec<crate::meter::SessionCompletedClipPass>,
-    session_reported_clip_passes: std::collections::HashSet<(String, usize, String, usize, usize)>,
-    record_enabled: bool,
-    step_recording_enabled: bool,
-    session_dir: Option<PathBuf>,
-    hw_out_level_db: f32,
-    hw_out_balance: f32,
-    hw_out_muted: bool,
-    last_hw_out_meter_publish: Option<Instant>,
-    #[cfg(unix)]
-    last_hw_out_meter_linear: Vec<f32>,
-    hw_out_peak_hold_linear: Vec<f32>,
-    #[cfg(unix)]
-    hw_out_meter_publish_phase: bool,
-    last_track_meter_publish: Option<Instant>,
-    last_meter_snapshot_publish: Option<Instant>,
-    last_session_report_publish: Option<Instant>,
-    track_meter_linear_by_track: HashMap<String, Vec<f32>>,
-    meter_decay_after_stop: Option<MeterDecay>,
-    meter_snapshot_producer:
-        crate::triple_buffer::TripleBufferProducer<crate::meter::MeterSnapshot>,
-    transport_snapshot_producer:
-        crate::triple_buffer::TripleBufferProducer<crate::meter::TransportSnapshot>,
-    session_runtime_snapshot_producer:
-        crate::triple_buffer::TripleBufferProducer<crate::meter::SessionRuntimeSnapshot>,
+    pub automation: fields::AutomationFields,
+    pub hw_midi: fields::HwMidiFields,
+    pub dispatch: fields::DispatchFields,
+    pub transport: fields::TransportFields,
+    pub recording: fields::RecordingFields,
+    pub session: fields::SessionFields,
+    pub meters: fields::MeterFields,
     /// Phase 2 render-plan machinery (see `LOCKLESS.md`): the executor
     /// drives per-cycle node dispatch, the builder thread recompiles and
     /// publishes plans, `pending_node_jobs` buffers jobs when no worker is
@@ -386,35 +306,11 @@ pub struct Engine {
     hw_ports: Arc<arc_swap::ArcSwap<crate::plan_builder::HwPorts>>,
     pending_node_jobs: VecDeque<crate::executor::NodeJob>,
     plan_builder: crate::plan_builder::PlanBuilder,
-    latest_hw_out_meter_db: Arc<Vec<f32>>,
-    latest_track_meter_snapshot: Arc<Vec<(String, Vec<f32>)>>,
-    history: History,
+    history: history::History,
     history_group: Option<UndoEntry>,
     history_suspended: bool,
-    offline_bounce_jobs: HashMap<String, OfflineBounceJob>,
-    /// Bounce jobs registered while a plan cycle was still in flight; the
-    /// work is handed to the reserved worker when the cycle completes
-    /// (`on_all_tracks_finished`), so the bounce never races RT workers.
-    pending_bounce_starts: Vec<(usize, crate::message::OfflineBounceWork)>,
-    /// Worker index → track name for in-flight bounce jobs; the worker's
-    /// terminal `Ready(id)` removes the job even on error/cancel paths
-    /// whose `OfflineBounceFinished` payload carries no track name.
-    bounce_worker_tracks: HashMap<usize, String>,
-    pending_midi_learn: Option<(String, crate::message::TrackMidiLearnTarget, Option<String>)>,
-    pending_global_midi_learn: Option<crate::message::GlobalMidiLearnTarget>,
-    pending_session_midi_learn: Option<crate::message::SessionMidiLearnTarget>,
+    pub midi_learn: fields::MidiLearnFields,
     audio_preview: Option<AudioPreviewPlayback>,
-    global_midi_learn_play_pause: Option<crate::message::MidiLearnBinding>,
-    global_midi_learn_stop: Option<crate::message::MidiLearnBinding>,
-    global_midi_learn_record_toggle: Option<crate::message::MidiLearnBinding>,
-    session_midi_learn_slots: HashMap<(String, usize), crate::message::MidiLearnBinding>,
-    session_midi_learn_scenes: HashMap<usize, crate::message::MidiLearnBinding>,
-    session_midi_learn_stop_track: HashMap<String, crate::message::MidiLearnBinding>,
-    session_midi_learn_stop_all: Option<crate::message::MidiLearnBinding>,
-    midi_cc_gate: HashMap<(String, u8, u8), bool>,
-    modulators: Vec<crate::modulator::Modulator>,
-    modulator_values: Option<Arc<std::collections::HashMap<usize, f32>>>,
-    mixosc_last_values: HashMap<(String, String), f32>,
     /// Wakes the dispatcher immediately when a node worker pushes a result,
     /// instead of waiting for the 1 ms periodic tick. This is critical on
     /// Windows, where the default timer quantum coarsens short waits.
@@ -500,15 +396,18 @@ mod tests {
     fn prepare_task_track_pushes_transport_state_and_marks_generation() {
         let (mut engine, _client_rx) = make_engine_with_client();
         let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
-        engine.transport_sample = 1234;
-        engine.tempo_bpm = 133.0;
-        engine.tsig_num = 7;
-        engine.tsig_denom = 8;
+        engine.transport.transport_sample = 1234;
+        engine.transport.tempo_bpm = 133.0;
+        engine.transport.tsig_num = 7;
+        engine.transport.tsig_denom = 8;
 
         let task = ProcessTask::Track(handle.clone());
         engine.prepare_task_track(&task);
 
-        assert_eq!(handle.last_prepare_generation(), engine.prepare_generation);
+        assert_eq!(
+            handle.last_prepare_generation(),
+            engine.transport.prepare_generation
+        );
         let t = handle.lock();
         // The transport sample travels through the shared lock-free snapshot
         // rather than a pushed field; the track picks it up at task start.
@@ -523,8 +422,8 @@ mod tests {
     fn prepare_task_track_skips_push_until_generation_bumps() {
         let (mut engine, _client_rx) = make_engine_with_client();
         let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
-        engine.tempo_bpm = 133.0;
-        let generation_before = engine.prepare_generation;
+        engine.transport.tempo_bpm = 133.0;
+        let generation_before = engine.transport.prepare_generation;
 
         let task = ProcessTask::Track(handle.clone());
         engine.prepare_task_track(&task);
@@ -533,8 +432,8 @@ mod tests {
         // No generation bump: a changed pushed field (tempo) must NOT reach
         // the track (the dispatcher takes the early-exit path), but the
         // lock-free transport snapshot still tracks the engine fields.
-        engine.transport_sample = 999;
-        engine.tempo_bpm = 200.0;
+        engine.transport.transport_sample = 999;
+        engine.transport.tempo_bpm = 200.0;
         engine.prepare_task_track(&task);
         assert_eq!(handle.last_prepare_generation(), generation_before);
         {
@@ -547,9 +446,12 @@ mod tests {
         // A transport mutation that affects pushed fields bumps the
         // generation, so the next prepare pushes again.
         engine.bump_prepare_generation();
-        assert_ne!(engine.prepare_generation, generation_before);
+        assert_ne!(engine.transport.prepare_generation, generation_before);
         engine.prepare_task_track(&task);
-        assert_eq!(handle.last_prepare_generation(), engine.prepare_generation);
+        assert_eq!(
+            handle.last_prepare_generation(),
+            engine.transport.prepare_generation
+        );
         let t = handle.lock();
         t.apply_transport_sample_snapshot();
         assert_eq!(t.rt.transport_sample, 999);
@@ -562,15 +464,15 @@ mod tests {
         let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
         let task = ProcessTask::Track(handle.clone());
         engine.prepare_task_track(&task);
-        let generation = engine.prepare_generation;
+        let generation = engine.transport.prepare_generation;
 
         // Simulate the per-cycle advance in `handle_hw_finished`: the sample
         // moves but the generation must stay constant, and the track must
         // observe the advanced sample at task start.
-        engine.transport_sample = engine.transport_sample.saturating_add(256);
+        engine.transport.transport_sample = engine.transport.transport_sample.saturating_add(256);
         engine.prepare_task_track(&task);
 
-        assert_eq!(engine.prepare_generation, generation);
+        assert_eq!(engine.transport.prepare_generation, generation);
         assert_eq!(handle.last_prepare_generation(), generation);
         let t = handle.lock();
         t.apply_transport_sample_snapshot();
@@ -582,26 +484,26 @@ mod tests {
         let (mut engine, _client_rx) = make_engine_with_client();
         let handle = Arc::new(Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0));
         let task = ProcessTask::Track(handle.clone());
-        engine.transport_sample = 100;
-        engine.session_transport_sample = 1_000;
+        engine.transport.transport_sample = 100;
+        engine.transport.session_transport_sample = 1_000;
         engine.prepare_task_track(&task);
         handle.lock().apply_transport_sample_snapshot();
         assert_eq!(handle.lock().rt.transport_sample, 100);
 
         // Enabling session clip playback changes the pushed choice and bumps
         // the generation; the snapshot now follows the session position.
-        engine.playing = true;
-        engine.session_clip_playback_enabled = true;
+        engine.transport.playing = true;
+        engine.transport.session_clip_playback_enabled = true;
         engine.bump_prepare_generation();
-        let generation = engine.prepare_generation;
+        let generation = engine.transport.prepare_generation;
         engine.prepare_task_track(&task);
         handle.lock().apply_transport_sample_snapshot();
         assert_eq!(handle.lock().rt.transport_sample, 1_000);
 
         // A per-cycle session advance must not bump the generation.
-        engine.session_transport_sample = 1_256;
+        engine.transport.session_transport_sample = 1_256;
         engine.prepare_task_track(&task);
-        assert_eq!(engine.prepare_generation, generation);
+        assert_eq!(engine.transport.prepare_generation, generation);
         handle.lock().apply_transport_sample_snapshot();
         assert_eq!(handle.lock().rt.transport_sample, 1_256);
     }
@@ -632,40 +534,49 @@ mod tests {
             &mut engine,
             Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
         );
-        engine.hw_out_peak_hold_linear = vec![1.0];
+        engine.meters.hw_out_peak_hold_linear = vec![1.0];
         engine
+            .meters
             .track_meter_linear_by_track
             .insert("track".to_string(), vec![1.0]);
 
         engine.reset_meters_after_stop();
 
-        assert!(engine.meter_decay_after_stop.is_some());
-        assert!(engine.latest_hw_out_meter_db[0] > -0.1);
-        assert!(engine.latest_track_meter_snapshot[0].1[0] > -0.1);
+        assert!(engine.meters.meter_decay_after_stop.is_some());
+        assert!(engine.meters.latest_hw_out_meter_db[0] > -0.1);
+        assert!(engine.meters.latest_track_meter_snapshot[0].1[0] > -0.1);
 
         engine
+            .meters
             .meter_decay_after_stop
             .as_mut()
             .expect("meter decay")
             .started_at = Instant::now() - Duration::from_millis(500);
         engine.update_meter_decay_after_stop();
 
-        assert!(engine.latest_hw_out_meter_db[0] < -5.5 && engine.latest_hw_out_meter_db[0] > -6.5);
         assert!(
-            engine.latest_track_meter_snapshot[0].1[0] < -5.5
-                && engine.latest_track_meter_snapshot[0].1[0] > -6.5
+            engine.meters.latest_hw_out_meter_db[0] < -5.5
+                && engine.meters.latest_hw_out_meter_db[0] > -6.5
+        );
+        assert!(
+            engine.meters.latest_track_meter_snapshot[0].1[0] < -5.5
+                && engine.meters.latest_track_meter_snapshot[0].1[0] > -6.5
         );
 
         engine
+            .meters
             .meter_decay_after_stop
             .as_mut()
             .expect("meter decay")
             .started_at = Instant::now() - Duration::from_millis(1_100);
         engine.update_meter_decay_after_stop();
 
-        assert!(engine.meter_decay_after_stop.is_none());
-        assert_eq!(engine.latest_hw_out_meter_db.as_slice(), &[-90.0]);
-        assert_eq!(engine.latest_track_meter_snapshot[0].1.as_slice(), &[-90.0]);
+        assert!(engine.meters.meter_decay_after_stop.is_none());
+        assert_eq!(engine.meters.latest_hw_out_meter_db.as_slice(), &[-90.0]);
+        assert_eq!(
+            engine.meters.latest_track_meter_snapshot[0].1.as_slice(),
+            &[-90.0]
+        );
     }
 
     #[tokio::test]
@@ -751,8 +662,8 @@ mod tests {
     #[tokio::test]
     async fn set_tempo_map_is_recorded_and_undone() {
         let (mut engine, _client_rx) = make_engine_with_client();
-        let original_tempo_points = engine.tempo_points.clone();
-        let original_time_signature_points = engine.time_signature_points.clone();
+        let original_tempo_points = engine.transport.tempo_points.clone();
+        let original_time_signature_points = engine.transport.time_signature_points.clone();
 
         let new_tempo_points = vec![crate::message::TempoPoint {
             sample: 0,
@@ -771,20 +682,26 @@ mod tests {
             })
             .await;
 
-        assert_eq!(engine.tempo_points, new_tempo_points);
-        assert_eq!(engine.time_signature_points, new_time_signature_points);
-        assert_eq!(engine.tempo_bpm, 140.0);
-        assert_eq!(engine.tsig_num, 3);
-        assert_eq!(engine.tsig_denom, 4);
+        assert_eq!(engine.transport.tempo_points, new_tempo_points);
+        assert_eq!(
+            engine.transport.time_signature_points,
+            new_time_signature_points
+        );
+        assert_eq!(engine.transport.tempo_bpm, 140.0);
+        assert_eq!(engine.transport.tsig_num, 3);
+        assert_eq!(engine.transport.tsig_denom, 4);
         assert!(engine.history.is_dirty());
 
         engine.handle_request(Action::Undo).await;
 
-        assert_eq!(engine.tempo_points, original_tempo_points);
-        assert_eq!(engine.time_signature_points, original_time_signature_points);
-        assert_eq!(engine.tempo_bpm, 120.0);
-        assert_eq!(engine.tsig_num, 4);
-        assert_eq!(engine.tsig_denom, 4);
+        assert_eq!(engine.transport.tempo_points, original_tempo_points);
+        assert_eq!(
+            engine.transport.time_signature_points,
+            original_time_signature_points
+        );
+        assert_eq!(engine.transport.tempo_bpm, 120.0);
+        assert_eq!(engine.transport.tsig_num, 4);
+        assert_eq!(engine.transport.tsig_denom, 4);
     }
 
     #[cfg_attr(
@@ -855,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn track_offline_bounce_rejects_when_same_track_is_active() {
         let (mut engine, mut client_rx) = make_engine_with_client();
-        engine.offline_bounce_jobs.insert(
+        engine.dispatch.offline_bounce_jobs.insert(
             "other".to_string(),
             OfflineBounceJob {
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -892,7 +809,7 @@ mod tests {
             &mut engine,
             Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
         );
-        engine.offline_bounce_jobs.insert(
+        engine.dispatch.offline_bounce_jobs.insert(
             "other".to_string(),
             OfflineBounceJob {
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -910,8 +827,8 @@ mod tests {
             })
             .await;
 
-        assert!(engine.offline_bounce_jobs.contains_key("other"));
-        assert_eq!(engine.pending_requests.len(), 1);
+        assert!(engine.dispatch.offline_bounce_jobs.contains_key("other"));
+        assert_eq!(engine.dispatch.pending_requests.len(), 1);
     }
 
     #[cfg_attr(
@@ -1288,9 +1205,9 @@ mod tests {
                 .await;
         }
 
-        engine.playing = true;
-        engine.session_clip_playback_enabled = true;
-        engine.session_transport_sample = 1_000;
+        engine.transport.playing = true;
+        engine.transport.session_clip_playback_enabled = true;
+        engine.transport.session_transport_sample = 1_000;
         {
             let state = engine.state.lock();
             let mut track = state.tracks.get("track").expect("track exists").lock();
@@ -1344,7 +1261,7 @@ mod tests {
                 Some(1_050)
             );
         }
-        assert_eq!(engine.session_scene_queue, Some((1, 1_050)));
+        assert_eq!(engine.session.session_scene_queue, Some((1, 1_050)));
     }
 
     #[cfg_attr(
@@ -1400,7 +1317,7 @@ mod tests {
                 .playing_session_clips
                 .clear();
         }
-        engine.session_current_scene = Some(0);
+        engine.session.session_current_scene = Some(0);
         engine
             .handle_request(Action::TrackSetSessionSlot {
                 track_name: "track".to_string(),
@@ -1566,7 +1483,7 @@ mod tests {
                 Some(1_050)
             );
         }
-        assert_eq!(engine.session_scene_queue, Some((0, 1_050)));
+        assert_eq!(engine.session.session_scene_queue, Some((0, 1_050)));
     }
 
     #[cfg_attr(
@@ -1582,7 +1499,7 @@ mod tests {
                 launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
-        assert_eq!(engine.session_current_scene, None);
+        assert_eq!(engine.session.session_current_scene, None);
 
         // Simulate the fire: the pending launch is consumed and the
         // scheduled stop has happened, so nothing references the queue's
@@ -1593,11 +1510,11 @@ mod tests {
             track.rt.pending_session_launches.clear();
             track.rt.playing_session_clips[0].stop_at_sample = None;
         }
-        engine.session_transport_sample = 1_050;
+        engine.transport.session_transport_sample = 1_050;
         engine.publish_session_runtime_reports().await;
 
-        assert_eq!(engine.session_scene_queue, None);
-        assert_eq!(engine.session_current_scene, Some(1));
+        assert_eq!(engine.session.session_scene_queue, None);
+        assert_eq!(engine.session.session_current_scene, Some(1));
     }
 
     #[cfg_attr(
@@ -1662,21 +1579,21 @@ mod tests {
                 launch_quantization: crate::message::LaunchQuantization::Bar,
             }))
             .await;
-        assert_eq!(engine.session_scene_queue, Some((1, 1_050)));
+        assert_eq!(engine.session.session_scene_queue, Some((1, 1_050)));
 
         // The session transport (1_000) has not reached the launch time:
         // the marker holds and the scene is not current yet.
         engine.publish_session_runtime_reports().await;
-        assert_eq!(engine.session_scene_queue, Some((1, 1_050)));
-        assert_eq!(engine.session_current_scene, None);
+        assert_eq!(engine.session.session_scene_queue, Some((1, 1_050)));
+        assert_eq!(engine.session.session_current_scene, None);
 
         // Once the transport passes the launch time, the scene becomes
         // current even though nothing was scheduled.
-        engine.session_transport_sample = 1_050;
-        engine.last_session_report_publish = None;
+        engine.transport.session_transport_sample = 1_050;
+        engine.session.last_session_report_publish = None;
         engine.publish_session_runtime_reports().await;
-        assert_eq!(engine.session_scene_queue, None);
-        assert_eq!(engine.session_current_scene, Some(1));
+        assert_eq!(engine.session.session_scene_queue, None);
+        assert_eq!(engine.session.session_current_scene, Some(1));
     }
 
     #[cfg_attr(
@@ -1698,9 +1615,9 @@ mod tests {
                 clip_id: Some("clip-1".to_string()),
             })
             .await;
-        engine.playing = true;
-        engine.session_clip_playback_enabled = true;
-        engine.session_transport_sample = 500;
+        engine.transport.playing = true;
+        engine.transport.session_clip_playback_enabled = true;
+        engine.transport.session_transport_sample = 500;
 
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
@@ -1735,11 +1652,11 @@ mod tests {
             })
             .await;
 
-        engine.playing = true;
-        engine.session_clip_playback_enabled = true;
-        engine.session_transport_sample = 600;
-        engine.session_current_scene = Some(0);
-        engine.session_current_scene_start_sample = 500;
+        engine.transport.playing = true;
+        engine.transport.session_clip_playback_enabled = true;
+        engine.transport.session_transport_sample = 600;
+        engine.session.session_current_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 500;
 
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
@@ -1757,7 +1674,7 @@ mod tests {
             expected_launch
         );
         assert_eq!(
-            engine.session_scene_queue,
+            engine.session.session_scene_queue,
             Some((1, expected_launch)),
             "clipless current scene should hold for the selected snap length"
         );
@@ -1788,11 +1705,11 @@ mod tests {
                 .await;
         }
 
-        engine.playing = true;
-        engine.session_clip_playback_enabled = true;
-        engine.session_transport_sample = 10_000;
-        engine.session_current_scene = Some(0);
-        engine.session_current_scene_start_sample = 1_000;
+        engine.transport.playing = true;
+        engine.transport.session_clip_playback_enabled = true;
+        engine.transport.session_transport_sample = 10_000;
+        engine.session.session_current_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 1_000;
 
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
@@ -1809,7 +1726,10 @@ mod tests {
             track.rt.pending_session_launches[0].launch_at_sample,
             expected_launch
         );
-        assert_eq!(engine.session_scene_queue, Some((1, expected_launch)));
+        assert_eq!(
+            engine.session.session_scene_queue,
+            Some((1, expected_launch))
+        );
     }
 
     #[cfg_attr(
@@ -1851,12 +1771,12 @@ mod tests {
             })
             .await;
 
-        engine.playing = true;
-        engine.session_clip_playback_enabled = true;
-        engine.session_transport_sample = 10_000;
-        engine.session_current_scene = Some(0);
-        engine.session_current_scene_start_sample = 0;
-        engine.session_current_scene_length_samples = 48_000;
+        engine.transport.playing = true;
+        engine.transport.session_clip_playback_enabled = true;
+        engine.transport.session_transport_sample = 10_000;
+        engine.session.session_current_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 0;
+        engine.session.session_current_scene_length_samples = 48_000;
 
         engine
             .handle_request(Action::Session(crate::message::SessionAction::QueueScene {
@@ -1865,7 +1785,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(engine.session_scene_queue_length_samples, 48_000);
+        assert_eq!(engine.session.session_scene_queue_length_samples, 48_000);
     }
 
     #[cfg_attr(
@@ -1887,10 +1807,10 @@ mod tests {
                 clip_id: Some("clip-1".to_string()),
             })
             .await;
-        engine.session_transport_sample = 1_000;
-        engine.session_current_scene = Some(0);
-        engine.session_current_scene_start_sample = 0;
-        engine.session_current_scene_length_samples = 1_000;
+        engine.transport.session_transport_sample = 1_000;
+        engine.session.session_current_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 0;
+        engine.session.session_current_scene_length_samples = 1_000;
         {
             let state = engine.state.lock();
             let mut track = state.tracks.get("track").expect("track exists").lock();
@@ -1913,8 +1833,8 @@ mod tests {
 
         engine.publish_session_runtime_reports().await;
 
-        assert_eq!(engine.session_completed_clip_passes.len(), 1);
-        let pass = &engine.session_completed_clip_passes[0];
+        assert_eq!(engine.session.session_completed_clip_passes.len(), 1);
+        let pass = &engine.session.session_completed_clip_passes[0];
         assert_eq!(pass.scene_index, 0);
         assert_eq!(pass.clip_id, "clip-1");
         assert_eq!(pass.start_sample, 0);
@@ -1960,19 +1880,20 @@ mod tests {
                 });
         }
 
-        engine.session_current_scene = Some(0);
-        engine.session_current_scene_start_sample = 0;
-        engine.session_current_scene_length_samples = 1_000;
-        engine.session_transport_sample = 1_000;
+        engine.session.session_current_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 0;
+        engine.session.session_current_scene_length_samples = 1_000;
+        engine.transport.session_transport_sample = 1_000;
         engine.publish_session_runtime_reports().await;
 
-        engine.session_current_scene = Some(0);
-        engine.session_current_scene_start_sample = 2_000;
-        engine.session_current_scene_length_samples = 1_000;
-        engine.session_transport_sample = 3_000;
+        engine.session.session_current_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 2_000;
+        engine.session.session_current_scene_length_samples = 1_000;
+        engine.transport.session_transport_sample = 3_000;
         engine.publish_session_runtime_reports().await;
 
         let starts: Vec<_> = engine
+            .session
             .session_completed_clip_passes
             .iter()
             .map(|pass| pass.start_sample)
@@ -2005,18 +1926,18 @@ mod tests {
                 .await;
         }
 
-        engine.session_current_scene = Some(0);
-        engine.session_current_scene_start_sample = 0;
-        engine.session_current_scene_length_samples = 1_000;
-        engine.session_scene_queue = Some((1, 1_000));
-        engine.session_scene_queue_length_samples = 1_000;
-        engine.session_transport_sample = 1_000;
+        engine.session.session_current_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 0;
+        engine.session.session_current_scene_length_samples = 1_000;
+        engine.session.session_scene_queue = Some((1, 1_000));
+        engine.session.session_scene_queue_length_samples = 1_000;
+        engine.transport.session_transport_sample = 1_000;
 
         engine.publish_session_runtime_reports().await;
 
-        assert_eq!(engine.session_current_scene, Some(1));
-        assert_eq!(engine.session_completed_clip_passes.len(), 1);
-        let pass = &engine.session_completed_clip_passes[0];
+        assert_eq!(engine.session.session_current_scene, Some(1));
+        assert_eq!(engine.session.session_completed_clip_passes.len(), 1);
+        let pass = &engine.session.session_completed_clip_passes[0];
         assert_eq!(pass.scene_index, 0);
         assert_eq!(pass.clip_id, "clip-scene-1");
         assert_eq!(pass.start_sample, 0);
@@ -2062,14 +1983,15 @@ mod tests {
             })
             .await;
 
-        engine.session_current_scene = Some(1);
-        engine.session_current_scene_previous_scene = Some(0);
-        engine.session_current_scene_start_sample = 48_000;
-        engine.session_current_scene_length_samples = 48_000;
-        engine.session_transport_sample = 96_000;
+        engine.session.session_current_scene = Some(1);
+        engine.session.session_current_scene_previous_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 48_000;
+        engine.session.session_current_scene_length_samples = 48_000;
+        engine.transport.session_transport_sample = 96_000;
         engine.publish_session_runtime_reports().await;
 
         let mut passes: Vec<_> = engine
+            .session
             .session_completed_clip_passes
             .iter()
             .map(|pass| {
@@ -2112,14 +2034,15 @@ mod tests {
             })
             .await;
 
-        engine.session_current_scene = Some(1);
-        engine.session_current_scene_previous_scene = Some(0);
-        engine.session_current_scene_start_sample = 500;
-        engine.session_current_scene_length_samples = 1_000;
-        engine.session_scene_queue = Some((0, 1_000));
-        engine.session_scene_queue_length_samples = 1_000;
-        engine.session_transport_sample = 500;
+        engine.session.session_current_scene = Some(1);
+        engine.session.session_current_scene_previous_scene = Some(0);
+        engine.session.session_current_scene_start_sample = 500;
+        engine.session.session_current_scene_length_samples = 1_000;
+        engine.session.session_scene_queue = Some((0, 1_000));
+        engine.session.session_scene_queue_length_samples = 1_000;
+        engine.transport.session_transport_sample = 500;
         engine
+            .session
             .session_completed_clip_passes
             .push(crate::meter::SessionCompletedClipPass {
                 track_name: "track".to_string(),
@@ -2163,9 +2086,9 @@ mod tests {
 
         engine.handle_request(Action::SessionPlay).await;
 
-        assert_eq!(engine.session_current_scene, None);
-        assert_eq!(engine.session_scene_queue, None);
-        assert!(engine.session_completed_clip_passes.is_empty());
+        assert_eq!(engine.session.session_current_scene, None);
+        assert_eq!(engine.session.session_scene_queue, None);
+        assert!(engine.session.session_completed_clip_passes.is_empty());
         {
             let state = engine.state.lock();
             let track = state.tracks.get("track").expect("track exists").lock();
@@ -2181,11 +2104,11 @@ mod tests {
                 },
             ))
             .await;
-        engine.session_transport_sample = 1_000;
+        engine.transport.session_transport_sample = 1_000;
         engine.publish_session_runtime_reports().await;
 
-        assert_eq!(engine.session_completed_clip_passes.len(), 1);
-        let pass = &engine.session_completed_clip_passes[0];
+        assert_eq!(engine.session.session_completed_clip_passes.len(), 1);
+        let pass = &engine.session.session_completed_clip_passes[0];
         assert_eq!(pass.scene_index, 0);
         assert_eq!(pass.clip_id, "clip-scene-1");
         assert_eq!(pass.start_sample, 0);
@@ -2252,10 +2175,10 @@ mod tests {
             })
             .await;
 
-        assert!(engine.offline_bounce_jobs.is_empty());
-        assert_eq!(engine.pending_requests.len(), 1);
+        assert!(engine.dispatch.offline_bounce_jobs.is_empty());
+        assert_eq!(engine.dispatch.pending_requests.len(), 1);
         assert!(matches!(
-            engine.pending_requests.front(),
+            engine.dispatch.pending_requests.front(),
             Some(Action::TrackOfflineBounce { track_name, length_samples, .. })
                 if track_name == "track" && *length_samples == 128
         ));
@@ -2304,7 +2227,7 @@ mod tests {
         engine
             .workers
             .push(WorkerData::new(worker_tx, tokio::spawn(async {})));
-        engine.ready_workers.push(0);
+        engine.dispatch.ready_workers.push(0);
 
         engine
             .handle_request(Action::TrackOfflineBounce {
@@ -2317,7 +2240,7 @@ mod tests {
             })
             .await;
 
-        assert!(engine.offline_bounce_jobs.is_empty());
+        assert!(engine.dispatch.offline_bounce_jobs.is_empty());
         match client_rx.recv().await.expect("response") {
             Message::Response(Err(err)) => {
                 assert!(err.contains("Failed to schedule offline bounce"));
@@ -2449,7 +2372,7 @@ mod tests {
         let track = Track::new("vol-track".to_string(), 0, 2, 0, 0, 128, 48_000.0);
         insert_track_for_modulator_test(&mut engine, track);
 
-        engine.modulators = vec![crate::modulator::Modulator {
+        engine.automation.modulators = vec![crate::modulator::Modulator {
             id: 1,
             name: "LFO".to_string(),
             shape: crate::modulator::ModulatorShape::Sine,
@@ -2485,7 +2408,7 @@ mod tests {
         let track = Track::new("pan-track".to_string(), 0, 2, 0, 0, 128, 48_000.0);
         insert_track_for_modulator_test(&mut engine, track);
 
-        engine.modulators = vec![crate::modulator::Modulator {
+        engine.automation.modulators = vec![crate::modulator::Modulator {
             id: 1,
             name: "LFO".to_string(),
             shape: crate::modulator::ModulatorShape::Sine,

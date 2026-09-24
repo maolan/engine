@@ -268,6 +268,9 @@ impl TrackData {
             let mut elapsed_samples = self.rt.playing_session_clips[i].elapsed_samples;
             let mut out_offset = 0usize;
             let mut rendered_any = false;
+            // Reusable render target across loop iterations; restored to
+            // `self.rt` after the loop.
+            let mut clip_scratch = std::mem::take(&mut self.rt.clip_render_scratch);
 
             while out_offset < frames {
                 if play_position >= clip_length {
@@ -288,16 +291,20 @@ impl TrackData {
                 session_clip.start = 0;
                 session_clip.end = clip_length;
 
-                let processed = match self.render_audio_clip_segment(
-                    &session_clip,
-                    0,
-                    play_position,
-                    segment_len,
-                    &mut active_clip_plugin_keys,
-                ) {
-                    Some(p) => p,
-                    None => break,
-                };
+                if self
+                    .render_audio_clip_segment(
+                        &session_clip,
+                        0,
+                        play_position,
+                        segment_len,
+                        &mut active_clip_plugin_keys,
+                        &mut clip_scratch,
+                    )
+                    .is_none()
+                {
+                    break;
+                }
+                let processed: &[Vec<f32>] = &clip_scratch;
                 for (ch, in_samples) in inputs.iter_mut().enumerate().take(channel_count) {
                     let src = processed.get(ch).or_else(|| processed.first());
                     if let Some(src) = src {
@@ -316,6 +323,7 @@ impl TrackData {
                 elapsed_samples += segment_len;
                 out_offset += segment_len;
             }
+            self.rt.clip_render_scratch = clip_scratch;
 
             if rendered_any {
                 position_updates.push((i, play_position, elapsed_samples));

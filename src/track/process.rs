@@ -34,13 +34,7 @@ impl TrackData {
             midi_input_monitor: ArcSwap::from_pointee(vec![false; io.midi_ins]),
             midi_disk_monitor: ArcSwap::from_pointee(vec![true; io.midi_ins]),
             color: None,
-            midi_learn_volume: None,
-            midi_learn_balance: None,
-            midi_learn_mute: None,
-            midi_learn_solo: None,
-            midi_learn_arm: None,
-            midi_learn_input_monitor: None,
-            midi_learn_disk_monitor: None,
+            midi_learn: Default::default(),
             is_folder,
             folder_open: AtomicBool::new(true),
             parent_track: None,
@@ -501,14 +495,16 @@ impl TrackData {
             disk_monitor,
             self.rt.clip_playback_enabled
         );
-        self.rt.folder_record_tap_input_snapshots = if self.armed() && self.rt.record_tap_enabled {
-            audio_inputs
-                .iter()
-                .map(|audio_in| audio_in.to_vec())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let record_tap_active = self.armed() && self.rt.record_tap_enabled;
+        {
+            let snapshots = &mut self.rt.folder_record_tap_input_snapshots;
+            snapshots.clear();
+            if record_tap_active {
+                for audio_in in audio_inputs.iter() {
+                    snapshots.push(audio_in.to_vec());
+                }
+            }
+        }
 
         let mut track_input_midi_events = self.collect_track_input_midi_events();
         let cycle_start = self.rt.transport_sample;
@@ -570,8 +566,6 @@ impl TrackData {
             input.mark_finished();
         }
 
-        self.rt.folder_input_midi_events = track_input_midi_events.clone();
-
         // Folder children receive the same input MIDI events as the folder.
         if !self.child_tracks.is_empty() {
             for child in &self.child_tracks {
@@ -585,6 +579,10 @@ impl TrackData {
                 }
             }
         }
+
+        // Hand the events to the RT state by move; nothing above needs them
+        // afterwards, so no per-cycle clone is necessary.
+        self.rt.folder_input_midi_events = track_input_midi_events;
 
         self.rt.folder_plugin_midi_node_events.clear();
         self.rt.folder_processed_midi_plugins.clear();
@@ -613,7 +611,6 @@ impl TrackData {
     ) {
         self.apply_transport_sample_snapshot();
         let frames = self.compute_process_frames();
-        let track_input_events = self.rt.folder_input_midi_events.clone();
 
         match kind {
             PluginKind::Clap => {
@@ -628,7 +625,7 @@ impl TrackData {
                 self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
-                    &track_input_events,
+                    &self.rt.folder_input_midi_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
                 let outputs = processor.process_with_audio_buffers(
@@ -680,7 +677,7 @@ impl TrackData {
                 let midi_inputs = self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
-                    &track_input_events,
+                    &self.rt.folder_input_midi_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
                 let _vst3_input = midi_inputs.first().cloned().unwrap_or_default();
@@ -717,7 +714,7 @@ impl TrackData {
                 let midi_inputs = self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
-                    &track_input_events,
+                    &self.rt.folder_input_midi_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
                 let _lv2_input = midi_inputs.first().cloned().unwrap_or_default();
@@ -791,12 +788,12 @@ impl TrackData {
         source_buffers: &[(usize, &[f32], usize)],
     ) {
         self.apply_transport_sample_snapshot();
-        let track_input_events = self.rt.folder_input_midi_events.clone();
-        let midi_node_events = self.rt.folder_plugin_midi_node_events.clone();
 
         self.ensure_midi_route_cache();
-        self.route_track_inputs_to_track_outputs(&track_input_events);
-        self.route_plugin_midi_to_track_outputs_graph(&track_input_events, &midi_node_events);
+        // Both `route_*` callees currently ignore their `_input_events`
+        // parameter, so no per-cycle snapshot of the events is needed.
+        self.route_track_inputs_to_track_outputs(&[]);
+        self.route_plugin_midi_to_track_outputs_graph(&[], &self.rt.folder_plugin_midi_node_events);
 
         // Sum child-track MIDI outputs into the folder's MIDI outputs.
         for child in &self.child_tracks {
@@ -804,14 +801,11 @@ impl TrackData {
             for (out_idx, child_out) in child.midi.outs.iter().enumerate() {
                 if let Some(folder_out) = self.midi.outs.get(out_idx) {
                     // Safety: plan edge child → folder-output serializes the
-                    // child's write before this read.
-                    let events = unsafe { child_out.buffer() }.to_vec();
-                    if !events.is_empty() {
-                        // Safety: plan single-writer invariant — the
-                        // folder-output task is the sole writer of its own
-                        // ports this cycle (LOCKLESS.md Phase 3).
-                        unsafe { folder_out.buffer_mut() }.extend_from_slice(&events);
-                    }
+                    // child's write before this read; child_out and
+                    // folder_out are distinct ports, so the two port guards
+                    // cannot alias.
+                    unsafe { folder_out.buffer_mut() }
+                        .extend_from_slice(unsafe { child_out.buffer() });
                 }
             }
         }
