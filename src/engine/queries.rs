@@ -24,11 +24,27 @@ impl Engine {
     /// (see `notify_query_reply`); events that used to produce OSC output
     /// while wrapped in `Ok(Action::...)` were query answers and now live
     /// there. `OfflineBounceFinished` errors keep the error-packet behavior.
+    ///
+    /// Events are best-effort reports (meters also flow via the triple
+    /// buffer), so a client whose channel is full drops this event instead
+    /// of stalling the engine behind a slow consumer; Responses and
+    /// QueryReplies keep their awaited sends. Dead senders are pruned.
     pub(crate) async fn notify_event(&mut self, event: Event) {
         self.clients.retain(|client| !client.is_closed());
         for client in self.clients.iter() {
-            if client.send(Message::Event(event.clone())).await.is_err() {}
+            match client.try_send(Message::Event(event.clone())) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Saturated client: dropping the event is acceptable
+                    // (see doc comment); the next event gets through once
+                    // the client drains.
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Pruned by the retain below.
+                }
+            }
         }
+        self.clients.retain(|client| !client.is_closed());
         if let Some(reply_to) = self.osc_reply_target
             && let Event::OfflineBounceFinished(result) = &event
             && let Err(reason) = result.as_ref()

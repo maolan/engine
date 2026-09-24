@@ -360,11 +360,16 @@ impl TrackData {
         self.process_render_block_with_input_sum(true)
     }
 
+    /// `sources` is used as scratch: any entries it already holds are kept,
+    /// the method appends the track's own inputs and plugin outputs, and the
+    /// combined list is passed on. The appended entries borrow buffers that
+    /// only live for this call, so the caller must clear `sources`
+    /// afterwards rather than retaining it.
     pub(crate) fn process_render_block_with_audio_buffers_and_metronome(
         &mut self,
         audio_inputs: &mut [&mut [f32]],
         audio_outputs: &mut [&mut [f32]],
-        source_buffers: &[(usize, &[f32], usize)],
+        sources: &mut Vec<(usize, &[f32], usize)>,
         metronome_output: Option<&mut [f32]>,
     ) -> usize {
         self.apply_transport_sample_snapshot();
@@ -384,19 +389,34 @@ impl TrackData {
         );
         let plugin_outputs =
             self.process_track_plugins_in_graph_order_with_audio_buffers(frames, audio_inputs);
-        let mut sources = source_buffers.to_vec();
-        for (audio_in, buffer) in self.audio.ins.iter().zip(audio_inputs.iter()) {
-            sources.push((Arc::as_ptr(audio_in) as usize, &**buffer, 0));
-        }
+        // Safety: the input buffers and `plugin_outputs` outlive the
+        // `process_folder_output_with_audio_buffers` call below, which is the
+        // only consumer of the appended entries; the caller clears `sources`
+        // afterwards (see doc comment).
+        sources.extend(
+            self.audio
+                .ins
+                .iter()
+                .zip(audio_inputs.iter())
+                .map(|(audio_in, buffer)| {
+                    let slice: &[f32] = buffer;
+                    (
+                        Arc::as_ptr(audio_in) as usize,
+                        unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) },
+                        0,
+                    )
+                }),
+        );
         let graph_latencies = self.current_plugin_graph_source_latencies();
-        for (key, buffer) in &plugin_outputs {
-            sources.push((
+        sources.extend(plugin_outputs.iter().map(|(key, buffer)| {
+            let slice = buffer.as_slice();
+            (
                 *key,
-                buffer.as_slice(),
+                unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) },
                 graph_latencies.get(key).copied().unwrap_or(0),
-            ));
-        }
-        self.process_folder_output_with_audio_buffers(audio_outputs, &sources);
+            )
+        }));
+        self.process_folder_output_with_audio_buffers(audio_outputs, sources);
         frames
     }
 
@@ -449,7 +469,7 @@ impl TrackData {
         self.process_render_block_with_audio_buffers_and_metronome(
             &mut inputs,
             &mut outputs,
-            &[],
+            &mut Vec::new(),
             None,
         )
     }
@@ -851,7 +871,13 @@ impl TrackData {
                     && (!c.rt.playing_session_clips.is_empty()
                         || !c.rt.pending_session_launches.is_empty())
             });
-        let record_tap_input_snapshots = self.rt.folder_record_tap_input_snapshots.clone();
+        // Take (rather than clone) the record-tap input snapshots captured by
+        // the folder-input pass: the loop below only reads them, and the
+        // field is restored before this function returns, so nothing can
+        // observe the temporary emptiness. This avoids copying every input
+        // buffer's samples once per block.
+        let record_tap_input_snapshots =
+            std::mem::take(&mut self.rt.folder_record_tap_input_snapshots);
         let input_monitor = self.input_monitor();
         let mut all_outputs_zero = true;
         for out_idx in 0..self.audio.outs.len().min(audio_outputs.len()) {
@@ -1010,6 +1036,7 @@ impl TrackData {
             audio_out.finished.store(true, Ordering::Release);
         }
 
+        self.rt.folder_record_tap_input_snapshots = record_tap_input_snapshots;
         self.rt.last_render_block_silent = all_outputs_zero;
         self.audio.set_finished(true);
         self.audio.set_processing(false);
@@ -1403,7 +1430,7 @@ impl TrackData {
             self.process_render_block_with_audio_buffers_and_metronome(
                 &mut inputs,
                 &mut outputs,
-                &[],
+                &mut Vec::new(),
                 None,
             );
             let step = (length_samples - cursor).min(block_size);

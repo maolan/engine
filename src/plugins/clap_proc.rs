@@ -23,6 +23,10 @@ unsafe fn latency_samples_atomic(ptr: *mut u8) -> &'static AtomicU32 {
     unsafe { &*(ptr.add(SHM_LATENCY_SAMPLES_OFFSET) as *const AtomicU32) }
 }
 
+unsafe fn response_counter(ptr: *mut u8) -> &'static AtomicU32 {
+    unsafe { response_counter_ref(ptr) }
+}
+
 fn wait_for_host_request_complete(
     header: &ShmHeader,
     events: &EventPair,
@@ -786,7 +790,7 @@ impl ClapProcessor {
         }
 
         let timeout = Duration::from_millis(100);
-        if events.wait_host(timeout).is_err() {
+        if ipc::wait_block_response(unsafe { response_counter(ptr) }, events, timeout).is_err() {
             ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
