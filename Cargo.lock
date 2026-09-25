@@ -2233,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "alsa",
  "arc-swap",
@@ -2672,9 +2672,9 @@ dependencies = [
 
 [[package]]
 name = "nvtree"
-version = "0.0.4"
+version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "787dbd53eccebdaa2d6f1f2e8383fe77f5cdef5a450d03675236d673a595944f"
+checksum = "0ac4d8e5e45da879fe4e8c52082e0dd829847644bfedd2dce4711abb4fddb0bb"
 
 [[package]]
 name = "objc"
