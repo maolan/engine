@@ -1,6 +1,6 @@
 [package]
 name = "maolan-engine"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2024"
 description = "Audio engine for the Maolan DAW with audio/MIDI tracks, routing, export, and out-of-process CLAP/VST3/LV2 plugin support"
 license = "BSD-2-Clause"
@@ -36,7 +36,11 @@ rubato = "5.0"
 audioadapter = "5.0"
 audioadapter-buffers = "5.1"
 timestretch = "0.15.0"
-mixosc = "0.0.14"
+mixosc = { version = "0.0.15", optional = true }
+
+[features]
+default = []
+mixosc = ["dep:mixosc"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.12.0"

@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::{Event, OfflineAutomationLane, OfflineAutomationPoint};
+#[cfg(feature = "mixosc")]
 use mixosc::parameters::{OscValue, build_set};
 
 /// Echo of an applied modulator/automation target. Level/balance rides the
@@ -267,62 +268,66 @@ impl Engine {
         if !self.transport.playing {
             return;
         }
-
-        let socket = match self.automation.mixosc_socket.as_ref() {
-            Some(socket) => socket,
-            None => match UdpSocket::bind("0.0.0.0:0") {
-                Ok(socket) => {
-                    self.automation.mixosc_socket = Some(socket);
-                    self.automation.mixosc_socket.as_ref().unwrap()
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "Failed to bind MixOSC output socket");
-                    return;
-                }
-            },
-        };
-
-        let state = self.state_snapshot.load_full();
-        for (track_name, track) in state.tracks.iter() {
-            let track_lock = track.lock();
-            let Some(track_addr) = track_lock.mixosc_addr.as_ref() else {
-                continue;
+        #[cfg(not(feature = "mixosc"))]
+        let _ = sample;
+        #[cfg(feature = "mixosc")]
+        {
+            let socket = match self.automation.mixosc_socket.as_ref() {
+                Some(socket) => socket,
+                None => match UdpSocket::bind("0.0.0.0:0") {
+                    Ok(socket) => {
+                        self.automation.mixosc_socket = Some(socket);
+                        self.automation.mixosc_socket.as_ref().unwrap()
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "Failed to bind MixOSC output socket");
+                        return;
+                    }
+                },
             };
-            let lanes: Vec<crate::message::OfflineAutomationLane> =
-                crate::engine::parse_automation_lanes(&track_lock.automation_lanes);
-            for lane in lanes {
-                if !lane.visible {
-                    continue;
-                }
-                let crate::message::OfflineAutomationTarget::MixOsc {
-                    addr: ref lane_addr,
-                    path: ref lane_path,
-                } = lane.target
-                else {
+
+            let state = self.state_snapshot.load_full();
+            for (track_name, track) in state.tracks.iter() {
+                let track_lock = track.lock();
+                let Some(track_addr) = track_lock.mixosc_addr.as_ref() else {
                     continue;
                 };
-                if lane_addr != track_addr {
-                    continue;
-                }
-                let Some(value) = lane.value_at(sample) else {
-                    continue;
-                };
-                let key = (track_addr.clone(), lane_path.clone());
-                if let Some(last) = self.automation.mixosc_last_values.get(&key)
-                    && (last - value).abs() < f32::EPSILON
-                {
-                    continue;
-                }
-                self.automation.mixosc_last_values.insert(key, value);
-                let packet = build_set(lane_path, OscValue::Float(value));
-                if let Err(err) = socket.send_to(&packet, track_addr) {
-                    tracing::debug!(
-                        %err,
-                        %track_name,
-                        %track_addr,
-                        %lane_path,
-                        "Failed to send MixOSC packet"
-                    );
+                let lanes: Vec<crate::message::OfflineAutomationLane> =
+                    crate::engine::parse_automation_lanes(&track_lock.automation_lanes);
+                for lane in lanes {
+                    if !lane.visible {
+                        continue;
+                    }
+                    let crate::message::OfflineAutomationTarget::MixOsc {
+                        addr: ref lane_addr,
+                        path: ref lane_path,
+                    } = lane.target
+                    else {
+                        continue;
+                    };
+                    if lane_addr != track_addr {
+                        continue;
+                    }
+                    let Some(value) = lane.value_at(sample) else {
+                        continue;
+                    };
+                    let key = (track_addr.clone(), lane_path.clone());
+                    if let Some(last) = self.automation.mixosc_last_values.get(&key)
+                        && (last - value).abs() < f32::EPSILON
+                    {
+                        continue;
+                    }
+                    self.automation.mixosc_last_values.insert(key, value);
+                    let packet = build_set(lane_path, OscValue::Float(value));
+                    if let Err(err) = socket.send_to(&packet, track_addr) {
+                        tracing::debug!(
+                            %err,
+                            %track_name,
+                            %track_addr,
+                            %lane_path,
+                            "Failed to send MixOSC packet"
+                        );
+                    }
                 }
             }
         }

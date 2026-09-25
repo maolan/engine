@@ -2233,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "alsa",
  "arc-swap",
@@ -2281,9 +2281,9 @@ dependencies = [
 
 [[package]]
 name = "maolan-widgets"
-version = "0.0.35"
+version = "0.0.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8201881f51e26aff699cf591f5fd243e1ecb3555bd3673263bfcf6684b91ed28"
+checksum = "4f6736326aefec6c26942724d7c4f2b5827492ad6ab46c4d65e2b1d94dca67f4"
 dependencies = [
  "iced",
  "iced_aw",
@@ -2384,9 +2384,9 @@ dependencies = [
 
 [[package]]
 name = "mixosc"
-version = "0.0.14"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeedb8f68326ded98233c8048331cd2fc9d385e5e4d656d31fe0ef07f481e279"
+checksum = "d947a4f2da930e588258b3174f8b023cd3d843a502ce9df17782bce898241fa3"
 dependencies = [
  "maolan-widgets",
  "tokio",

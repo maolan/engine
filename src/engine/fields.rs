@@ -7,6 +7,7 @@
 //! flat on `Engine`.
 use super::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(feature = "mixosc")]
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -252,7 +253,9 @@ pub struct RecordingFields {
 pub struct AutomationFields {
     pub modulators: Vec<crate::modulator::Modulator>,
     pub modulator_values: Option<Arc<HashMap<usize, f32>>>,
+    #[cfg(feature = "mixosc")]
     pub mixosc_last_values: HashMap<(String, String), f32>,
+    #[cfg(feature = "mixosc")]
     pub mixosc_socket: Option<UdpSocket>,
 }
 
