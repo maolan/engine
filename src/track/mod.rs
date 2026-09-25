@@ -36,6 +36,7 @@ mod track_routing;
 #[cfg(unix)]
 pub use instances::Lv2Instance;
 pub use instances::{ClapInstance, Vst3Instance};
+pub use process::TrackMonitorKind;
 pub(crate) use streaming::{DEFAULT_RING_BUFFER_MULTIPLIER, set_ring_buffer_multiplier};
 
 type MidiClipEvents = Arc<Vec<(usize, Vec<u8>)>>;

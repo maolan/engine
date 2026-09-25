@@ -267,30 +267,32 @@ pub fn find_plugin_host_binary() -> Option<PathBuf> {
 
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let engine_root = Path::new(&manifest);
-        for profile in ["debug", "release"] {
-            let candidate = engine_root
-                .parent()
-                .unwrap_or(Path::new(""))
-                .join("daw")
-                .join("target")
-                .join(profile)
-                .join(host_name);
-            if candidate.exists() {
-                tracing::info!(path = %candidate.display(), "Using plugin-host from daw workspace target");
-                return Some(candidate);
-            }
+        for workspace_dir in ["maolan", "daw"] {
+            for profile in ["debug", "release"] {
+                let candidate = engine_root
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join(workspace_dir)
+                    .join("target")
+                    .join(profile)
+                    .join(host_name);
+                if candidate.exists() {
+                    tracing::info!(path = %candidate.display(), "Using plugin-host from workspace target");
+                    return Some(candidate);
+                }
 
-            let candidate = engine_root
-                .parent()
-                .unwrap_or(Path::new(""))
-                .join("daw")
-                .join("plugin-host")
-                .join("target")
-                .join(profile)
-                .join(host_name);
-            if candidate.exists() {
-                tracing::info!(path = %candidate.display(), "Using plugin-host from plugin-host crate target");
-                return Some(candidate);
+                let candidate = engine_root
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join(workspace_dir)
+                    .join("plugin-host")
+                    .join("target")
+                    .join(profile)
+                    .join(host_name);
+                if candidate.exists() {
+                    tracing::info!(path = %candidate.display(), "Using plugin-host from plugin-host crate target");
+                    return Some(candidate);
+                }
             }
         }
     }

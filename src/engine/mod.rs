@@ -2289,8 +2289,24 @@ mod tests {
             engine.work().await;
         });
 
-        // Wait for worker tasks to start up and send Ready messages.
-        tokio::time::sleep(TokioDuration::from_millis(100)).await;
+        // Wait for the work loop to come up by sending a benign request and
+        // awaiting its response with a deadline (event-driven instead of a
+        // fixed sleep, so slow CI machines under parallel test load do not
+        // race the worker startup).
+        tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
+            .await
+            .unwrap();
+        let startup_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match tokio::time::timeout(TokioDuration::from_secs(1), client_rx.recv()).await {
+                Ok(Some(_)) => break,
+                Ok(None) => panic!("engine client channel closed during startup"),
+                Err(_) if Instant::now() >= startup_deadline => {
+                    panic!("engine did not respond within startup deadline")
+                }
+                Err(_) => {}
+            }
+        }
 
         async fn drain_responses(
             client_rx: &mut tokio::sync::mpsc::Receiver<Message>,
@@ -2302,10 +2318,12 @@ mod tests {
         }
 
         async fn wait_for_audible_track(
+            tx: &tokio::sync::mpsc::Sender<Message>,
             client_rx: &mut tokio::sync::mpsc::Receiver<Message>,
             state: &State,
         ) -> Option<f32> {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut last_retrigger: Option<Instant> = None;
             while Instant::now() < deadline {
                 {
                     let state = state.lock();
@@ -2323,6 +2341,20 @@ mod tests {
                         return Some(peak);
                     }
                 }
+                // Without a hardware device the engine runs a single plan
+                // cycle per Play request. If the clip's streaming decoder
+                // underruns on that first cycle (slow machine or parallel
+                // test load), retrigger Play to run another cycle at the
+                // same transport position rather than depending on decode
+                // timing luck.
+                let needs_retrigger = match last_retrigger {
+                    None => true,
+                    Some(t) => t.elapsed() >= Duration::from_millis(200),
+                };
+                if needs_retrigger {
+                    last_retrigger = Some(Instant::now());
+                    let _ = tx.send(Message::Request(Action::Play)).await;
+                }
                 let _ =
                     tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await;
                 tokio::time::sleep(TokioDuration::from_millis(10)).await;
@@ -2334,7 +2366,7 @@ mod tests {
             .await
             .unwrap();
         tx.send(Message::Request(Action::Play)).await.unwrap();
-        let first_peak = wait_for_audible_track(&mut client_rx, &state)
+        let first_peak = wait_for_audible_track(&tx, &mut client_rx, &state)
             .await
             .unwrap_or(0.0);
         assert!(
@@ -2352,7 +2384,7 @@ mod tests {
             .await
             .unwrap();
         tx.send(Message::Request(Action::Play)).await.unwrap();
-        let second_peak = wait_for_audible_track(&mut client_rx, &state)
+        let second_peak = wait_for_audible_track(&tx, &mut client_rx, &state)
             .await
             .unwrap_or(0.0);
         assert!(
@@ -2396,9 +2428,9 @@ mod tests {
             track.level()
         );
         assert!(
-            echoes
-                .iter()
-                .any(|a| matches!(a, Action::TrackAutomationLevel(name, _) if name == "vol-track"))
+            echoes.iter().any(
+                |a| matches!(a, crate::engine::automation::AutomationEcho::Level { track_name, .. } if track_name == "vol-track")
+            )
         );
     }
 
@@ -2432,9 +2464,10 @@ mod tests {
             track.balance()
         );
         assert!(
-            echoes.iter().any(
-                |a| matches!(a, Action::TrackAutomationBalance(name, _) if name == "pan-track")
-            )
+            echoes.iter().any(|a| matches!(
+                a,
+                crate::engine::automation::AutomationEcho::Balance { track_name, .. } if track_name == "pan-track"
+            ))
         );
     }
 

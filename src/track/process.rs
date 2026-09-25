@@ -2,6 +2,15 @@ use crate::audio::track::AudioTrack;
 use crate::message::{PluginGraphNode, PluginKind};
 use crate::midi::track::MIDITrack;
 
+/// Selects one of the four per-lane monitor vectors on a track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackMonitorKind {
+    Input,
+    Disk,
+    MidiInput,
+    MidiDisk,
+}
+
 use super::*;
 use crate::{audio::io::AudioIO, midi::io::MIDIIO};
 use std::{
@@ -1289,6 +1298,27 @@ impl TrackData {
     pub fn is_master(&self) -> bool {
         self.is_master.load(Ordering::Relaxed)
     }
+    /// Sets every lane of the given monitor kind to `value` in a single
+    /// store, returning the indices of the lanes that actually changed.
+    pub fn set_all_monitors(&self, kind: TrackMonitorKind, value: bool) -> Vec<usize> {
+        let swap = match kind {
+            TrackMonitorKind::Input => &self.input_monitor,
+            TrackMonitorKind::Disk => &self.disk_monitor,
+            TrackMonitorKind::MidiInput => &self.midi_input_monitor,
+            TrackMonitorKind::MidiDisk => &self.midi_disk_monitor,
+        };
+        let mut monitors = swap.load_full();
+        let mut changed = Vec::new();
+        for (lane, monitor) in Arc::make_mut(&mut monitors).iter_mut().enumerate() {
+            if *monitor != value {
+                *monitor = value;
+                changed.push(lane);
+            }
+        }
+        swap.store(monitors);
+        changed
+    }
+
     pub fn toggle_input_monitor(&mut self, lane: usize) {
         let mut monitors = self.input_monitor();
         if let Some(monitor) = Arc::make_mut(&mut monitors).get_mut(lane) {

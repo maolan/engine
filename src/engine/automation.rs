@@ -1,8 +1,40 @@
 use super::*;
-use crate::message::{OfflineAutomationLane, OfflineAutomationPoint};
+use crate::message::{Event, OfflineAutomationLane, OfflineAutomationPoint};
 use mixosc::parameters::{OscValue, build_set};
 
+/// Echo of an applied modulator/automation target. Level/balance rides the
+/// `Event` channel (reports); plugin-parameter updates stay command-shaped
+/// acks since the GUI also sends those as commands.
+#[derive(Clone, Debug)]
+pub(crate) enum AutomationEcho {
+    Level { track_name: String, level: f32 },
+    Balance { track_name: String, balance: f32 },
+    Action(Box<Action>),
+}
+
 impl Engine {
+    pub(crate) async fn dispatch_automation_echoes(&mut self, echoes: Vec<AutomationEcho>) {
+        for echo in echoes {
+            match echo {
+                AutomationEcho::Level { track_name, level } => {
+                    self.notify_event(Event::TrackAutomationLevel { track_name, level })
+                        .await;
+                }
+                AutomationEcho::Balance {
+                    track_name,
+                    balance,
+                } => {
+                    self.notify_event(Event::TrackAutomationBalance {
+                        track_name,
+                        balance,
+                    })
+                    .await;
+                }
+                AutomationEcho::Action(action) => self.notify_clients(Ok(*action)).await,
+            }
+        }
+    }
+
     pub(crate) fn compute_modulator_values(
         &self,
         sample: usize,
@@ -24,7 +56,7 @@ impl Engine {
         Arc::new(values)
     }
 
-    pub(crate) fn apply_modulators(&mut self, sample: usize) -> Vec<Action> {
+    pub(crate) fn apply_modulators(&mut self, sample: usize) -> Vec<AutomationEcho> {
         use crate::modulator::ModulatorTarget;
         let values = self.compute_modulator_values(sample);
         self.automation.modulator_values = Some(values.clone());
@@ -72,15 +104,20 @@ impl Engine {
                         let clamped = map_f32(value, *min, *max);
                         if (self.meters.hw_out_level_db - clamped).abs() > f32::EPSILON {
                             self.meters.hw_out_level_db = clamped;
-                            echoes
-                                .push(Action::TrackAutomationLevel("hw:out".to_string(), clamped));
+                            echoes.push(AutomationEcho::Level {
+                                track_name: "hw:out".to_string(),
+                                level: clamped,
+                            });
                         }
                     }
                     ModulatorTarget::HwOutBalance { min, max } => {
                         let next = map_f32(value, *min, *max).clamp(-1.0, 1.0);
                         if (self.meters.hw_out_balance - next).abs() > f32::EPSILON {
                             self.meters.hw_out_balance = next;
-                            echoes.push(Action::TrackAutomationBalance("hw:out".to_string(), next));
+                            echoes.push(AutomationEcho::Balance {
+                                track_name: "hw:out".to_string(),
+                                balance: next,
+                            });
                         }
                     }
                     ModulatorTarget::ClapParameter {
@@ -141,7 +178,10 @@ impl Engine {
                 let t = track.lock();
                 if (t.level() - level).abs() > f32::EPSILON {
                     t.set_level(level);
-                    echoes.push(Action::TrackAutomationLevel(track_name.clone(), level));
+                    echoes.push(AutomationEcho::Level {
+                        track_name: track_name.clone(),
+                        level,
+                    });
                 }
             }
             if let Some(balance) = balance
@@ -151,7 +191,10 @@ impl Engine {
                 let next = balance.clamp(-1.0, 1.0);
                 if (t.balance() - next).abs() > f32::EPSILON {
                     t.set_balance(next);
-                    echoes.push(Action::TrackAutomationBalance(track_name.clone(), next));
+                    echoes.push(AutomationEcho::Balance {
+                        track_name: track_name.clone(),
+                        balance: next,
+                    });
                 }
             }
         }
@@ -169,12 +212,14 @@ impl Engine {
                     .set_clap_parameter(instance_id, param_id, value)
                     .is_ok()
             {
-                echoes.push(Action::TrackSetClapParameter {
-                    track_name,
-                    instance_id,
-                    param_id,
-                    value,
-                });
+                echoes.push(AutomationEcho::Action(Box::new(
+                    Action::TrackSetClapParameter {
+                        track_name,
+                        instance_id,
+                        param_id,
+                        value,
+                    },
+                )));
             }
         }
         for ((track_name, instance_id, param_id), value) in vst3_params {
@@ -184,12 +229,14 @@ impl Engine {
                     .set_vst3_parameter(instance_id, param_id, value)
                     .is_ok()
             {
-                echoes.push(Action::TrackSetVst3Parameter {
-                    track_name,
-                    instance_id,
-                    param_id,
-                    value,
-                });
+                echoes.push(AutomationEcho::Action(Box::new(
+                    Action::TrackSetVst3Parameter {
+                        track_name,
+                        instance_id,
+                        param_id,
+                        value,
+                    },
+                )));
             }
         }
         #[cfg(unix)]
@@ -200,12 +247,14 @@ impl Engine {
                     .set_lv2_control_value(instance_id, index as usize, f64::from(value))
                     .is_ok()
             {
-                echoes.push(Action::TrackSetLv2ControlValue {
-                    track_name,
-                    instance_id,
-                    index,
-                    value,
-                });
+                echoes.push(AutomationEcho::Action(Box::new(
+                    Action::TrackSetLv2ControlValue {
+                        track_name,
+                        instance_id,
+                        index,
+                        value,
+                    },
+                )));
             }
         }
 
@@ -394,9 +443,7 @@ impl Engine {
             Action::SetModulators(ref modulators) => {
                 self.automation.modulators = modulators.clone();
                 let echoes = self.apply_modulators(self.active_transport_sample());
-                for action in echoes {
-                    self.notify_clients(Ok(action)).await;
-                }
+                self.dispatch_automation_echoes(echoes).await;
             }
             Action::SetTrackAutomationLanes {
                 ref track_name,
@@ -445,6 +492,11 @@ impl Engine {
                 } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().set_level(level);
                 }
+                self.notify_event(Event::TrackAutomationLevel {
+                    track_name: name.clone(),
+                    level,
+                })
+                .await;
             }
             Action::TrackAutomationBalance(ref name, balance) => {
                 if name == "hw:out" {
@@ -452,6 +504,11 @@ impl Engine {
                 } else if let Some(track) = self.state_snapshot.load_full().tracks.get(name) {
                     track.lock().set_balance(balance);
                 }
+                self.notify_event(Event::TrackAutomationBalance {
+                    track_name: name.clone(),
+                    balance,
+                })
+                .await;
             }
             _ => {}
         }

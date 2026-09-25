@@ -678,6 +678,29 @@ pub enum Event {
         files: Vec<(u32, String)>,
     },
     TransportPosition(usize),
+    /// Per-track meter report emitted from the throttled meter publish
+    /// path. The bulk meter flow is the shared-memory
+    /// `meter_snapshot_producer` triple buffer plus
+    /// `QueryReply::MeterSnapshot`; this event keeps the message-channel
+    /// path honest for clients that only consume `Event`s.
+    TrackMeters {
+        track_name: String,
+        output_db: Vec<f32>,
+    },
+    /// Engine automation/modulator level echo. The *command* twin (GUI
+    /// fader, OSC `/track/automation_level`) remains
+    /// `Action::TrackAutomationLevel`.
+    TrackAutomationLevel {
+        track_name: String,
+        level: f32,
+    },
+    /// Engine automation/modulator balance echo. The *command* twin (GUI
+    /// fader, OSC `/track/automation_balance`) remains
+    /// `Action::TrackAutomationBalance`.
+    TrackAutomationBalance {
+        track_name: String,
+        balance: f32,
+    },
     /// Result of an offline (freeze/export) bounce job. The inner `Action`
     /// is the finished or canceled `TrackOfflineBounce` command (those stay
     /// `Action` variants since the GUI also sends them).
@@ -1027,17 +1050,17 @@ pub enum Action {
     RemoveTrack(String),
     TrackLevel(String, f32),
     TrackBalance(String, f32),
+    /// Automation level command (GUI fader / OSC). The engine's automation
+    /// *echoes* are `Event::TrackAutomationLevel`.
     TrackAutomationLevel(String, f32),
+    /// Automation balance command (GUI fader / OSC). The engine's
+    /// automation *echoes* are `Event::TrackAutomationBalance`.
     TrackAutomationBalance(String, f32),
     TrackMidiCc {
         track_name: String,
         channel: u8,
         cc: u8,
         value: u8,
-    },
-    TrackMeters {
-        track_name: String,
-        output_db: Vec<f32>,
     },
     RequestMeterSnapshot,
     RequestTrackList,

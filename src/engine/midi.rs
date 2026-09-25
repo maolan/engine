@@ -976,6 +976,7 @@ impl Engine {
         }
 
         let mut mapped_actions = Vec::<Action>::new();
+        let mut monitor_sets = Vec::<(String, crate::track::TrackMonitorKind, bool)>::new();
         let state = self.state_snapshot.load_full();
         for (track_name, track) in state.tracks.iter() {
             let t = track.lock();
@@ -1024,11 +1025,12 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.input_monitor().first() != Some(&wanted) {
-                        mapped_actions.push(Action::TrackToggleInputMonitor {
-                            track_name: track_name.clone(),
-                            lane: 0,
-                        });
+                    if t.input_monitor().iter().any(|&monitor| monitor != wanted) {
+                        monitor_sets.push((
+                            track_name.clone(),
+                            crate::track::TrackMonitorKind::Input,
+                            wanted,
+                        ));
                     }
                 }
             }
@@ -1036,11 +1038,12 @@ impl Engine {
                 let device_matches = binding.device.as_ref().is_none_or(|d| d.as_str() == device);
                 if device_matches && binding.channel == channel && binding.cc == cc {
                     let wanted = value >= 64;
-                    if t.disk_monitor().first() != Some(&wanted) {
-                        mapped_actions.push(Action::TrackToggleDiskMonitor {
-                            track_name: track_name.clone(),
-                            lane: 0,
-                        });
+                    if t.disk_monitor().iter().any(|&monitor| monitor != wanted) {
+                        monitor_sets.push((
+                            track_name.clone(),
+                            crate::track::TrackMonitorKind::Disk,
+                            wanted,
+                        ));
                     }
                 }
             }
@@ -1114,6 +1117,37 @@ impl Engine {
                     triggered_session_learns.push(Event::SessionMidiLearnTriggered {
                         target: crate::message::SessionMidiLearnTarget::StopAll,
                     });
+                }
+            }
+        }
+        let state = self.state_snapshot.load_full();
+        for (track_name, kind, wanted) in monitor_sets {
+            if let Some(track) = state.tracks.get(&track_name) {
+                let changed_lanes = track.lock().set_all_monitors(kind, wanted);
+                for lane in changed_lanes {
+                    let action = match kind {
+                        crate::track::TrackMonitorKind::Input => Action::TrackToggleInputMonitor {
+                            track_name: track_name.clone(),
+                            lane,
+                        },
+                        crate::track::TrackMonitorKind::Disk => Action::TrackToggleDiskMonitor {
+                            track_name: track_name.clone(),
+                            lane,
+                        },
+                        crate::track::TrackMonitorKind::MidiInput => {
+                            Action::TrackToggleMidiInputMonitor {
+                                track_name: track_name.clone(),
+                                lane,
+                            }
+                        }
+                        crate::track::TrackMonitorKind::MidiDisk => {
+                            Action::TrackToggleMidiDiskMonitor {
+                                track_name: track_name.clone(),
+                                lane,
+                            }
+                        }
+                    };
+                    self.notify_clients(Ok(action)).await;
                 }
             }
         }
@@ -2068,6 +2102,64 @@ mod tests {
     use super::Engine;
     use crate::message::{MpeExpressionCurve, MpeExpressionPoint, MpeNoteExpression};
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn midi_learn_monitor_toggle_flips_all_lanes() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+
+            let track = Arc::new(crate::track::Track::new(
+                "t1".to_string(),
+                2,
+                2,
+                0,
+                0,
+                64,
+                48_000.0,
+            ));
+            {
+                let state = engine.state();
+                let mut state = state.lock();
+                state.tracks.insert("t1".to_string(), track.clone());
+            }
+            engine.publish_state_snapshot();
+            track.lock().midi_learn.input_monitor = Some(crate::message::MidiLearnBinding {
+                device: None,
+                channel: 0,
+                cc: 20,
+            });
+            track.lock().midi_learn.disk_monitor = Some(crate::message::MidiLearnBinding {
+                device: None,
+                channel: 0,
+                cc: 21,
+            });
+
+            // Lane 1 of the input monitor starts out of sync with lane 0 to
+            // catch single-lane toggles.
+            track.lock().set_input_monitor(vec![false, true]);
+
+            engine.handle_incoming_hw_cc("dev", 0, 20, 127).await;
+            assert_eq!(
+                track.lock().input_monitor().as_slice(),
+                &[true, true],
+                "input monitor toggle must apply to every lane"
+            );
+
+            engine.handle_incoming_hw_cc("dev", 0, 21, 0).await;
+            assert_eq!(
+                track.lock().disk_monitor().as_slice(),
+                &[false, false],
+                "disk monitor toggle must apply to every lane"
+            );
+
+            // Re-sending a value that matches all lanes must be a no-op.
+            engine.handle_incoming_hw_cc("dev", 0, 20, 127).await;
+            assert_eq!(track.lock().input_monitor().as_slice(), &[true, true]);
+        });
+    }
 
     #[test]
     fn mpe_expression_round_trips_through_midi_file() {

@@ -77,7 +77,7 @@ impl Engine {
         }
     }
 
-    pub(crate) fn publish_track_meters(&mut self) {
+    pub(crate) async fn publish_track_meters(&mut self) {
         if !self.meters.should_publish_track_meters() {
             return;
         }
@@ -106,6 +106,13 @@ impl Engine {
                 .map(MeterFields::meter_linear_to_db)
                 .collect::<Vec<_>>();
             snapshot.push((name.clone(), output_db));
+        }
+        for (track_name, output_db) in &snapshot {
+            self.notify_event(crate::message::Event::TrackMeters {
+                track_name: track_name.clone(),
+                output_db: output_db.clone(),
+            })
+            .await;
         }
         self.meters.latest_track_meter_snapshot = Arc::new(snapshot);
     }
@@ -248,18 +255,14 @@ impl Engine {
 impl Engine {
     /// Meter request arms.
     pub(crate) async fn handle_meter_request(&mut self, a: Action) -> bool {
-        match a {
-            Action::RequestMeterSnapshot => {
-                self.update_meter_decay_after_stop();
-                self.notify_query_reply(QueryReply::MeterSnapshot {
-                    hw_out_db: self.meters.latest_hw_out_meter_db.clone(),
-                    track_meters: self.meters.latest_track_meter_snapshot.clone(),
-                })
-                .await;
-                return true;
-            }
-            Action::TrackMeters { .. } => {}
-            _ => {}
+        if let Action::RequestMeterSnapshot = a {
+            self.update_meter_decay_after_stop();
+            self.notify_query_reply(QueryReply::MeterSnapshot {
+                hw_out_db: self.meters.latest_hw_out_meter_db.clone(),
+                track_meters: self.meters.latest_track_meter_snapshot.clone(),
+            })
+            .await;
+            return true;
         }
         false
     }

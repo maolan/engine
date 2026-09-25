@@ -178,7 +178,7 @@ impl Engine {
                 reconfigured_tracks.push(track_name.clone());
             }
         }
-        self.publish_track_meters();
+        self.publish_track_meters().await;
         self.publish_session_runtime_reports().await;
         self.publish_clap_state_dirty().await;
         for track_name in reconfigured_tracks {
@@ -264,9 +264,7 @@ impl Engine {
         }
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
-            for action in echoes {
-                self.notify_clients(Ok(action)).await;
-            }
+            self.dispatch_automation_echoes(echoes).await;
         }
         self.apply_mixosc_automation(self.active_transport_sample());
         let cycle_started = self.start_plan_cycle().await;
@@ -404,9 +402,7 @@ impl Engine {
         self.preload_track_clips().await;
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
-            for action in echoes {
-                self.notify_clients(Ok(action)).await;
-            }
+            self.dispatch_automation_echoes(echoes).await;
         }
         if !self.transport.awaiting_hwfinished && !self.transport.handling_hwfinished {
             let completed = self.start_plan_cycle().await;
@@ -555,9 +551,7 @@ impl Engine {
         self.preload_track_clips().await;
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
-            for action in echoes {
-                self.notify_clients(Ok(action)).await;
-            }
+            self.dispatch_automation_echoes(echoes).await;
         }
         if !self.transport.awaiting_hwfinished && !self.transport.handling_hwfinished {
             let completed = self.start_plan_cycle().await;
@@ -580,9 +574,7 @@ impl Engine {
         self.publish_transport_snapshot();
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
-            for action in echoes {
-                self.notify_clients(Ok(action)).await;
-            }
+            self.dispatch_automation_echoes(echoes).await;
         }
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
