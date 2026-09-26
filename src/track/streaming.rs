@@ -426,6 +426,7 @@ fn run_producer(
     let mut pending: Option<(Vec<f32>, usize)> = None;
     // Frames already discarded while satisfying the current seek request.
     let mut discard_remaining = 0usize;
+    let mut at_eof = false;
 
     loop {
         if control.stop.load(Ordering::Acquire) {
@@ -452,6 +453,13 @@ fn run_producer(
                     .unwrap_or(0);
                 out_buffer = vec![0.0_f32; out_capacity.saturating_mul(channels)];
             }
+            at_eof = false;
+            control.eof.store(false, Ordering::Release);
+        }
+        if at_eof {
+            // Keep the producer alive so a loop can seek this clip again.
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
         }
 
         if pending.is_none() {
@@ -472,7 +480,9 @@ fn run_producer(
                         continue;
                     }
                 }
-                return Ok(());
+                at_eof = true;
+                control.eof.store(true, Ordering::Release);
+                continue;
             };
             let frames = chunk.len() / channels;
             if discard_remaining > 0 {

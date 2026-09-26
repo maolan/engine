@@ -475,6 +475,7 @@ fn run_producer(
     // Byte position inside the data chunk that the next read consumes.
     let mut position = 0u64;
     let mut pending: Option<(Vec<f32>, usize)> = None;
+    let mut at_eof = false;
 
     loop {
         if control.stop.load(Ordering::Acquire) {
@@ -486,11 +487,21 @@ fn run_producer(
             // O(1) seek: the next read starts at the requested frame.
             position = (seek as u64 - 1).saturating_mul(block_align as u64);
             pending = None;
+            at_eof = false;
+            control.eof.store(false, Ordering::Release);
+        }
+        if at_eof {
+            // A seekable clip may be looped after reaching EOF. Keep the
+            // producer alive so a later seek can refill the rings.
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
         }
 
         if pending.is_none() {
             if position as usize >= total_bytes {
-                return Ok(());
+                at_eof = true;
+                control.eof.store(true, Ordering::Release);
+                continue;
             }
             let want_bytes = DECODE_CHUNK_FRAMES.saturating_mul(block_align);
             let remaining = total_bytes.saturating_sub(position as usize);
@@ -654,6 +665,37 @@ mod tests {
                 (actual - expected).abs() < 1.0e-6,
                 "post-seek sample {i}: got {actual}, expected {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn seekable_stream_can_seek_again_after_eof() {
+        let (path, source) = tone_wav("maolan_seekstream_after_eof", 48_000, 0.05, 440.0);
+        let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 128, 4)
+            .expect("start seekable buffer");
+        let total = source.len();
+        let mut out = vec![vec![0.0_f32; 256]; 1];
+        let mut from = 0;
+        while from < total {
+            let n = (total - from).min(out[0].len());
+            wait_for_frames(&buffer, n, Duration::from_secs(5));
+            buffer.read_frames(from, n, &mut out);
+            from += n;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !buffer.is_eof() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        buffer.read_frames(0, out[0].len(), &mut out);
+        assert!(wait_for_frames(&buffer, out[0].len(), Duration::from_secs(5)) >= out[0].len());
+        buffer.read_frames(0, out[0].len(), &mut out);
+        assert!(wait_for_frames(&buffer, out[0].len(), Duration::from_secs(5)) >= out[0].len());
+        buffer.read_frames(out[0].len(), out[0].len(), &mut out);
+        let _ = std::fs::remove_file(&path);
+
+        for (actual, expected) in out[0].iter().zip(&source[out[0].len()..]) {
+            assert!((actual - expected).abs() < 1.0e-6);
         }
     }
 
