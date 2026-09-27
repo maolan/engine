@@ -1,4 +1,4 @@
-use super::{Audio, MidiHub, OSSChannel};
+use super::{Audio, MidiHub, OSSChannel, add_to_sync_group, start_sync_group};
 use crate::audio::io::AudioIO;
 use crate::hw::common;
 use crate::hw::latency;
@@ -183,12 +183,36 @@ impl HwDriver {
         }
     }
 
-    pub fn start_input_trigger(&self) -> std::io::Result<()> {
-        self.capture.start_trigger()
+    /// Current capture frame position reported by the OSS driver
+    /// (`SNDCTL_DSP_GETIPTR`), in frames since the input stream started.
+    pub fn current_capture_frame(&self) -> Option<i64> {
+        self.capture.current_capture_frame()
     }
 
-    pub fn start_output_trigger(&self) -> std::io::Result<()> {
-        self.playback.start_trigger()
+    /// Join capture and playback in an OSS sync group and start them
+    /// together (or fall back to per-direction triggers when the device
+    /// cannot do sync groups). Returns true when a sync group was started.
+    /// The result is recorded in the shared `DuplexSync` so that later
+    /// transport transitions know whether per-direction `SNDCTL_DSP_TRIGGER`
+    /// ioctls are safe to issue.
+    pub fn start_duplex_sync(&self) -> bool {
+        let in_fd = self.capture.fd();
+        let out_fd = self.playback.fd();
+        let mut group = 0;
+        let in_group = add_to_sync_group(in_fd, group, true);
+        if in_group > 0 {
+            group = in_group;
+        }
+        let out_group = add_to_sync_group(out_fd, group, false);
+        if out_group > 0 {
+            group = out_group;
+        }
+        let started = group > 0 && start_sync_group(in_fd, group).is_ok();
+        if !started {
+            let _ = self.capture.start_trigger();
+            let _ = self.playback.start_trigger();
+        }
+        started
     }
 
     pub fn channel(&mut self) -> OSSChannel<'_> {
@@ -229,13 +253,22 @@ impl HwDriver {
     }
 
     pub fn set_playing(&mut self, playing: bool) {
+        // State flag only: playback DMA never halts. While stopped, the
+        // per-cycle render is silence (fill_output_buffer zeroes it when
+        // !playing) and the ring is kept/-fed silent via
+        // `zero_fill_hw_buffers` — no trigger ioctls on stop/resume.
         self.playing.store(playing, Ordering::Relaxed);
-        if playing {
-            let _ = self.playback.start_trigger();
-        } else {
-            let _ = self.playback.stop_trigger();
+        if !playing {
             self.playback.force_silence_now();
         }
+    }
+
+    /// One full write of the persistent zero buffer into the mapped
+    /// playback ring, plus userspace buffer silence. Called when the
+    /// transport stops: the zeros drain as silence and, with no cycles
+    /// running while stopped, nothing overwrites them.
+    pub fn zero_fill_hw_buffers(&mut self) {
+        self.playback.zero_fill_hw_buffers();
     }
 
     pub fn close_fds(&mut self) {
@@ -263,6 +296,10 @@ impl HwWorkerDriver for HwDriver {
 
     fn set_output_gain_balance(&mut self, gain: f32, balance: f32) {
         self.set_output_gain_balance(gain, balance)
+    }
+
+    fn zero_fill_hw_buffers(&mut self) {
+        self.zero_fill_hw_buffers()
     }
 
     fn run_cycle_for_worker(&mut self) -> Result<(), String> {
@@ -300,6 +337,14 @@ impl HwWorkerDriver for HwDriver {
     #[cfg(unix)]
     fn playback_fd(&self) -> Option<std::os::fd::RawFd> {
         Some(self.playback.fd())
+    }
+
+    fn current_capture_frame(&self) -> Option<i64> {
+        self.current_capture_frame()
+    }
+
+    fn stop_signaller(&self) -> Option<Arc<AtomicBool>> {
+        Some(self.stop_requested.clone())
     }
 }
 

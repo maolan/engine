@@ -20,6 +20,20 @@ use std::{
 use tracing::error;
 
 impl Engine {
+    /// Zero every track's reusable buffers and the current render plan's
+    /// arena/delay lines. Only callable with no plan cycle in flight; the
+    /// engine invokes it from `start_plan_cycle` (dispatcher thread) when a
+    /// transport-start path requested it, never mid-cycle from the async
+    /// transport path.
+    pub(crate) fn clear_processing_buffers_before_playback(&mut self) {
+        let state = self.state_snapshot.load_full();
+        for track in state.tracks.values() {
+            track.lock().clear_processing_buffers();
+        }
+        let plan = self.plan_slot.load();
+        plan.clear_processing_buffers();
+    }
+
     pub(crate) const TRACK_PROCESS_TIMEOUT: Duration = Duration::from_millis(250);
 
     #[cfg(not(unix))]
@@ -51,7 +65,6 @@ impl Engine {
             | Action::Quit
             | Action::Play
             | Action::Pause
-            | Action::Stop
             | Action::TransportPosition(_)
             | Action::JumpToEnd
             | Action::SetLoopEnabled(_)
@@ -305,6 +318,13 @@ impl Engine {
         }
         self.refresh_realtime_infection();
         self.ensure_metronome_wiring();
+        if self.transport.clear_processing_buffers_pending {
+            // No cycle can be in flight here (`cycle_complete` was checked
+            // above), so zeroing track/plan buffers is race-free. This is the
+            // cycle-safe counterpart of the transport-start request.
+            self.transport.clear_processing_buffers_pending = false;
+            self.clear_processing_buffers_before_playback();
+        }
         let jobs = self.executor.start_cycle(Instant::now());
         if self.dispatch_node_jobs(jobs).await {
             self.on_all_tracks_finished().await;

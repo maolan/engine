@@ -5,10 +5,14 @@ use crate::{
 #[cfg(unix)]
 use nix::libc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
+
+/// Sentinel stored in the capture-frame mirror when the backend reports no
+/// capture position (or has not run a cycle yet).
+pub(crate) const CAPTURE_FRAME_UNKNOWN: i64 = -1;
 
 pub trait Backend: Send + Sync + 'static {
     type Driver: HwWorkerDriver + Send + 'static;
@@ -40,6 +44,10 @@ pub struct HwWorker<B: Backend> {
     /// flushed on receipt (panic All-Sound-Off must not wait for a cycle)
     /// and MIDI input is drained by a periodic timer instead of per cycle.
     playing: bool,
+    /// Shared with the engine dispatcher; refreshed from the driver's
+    /// `current_capture_frame` after every audio cycle. `CAPTURE_FRAME_UNKNOWN`
+    /// when the backend reports nothing.
+    capture_frame: Arc<AtomicI64>,
 }
 
 /// How often hardware MIDI input is polled when no audio cycles are running
@@ -184,6 +192,7 @@ impl<B: Backend> HwWorker<B> {
         midi_hub: B::MidiHub,
         rx: Receiver<Message>,
         tx: Sender<Message>,
+        capture_frame: Arc<AtomicI64>,
     ) -> Self {
         let cycle_frames = driver.cycle_samples() as u32;
         Self {
@@ -196,6 +205,19 @@ impl<B: Backend> HwWorker<B> {
             pending_midi_out_sorted: true,
             midi_stop: Arc::new(AtomicBool::new(false)),
             playing: false,
+            capture_frame,
+        }
+    }
+
+    /// Refresh the shared capture-frame mirror from the driver, if it reports
+    /// one. Runs on the worker thread between cycles, when the driver is back
+    /// in hand.
+    fn publish_capture_frame(&self) {
+        if let Some(driver) = self.driver.as_ref() {
+            let frame = driver
+                .current_capture_frame()
+                .unwrap_or(CAPTURE_FRAME_UNKNOWN);
+            self.capture_frame.store(frame, Ordering::Relaxed);
         }
     }
 
@@ -258,16 +280,42 @@ impl<B: Backend> HwWorker<B> {
     #[cfg(unix)]
     async fn work_async(&mut self) {
         let mut cycle_running = false;
+        let mut quit_pending = false;
+        // Stop flag the worker can raise while a cycle owns the driver, so
+        // a cycle blocked on device I/O unwinds promptly instead of
+        // deadlocking shutdown (Quit cannot reach `request_stop` while the
+        // message handler waits for the cycle to finish).
+        let stop_signaller = self.driver.as_ref().and_then(|d| d.stop_signaller());
         let (cycle_tx, mut cycle_rx) =
             tokio::sync::mpsc::channel::<(B::Driver, Result<(), String>)>(1);
         let mut midi_input_poll = tokio::time::interval(MIDI_INPUT_POLL_INTERVAL);
         loop {
             tokio::select! {
                 // While a cycle is in flight the driver lives on the blocking
-                // thread, so the message channel is not polled; queued
-                // messages (including Quit) are handled once the cycle
-                // returns — bounded by one audio period.
-                msg = self.rx.recv(), if !cycle_running => {
+                // thread, so regular messages are handled once the cycle
+                // returns. Quit is the exception: it must interrupt a cycle
+                // that never returns (e.g. a stalled device), so it is
+                // received here and turned into the shared stop flag the
+                // cycle polls.
+                msg = self.rx.recv() => {
+                    if cycle_running {
+                        // While a cycle is in flight the driver lives on the
+                        // blocking thread, so regular messages are handled
+                        // once the cycle returns. Quit is the exception: it
+                        // must interrupt a cycle that never returns (e.g. a
+                        // stalled device), so it is turned into the shared
+                        // stop flag the cycle polls.
+                        match msg {
+                            Some(Message::Request(crate::message::Action::Quit)) | None => {
+                                if let Some(flag) = &stop_signaller {
+                                    flag.store(true, Ordering::Release);
+                                }
+                                quit_pending = true;
+                            }
+                            Some(_) => {}
+                        }
+                        continue;
+                    }
                     let msg = match msg {
                         Some(m) => m,
                         None => {
@@ -314,6 +362,9 @@ impl<B: Backend> HwWorker<B> {
                             self.playing = playing;
                             self.driver_mut().set_playing(playing);
                         }
+                        Message::HWZeroFillBuffers => {
+                            self.driver_mut().zero_fill_hw_buffers();
+                        }
                         Message::HWSetOutputGainBalance { gain, balance } => {
                             self.driver_mut().set_output_gain_balance(gain, balance);
                         }
@@ -344,6 +395,11 @@ impl<B: Backend> HwWorker<B> {
                             )))).await;
                         }
                     }
+                    if quit_pending {
+                        self.shutdown_quit();
+                        return;
+                    }
+                    self.publish_capture_frame();
                     if let Err(e) = self.tx.send(Message::HWFinished).await {
                         error!("{} worker failed to send HWFinished: {}", B::LABEL, e);
                     }
@@ -379,97 +435,156 @@ impl<B: Backend> HwWorker<B> {
                     continue;
                 }
             };
-            match msg {
-                Message::Request(crate::message::Action::Quit) => {
+            if self.handle_legacy_msg(msg).await {
+                return;
+            }
+        }
+    }
+
+    /// Handle one worker message in the legacy loop. Returns true when the
+    /// worker should exit (Quit or a failed cycle task).
+    async fn handle_legacy_msg(&mut self, msg: Message) -> bool {
+        match msg {
+            Message::Request(crate::message::Action::Quit) => {
+                self.driver_mut().request_stop();
+                self.flush_pending_midi_out();
+                self.shutdown_midi();
+                self.driver_mut().close_fds();
+                self.driver_mut().request_stop();
+                return true;
+            }
+            Message::TracksFinished => {
+                self.flush_pending_midi_out();
+                self.drain_midi_input().await;
+                // The cycle blocks for a full audio period; run it on a
+                // blocking thread with per-cycle RT priority instead of
+                // stalling the async worker task (see work_async).
+                let stop_signaller = self.driver.as_ref().and_then(|d| d.stop_signaller());
+                let driver = self
+                    .driver
+                    .take()
+                    .expect("driver is only absent while a cycle is running");
+                let mut cycle =
+                    tokio::task::spawn_blocking(move || Self::run_cycle_blocking(driver));
+                // Watch for Quit while the cycle runs: a cycle blocked on
+                // device I/O would otherwise deadlock shutdown, because
+                // request_stop is only reachable from message handling.
+                // Non-Quit messages are buffered and handled once the
+                // cycle returns.
+                let mut quit_pending = false;
+                let mut buffered: Vec<Message> = Vec::new();
+                let outcome = loop {
+                    tokio::select! {
+                        res = &mut cycle => break res,
+                        msg = self.rx.recv() => match msg {
+                            Some(m) => {
+                                if matches!(m, Message::Request(crate::message::Action::Quit)) {
+                                    if !quit_pending
+                                        && let Some(flag) = &stop_signaller {
+                                            flag.store(true, Ordering::Release);
+                                        }
+                                    quit_pending = true;
+                                }
+                                buffered.push(m);
+                            }
+                            None => {
+                                if !quit_pending
+                                    && let Some(flag) = &stop_signaller {
+                                        flag.store(true, Ordering::Release);
+                                    }
+                                quit_pending = true;
+                            }
+                        },
+                    }
+                };
+                match outcome {
+                    Ok((driver, result)) => {
+                        self.driver = Some(driver);
+                        self.publish_capture_frame();
+                        if let Err(e) = result {
+                            error!("{} assist cycle error: {}", B::LABEL, e);
+                            let _ = self
+                                .tx
+                                .send(Message::Response(Err(format!(
+                                    "{} assist cycle error: {}",
+                                    B::LABEL,
+                                    e
+                                ))))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("{} cycle task failed: {}", B::LABEL, e);
+                        return true;
+                    }
+                }
+                if quit_pending {
                     self.driver_mut().request_stop();
                     self.flush_pending_midi_out();
                     self.shutdown_midi();
                     self.driver_mut().close_fds();
                     self.driver_mut().request_stop();
-                    return;
+                    return true;
                 }
-                Message::TracksFinished => {
-                    self.flush_pending_midi_out();
-                    self.drain_midi_input().await;
-                    // The cycle blocks for a full audio period; run it on a
-                    // blocking thread with per-cycle RT priority instead of
-                    // stalling the async worker task (see work_async).
-                    let driver = self
-                        .driver
-                        .take()
-                        .expect("driver is only absent while a cycle is running");
-                    let cycle =
-                        tokio::task::spawn_blocking(move || Self::run_cycle_blocking(driver));
-                    match cycle.await {
-                        Ok((driver, result)) => {
-                            self.driver = Some(driver);
-                            if let Err(e) = result {
-                                error!("{} assist cycle error: {}", B::LABEL, e);
-                                let _ = self
-                                    .tx
-                                    .send(Message::Response(Err(format!(
-                                        "{} assist cycle error: {}",
-                                        B::LABEL,
-                                        e
-                                    ))))
-                                    .await;
-                            }
-                        }
-                        Err(e) => {
-                            error!("{} cycle task failed: {}", B::LABEL, e);
-                            return;
-                        }
-                    }
-                    if let Err(e) = self.tx.send(Message::HWFinished).await {
-                        error!(
-                            "{} worker failed to send HWFinished to engine: {}",
-                            B::LABEL,
-                            e
-                        );
+                if let Err(e) = self.tx.send(Message::HWFinished).await {
+                    error!(
+                        "{} worker failed to send HWFinished to engine: {}",
+                        B::LABEL,
+                        e
+                    );
+                }
+                for m in buffered {
+                    // Boxed to allow the recursive call (async fn).
+                    if Box::pin(self.handle_legacy_msg(m)).await {
+                        return true;
                     }
                 }
-                Message::HWMidiOutEvents(mut events) => {
-                    self.pending_midi_out_events.append(&mut events);
-                    self.pending_midi_out_sorted = false;
-                    // Stopped transport means no cycles and no TracksFinished
-                    // to flush on; write immediately (panic All-Sound-Off).
-                    if !self.playing {
-                        self.flush_pending_midi_out();
-                    }
-                }
-                Message::ClearHWMidiOutEvents => {
-                    self.pending_midi_out_events.clear();
-                    self.pending_midi_out_sorted = true;
-                }
-                Message::HWSetPlaying(playing) => {
-                    self.playing = playing;
-                    self.driver_mut().set_playing(playing);
-                }
-                Message::HWSetOutputGainBalance { gain, balance } => {
-                    self.driver_mut().set_output_gain_balance(gain, balance);
-                }
-                Message::HWOpenMidiInputDevice(device) => {
-                    let result = self.midi_hub.open_input(&device);
-                    let action = crate::message::Action::OpenMidiInputDevice(device);
-                    let _ = self
-                        .tx
-                        .send(Message::Response(result.map(|_| action)))
-                        .await;
-                }
-                Message::HWOpenMidiOutputDevice(device) => {
-                    let result = self.midi_hub.open_output(&device);
-                    let action = crate::message::Action::OpenMidiOutputDevice(device);
-                    let _ = self
-                        .tx
-                        .send(Message::Response(result.map(|_| action)))
-                        .await;
-                }
-                Message::HWCloseMidiDevices => {
-                    self.midi_hub.close_all();
-                }
-                _ => {}
             }
+            Message::HWMidiOutEvents(mut events) => {
+                self.pending_midi_out_events.append(&mut events);
+                self.pending_midi_out_sorted = false;
+                // Stopped transport means no cycles and no TracksFinished
+                // to flush on; write immediately (panic All-Sound-Off).
+                if !self.playing {
+                    self.flush_pending_midi_out();
+                }
+            }
+            Message::ClearHWMidiOutEvents => {
+                self.pending_midi_out_events.clear();
+                self.pending_midi_out_sorted = true;
+            }
+            Message::HWSetPlaying(playing) => {
+                self.playing = playing;
+                self.driver_mut().set_playing(playing);
+            }
+            Message::HWZeroFillBuffers => {
+                self.driver_mut().zero_fill_hw_buffers();
+            }
+            Message::HWSetOutputGainBalance { gain, balance } => {
+                self.driver_mut().set_output_gain_balance(gain, balance);
+            }
+            Message::HWOpenMidiInputDevice(device) => {
+                let result = self.midi_hub.open_input(&device);
+                let action = crate::message::Action::OpenMidiInputDevice(device);
+                let _ = self
+                    .tx
+                    .send(Message::Response(result.map(|_| action)))
+                    .await;
+            }
+            Message::HWOpenMidiOutputDevice(device) => {
+                let result = self.midi_hub.open_output(&device);
+                let action = crate::message::Action::OpenMidiOutputDevice(device);
+                let _ = self
+                    .tx
+                    .send(Message::Response(result.map(|_| action)))
+                    .await;
+            }
+            Message::HWCloseMidiDevices => {
+                self.midi_hub.close_all();
+            }
+            _ => {}
         }
+        false
     }
 
     fn flush_pending_midi_out(&mut self) {
@@ -531,5 +646,113 @@ fn spread_hw_event_frames(events: &mut [HwMidiEvent], frames: u32) {
     for (idx, event) in events.iter_mut().enumerate() {
         let pos = idx as u32;
         event.event.frame = ((pos as u64 * (frames - 1) as u64) / n as u64) as u32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Backend, CAPTURE_FRAME_UNKNOWN, HwWorker};
+    use crate::hw::traits::{HwMidiHub, HwWorkerDriver};
+    use crate::message::{Action, HwMidiEvent, Message};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::mpsc::channel;
+
+    /// Driver whose cycle blocks until the shared stop flag is set,
+    /// simulating a device stalled mid-cycle (e.g. capture that never
+    /// becomes readable).
+    #[derive(Debug)]
+    struct StallingDriver {
+        stop: Arc<AtomicBool>,
+    }
+
+    impl HwWorkerDriver for StallingDriver {
+        fn cycle_samples(&self) -> usize {
+            1024
+        }
+
+        fn sample_rate(&self) -> i32 {
+            48_000
+        }
+
+        fn run_cycle_for_worker(&mut self) -> Result<(), String> {
+            while !self.stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+
+        fn run_assist_step_for_worker(&mut self) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn stop_signaller(&self) -> Option<Arc<AtomicBool>> {
+            Some(self.stop.clone())
+        }
+
+        #[cfg(unix)]
+        fn capture_fd(&self) -> Option<std::os::fd::RawFd> {
+            use std::os::fd::AsRawFd;
+            Some(std::fs::File::open("/dev/null").ok()?.as_raw_fd())
+        }
+
+        #[cfg(unix)]
+        fn playback_fd(&self) -> Option<std::os::fd::RawFd> {
+            use std::os::fd::AsRawFd;
+            Some(std::fs::File::open("/dev/null").ok()?.as_raw_fd())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct NoopMidiHub;
+
+    impl HwMidiHub for NoopMidiHub {
+        fn read_events_into(&mut self, _out: &mut Vec<HwMidiEvent>) {}
+
+        fn write_events(&mut self, _events: &[HwMidiEvent]) {}
+    }
+
+    #[derive(Debug)]
+    struct StallingBackend;
+
+    impl Backend for StallingBackend {
+        type Driver = StallingDriver;
+        type MidiHub = NoopMidiHub;
+
+        const LABEL: &'static str = "stalling";
+        const WORKER_THREAD_NAME: &'static str = "stalling-worker";
+        const ASSIST_THREAD_NAME: &'static str = "stalling-assist";
+        const ASSIST_AUTONOMOUS_ENV: &'static str = "MAOLAN_STALLING_ASSIST";
+    }
+
+    /// Regression test for the shutdown deadlock: a `Quit` received while a
+    /// hardware cycle is blocked on device I/O must interrupt the cycle via
+    /// the driver's stop flag and shut the worker down. Before the fix the
+    /// message loop could not process `Quit` until the cycle returned, so a
+    /// stalled cycle deadlocked process exit forever.
+    #[tokio::test]
+    async fn quit_interrupts_stalled_cycle() {
+        let driver = StallingDriver {
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let (msg_tx, msg_rx) = channel::<Message>(32);
+        let (engine_tx, _engine_rx) = channel::<Message>(32);
+        let worker = HwWorker::<StallingBackend>::new(
+            driver,
+            NoopMidiHub,
+            msg_rx,
+            engine_tx,
+            Arc::new(AtomicI64::new(CAPTURE_FRAME_UNKNOWN)),
+        );
+        let handle = tokio::spawn(worker.work());
+        // Start a cycle, let it stall, then quit while it is in flight.
+        msg_tx.send(Message::TracksFinished).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        msg_tx.send(Message::Request(Action::Quit)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("worker did not shut down after Quit during a stalled cycle")
+            .expect("worker task panicked");
     }
 }

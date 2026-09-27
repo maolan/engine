@@ -12,6 +12,58 @@ use std::{
 };
 
 impl Engine {
+    /// Discard count for a new take: the not-yet-valid startup region of the
+    /// capture stream. Uses the backend's exact first-valid capture frame
+    /// when one is reported, otherwise the buffer-size + input-latency
+    /// heuristic (JACK2 reports only static capture latency and gives no
+    /// validity signal). This is additional to the `hw_input_latency_frames`
+    /// segment compensation in `recording_segments_for_cycle`: the
+    /// compensation aligns capture with the monitored signal, while the
+    /// discard removes the capture frames before even that region is valid.
+    pub(crate) fn record_discard_seed(
+        capture_frame: Option<i64>,
+        transport_position: usize,
+        buffer_size: usize,
+        input_latency: usize,
+    ) -> usize {
+        match capture_frame {
+            Some(frame) => (frame - transport_position as i64).max(0) as usize,
+            None => buffer_size.saturating_add(input_latency),
+        }
+    }
+
+    /// Seed `discard_remaining_frames` for a take starting at the current
+    /// transport position. Runs synchronously on the engine dispatcher.
+    pub(crate) fn seed_record_start_discard(&mut self) {
+        let buffer_size = self.current_cycle_samples();
+        let input_latency = self.transport.hw_input_latency_frames;
+        let position = self.transport.transport_sample;
+        let capture_frame = self.current_capture_frame();
+        self.recording.discard_remaining_frames =
+            Self::record_discard_seed(capture_frame, position, buffer_size, input_latency);
+    }
+
+    /// Split one transport segment at the take-start discard: returns
+    /// `(skip, start, offset, keep)` — how many captured frames to drop, the
+    /// shifted take `start_sample`, the shifted capture buffer offset, and
+    /// the kept length. Shifting `start` in the same direction as the
+    /// flush-time output-latency trim keeps the recorded region aligned with
+    /// what was monitored.
+    pub(crate) fn segment_discard_split(
+        discard: usize,
+        segment_start: usize,
+        frame_offset: usize,
+        segment_len: usize,
+    ) -> (usize, usize, usize, usize) {
+        let skip = discard.min(segment_len);
+        (
+            skip,
+            segment_start.saturating_add(skip),
+            frame_offset.saturating_add(skip),
+            segment_len - skip,
+        )
+    }
+
     pub(crate) fn recording_segments_for_cycle(&self, frames: usize) -> Vec<(usize, usize, usize)> {
         let segments = self.cycle_segments(frames);
         let comp = self.transport.hw_input_latency_frames;
@@ -84,6 +136,7 @@ impl Engine {
             return;
         }
         let state = self.state_snapshot.load_full();
+        let mut discard_leftover: Option<usize> = None;
         for (name, track_handle) in &state.tracks {
             let track = track_handle.lock();
             if !track.armed() {
@@ -101,20 +154,36 @@ impl Engine {
                 continue;
             }
             let segments = self.recording_segments_for_cycle(frames);
+            // The discard counter is global to the take; every armed track
+            // shares the same take timeline, so consume it once (from the
+            // first track's pass) and reuse the same skips for the rest.
+            let mut discard = discard_leftover.unwrap_or(self.recording.discard_remaining_frames);
             for (segment_start, segment_end, frame_offset) in segments {
                 let segment_len = segment_end.saturating_sub(segment_start);
                 if segment_len == 0 {
                     continue;
                 }
+                let (skip, start, offset, keep) =
+                    Self::segment_discard_split(discard, segment_start, frame_offset, segment_len);
+                discard -= skip;
 
                 if audio_channels > 0 && audio_frames > 0 {
+                    if !self.recording.audio_recordings.contains_key(name.as_str())
+                        && self.recording.discard_remaining_frames == 0
+                    {
+                        // A new take is starting (punch-in or loop-wrap
+                        // restart) and the previous discard is exhausted:
+                        // seed a fresh one for this take.
+                        self.seed_record_start_discard();
+                        discard = self.recording.discard_remaining_frames;
+                    }
                     let audio_entry = self
                         .recording
                         .audio_recordings
                         .entry(name.clone())
                         .or_insert_with(|| RecordingSession {
-                            start_sample: segment_start,
-                            samples: Vec::with_capacity(segment_len * audio_channels * 2),
+                            start_sample: start,
+                            samples: Vec::with_capacity(keep * audio_channels * 2),
                             channels: audio_channels,
                             file_name: Self::next_recording_file_name(name),
                             stripe_peaks: vec![Vec::new(); audio_channels],
@@ -123,9 +192,11 @@ impl Engine {
                     if audio_entry.channels != audio_channels {
                         continue;
                     }
-                    if let Some(entry) = self.recording.audio_recordings.get_mut(name.as_str()) {
-                        let from = frame_offset.min(audio_frames);
-                        let to = frame_offset.saturating_add(segment_len).min(audio_frames);
+                    if let Some(entry) = self.recording.audio_recordings.get_mut(name.as_str())
+                        && keep > 0
+                    {
+                        let from = offset.min(audio_frames);
+                        let to = offset.saturating_add(keep).min(audio_frames);
                         for frame in from..to {
                             let is_new_stripe =
                                 entry.current_stripe_frames % RECORDING_STRIPE_FRAMES == 0;
@@ -147,24 +218,33 @@ impl Engine {
                     }
                 }
 
-                let entry = self
-                    .recording
-                    .midi_recordings
-                    .entry(name.clone())
-                    .or_insert_with(|| MidiRecordingSession {
-                        start_sample: segment_start,
-                        events: Vec::new(),
-                        file_name: Self::next_midi_recording_file_name(name),
-                    });
-                let from = frame_offset;
-                let to = frame_offset.saturating_add(segment_len);
-                for event in &track.rt.record_tap_midi_in {
-                    let frame = event.frame as usize;
-                    if frame < from || frame >= to {
-                        continue;
+                if keep > 0 {
+                    if !self.recording.midi_recordings.contains_key(name.as_str())
+                        && self.recording.discard_remaining_frames == 0
+                    {
+                        // MIDI-only fresh take (see the audio branch above).
+                        self.seed_record_start_discard();
+                        discard = self.recording.discard_remaining_frames;
                     }
-                    let abs_sample = segment_start as u64 + (frame - from) as u64;
-                    entry.events.push((abs_sample, event.data.clone()));
+                    let entry = self
+                        .recording
+                        .midi_recordings
+                        .entry(name.clone())
+                        .or_insert_with(|| MidiRecordingSession {
+                            start_sample: start,
+                            events: Vec::new(),
+                            file_name: Self::next_midi_recording_file_name(name),
+                        });
+                    let from = offset;
+                    let to = offset.saturating_add(keep);
+                    for event in &track.rt.record_tap_midi_in {
+                        let frame = event.frame as usize;
+                        if frame < from || frame >= to {
+                            continue;
+                        }
+                        let abs_sample = start as u64 + (frame - from) as u64;
+                        entry.events.push((abs_sample, event.data.clone()));
+                    }
                 }
 
                 if self.transport.punch_enabled
@@ -197,6 +277,12 @@ impl Engine {
                     }
                 }
             }
+            if discard_leftover.is_none() {
+                discard_leftover = Some(discard);
+            }
+        }
+        if let Some(leftover) = discard_leftover {
+            self.recording.discard_remaining_frames = leftover;
         }
     }
 
@@ -672,6 +758,11 @@ impl Engine {
 
         self.recording.record_enabled = enabled;
         self.bump_prepare_generation();
+        if enabled && self.transport.playing {
+            // Seed synchronously on the engine side: a message would race
+            // the prepare generation and the first captured cycles.
+            self.seed_record_start_discard();
+        }
         if !enabled {
             if self.transport.awaiting_hwfinished {
                 self.append_recorded_cycle();
@@ -725,5 +816,63 @@ impl Engine {
             )]),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Engine;
+
+    #[test]
+    fn discard_seed_uses_first_valid_capture_frame_when_reported() {
+        // 480 frames captured ahead of the transport position: the first 480
+        // captured frames of the take are not yet valid and must be dropped.
+        assert_eq!(Engine::record_discard_seed(Some(480), 0, 256, 128), 480);
+        // The discard never extends before the transport position.
+        assert_eq!(Engine::record_discard_seed(Some(100), 480, 256, 128), 0);
+    }
+
+    #[test]
+    fn discard_seed_falls_back_to_buffer_plus_input_latency() {
+        // No validity signal (e.g. JACK2): buffer size + input latency.
+        assert_eq!(Engine::record_discard_seed(None, 10_000, 256, 128), 384);
+        assert_eq!(Engine::record_discard_seed(None, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn segment_discard_split_shifts_start_and_offset_like_the_flush_trim() {
+        // 100 frames to drop from a 256-frame segment starting at transport
+        // sample 1000 with capture offset 0: the take starts 100 samples
+        // later (same direction as the flush-time output-latency trim).
+        let (skip, start, offset, keep) = Engine::segment_discard_split(100, 1000, 0, 256);
+        assert_eq!(skip, 100);
+        assert_eq!(start, 1100);
+        assert_eq!(offset, 100);
+        assert_eq!(keep, 156);
+    }
+
+    #[test]
+    fn segment_discard_split_caps_at_segment_len() {
+        let (skip, start, offset, keep) = Engine::segment_discard_split(500, 1000, 0, 256);
+        assert_eq!(skip, 256);
+        assert_eq!(start, 1256);
+        assert_eq!(offset, 256);
+        assert_eq!(keep, 0);
+    }
+
+    #[test]
+    fn discard_counter_survives_across_segments_within_a_take() {
+        // A 384-frame discard across two 256-frame segments (e.g. a loop wrap
+        // mid-cycle): the first segment is fully consumed, the second keeps
+        // its tail after the counter runs dry.
+        let mut discard = 384_usize;
+        let (skip, _start, _offset, keep) = Engine::segment_discard_split(discard, 0, 0, 256);
+        discard -= skip;
+        assert_eq!((skip, keep), (256, 0));
+        assert_eq!(discard, 128);
+        let (skip, start, _offset, keep) = Engine::segment_discard_split(discard, 256, 256, 256);
+        discard -= skip;
+        assert_eq!((skip, start, keep), (128, 384, 128));
+        assert_eq!(discard, 0);
     }
 }

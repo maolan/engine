@@ -640,6 +640,12 @@ impl TrackData {
     ) {
         self.apply_transport_sample_snapshot();
         let frames = self.compute_process_frames();
+        // Plugin implementations are allowed to leave an output port
+        // untouched. Always present a zeroed destination so an output from a
+        // previous cycle cannot leak into the current one.
+        for output in audio_outputs.iter_mut() {
+            output.fill(0.0);
+        }
 
         match kind {
             PluginKind::Clap => {
@@ -1083,6 +1089,44 @@ impl TrackData {
     pub fn clear_output_meters(&mut self) {
         self.rt.output_meter_linear_cache.fill(0.0);
         self.rt.meter_peak_hold_linear.fill(0.0);
+    }
+
+    /// Clear reusable track-side audio/MIDI state before a new transport run.
+    /// Plugin audio buffers live in the render plan and are cleared there.
+    /// The engine calls this only between cycles (from `start_plan_cycle`,
+    /// with no plan cycle in flight), per `RenderPlan::clear_processing_buffers`.
+    pub(crate) fn clear_processing_buffers(&mut self) {
+        self.rt.with_rt(|rt| {
+            rt.last_audio_outputs
+                .iter_mut()
+                .for_each(|buffer| buffer.fill(0.0));
+            rt.record_tap_outs
+                .iter_mut()
+                .for_each(|buffer| buffer.fill(0.0));
+            rt.folder_record_tap_input_snapshots
+                .iter_mut()
+                .for_each(|buffer| buffer.fill(0.0));
+            rt.clip_render_scratch
+                .iter_mut()
+                .for_each(|buffer| buffer.fill(0.0));
+            rt.clip_render_group_scratch
+                .iter_mut()
+                .for_each(|buffer| buffer.fill(0.0));
+            rt.clip_render_stream_scratch
+                .iter_mut()
+                .for_each(|buffer| buffer.fill(0.0));
+            rt.pending_hw_midi_out_events.clear();
+            rt.pending_modulator_midi_events.clear();
+            rt.pending_automation_midi_events.clear();
+            rt.record_tap_midi_in.clear();
+            rt.folder_input_midi_events.clear();
+            rt.folder_plugin_midi_node_events.clear();
+            rt.folder_processed_midi_plugins.clear();
+        });
+        self.clear_local_midi_inputs();
+        for output in &self.midi.outs {
+            unsafe { output.buffer_mut() }.clear();
+        }
     }
 
     pub fn arm(&self) {

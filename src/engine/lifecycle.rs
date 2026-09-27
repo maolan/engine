@@ -68,6 +68,9 @@ impl Engine {
             workers: vec![],
             hw_driver: None,
             hw_driver_info: None,
+            hw_capture_frame: Arc::new(AtomicI64::new(
+                crate::workers::hw_worker::CAPTURE_FRAME_UNKNOWN,
+            )),
             hw_input_ports: Vec::new(),
             hw_output_ports: Vec::new(),
             #[cfg(unix)]

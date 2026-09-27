@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64},
+    },
     time::Instant,
 };
 use tokio::sync::Notify;
@@ -278,6 +281,10 @@ pub struct Engine {
     workers: Vec<WorkerData>,
     hw_driver: Option<HwDriver>,
     hw_driver_info: Option<HwDriverInfo>,
+    /// Mirror of the HW worker driver's last reported capture frame
+    /// (`CAPTURE_FRAME_UNKNOWN` when the backend reports none). Shared with
+    /// the worker; read when seeding the record-start discard counter.
+    hw_capture_frame: Arc<AtomicI64>,
     hw_input_ports: Vec<Arc<crate::audio::io::AudioIO>>,
     hw_output_ports: Vec<Arc<crate::audio::io::AudioIO>>,
     #[cfg(unix)]
@@ -2284,6 +2291,7 @@ mod tests {
         track.session_base_dir = Some(tmp_dir.clone());
         insert_track(&mut engine, track);
 
+        let _plan_slot = engine.plan_slot.clone();
         let tx = engine.tx.clone();
         let work_handle = tokio::spawn(async move {
             engine.work().await;
@@ -3221,5 +3229,200 @@ mod tests {
             matches!(msg, Ok(Some(Message::Response(Err(_))))),
             "setting master track as folder child should report an error"
         );
+    }
+
+    /// Stop is queued (not handled inline) when a hw cycle can be scheduled,
+    /// and drains at the cycle boundary with the full silence broadcast:
+    /// transport stops, hw worker receives HWSetPlaying(false) AND
+    /// HWZeroFillBuffers.
+    #[tokio::test]
+    async fn stop_is_queued_and_broadcasts_zero_fill_at_cycle_boundary() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        // Simulate an active transport with a hw worker: the stop must
+        // queue instead of being handled inline.
+        let (worker_tx, mut worker_rx) = channel::<Message>(32);
+        engine.hw_worker = Some(WorkerData::new(worker_tx, tokio::spawn(async {})));
+        engine.transport.playing = true;
+
+        engine.dispatch_request(Action::Stop).await;
+
+        assert!(
+            engine.transport.playing,
+            "stop must not be handled inline while a hw cycle can be scheduled"
+        );
+        assert_eq!(engine.dispatch.pending_requests.len(), 1);
+        assert!(matches!(
+            engine.dispatch.pending_requests.front(),
+            Some(Action::Stop)
+        ));
+
+        // Cycle boundary: drain the queue like the HWFinished handler does.
+        while let Some(a) = engine.dispatch.pending_requests.pop_front() {
+            engine.handle_request(a).await;
+        }
+
+        assert!(!engine.transport.playing);
+        let mut saw_set_playing_false = false;
+        let mut saw_zero_fill = false;
+        while let Ok(msg) = worker_rx.try_recv() {
+            match msg {
+                Message::HWSetPlaying(false) => saw_set_playing_false = true,
+                Message::HWZeroFillBuffers => saw_zero_fill = true,
+                _ => {}
+            }
+        }
+        assert!(saw_set_playing_false, "HWSetPlaying(false) not sent");
+        assert!(saw_zero_fill, "HWZeroFillBuffers not broadcast on stop");
+    }
+
+    /// Without an active transport (nothing can schedule a hw cycle), the
+    /// queued stop drains immediately.
+    #[tokio::test]
+    async fn stop_without_active_transport_is_handled_immediately() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        engine.dispatch_request(Action::Stop).await;
+        assert!(!engine.transport.playing);
+        assert!(engine.dispatch.pending_requests.is_empty());
+    }
+
+    /// Device-gated (skips when unavailable; OSS_TEST_DEVICE, default
+    /// /dev/dsp5): open the real device, play a tone, stop (queued; the
+    /// zero-fill broadcast silences the output), play again — audio must
+    /// return (no trigger ioctls, no halt/resync stall).
+    #[tokio::test]
+    async fn oss_play_stop_play_resumes_output() {
+        use crate::audio::clip::AudioClip;
+        use crate::audio_codec::write_wav_f32;
+
+        let device = std::env::var("OSS_TEST_DEVICE").unwrap_or_else(|_| "/dev/dsp5".to_string());
+        let (engine_tx, engine_rx) = channel(16);
+        let mut engine = Engine::new(engine_rx, engine_tx);
+        let state = engine.state();
+        let (client_tx, mut client_rx) = channel(64);
+        engine.clients.push(client_tx);
+        engine.init().await;
+
+        let tmp_dir = std::env::temp_dir().join("maolan_oss_resume_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let wav_path = tmp_dir.join("tone.wav");
+        let sample_rate = 48_000u32;
+        let clip_samples = sample_rate as usize;
+        let mut samples = Vec::with_capacity(clip_samples);
+        for i in 0..clip_samples {
+            let phase = i as f32 / sample_rate as f32 * 2.0 * std::f32::consts::PI * 440.0;
+            samples.push(phase.sin() * 0.5);
+        }
+        write_wav_f32(&wav_path, &samples, 1, sample_rate).expect("write wav");
+        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 1024, sample_rate as f64);
+        let mut clip = AudioClip::new(wav_path.to_string_lossy().to_string(), 0, clip_samples);
+        clip.fade_enabled = false;
+        track.audio.push_clip(clip);
+        track.session_base_dir = Some(tmp_dir.clone());
+        insert_track(&mut engine, track);
+
+        let tx = engine.tx.clone();
+        let work_handle = tokio::spawn(async move {
+            engine.work().await;
+        });
+
+        tx.send(Message::Request(Action::OpenAudioDevice {
+            device: device.clone(),
+            input_device: Some(device.clone()),
+            sample_rate_hz: 48_000,
+            bits: 32,
+            exclusive: false,
+            period_frames: 1024,
+            nperiods: 1,
+            sync_mode: false,
+            actual_period_frames: 0,
+            input_channels: 0,
+            output_channels: 0,
+            bytes_per_frame: 0,
+            ring_buffer_multiplier: 0,
+            auto_open_midi_devices: false,
+        }))
+        .await
+        .unwrap();
+        let open_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let open = tokio::time::timeout(std::time::Duration::from_secs(5), client_rx.recv())
+                .await
+                .expect("timeout opening audio device");
+            match open {
+                Some(Message::Response(Err(e))) => {
+                    eprintln!("audio device {device} unavailable ({e}); skipping");
+                    work_handle.abort();
+                    return;
+                }
+                Some(Message::Response(Ok(_))) => break,
+                Some(_) if Instant::now() < open_deadline => continue,
+                other => panic!("unexpected open response: {other:?}"),
+            }
+        }
+
+        async fn peak_of(state: &State) -> f32 {
+            let state = state.lock();
+            state
+                .tracks
+                .get("track")
+                .map(|t| {
+                    t.lock()
+                        .output_meter_linear()
+                        .into_iter()
+                        .fold(0.0_f32, f32::max)
+                })
+                .unwrap_or(0.0)
+        }
+
+        async fn wait_peak(
+            tx: &tokio::sync::mpsc::Sender<Message>,
+            client_rx: &mut tokio::sync::mpsc::Receiver<Message>,
+            state: &State,
+            what: &str,
+        ) -> f32 {
+            let _ = tx.send(Message::Request(Action::Play)).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let peak = peak_of(state).await;
+                if peak > 0.001 {
+                    return peak;
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), client_rx.recv())
+                        .await;
+            }
+            panic!("no audible output {what}");
+        }
+
+        tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
+            .await
+            .unwrap();
+        wait_peak(&tx, &mut client_rx, &state, "on first play").await;
+
+        // GUI stop: SetClipPlaybackEnabled + Stop (queued; drains at the
+        // next cycle boundary and broadcasts the zero-fill).
+        tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
+            .await
+            .unwrap();
+        tx.send(Message::Request(Action::Stop)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        for _ in 0..8 {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(20), client_rx.recv()).await;
+        }
+
+        tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
+            .await
+            .unwrap();
+        wait_peak(&tx, &mut client_rx, &state, "after stop+play").await;
+
+        let _ = tx.send(Message::Request(Action::Quit)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        work_handle.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

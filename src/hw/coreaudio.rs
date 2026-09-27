@@ -1587,6 +1587,10 @@ impl traits::HwWorkerDriver for HwDriver {
         self.stop_requested.store(true, Ordering::Release);
         self.close_fds();
     }
+
+    fn stop_signaller(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        Some(self.stop_requested.clone())
+    }
 }
 
 crate::impl_hw_device_for_driver!(HwDriver);

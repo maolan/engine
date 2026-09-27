@@ -835,6 +835,10 @@ impl crate::hw::traits::HwWorkerDriver for HwDriver {
         let _ = self.playback.drop();
     }
 
+    fn stop_signaller(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        Some(self.stop_requested.clone())
+    }
+
     fn run_cycle_for_worker(&mut self) -> Result<(), String> {
         self.channel().run_cycle().map_err(|e| e.to_string())
     }

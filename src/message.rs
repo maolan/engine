@@ -1683,6 +1683,11 @@ pub enum Message {
     },
     StopAudioPreview,
     HWSetPlaying(bool),
+    /// Zero-fill every device-side output buffer (mapped DMA ring +
+    /// userspace buffers) so a stopped transport outputs silence by
+    /// construction. Playback DMA keeps running; the ring holds/writes
+    /// zeros.
+    HWZeroFillBuffers,
     HWSetOutputGainBalance {
         gain: f32,
         balance: f32,

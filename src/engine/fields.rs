@@ -58,6 +58,11 @@ pub struct TransportFields {
     pub session_transport_sample: usize,
     pub hw_input_latency_frames: usize,
     pub hw_output_latency_frames: usize,
+    /// Set by the transport-start paths; consumed by `start_plan_cycle` (with
+    /// no cycle in flight) to zero track/plan reusable buffers before the
+    /// first cycle of the new run. Clearing mid-cycle from the async
+    /// transport path would race running plan nodes.
+    pub clear_processing_buffers_pending: bool,
     pub transport_snapshot_producer:
         crate::triple_buffer::TripleBufferProducer<crate::meter::TransportSnapshot>,
 }
@@ -101,6 +106,7 @@ impl TransportFields {
             session_transport_sample: 0,
             hw_input_latency_frames: 0,
             hw_output_latency_frames: 0,
+            clear_processing_buffers_pending: false,
             transport_snapshot_producer,
         }
     }
@@ -241,6 +247,14 @@ pub struct HwMidiFields {
 #[derive(Default)]
 pub struct RecordingFields {
     pub record_enabled: bool,
+    /// Frames of captured audio/MIDI still to drop from the start of the
+    /// current take: the not-yet-valid startup region of the capture stream
+    /// (sized by the backend's first-valid capture frame, or by the
+    /// buffer-size + input-latency heuristic when the backend cannot report
+    /// one). Decremented in `append_recorded_cycle` and surviving segment
+    /// boundaries within a take; re-seeded when a new take starts after a
+    /// punch-in or loop wrap.
+    pub discard_remaining_frames: usize,
     pub step_recording_enabled: bool,
     pub audio_recordings: HashMap<String, RecordingSession>,
     pub midi_recordings: HashMap<String, MidiRecordingSession>,

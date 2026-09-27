@@ -7,6 +7,10 @@ pub trait HwWorkerDriver {
     fn close_fds(&mut self) {}
     fn set_playing(&mut self, _playing: bool) {}
     fn set_output_gain_balance(&mut self, _gain: f32, _balance: f32) {}
+
+    /// Zero-fill device-side output buffers (mapped ring + userspace
+    /// buffers) on transport stop. Backends without device buffers ignore.
+    fn zero_fill_hw_buffers(&mut self) {}
     fn run_cycle_for_worker(&mut self) -> Result<(), String>;
     fn run_assist_step_for_worker(&mut self) -> Result<bool, String>;
 
@@ -24,6 +28,24 @@ pub trait HwWorkerDriver {
     }
     #[cfg(unix)]
     fn playback_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
+    /// Exact capture position (in frames) the backend can report, used to
+    /// size the record-start discard of not-yet-valid capture frames.
+    /// `None` means the backend gives no validity signal (e.g. JACK2's
+    /// static capture latency), in which case the engine falls back to the
+    /// buffer-size + input-latency heuristic.
+    fn current_capture_frame(&self) -> Option<i64> {
+        None
+    }
+
+    /// Shared stop flag the HW worker can set while a cycle is in flight so
+    /// a cycle blocked on device I/O unwinds promptly. Without this, a
+    /// backend whose cycle can block indefinitely would also block shutdown,
+    /// because `request_stop` is only reachable from worker message
+    /// handling. `None` if the backend has no interruptible stop flag.
+    fn stop_signaller(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         None
     }
 }

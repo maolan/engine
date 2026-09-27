@@ -12,8 +12,6 @@ use crate::hw::options::HwOptions;
 #[cfg(target_os = "windows")]
 use crate::hw::options::HwOptions;
 #[cfg(target_os = "freebsd")]
-use crate::hw::oss as hw;
-#[cfg(target_os = "freebsd")]
 use crate::hw::oss::{HwDriver, HwOptions};
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
@@ -133,26 +131,7 @@ impl Engine {
     #[cfg(target_os = "freebsd")]
     pub(crate) fn maybe_start_freebsd_sync_group(&self) {
         if let Some(oss) = &self.hw_driver {
-            let in_fd = oss.input_fd();
-            let out_fd = oss.output_fd();
-            let mut group = 0;
-            let in_group = hw::add_to_sync_group(in_fd, group, true);
-            if in_group > 0 {
-                group = in_group;
-            }
-            let out_group = hw::add_to_sync_group(out_fd, group, false);
-            if out_group > 0 {
-                group = out_group;
-            }
-            let sync_started = if group > 0 {
-                hw::start_sync_group(in_fd, group).is_ok()
-            } else {
-                false
-            };
-            if !sync_started {
-                let _ = oss.start_input_trigger();
-                let _ = oss.start_output_trigger();
-            }
+            let _ = oss.start_duplex_sync();
         }
     }
 
@@ -427,11 +406,26 @@ impl Engine {
         let hw = self.hw_driver.take().unwrap();
         let midi_hub = self.midi_hub.take().unwrap_or_default();
         let tx_engine = self.tx.clone();
+        self.hw_capture_frame.store(
+            crate::workers::hw_worker::CAPTURE_FRAME_UNKNOWN,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let capture_frame = self.hw_capture_frame.clone();
         let handler = tokio::spawn(async move {
-            let worker = HwWorker::new(hw, midi_hub, rx, tx_engine);
+            let worker = HwWorker::new(hw, midi_hub, rx, tx_engine, capture_frame);
             worker.work().await;
         });
         self.hw_worker = Some(WorkerData::new(tx, handler));
+    }
+
+    /// Last capture-frame position reported by the HW driver, if the backend
+    /// provides one. `None` = unknown; callers fall back to the input-latency
+    /// heuristic.
+    pub(crate) fn current_capture_frame(&self) -> Option<i64> {
+        let raw = self
+            .hw_capture_frame
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (raw >= 0).then_some(raw)
     }
 
     pub(crate) fn build_hw_options(

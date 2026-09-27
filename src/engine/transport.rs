@@ -385,6 +385,10 @@ impl Engine {
         self.meters.meter_decay_after_stop = None;
         self.transport.playing = true;
         self.bump_prepare_generation();
+        self.transport.clear_processing_buffers_pending = true;
+        if self.recording.record_enabled {
+            self.seed_record_start_discard();
+        }
         self.transport.transport_running = true;
         self.transport.transport_restart_pending = true;
         self.transport.notified_loop_wrap_sample = None;
@@ -432,6 +436,10 @@ impl Engine {
         if !self.transport.playing {
             self.transport.playing = true;
             self.bump_prepare_generation();
+            self.transport.clear_processing_buffers_pending = true;
+            if self.recording.record_enabled {
+                self.seed_record_start_discard();
+            }
             self.transport.transport_restart_pending = true;
             self.transport.notified_loop_wrap_sample = None;
             self.publish_transport_snapshot();
@@ -488,6 +496,16 @@ impl Engine {
         }
         self.publish_transport_snapshot();
         self.set_hw_playing(false).await;
+        // Silence by construction: zero every engine-side buffer (tracks,
+        // scrubs, plugin/midi ports via TrackData::clear_processing_buffers,
+        // render-plan arena and routing delay lines) and tell the hw worker
+        // to write its persistent zero buffer into the device ring. The
+        // queued stop drains after the in-flight cycle, so this lands
+        // between cycles — at most one period of skew.
+        self.clear_processing_buffers_before_playback();
+        if let Some(worker) = &self.hw_worker {
+            let _ = worker.tx.send(Message::HWZeroFillBuffers).await;
+        }
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime
             && let Err(e) = jack.transport_stop()
@@ -527,6 +545,10 @@ impl Engine {
         self.transport.session_clip_playback_enabled = true;
         self.transport.session_transport_sample = 0;
         self.bump_prepare_generation();
+        self.transport.clear_processing_buffers_pending = true;
+        if self.recording.record_enabled {
+            self.seed_record_start_discard();
+        }
         self.session.session_scene_queue = None;
         self.session.session_scene_queue_length_samples = 0;
         self.session.session_current_scene = None;
@@ -585,6 +607,10 @@ impl Engine {
         if self.transport.playing {
             self.transport.transport_restart_pending = true;
             self.transport.transport_panic_flush_pending = self.hw_worker.is_some();
+            self.transport.clear_processing_buffers_pending = true;
+            if self.recording.record_enabled {
+                self.seed_record_start_discard();
+            }
             self.clear_hw_midi_output_state(true).await;
             // The running cycle (if any) finishes naturally — at most one
             // block at the old position; the next dispatch reads the new

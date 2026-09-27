@@ -187,6 +187,13 @@ impl DelayLine {
         self.buffer.fill(0.0);
     }
 
+    /// Zero the line in place, keeping its length. Transport-boundary
+    /// hygiene: stale delayed samples must not leak into a new run.
+    fn clear(&mut self) {
+        self.buffer.fill(0.0);
+        self.pos = 0;
+    }
+
     fn process_direct(&mut self, input: &[f32], delay: usize, output: &mut [f32], add: bool) {
         if delay == 0 {
             if add {
@@ -231,6 +238,26 @@ impl Default for DelayLine {
 }
 
 impl RenderPlan {
+    /// Clear every arena buffer and every routing delay line. The caller must
+    /// invoke this only between cycles, when no plan node is running (the
+    /// engine does it from `start_plan_cycle` with no cycle in flight, before
+    /// dispatch).
+    pub fn clear_processing_buffers(&self) {
+        for buffer in &self.buffers {
+            // Safety: the caller invokes this only between cycles, before the
+            // plan is dispatched, so no node can access the arena buffers.
+            unsafe { (&mut *buffer.get()).fill(0.0) };
+        }
+        for node in &self.nodes {
+            if let Op::Sum { delays, .. } = node {
+                for delay in delays {
+                    // Safety: same between-cycles invariant as the arena.
+                    unsafe { &mut *delay.get() }.clear();
+                }
+            }
+        }
+    }
+
     /// Mutable access to an arena buffer, as a raw pointer.
     ///
     /// Returns a pointer rather than a `&mut` because the aliasing discipline
@@ -1298,5 +1325,52 @@ mod tests {
         // Two unconnected inputs -> two Zero nodes.
         assert_eq!(zero_count(&plan), 2);
         assert_eq!(plan.port_map.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod hygiene_tests {
+    use super::*;
+    use std::cell::UnsafeCell;
+
+    fn dirty_delay_line() -> DelayLine {
+        let mut line = DelayLine::new();
+        line.reset(3);
+        line.buffer.fill(1.0);
+        line.pos = 2;
+        line
+    }
+
+    #[test]
+    fn clear_processing_buffers_zeroes_arena_and_routing_delay_lines() {
+        let plan = RenderPlan {
+            buffer_size: 4,
+            buffers: vec![UnsafeCell::new(vec![1.0; 4]), UnsafeCell::new(vec![2.0; 4])],
+            buffer_latencies: vec![AtomicUsize::new(0), AtomicUsize::new(0)],
+            nodes: vec![Op::Sum {
+                inputs: vec![0],
+                delays: vec![UnsafeCell::new(dirty_delay_line())],
+                output: 1,
+            }],
+            indegree: vec![0],
+            dependents: vec![vec![]],
+            sources: vec![0],
+            hw_in_map: vec![],
+            hw_out_map: vec![],
+            port_map: HashMap::new(),
+            midi_edges: vec![],
+            forced: vec![],
+        };
+        plan.clear_processing_buffers();
+        for buffer in &plan.buffers {
+            // Safety: test-only, no node is executing.
+            assert!(unsafe { &*buffer.get() }.iter().all(|&s| s == 0.0));
+        }
+        let Op::Sum { delays, .. } = &plan.nodes[0] else {
+            panic!("expected Sum node");
+        };
+        let line = unsafe { &*delays[0].get() };
+        assert!(line.buffer.iter().all(|&s| s == 0.0));
+        assert_eq!(line.pos, 0);
     }
 }
