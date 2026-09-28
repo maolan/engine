@@ -1,8 +1,12 @@
 //! Hand-rolled CoreAudio backend (HALOutput AudioUnit).
 //!
 //! Callback-driven like WASAPI: the engine's cycle is paced by the HAL
-//! render callback consuming interleaved f32 periods from a bounded
-//! mutex+condvar reservoir (backpressure mirrors `wasapi::HwDriver`).
+//! render callback consuming interleaved f32 periods from bounded rtrb
+//! SPSC rings (backpressure mirrors `wasapi::HwDriver`). The producer half
+//! of the output ring lives in `HwDriver`; the consumer half lives in the
+//! render callback context. For input the halves are swapped. Tiny
+//! mutex+condvar gates cover wake/backpressure signalling only; sample
+//! data itself is moved through the lock-free rings.
 //! All CoreAudio/CoreFoundation interaction is raw FFI — no cpal,
 //! coreaudio-rs, or other device-access crates.
 //!
@@ -11,12 +15,14 @@
 //!   refcon; it stays valid until `AudioOutputUnitStop` returns (stop is
 //!   synchronous with respect to the IO thread) and the box is reclaimed
 //!   in `close_fds`.
-//! - The callback only locks the shared reservoir mutex; it never calls
-//!   into driver code that could re-enter the HAL IO thread.
+//! - The callback only locks the small shared gate mutex (and, on input
+//!   overflow only, the consumer mutex); it never calls into driver code
+//!   that could re-enter the HAL IO thread.
 
 use crate::audio::io::AudioIO;
 use crate::hw::{common, latency, options::HwOptions, traits};
-use std::collections::VecDeque;
+use rtrb::{Consumer, Producer, RingBuffer};
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, c_char, c_void};
 use std::mem::size_of;
 use std::ptr;
@@ -55,6 +61,7 @@ const K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK: u32 = 23;
 const K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO: u32 = 2003;
 const K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE: u32 = 2000;
 const K_AUDIO_OUTPUT_UNIT_PROPERTY_SET_INPUT_CALLBACK: u32 = 2005;
+const K_AUDIO_OUTPUT_UNIT_PROPERTY_START_TIMESTAMPS_AT_ZERO: u32 = 2007;
 const K_AUDIO_FORMAT_LINEAR_PCM: u32 = 0x6C70_636D; // 'lpcm'
 const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 0x1;
 const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 0x8;
@@ -504,6 +511,27 @@ fn actual_buffer_frame_size(device: AudioDeviceId) -> Option<u32> {
     )
 }
 
+/// Set the device nominal sample rate via `AudioObjectSetPropertyData`.
+/// Returns false (without failing the open) when the device rejects the
+/// rate; callers warn and continue.
+fn set_device_nominal_sample_rate(device: AudioDeviceId, rate: f64) -> bool {
+    let address = property_address(
+        K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+        K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+    );
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            device,
+            &address,
+            0,
+            ptr::null(),
+            size_of::<f64>() as u32,
+            (&rate as *const f64).cast::<c_void>(),
+        )
+    };
+    status == 0
+}
+
 fn default_device_id(selector: u32, context: &str) -> Result<AudioDeviceId, String> {
     let id = get_property_data::<AudioDeviceId>(
         K_AUDIO_OBJECT_SYSTEM_OBJECT,
@@ -524,6 +552,32 @@ pub struct AudioDeviceDescriptor {
     pub supports_input: bool,
     pub supports_output: bool,
     pub sample_rates: Vec<i32>,
+    /// Supported device buffer (period) frame range advertised by the
+    /// device, `None` when the range is unknown or invalid.
+    pub min_period_frames: Option<usize>,
+    pub max_period_frames: Option<usize>,
+}
+
+fn device_period_frame_bounds(device: AudioDeviceId) -> (Option<usize>, Option<usize>) {
+    match device_buffer_frame_size_range(device) {
+        Some(range) => device_period_frame_bounds_from_range(range.m_minimum, range.m_maximum),
+        None => (None, None),
+    }
+}
+
+/// Pure conversion of an `AudioValueRange` into validated period-frame
+/// bounds: `None` when the device advertises an empty/invalid range.
+fn device_period_frame_bounds_from_range(
+    m_minimum: f64,
+    m_maximum: f64,
+) -> (Option<usize>, Option<usize>) {
+    let min = m_minimum.floor() as usize;
+    let max = m_maximum.ceil() as usize;
+    if min > 0 && max >= min {
+        (Some(min), Some(max))
+    } else {
+        (None, None)
+    }
 }
 
 pub fn discover_coreaudio_audio_devices() -> Vec<AudioDeviceDescriptor> {
@@ -541,12 +595,15 @@ pub fn discover_coreaudio_audio_devices() -> Vec<AudioDeviceDescriptor> {
                 .collect();
             sample_rates.sort_unstable();
             sample_rates.dedup();
+            let (min_period_frames, max_period_frames) = device_period_frame_bounds(id);
             Some(AudioDeviceDescriptor {
                 id: uid,
                 label,
                 supports_input,
                 supports_output,
                 sample_rates,
+                min_period_frames,
+                max_period_frames,
             })
         })
         .collect()
@@ -841,6 +898,70 @@ fn set_input_callback(unit: AudioUnitRef, context: *mut c_void) -> Result<(), St
     )
 }
 
+/// Best-effort: ask the HAL to report sample timestamps starting at zero so
+/// the cadence diagnostic sees a sane baseline. Warns and continues on
+/// failure (some drivers reject this property).
+fn set_start_timestamps_at_zero(unit: AudioUnitRef) {
+    let flag: u32 = 1;
+    if let Err(err) = set_unit_property(
+        unit,
+        K_AUDIO_OUTPUT_UNIT_PROPERTY_START_TIMESTAMPS_AT_ZERO,
+        K_AUDIO_UNIT_SCOPE_GLOBAL,
+        0,
+        &flag,
+        "kAudioOutputUnitPropertyStartTimestampsAtZero",
+    ) {
+        warn!("CoreAudio: {err}; sample-time cadence diagnostics may be skewed");
+    }
+}
+
+/// Detect a discontinuity in the HAL-reported sample-time cadence.
+///
+/// `timestamp` points at an `AudioTimeStamp` whose leading field is the
+/// `f64` `mSampleTime`. With `kAudioOutputUnitProperty_StartTimestampsAtZero`
+/// set, successive callback timestamps should advance by exactly
+/// `frames_per_callback`; a materially different advance means the device
+/// dropped/repeated buffers (an xrun-class event). Returns true when a
+/// discontinuity is detected (or the sample time is not finite, which is
+/// also treated as a cadence break).
+fn sample_time_discontinuity(
+    last: Option<f64>,
+    timestamp: *const c_void,
+    frames: u32,
+) -> (bool, Option<f64>) {
+    if timestamp.is_null() || frames == 0 {
+        return (false, last);
+    }
+    // SAFETY: the HAL passes a valid AudioTimeStamp whose first member is
+    // the f64 mSampleTime; only that leading field is read, without imposing
+    // alignment beyond the pointer's actual storage.
+    let sample_time = unsafe { ptr::read_unaligned(timestamp.cast::<f64>()) };
+    let Some(last) = last else {
+        return (false, Some(sample_time));
+    };
+    let expected = last + f64::from(frames);
+    let threshold = f64::from(frames) * 0.5;
+    (
+        !sample_time.is_finite() || (sample_time - expected).abs() > threshold,
+        Some(sample_time),
+    )
+}
+
+/// Frames dropped/repeated implied by a sample-time discontinuity, for
+/// diagnostics. Returns 0 when the jump is within normal jitter.
+fn discontinuity_frames(last: f64, current: f64, frames: u32) -> usize {
+    if frames == 0 {
+        return 0;
+    }
+    let delta = (current - last - f64::from(frames)).abs();
+    let threshold = f64::from(frames) * 0.5;
+    if delta <= threshold {
+        0
+    } else {
+        delta.round() as usize
+    }
+}
+
 fn start_unit(unit: AudioUnitRef, context: &str) -> Result<(), String> {
     // SAFETY: `unit` is a valid, initialized HALOutput instance.
     let status = unsafe { AudioOutputUnitStart(unit) };
@@ -864,41 +985,42 @@ fn tune_device_buffer(device: AudioDeviceId, requested: u32) -> u32 {
     requested.max(1)
 }
 
-struct OutputState {
-    samples: VecDeque<f32>,
-    capacity: usize,
-    wait_timeout: Duration,
-    /// Short grace used once the transport stops: the callback must never
-    /// block the HAL IO thread past the buffer deadline waiting for engine
-    /// data that will never arrive, or the HAL emits repeated/clicking
-    /// buffers (the stop-crackle bug).
-    idle_timeout: Duration,
+struct OutputGate {
     stopped: bool,
 }
 
 struct OutputShared {
-    state: Mutex<OutputState>,
+    gate: Mutex<OutputGate>,
     condvar: Condvar,
     playing: AtomicBool,
     xruns: AtomicUsize,
+    wait_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 struct OutputCallbackContext {
     shared: Arc<OutputShared>,
-}
-
-struct InputState {
-    samples: VecDeque<f32>,
-    capacity: usize,
-    channels: usize,
+    consumer: Consumer<f32>,
+    /// Reusable de-interleave scratch for one HAL slice; avoids any
+    /// per-callback allocation or mutex-protected sample reservoir.
+    scratch: RefCell<Vec<f32>>,
+    last_sample_time: Cell<Option<f64>>,
 }
 
 struct InputShared {
-    state: Mutex<InputState>,
+    consumer: Mutex<Consumer<f32>>,
+    channels: usize,
+    /// Full-period drops caused by input overflow (oldest frames dropped).
+    overflow_drops: AtomicUsize,
+    xruns: AtomicUsize,
 }
 
 struct InputCallbackContext {
     shared: Arc<InputShared>,
+    producer: Producer<f32>,
+    /// Reusable interleave scratch for one HAL slice.
+    scratch: RefCell<Vec<f32>>,
+    last_sample_time: Cell<Option<f64>>,
 }
 
 /// Resolve an `AudioBufferList` into per-channel (base, stride, offset)
@@ -930,45 +1052,62 @@ fn channel_layouts(io_data: *mut AudioBufferList) -> Vec<(*mut f32, usize, usize
     }
 }
 
-/// Pull `frames * channels` samples from the reservoir into the HAL output
-/// buffers. While the transport is playing, block up to two periods for the
+/// Pull `frames * channels` samples from the ring into the HAL output
+/// buffers. While the transport is playing, block up to one period for the
 /// engine to catch up (device-paced backpressure); once stopped (or at
 /// startup), only wait a short jitter grace and then emit silence — the HAL
 /// render callback must return within the buffer period or the device
 /// glitches.
-fn fill_output_buffers(shared: &OutputShared, frames: usize, io_data: *mut AudioBufferList) {
+fn fill_output_buffers(
+    context: &mut OutputCallbackContext,
+    frames: usize,
+    io_data: *mut AudioBufferList,
+) {
+    let shared = &context.shared;
     let layouts = channel_layouts(io_data);
     let needed = frames.saturating_mul(layouts.len().max(1));
-    let mut state = match shared.state.lock() {
-        Ok(state) => state,
-        Err(_) => return,
+    let mut scratch = context.scratch.borrow_mut();
+    scratch.clear();
+    let popped = {
+        let Ok(mut gate) = shared.gate.lock() else {
+            return;
+        };
+        loop {
+            while scratch.len() < needed
+                && let Ok(sample) = context.consumer.pop()
+            {
+                scratch.push(sample);
+            }
+            if scratch.len() >= needed || gate.stopped {
+                break;
+            }
+            let wait = if shared.playing.load(Ordering::Acquire) {
+                shared.wait_timeout
+            } else {
+                shared.idle_timeout
+            };
+            if wait.is_zero() {
+                break;
+            }
+            let (guard, timeout) = match shared.condvar.wait_timeout(gate, wait) {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            gate = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        scratch.len()
     };
-    while state.samples.len() < needed && !state.stopped {
-        let playing = shared.playing.load(Ordering::Acquire);
-        let wait = if playing {
-            state.wait_timeout
-        } else {
-            state.idle_timeout
-        };
-        if wait.is_zero() {
-            break;
-        }
-        let (guard, timeout) = match shared.condvar.wait_timeout(state, wait) {
-            Ok(pair) => pair,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state = guard;
-        if timeout.timed_out() {
-            break;
-        }
-    }
-    let available = state.samples.len().min(needed);
+    drop(scratch);
     let mut copied = 0_usize;
     if !layouts.is_empty() {
+        let scratch = context.scratch.borrow();
         for frame in 0..frames {
             for (base, stride, offset) in &layouts {
-                let sample = if copied < available {
-                    state.samples.pop_front().unwrap_or(0.0)
+                let sample = if copied < popped {
+                    scratch.get(copied).copied().unwrap_or(0.0)
                 } else {
                     0.0
                 };
@@ -984,15 +1123,14 @@ fn fill_output_buffers(shared: &OutputShared, frames: usize, io_data: *mut Audio
     if copied < needed {
         shared.xruns.fetch_add(1, Ordering::Relaxed);
     }
-    drop(state);
-    // Wake a producer blocked on a full reservoir.
+    // Wake a producer blocked on a full ring.
     shared.condvar.notify_all();
 }
 
 unsafe extern "C" fn render_callback(
     in_ref_con: *mut c_void,
     _io_action_flags: *mut u32,
-    _in_time_stamp: *const c_void,
+    in_time_stamp: *const c_void,
     _in_bus_number: u32,
     in_number_frames: u32,
     io_data: *mut AudioBufferList,
@@ -1002,20 +1140,44 @@ unsafe extern "C" fn render_callback(
     }
     // SAFETY: the refcon box lives until `close_fds` reclaims it after the
     // unit is stopped; the HAL guarantees io_data validity for the call.
-    let context = unsafe { &*(in_ref_con as *const OutputCallbackContext) };
-    fill_output_buffers(&context.shared, in_number_frames as usize, io_data);
+    // The box is uniquely owned (never aliased), so `&mut` is sound.
+    let context = unsafe { &mut *(in_ref_con as *mut OutputCallbackContext) };
+    let (discontinuity, last) = sample_time_discontinuity(
+        context.last_sample_time.get(),
+        in_time_stamp,
+        in_number_frames,
+    );
+    if let Some(last) = last {
+        if discontinuity {
+            context.shared.xruns.fetch_add(1, Ordering::Relaxed);
+            if let Some(previous) = context.last_sample_time.get() {
+                debug!(
+                    dropped_frames = discontinuity_frames(previous, last, in_number_frames),
+                    "CoreAudio: output sample-time discontinuity (xrun-class event)"
+                );
+            }
+        }
+        context.last_sample_time.set(Some(last));
+    }
+    fill_output_buffers(context, in_number_frames as usize, io_data);
     0
 }
 
 /// Interleave an incoming `AudioBufferList` and push it into the input
-/// reservoir, dropping the oldest frames when full.
-fn push_input_buffers(shared: &InputShared, frames: usize, io_data: *mut AudioBufferList) {
+/// ring, dropping the oldest complete frames when full.
+fn push_input_buffers(
+    context: &mut InputCallbackContext,
+    frames: usize,
+    io_data: *mut AudioBufferList,
+) {
+    let shared = &context.shared;
     let layouts = channel_layouts(io_data);
     if layouts.is_empty() {
         return;
     }
-    let channels = layouts.len();
-    let mut chunk = Vec::with_capacity(frames.saturating_mul(channels));
+    let _channels = layouts.len();
+    let mut chunk = context.scratch.borrow_mut();
+    chunk.clear();
     for frame in 0..frames {
         for (base, stride, offset) in &layouts {
             // SAFETY: `base` points at a live f32 buffer of
@@ -1024,21 +1186,36 @@ fn push_input_buffers(shared: &InputShared, frames: usize, io_data: *mut AudioBu
             chunk.push(sample);
         }
     }
-    let Ok(mut state) = shared.state.lock() else {
-        return;
-    };
-    while state.samples.len() + chunk.len() > state.capacity {
-        for _ in 0..state.channels.max(1) {
-            state.samples.pop_front();
+    let mut offset = 0_usize;
+    while offset < chunk.len() {
+        match context.producer.push(chunk[offset]) {
+            Ok(()) => offset += 1,
+            Err(sample) => {
+                // Ring full: drop the oldest complete frame and retry.
+                chunk[offset] = match sample {
+                    rtrb::PushError::Full(v) => v,
+                };
+                let Ok(mut consumer) = shared.consumer.lock() else {
+                    return;
+                };
+                let frame_samples = shared.channels.max(1);
+                for _ in 0..frame_samples {
+                    if consumer.pop().is_err() {
+                        break;
+                    }
+                }
+                // This counter advances once per dropped complete frame; the
+                // retry below always frees exactly one frame before pushing again.
+                shared.overflow_drops.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
-    state.samples.extend(chunk);
 }
 
 unsafe extern "C" fn input_callback(
     in_ref_con: *mut c_void,
     _io_action_flags: *mut u32,
-    _in_time_stamp: *const c_void,
+    in_time_stamp: *const c_void,
     _in_bus_number: u32,
     in_number_frames: u32,
     io_data: *mut AudioBufferList,
@@ -1046,9 +1223,21 @@ unsafe extern "C" fn input_callback(
     if in_ref_con.is_null() {
         return 0;
     }
-    // SAFETY: same ownership invariant as `render_callback`.
-    let context = unsafe { &*(in_ref_con as *const InputCallbackContext) };
-    push_input_buffers(&context.shared, in_number_frames as usize, io_data);
+    // SAFETY: same ownership invariant as `render_callback`; the box is
+    // uniquely owned, so `&mut` is sound.
+    let context = unsafe { &mut *(in_ref_con as *mut InputCallbackContext) };
+    let (discontinuity, last) = sample_time_discontinuity(
+        context.last_sample_time.get(),
+        in_time_stamp,
+        in_number_frames,
+    );
+    if let Some(last) = last {
+        if discontinuity {
+            context.shared.xruns.fetch_add(1, Ordering::Relaxed);
+        }
+        context.last_sample_time.set(Some(last));
+    }
+    push_input_buffers(context, in_number_frames as usize, io_data);
     0
 }
 
@@ -1058,10 +1247,14 @@ pub struct HwDriver {
     output_context: Option<*mut OutputCallbackContext>,
     input_context: Option<*mut InputCallbackContext>,
     output_shared: Arc<OutputShared>,
+    output_producer: Producer<f32>,
     input_shared: Option<Arc<InputShared>>,
     audio_ins: Vec<Arc<AudioIO>>,
     audio_outs: Vec<Arc<AudioIO>>,
     input_queue: Vec<f32>,
+    /// Reusable interleaved output period; fed to the ring without any
+    /// intermediate VecDeque copy.
+    output_period: Vec<f32>,
     output_gain_linear: f32,
     output_balance: f32,
     sample_rate: usize,
@@ -1087,7 +1280,7 @@ impl HwDriver {
     ) -> Result<Self, String> {
         let requested_rate = f64::from(rate.max(1));
         let requested_period = (options.period_frames.max(1)) as u32;
-        let nperiods = options.nperiods.max(2);
+        let nperiods = options.nperiods.max(1);
         let stop_requested = Arc::new(AtomicBool::new(false));
 
         let output_id = resolve_device_id(
@@ -1105,6 +1298,33 @@ impl HwDriver {
             None
         };
         let duplex_same_device = input_id == Some(output_id);
+
+        // Pin the device nominal rate before unit configuration when it
+        // differs from the requested rate; failure is non-fatal.
+        if let Some(current) = device_nominal_sample_rate(output_id)
+            && (current - requested_rate).abs() > 1.0
+            && !set_device_nominal_sample_rate(output_id, requested_rate)
+        {
+            warn!(
+                device = output_id,
+                requested = requested_rate,
+                current,
+                "CoreAudio: failed to set output device nominal sample rate; continuing"
+            );
+        }
+        if !duplex_same_device
+            && let Some(in_id) = input_id
+            && let Some(current) = device_nominal_sample_rate(in_id)
+            && (current - requested_rate).abs() > 1.0
+            && !set_device_nominal_sample_rate(in_id, requested_rate)
+        {
+            warn!(
+                device = in_id,
+                requested = requested_rate,
+                current,
+                "CoreAudio: failed to set input device nominal sample rate; continuing"
+            );
+        }
 
         // ---- output unit -------------------------------------------------
         let mut unit_guard = UnitGuard::new(create_hal_output_unit()?);
@@ -1161,22 +1381,22 @@ impl HwDriver {
         let period_samples = period_frames.saturating_mul(output_channels);
         let output_capacity = nperiods.saturating_mul(period_samples).max(period_samples);
         let wait_timeout = Duration::from_millis(
-            ((period_frames as u64) * 2_000 / sample_rate.max(1) as u64).max(2),
+            ((period_frames as u64) * 1_000 / sample_rate.max(1) as u64).max(2),
         );
+        let (output_producer, output_consumer) = RingBuffer::<f32>::new(output_capacity.max(1));
         let output_shared = Arc::new(OutputShared {
-            state: Mutex::new(OutputState {
-                samples: VecDeque::with_capacity(period_samples.saturating_mul(2)),
-                capacity: output_capacity,
-                wait_timeout,
-                idle_timeout: Duration::from_millis(2),
-                stopped: false,
-            }),
+            gate: Mutex::new(OutputGate { stopped: false }),
             condvar: Condvar::new(),
             playing: AtomicBool::new(false),
             xruns: AtomicUsize::new(0),
+            wait_timeout,
+            idle_timeout: Duration::from_millis(2),
         });
         let output_context = Box::into_raw(Box::new(OutputCallbackContext {
             shared: output_shared.clone(),
+            consumer: output_consumer,
+            scratch: RefCell::new(Vec::with_capacity(period_samples)),
+            last_sample_time: Cell::new(None),
         }));
         let render_result = set_render_callback(unit, output_context.cast::<c_void>());
         if let Err(err) = render_result {
@@ -1189,15 +1409,19 @@ impl HwDriver {
 
         // ---- input -------------------------------------------------------
         let (input_shared, input_context) = if input_on_primary {
+            let in_capacity = period_samples.saturating_mul(4).max(period_samples).max(1);
+            let (producer, consumer) = RingBuffer::<f32>::new(in_capacity);
             let shared = Arc::new(InputShared {
-                state: Mutex::new(InputState {
-                    samples: VecDeque::with_capacity(period_samples),
-                    capacity: period_samples.saturating_mul(4).max(period_samples),
-                    channels: input_channels.max(1),
-                }),
+                consumer: Mutex::new(consumer),
+                channels: input_channels.max(1),
+                overflow_drops: AtomicUsize::new(0),
+                xruns: AtomicUsize::new(0),
             });
             let context = Box::into_raw(Box::new(InputCallbackContext {
                 shared: shared.clone(),
+                producer,
+                scratch: RefCell::new(Vec::with_capacity(period_samples)),
+                last_sample_time: Cell::new(None),
             }));
             if let Err(err) = set_input_callback(unit, context.cast::<c_void>()) {
                 // SAFETY: same uniqueness invariant as the render context.
@@ -1212,6 +1436,7 @@ impl HwDriver {
         };
 
         // Everything device-dependent is configured; initialize and start.
+        set_start_timestamps_at_zero(unit);
         // SAFETY: `unit` is valid and all pre-initialize properties are set.
         let init_status = unsafe { AudioUnitInitialize(unit) };
         if init_status != 0 {
@@ -1248,15 +1473,18 @@ impl HwDriver {
                     .saturating_mul(in_channels)
                     .saturating_mul(4)
                     .max(1);
+                let (producer, consumer) = RingBuffer::<f32>::new(in_capacity);
                 let shared = Arc::new(InputShared {
-                    state: Mutex::new(InputState {
-                        samples: VecDeque::with_capacity(in_capacity),
-                        capacity: in_capacity,
-                        channels: in_channels.max(1),
-                    }),
+                    consumer: Mutex::new(consumer),
+                    channels: in_channels.max(1),
+                    overflow_drops: AtomicUsize::new(0),
+                    xruns: AtomicUsize::new(0),
                 });
                 let context = Box::into_raw(Box::new(InputCallbackContext {
                     shared: shared.clone(),
+                    producer,
+                    scratch: RefCell::new(Vec::with_capacity(in_capacity)),
+                    last_sample_time: Cell::new(None),
                 }));
                 if let Err(err) = set_input_callback(in_unit, context.cast::<c_void>()) {
                     // SAFETY: the unit was never started; the box is uniquely
@@ -1266,6 +1494,7 @@ impl HwDriver {
                     }
                     return Err(err);
                 }
+                set_start_timestamps_at_zero(in_unit);
                 // SAFETY: `in_unit` is valid and configured.
                 let init_status = unsafe { AudioUnitInitialize(in_unit) };
                 if init_status != 0 {
@@ -1310,10 +1539,12 @@ impl HwDriver {
             output_context: Some(output_context),
             input_context: final_input_context,
             output_shared,
+            output_producer,
             input_shared: final_input_shared,
             audio_ins,
             audio_outs,
             input_queue: Vec::new(),
+            output_period: vec![0.0_f32; period_samples],
             output_gain_linear: 1.0,
             output_balance: 0.0,
             sample_rate,
@@ -1388,9 +1619,11 @@ impl HwDriver {
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
         if let Some(shared) = &self.input_shared
-            && let Ok(mut state) = shared.state.lock()
+            && let Ok(mut consumer) = shared.consumer.lock()
         {
-            self.input_queue.extend(state.samples.drain(..));
+            while let Ok(sample) = consumer.pop() {
+                self.input_queue.push(sample);
+            }
         }
 
         let have_samples = self.input_queue.len();
@@ -1419,7 +1652,7 @@ impl HwDriver {
         let channels = self.output_channels;
         let gain = self.output_gain_linear;
         let balance = self.output_balance;
-        let mut interleaved = vec![0.0_f32; frames.saturating_mul(channels)];
+        self.output_period.fill(0.0);
         if self.playing
             && let Some(slot) = &self.plan_slot
         {
@@ -1431,41 +1664,53 @@ impl HwDriver {
                 balance,
                 |ch, frame, sample| {
                     let idx = frame * channels + ch;
-                    if let Some(dst) = interleaved.get_mut(idx) {
+                    if let Some(dst) = self.output_period.get_mut(idx) {
                         *dst = sample;
                     }
                 },
             );
         }
 
-        self.queue_output_period(interleaved)
+        let period = std::mem::take(&mut self.output_period);
+        let result = self.queue_output_period(&period);
+        self.output_period = period;
+        result
     }
 
-    fn queue_output_period(&mut self, interleaved: Vec<f32>) -> Result<(), String> {
+    fn queue_output_period(&mut self, period: &[f32]) -> Result<(), String> {
         let shared = &self.output_shared;
-        let mut state = shared
-            .state
+        let producer = &mut self.output_producer;
+        let mut gate = shared
+            .gate
             .lock()
-            .map_err(|_| "CoreAudio output state poisoned".to_string())?;
-        loop {
-            if self.stop_requested.load(Ordering::Acquire) || state.stopped {
+            .map_err(|_| "CoreAudio output gate poisoned".to_string())?;
+        let mut offset = 0_usize;
+        while offset < period.len() {
+            if self.stop_requested.load(Ordering::Acquire) || gate.stopped {
                 return Ok(());
             }
-            if state.samples.len() + interleaved.len() <= state.capacity {
-                state.samples.extend(interleaved.iter().copied());
-                shared.condvar.notify_one();
-                return Ok(());
+            while offset < period.len() {
+                match producer.push(period[offset]) {
+                    Ok(()) => offset += 1,
+                    // Ring full: the HAL render callback paces the engine
+                    // cycle; wait for it to drain below capacity.
+                    Err(_) => break,
+                }
             }
-            // Reservoir full: the HAL render callback paces the engine cycle.
+            if offset >= period.len() {
+                break;
+            }
             let (guard, timeout) = shared
                 .condvar
-                .wait_timeout(state, Duration::from_millis(500))
-                .map_err(|_| "CoreAudio output state poisoned".to_string())?;
-            state = guard;
+                .wait_timeout(gate, Duration::from_millis(500))
+                .map_err(|_| "CoreAudio output gate poisoned".to_string())?;
+            gate = guard;
             if timeout.timed_out() {
                 return Err("Timed out waiting for CoreAudio render callback".to_string());
             }
         }
+        shared.condvar.notify_all();
+        Ok(())
     }
 
     pub fn run_assist_step(&mut self) -> Result<bool, String> {
@@ -1491,8 +1736,8 @@ impl HwDriver {
         }
         self.closed = true;
         self.stop_requested.store(true, Ordering::Release);
-        if let Ok(mut state) = self.output_shared.state.lock() {
-            state.stopped = true;
+        if let Ok(mut gate) = self.output_shared.gate.lock() {
+            gate.stopped = true;
         }
         self.output_shared.condvar.notify_all();
         // SAFETY: stopping a HALOutput unit is synchronous with respect to
@@ -1600,19 +1845,25 @@ mod stop_silence_tests {
     use super::*;
     use std::time::Instant;
 
-    fn test_shared(wait_timeout: Duration) -> Arc<OutputShared> {
-        Arc::new(OutputShared {
-            state: Mutex::new(OutputState {
-                samples: VecDeque::new(),
-                capacity: 4096,
+    fn test_context(
+        capacity: usize,
+        wait_timeout: Duration,
+    ) -> (OutputCallbackContext, Producer<f32>) {
+        let (producer, consumer) = RingBuffer::<f32>::new(capacity);
+        let context = OutputCallbackContext {
+            shared: Arc::new(OutputShared {
+                gate: Mutex::new(OutputGate { stopped: false }),
+                condvar: Condvar::new(),
+                playing: AtomicBool::new(false),
+                xruns: AtomicUsize::new(0),
                 wait_timeout,
                 idle_timeout: Duration::from_millis(1),
-                stopped: false,
             }),
-            condvar: Condvar::new(),
-            playing: AtomicBool::new(false),
-            xruns: AtomicUsize::new(0),
-        })
+            consumer,
+            scratch: RefCell::new(Vec::new()),
+            last_sample_time: Cell::new(None),
+        };
+        (context, producer)
     }
 
     /// One interleaved HAL buffer filled with a 7.0 sentinel so tests can
@@ -1638,10 +1889,10 @@ mod stop_silence_tests {
 
     #[test]
     fn starved_callback_emits_silence_immediately_when_not_playing() {
-        let shared = test_shared(Duration::from_secs(5));
+        let (mut context, _producer) = test_context(4096, Duration::from_secs(5));
         let (mut list, ptr, len) = make_abl(64, 2);
         let start = Instant::now();
-        fill_output_buffers(&shared, 64, &mut list);
+        fill_output_buffers(&mut context, 64, &mut list);
         assert!(
             start.elapsed() < Duration::from_millis(250),
             "starved callback blocked the HAL thread for {:?}",
@@ -1653,11 +1904,11 @@ mod stop_silence_tests {
 
     #[test]
     fn starved_callback_still_backpressures_while_playing() {
-        let shared = test_shared(Duration::from_millis(150));
-        shared.playing.store(true, Ordering::Release);
+        let (mut context, _producer) = test_context(4096, Duration::from_millis(150));
+        context.shared.playing.store(true, Ordering::Release);
         let (mut list, _, _) = make_abl(64, 2);
         let start = Instant::now();
-        fill_output_buffers(&shared, 64, &mut list);
+        fill_output_buffers(&mut context, 64, &mut list);
         assert!(
             start.elapsed() >= Duration::from_millis(100),
             "playing callback should wait for engine data, returned after {:?}",
@@ -1666,23 +1917,101 @@ mod stop_silence_tests {
     }
 
     #[test]
-    fn drained_reservoir_never_repeats_stale_audio() {
-        let shared = test_shared(Duration::from_secs(5));
+    fn drained_ring_never_repeats_stale_audio() {
+        let (mut context, mut producer) = test_context(4096, Duration::from_secs(5));
         let (mut list, ptr, len) = make_abl(64, 2);
-        shared
-            .state
-            .lock()
-            .unwrap()
-            .samples
-            .extend(std::iter::repeat_n(0.5_f32, 128));
-        fill_output_buffers(&shared, 64, &mut list);
-        // Reservoir now empty: the next callback must output silence, not
+        for sample in std::iter::repeat_n(0.5_f32, 128) {
+            producer.push(sample).expect("push into test ring");
+        }
+        fill_output_buffers(&mut context, 64, &mut list);
+        // Ring now empty: the next callback must output silence, not
         // replay the previous period.
-        fill_output_buffers(&shared, 64, &mut list);
+        fill_output_buffers(&mut context, 64, &mut list);
         let out = unsafe { read_abl(ptr, len) };
         assert!(
             out.iter().all(|sample| *sample == 0.0),
             "stale audio repeated after drain"
+        );
+    }
+
+    #[test]
+    fn ring_delivery_preserves_interleaved_order() {
+        let (mut context, mut producer) = test_context(4096, Duration::from_secs(5));
+        let (mut list, ptr, len) = make_abl(64, 2);
+        let expected: Vec<f32> = (0..128).map(|i| i as f32 * 0.25).collect();
+        for sample in &expected {
+            producer.push(*sample).expect("push into test ring");
+        }
+        fill_output_buffers(&mut context, 64, &mut list);
+        let out = unsafe { read_abl(ptr, len) };
+        assert_eq!(out, expected);
+        assert_eq!(context.shared.xruns.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn steady_cadence_is_not_a_discontinuity() {
+        let ts = [1000.0_f64, 0.0, 0.0, 0.0];
+        let first = sample_time_discontinuity(None, ts.as_ptr().cast(), 512);
+        assert!(!first.0);
+        let ts_next = [1512.0_f64, 0.0, 0.0, 0.0];
+        let second = sample_time_discontinuity(first.1, ts_next.as_ptr().cast(), 512);
+        assert!(!second.0);
+    }
+
+    #[test]
+    fn dropped_period_is_counted_as_discontinuity() {
+        let first = sample_time_discontinuity(None, [1000.0_f64].as_ptr().cast(), 512);
+        let jumped = sample_time_discontinuity(first.1, [2512.0_f64].as_ptr().cast(), 512);
+        assert!(jumped.0);
+        // Advance of 1512 where 512 was expected: 1000 frames unaccounted.
+        assert_eq!(discontinuity_frames(1000.0, 2512.0, 512), 1000);
+    }
+
+    #[test]
+    fn small_jitter_is_not_a_discontinuity() {
+        // 8 frames of jitter around the expected 1512 advance stays far
+        // under the 50% threshold.
+        assert_eq!(discontinuity_frames(1000.0, 1520.0, 512), 0);
+        assert!(!sample_time_discontinuity(Some(1000.0), [1520.0_f64].as_ptr().cast(), 512).0);
+    }
+
+    #[test]
+    fn null_timestamp_keeps_last_and_reports_no_break() {
+        let first = sample_time_discontinuity(None, [42.0_f64].as_ptr().cast(), 256);
+        let (broke, last) = sample_time_discontinuity(first.1, ptr::null(), 256);
+        assert!(!broke);
+        assert_eq!(last, Some(42.0));
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn period_bounds_round_floor_and_ceil() {
+        let (min, max) = match device_period_frame_bounds_from_range(14.0, 96.2) {
+            (Some(min), Some(max)) => (min, max),
+            other => panic!("expected concrete bounds, got {other:?}"),
+        };
+        assert_eq!(min, 14);
+        assert_eq!(max, 97);
+    }
+
+    #[test]
+    fn period_bounds_reject_invalid_range() {
+        assert_eq!(
+            device_period_frame_bounds_from_range(0.0, 96.0),
+            (None, None)
+        );
+        assert_eq!(
+            device_period_frame_bounds_from_range(100.0, 50.0),
+            (None, None)
         );
     }
 }
