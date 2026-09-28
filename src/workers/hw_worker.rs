@@ -277,10 +277,93 @@ impl<B: Backend> HwWorker<B> {
         self.work_legacy().await;
     }
 
+    /// Handle one worker message outside of a running cycle. `cycle_tx` and
+    /// `cycle_running` let `TracksFinished` launch a cycle. Returns true when
+    /// the worker should exit (Quit or a closed channel).
+    async fn handle_async_msg(
+        &mut self,
+        msg: Message,
+        cycle_tx: &tokio::sync::mpsc::Sender<(B::Driver, Result<(), String>)>,
+        cycle_running: &mut bool,
+    ) -> bool {
+        match msg {
+            Message::Request(crate::message::Action::Quit) => {
+                self.driver_mut().request_stop();
+                self.shutdown_quit();
+                return true;
+            }
+            Message::TracksFinished => {
+                self.flush_pending_midi_out();
+                self.drain_midi_input().await;
+                if !*cycle_running {
+                    *cycle_running = true;
+                    let tx = cycle_tx.clone();
+                    let driver = self
+                        .driver
+                        .take()
+                        .expect("driver is only absent while a cycle is running");
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.blocking_send(Self::run_cycle_blocking(driver));
+                    });
+                }
+            }
+            Message::HWMidiOutEvents(mut events) => {
+                self.pending_midi_out_events.append(&mut events);
+                self.pending_midi_out_sorted = false;
+                // Stopped transport means no cycles and no
+                // TracksFinished to flush on; write immediately so
+                // e.g. panic All-Sound-Off reaches the device.
+                if !self.playing {
+                    self.flush_pending_midi_out();
+                }
+            }
+            Message::ClearHWMidiOutEvents => {
+                self.pending_midi_out_events.clear();
+                self.pending_midi_out_sorted = true;
+            }
+            Message::HWSetPlaying(playing) => {
+                self.playing = playing;
+                self.driver_mut().set_playing(playing);
+            }
+            Message::HWZeroFillBuffers => {
+                self.driver_mut().zero_fill_hw_buffers();
+            }
+            Message::HWSetOutputGainBalance { gain, balance } => {
+                self.driver_mut().set_output_gain_balance(gain, balance);
+            }
+            Message::HWOpenMidiInputDevice(device) => {
+                let result = self.midi_hub.open_input(&device);
+                let action = crate::message::Action::OpenMidiInputDevice(device);
+                let _ = self
+                    .tx
+                    .send(Message::Response(result.map(|_| action)))
+                    .await;
+            }
+            Message::HWOpenMidiOutputDevice(device) => {
+                let result = self.midi_hub.open_output(&device);
+                let action = crate::message::Action::OpenMidiOutputDevice(device);
+                let _ = self
+                    .tx
+                    .send(Message::Response(result.map(|_| action)))
+                    .await;
+            }
+            Message::HWCloseMidiDevices => {
+                self.midi_hub.close_all();
+            }
+            _ => {}
+        }
+        false
+    }
+
     #[cfg(unix)]
     async fn work_async(&mut self) {
         let mut cycle_running = false;
         let mut quit_pending = false;
+        // Messages received while a cycle is in flight cannot be handled (the
+        // driver lives on the blocking thread), so they are buffered here and
+        // replayed once the cycle returns. Dropping them instead would lose
+        // e.g. MIDI device opens sent right after the audio device opens.
+        let mut buffered: Vec<Message> = Vec::new();
         // Stop flag the worker can raise while a cycle owns the driver, so
         // a cycle blocked on device I/O unwinds promptly instead of
         // deadlocking shutdown (Quit cannot reach `request_stop` while the
@@ -299,12 +382,6 @@ impl<B: Backend> HwWorker<B> {
                 // cycle polls.
                 msg = self.rx.recv() => {
                     if cycle_running {
-                        // While a cycle is in flight the driver lives on the
-                        // blocking thread, so regular messages are handled
-                        // once the cycle returns. Quit is the exception: it
-                        // must interrupt a cycle that never returns (e.g. a
-                        // stalled device), so it is turned into the shared
-                        // stop flag the cycle polls.
                         match msg {
                             Some(Message::Request(crate::message::Action::Quit)) | None => {
                                 if let Some(flag) = &stop_signaller {
@@ -312,7 +389,7 @@ impl<B: Backend> HwWorker<B> {
                                 }
                                 quit_pending = true;
                             }
-                            Some(_) => {}
+                            Some(m) => buffered.push(m),
                         }
                         continue;
                     }
@@ -324,64 +401,11 @@ impl<B: Backend> HwWorker<B> {
                             return;
                         }
                     };
-                    match msg {
-                        Message::Request(crate::message::Action::Quit) => {
-                            self.driver_mut().request_stop();
-                            self.shutdown_quit();
-                            return;
-                        }
-                        Message::TracksFinished => {
-                            self.flush_pending_midi_out();
-                            self.drain_midi_input().await;
-                            if !cycle_running {
-                                cycle_running = true;
-                                let tx = cycle_tx.clone();
-                                let driver = self.driver.take().expect(
-                                    "driver is only absent while a cycle is running",
-                                );
-                                tokio::task::spawn_blocking(move || {
-                                    let _ = tx.blocking_send(Self::run_cycle_blocking(driver));
-                                });
-                            }
-                        }
-                        Message::HWMidiOutEvents(mut events) => {
-                            self.pending_midi_out_events.append(&mut events);
-                            self.pending_midi_out_sorted = false;
-                            // Stopped transport means no cycles and no
-                            // TracksFinished to flush on; write immediately so
-                            // e.g. panic All-Sound-Off reaches the device.
-                            if !self.playing {
-                                self.flush_pending_midi_out();
-                            }
-                        }
-                        Message::ClearHWMidiOutEvents => {
-                            self.pending_midi_out_events.clear();
-                            self.pending_midi_out_sorted = true;
-                        }
-                        Message::HWSetPlaying(playing) => {
-                            self.playing = playing;
-                            self.driver_mut().set_playing(playing);
-                        }
-                        Message::HWZeroFillBuffers => {
-                            self.driver_mut().zero_fill_hw_buffers();
-                        }
-                        Message::HWSetOutputGainBalance { gain, balance } => {
-                            self.driver_mut().set_output_gain_balance(gain, balance);
-                        }
-                        Message::HWOpenMidiInputDevice(device) => {
-                            let result = self.midi_hub.open_input(&device);
-                            let action = crate::message::Action::OpenMidiInputDevice(device);
-                            let _ = self.tx.send(Message::Response(result.map(|_| action))).await;
-                        }
-                        Message::HWOpenMidiOutputDevice(device) => {
-                            let result = self.midi_hub.open_output(&device);
-                            let action = crate::message::Action::OpenMidiOutputDevice(device);
-                            let _ = self.tx.send(Message::Response(result.map(|_| action))).await;
-                        }
-                        Message::HWCloseMidiDevices => {
-                            self.midi_hub.close_all();
-                        }
-                        _ => {}
+                    if self
+                        .handle_async_msg(msg, &cycle_tx, &mut cycle_running)
+                        .await
+                    {
+                        return;
                     }
                 }
                 result = cycle_rx.recv(), if cycle_running => {
@@ -402,6 +426,19 @@ impl<B: Backend> HwWorker<B> {
                     self.publish_capture_frame();
                     if let Err(e) = self.tx.send(Message::HWFinished).await {
                         error!("{} worker failed to send HWFinished: {}", B::LABEL, e);
+                    }
+                    for m in std::mem::take(&mut buffered) {
+                        if self
+                            .handle_async_msg(m, &cycle_tx, &mut cycle_running)
+                            .await
+                        {
+                            return;
+                        }
+                        if cycle_running {
+                            // A buffered TracksFinished started a new cycle;
+                            // the rest waits for it to return.
+                            break;
+                        }
                     }
                 }
                 // Hardware MIDI input must flow even while the transport is
