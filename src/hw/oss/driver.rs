@@ -189,6 +189,14 @@ impl HwDriver {
         self.capture.current_capture_frame()
     }
 
+    /// Total capture buffer capacity in frames. The GETIPTR counter is
+    /// monotonic since device open, so at a take start at most this many
+    /// captured frames can still be pending in the ring; it bounds the
+    /// record-start discard.
+    pub fn capture_buffer_frames(&self) -> usize {
+        usize::try_from(self.capture.buffer_frames().max(0)).unwrap_or(0)
+    }
+
     /// Join capture and playback in an OSS sync group and start them
     /// together (or fall back to per-direction triggers when the device
     /// cannot do sync groups). Returns true when a sync group was started.

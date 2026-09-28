@@ -157,6 +157,11 @@ pub(crate) struct HwDriverInfo {
     pub output_channels: usize,
     pub sample_bits: i32,
     pub frame_size_bytes: usize,
+    /// Total capture buffer capacity in frames. The backend's capture
+    /// position counter is monotonic since device open and does not follow
+    /// transport rewinds, so it bounds the region of captured-but-not-yet-
+    /// valid audio at a take start. `0` = unknown (no clamping).
+    pub capture_buffer_frames: usize,
 }
 
 #[derive(Debug, Clone)]

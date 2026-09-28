@@ -39,8 +39,23 @@ impl Engine {
         let input_latency = self.transport.hw_input_latency_frames;
         let position = self.transport.transport_sample;
         let capture_frame = self.current_capture_frame();
-        self.recording.discard_remaining_frames =
-            Self::record_discard_seed(capture_frame, position, buffer_size, input_latency);
+        let seed = Self::record_discard_seed(capture_frame, position, buffer_size, input_latency);
+        let cap = self
+            .hw_driver_info
+            .map(|info| info.capture_buffer_frames)
+            .unwrap_or(0);
+        self.recording.discard_remaining_frames = Self::clamp_record_discard_seed(seed, cap);
+    }
+
+    /// Bound a discard seed by the capture buffer capacity. Backend capture
+    /// counters are monotonic since device open and do not follow transport
+    /// rewinds, so after the first stop/rewind the raw seed can sit
+    /// arbitrarily far ahead of the transport position and would swallow
+    /// every later take entirely. Only up to one capture buffer of audio can
+    /// still be pending at a take start, so the seed is bounded by it.
+    /// `cap == 0` means the capacity is unknown and the seed passes through.
+    pub(crate) fn clamp_record_discard_seed(seed: usize, cap: usize) -> usize {
+        if cap > 0 { seed.min(cap) } else { seed }
     }
 
     /// Split one transport segment at the take-start discard: returns
@@ -837,6 +852,20 @@ mod tests {
         // No validity signal (e.g. JACK2): buffer size + input latency.
         assert_eq!(Engine::record_discard_seed(None, 10_000, 256, 128), 384);
         assert_eq!(Engine::record_discard_seed(None, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn discard_seed_is_clamped_to_capture_buffer_capacity() {
+        // OSS GETIPTR counts since device open and keeps advancing while the
+        // transport is stopped: after a stop/rewind the raw seed is in the
+        // millions and would swallow the whole take. At most one capture
+        // buffer can still be pending, so the seed is bounded by it.
+        let raw = Engine::record_discard_seed(Some(28_800_000), 0, 256, 128);
+        assert_eq!(Engine::clamp_record_discard_seed(raw, 8192), 8192);
+        // A small legitimate seed passes through untouched.
+        assert_eq!(Engine::clamp_record_discard_seed(480, 8192), 480);
+        // Unknown capacity (cap 0) disables the clamp.
+        assert_eq!(Engine::clamp_record_discard_seed(raw, 0), raw);
     }
 
     #[test]

@@ -479,6 +479,10 @@ impl Engine {
         self.hw_output_ports = (0..out_channels)
             .filter_map(|idx| d.output_port(idx))
             .collect();
+        #[cfg(target_os = "freebsd")]
+        let capture_buffer_frames = d.capture_buffer_frames();
+        #[cfg(not(target_os = "freebsd"))]
+        let capture_buffer_frames = 0;
         self.hw_driver_info = Some(HwDriverInfo {
             cycle_samples: d.cycle_samples(),
             sample_rate: d.sample_rate(),
@@ -486,6 +490,7 @@ impl Engine {
             output_channels: out_channels,
             sample_bits: d.sample_bits(),
             frame_size_bytes: d.frame_size_bytes(),
+            capture_buffer_frames,
         });
         #[cfg(unix)]
         {
