@@ -205,6 +205,7 @@ impl Engine {
                 }
                 self.hw_driver = None;
                 self.hw_driver_info = None;
+                crate::plugins::ipc::reset_plugin_wait_bound();
                 self.hw_input_ports.clear();
                 self.hw_output_ports.clear();
                 if self.midi_hub.is_none() {
@@ -411,8 +412,9 @@ impl Engine {
             std::sync::atomic::Ordering::Relaxed,
         );
         let capture_frame = self.hw_capture_frame.clone();
+        let inline_render = self.rt_inline_enabled.then(|| self.inline_render.clone());
         let handler = tokio::spawn(async move {
-            let worker = HwWorker::new(hw, midi_hub, rx, tx_engine, capture_frame);
+            let worker = HwWorker::new(hw, midi_hub, rx, tx_engine, capture_frame, inline_render);
             worker.work().await;
         });
         self.hw_worker = Some(WorkerData::new(tx, handler));
@@ -454,6 +456,12 @@ impl Engine {
         let hw_profile_enabled = config::env_flag(config::HW_PROFILE_ENV);
         let mut d = Self::open_hw_driver(device, input_device, sample_rate_hz, bits, hw_opts)?;
         d.set_plan_slot(self.plan_slot.clone());
+        // RT-inline render (ARCHITECTURE.md Phase 2): when the backend has
+        // the mid-cycle hook (currently OSS) and MAOLAN_RT_INLINE is not
+        // disabled, the render plan executes on the cycle thread between the
+        // capture fill and the playback drain.
+        self.rt_inline_enabled = !config::env_opt_out("MAOLAN_RT_INLINE");
+        d.set_inline_render(self.rt_inline_enabled.then(|| self.inline_render.clone()));
         let (in_channels, out_channels, rate, (in_lat, out_lat)) = Self::hw_device_info(&d);
         if hw_profile_enabled {
             let label = Self::hw_profile_backend_label(device);
@@ -492,6 +500,14 @@ impl Engine {
             frame_size_bytes: d.frame_size_bytes(),
             capture_buffer_frames,
         });
+        // Bound the plugin-host wait by the device period (ARCHITECTURE.md
+        // Phase 3): min(100 ms, 2 × period).
+        crate::plugins::ipc::set_plugin_wait_bound(
+            crate::plugins::ipc::plugin_wait_bound_for_period(
+                d.cycle_samples(),
+                d.sample_rate().max(1) as usize,
+            ),
+        );
         #[cfg(unix)]
         {
             self.jack_runtime = None;

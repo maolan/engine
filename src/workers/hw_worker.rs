@@ -5,6 +5,7 @@ use crate::{
 #[cfg(unix)]
 use nix::libc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -33,7 +34,11 @@ pub struct HwWorker<B: Backend> {
     /// thread for the duration of each audio cycle (`None` only while a
     /// cycle is in flight, during which the message channel is not polled).
     driver: Option<B::Driver>,
-    midi_hub: B::MidiHub,
+    /// Shared with the RT cycle thread while inline render is armed: the
+    /// cycle drains MIDI input mid-cycle (after the capture read), the
+    /// worker keeps using it between cycles. Both sides only lock across
+    /// cycle boundaries, so the mutex is uncontended in practice.
+    midi_hub: Arc<Mutex<B::MidiHub>>,
     rx: Receiver<Message>,
     tx: Sender<Message>,
     cycle_frames: u32,
@@ -48,6 +53,11 @@ pub struct HwWorker<B: Backend> {
     /// `current_capture_frame` after every audio cycle. `CAPTURE_FRAME_UNKNOWN`
     /// when the backend reports nothing.
     capture_frame: Arc<AtomicI64>,
+    /// RT-inline render context. When armed, `TracksFinished` is the Go
+    /// signal for a cycle that executes the render plan on the cycle thread;
+    /// the pre-cycle MIDI-in drain moves into that cycle, so the worker
+    /// skips it here.
+    inline_render: Option<Arc<crate::inline_render::InlineRender>>,
 }
 
 /// How often hardware MIDI input is polled when no audio cycles are running
@@ -61,8 +71,10 @@ impl<B: Backend> Drop for HwWorker<B> {
             driver.request_stop();
         }
         self.midi_stop.store(true, Ordering::Release);
-        self.midi_hub.wake_input_waiter();
-        self.midi_hub.close_all();
+        let mut hub = self.lock_midi_hub();
+        hub.wake_input_waiter();
+        hub.close_all();
+        drop(hub);
         if let Some(driver) = self.driver.as_mut() {
             driver.close_fds();
         }
@@ -193,8 +205,15 @@ impl<B: Backend> HwWorker<B> {
         rx: Receiver<Message>,
         tx: Sender<Message>,
         capture_frame: Arc<AtomicI64>,
+        inline_render: Option<Arc<crate::inline_render::InlineRender>>,
     ) -> Self {
         let cycle_frames = driver.cycle_samples() as u32;
+        let midi_hub = Arc::new(Mutex::new(midi_hub));
+        if let Some(ctx) = inline_render.as_ref() {
+            let source: Arc<Mutex<dyn crate::inline_render::MidiInSource + Send>> =
+                midi_hub.clone();
+            ctx.set_midi_source(&source);
+        }
         Self {
             driver: Some(driver),
             midi_hub,
@@ -206,6 +225,7 @@ impl<B: Backend> HwWorker<B> {
             midi_stop: Arc::new(AtomicBool::new(false)),
             playing: false,
             capture_frame,
+            inline_render,
         }
     }
 
@@ -227,6 +247,10 @@ impl<B: Backend> HwWorker<B> {
             .expect("driver is only absent while a cycle runs on the blocking thread")
     }
 
+    fn lock_midi_hub(&self) -> std::sync::MutexGuard<'_, B::MidiHub> {
+        self.midi_hub.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Run one audio cycle on a tokio blocking thread. The blocking pool
     /// thread does not inherit the async worker thread's realtime priority,
     /// so configure it for every cycle — the pool may hand each cycle to a
@@ -246,6 +270,8 @@ impl<B: Backend> HwWorker<B> {
         }
         let _rt_us = rt_start.elapsed().as_micros() as u64;
         let _cycle_start = std::time::Instant::now();
+        crate::cycle_trace::begin_cycle();
+        crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwCycleStart);
         let result = driver.run_cycle_for_worker();
         let _cycle_us = _cycle_start.elapsed().as_micros() as u64;
         (driver, result)
@@ -293,8 +319,14 @@ impl<B: Backend> HwWorker<B> {
                 return true;
             }
             Message::TracksFinished => {
+                crate::cycle_trace::mark(crate::cycle_trace::TracePoint::GoReceived);
                 self.flush_pending_midi_out();
-                self.drain_midi_input().await;
+                // Inline render drains MIDI input on the cycle thread, right
+                // after the capture read, so events reach the render in the
+                // same cycle instead of one cycle late.
+                if self.inline_render.is_none() {
+                    self.drain_midi_input().await;
+                }
                 if !*cycle_running {
                     *cycle_running = true;
                     let tx = cycle_tx.clone();
@@ -332,7 +364,7 @@ impl<B: Backend> HwWorker<B> {
                 self.driver_mut().set_output_gain_balance(gain, balance);
             }
             Message::HWOpenMidiInputDevice(device) => {
-                let result = self.midi_hub.open_input(&device);
+                let result = self.lock_midi_hub().open_input(&device);
                 let action = crate::message::Action::OpenMidiInputDevice(device);
                 let _ = self
                     .tx
@@ -340,7 +372,7 @@ impl<B: Backend> HwWorker<B> {
                     .await;
             }
             Message::HWOpenMidiOutputDevice(device) => {
-                let result = self.midi_hub.open_output(&device);
+                let result = self.lock_midi_hub().open_output(&device);
                 let action = crate::message::Action::OpenMidiOutputDevice(device);
                 let _ = self
                     .tx
@@ -348,7 +380,7 @@ impl<B: Backend> HwWorker<B> {
                     .await;
             }
             Message::HWCloseMidiDevices => {
-                self.midi_hub.close_all();
+                self.lock_midi_hub().close_all();
             }
             _ => {}
         }
@@ -424,6 +456,8 @@ impl<B: Backend> HwWorker<B> {
                         return;
                     }
                     self.publish_capture_frame();
+                    crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwCycleEnd);
+                    crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwFinishedSent);
                     if let Err(e) = self.tx.send(Message::HWFinished).await {
                         error!("{} worker failed to send HWFinished: {}", B::LABEL, e);
                     }
@@ -491,8 +525,11 @@ impl<B: Backend> HwWorker<B> {
                 return true;
             }
             Message::TracksFinished => {
+                crate::cycle_trace::mark(crate::cycle_trace::TracePoint::GoReceived);
                 self.flush_pending_midi_out();
-                self.drain_midi_input().await;
+                if self.inline_render.is_none() {
+                    self.drain_midi_input().await;
+                }
                 // The cycle blocks for a full audio period; run it on a
                 // blocking thread with per-cycle RT priority instead of
                 // stalling the async worker task (see work_async).
@@ -563,6 +600,8 @@ impl<B: Backend> HwWorker<B> {
                     self.driver_mut().request_stop();
                     return true;
                 }
+                crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwCycleEnd);
+                crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwFinishedSent);
                 if let Err(e) = self.tx.send(Message::HWFinished).await {
                     error!(
                         "{} worker failed to send HWFinished to engine: {}",
@@ -601,7 +640,7 @@ impl<B: Backend> HwWorker<B> {
                 self.driver_mut().set_output_gain_balance(gain, balance);
             }
             Message::HWOpenMidiInputDevice(device) => {
-                let result = self.midi_hub.open_input(&device);
+                let result = self.lock_midi_hub().open_input(&device);
                 let action = crate::message::Action::OpenMidiInputDevice(device);
                 let _ = self
                     .tx
@@ -609,7 +648,7 @@ impl<B: Backend> HwWorker<B> {
                     .await;
             }
             Message::HWOpenMidiOutputDevice(device) => {
-                let result = self.midi_hub.open_output(&device);
+                let result = self.lock_midi_hub().open_output(&device);
                 let action = crate::message::Action::OpenMidiOutputDevice(device);
                 let _ = self
                     .tx
@@ -617,7 +656,7 @@ impl<B: Backend> HwWorker<B> {
                     .await;
             }
             Message::HWCloseMidiDevices => {
-                self.midi_hub.close_all();
+                self.lock_midi_hub().close_all();
             }
             _ => {}
         }
@@ -637,13 +676,14 @@ impl<B: Backend> HwWorker<B> {
             });
             self.pending_midi_out_sorted = true;
         }
-        self.midi_hub.write_events(&self.pending_midi_out_events);
+        self.lock_midi_hub()
+            .write_events(&self.pending_midi_out_events);
         self.pending_midi_out_events.clear();
     }
 
     async fn drain_midi_input(&mut self) {
         let mut midi_in_events = Vec::with_capacity(64);
-        self.midi_hub.read_events_into(&mut midi_in_events);
+        self.lock_midi_hub().read_events_into(&mut midi_in_events);
         if midi_in_events.is_empty() {
             return;
         }
@@ -653,8 +693,9 @@ impl<B: Backend> HwWorker<B> {
 
     fn shutdown_midi(&mut self) {
         self.midi_stop.store(true, Ordering::Release);
-        self.midi_hub.wake_input_waiter();
-        self.midi_hub.close_all();
+        let mut hub = self.lock_midi_hub();
+        hub.wake_input_waiter();
+        hub.close_all();
     }
 
     #[cfg(unix)]
@@ -781,6 +822,7 @@ mod tests {
             msg_rx,
             engine_tx,
             Arc::new(AtomicI64::new(CAPTURE_FRAME_UNKNOWN)),
+            None,
         );
         let handle = tokio::spawn(worker.work());
         // Start a cycle, let it stall, then quit while it is in flight.

@@ -17,6 +17,7 @@ mod bounce;
 mod fields;
 mod hardware;
 pub(crate) mod history;
+mod inline;
 mod lifecycle;
 mod meters;
 mod midi;
@@ -271,12 +272,6 @@ pub(crate) enum MidiLearnSlot {
     Session(crate::message::SessionMidiLearnTarget),
 }
 
-struct AudioPreviewPlayback {
-    samples: Arc<Vec<f32>>,
-    channels: usize,
-    cursor: usize,
-}
-
 pub struct Engine {
     clients: Vec<Sender<Message>>,
     rx: Receiver<Message>,
@@ -309,6 +304,15 @@ pub struct Engine {
     pub recording: fields::RecordingFields,
     pub session: fields::SessionFields,
     pub meters: fields::MeterFields,
+    /// RT-inline render context shared with the audio driver and the hw
+    /// worker (see `inline_render.rs`). Also carries the shared audio
+    /// preview, which both render paths mix into the hardware-output arena.
+    pub(crate) inline_render: Arc<crate::inline_render::InlineRender>,
+    /// Whether the currently open audio device runs the render plan inline
+    /// on the cycle thread (set when the device opens with the mid-cycle
+    /// hook and `MAOLAN_RT_INLINE` is not `0`). When false the worker-pool
+    /// pipeline runs unchanged.
+    pub(crate) rt_inline_enabled: bool,
     /// Phase 2 render-plan machinery (see `LOCKLESS.md`): the executor
     /// drives per-cycle node dispatch, the builder thread recompiles and
     /// publishes plans, `pending_node_jobs` buffers jobs when no worker is
@@ -322,13 +326,18 @@ pub struct Engine {
     history_group: Option<UndoEntry>,
     history_suspended: bool,
     pub midi_learn: fields::MidiLearnFields,
-    audio_preview: Option<AudioPreviewPlayback>,
     /// Wakes the dispatcher immediately when a node worker pushes a result,
     /// instead of waiting for the 1 ms periodic tick. This is critical on
     /// Windows, where the default timer quantum coarsens short waits.
     node_result_notify: Arc<Notify>,
     #[cfg(target_os = "windows")]
     _windows_timer_guard: Option<crate::WindowsTimerResolutionGuard>,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        crate::cycle_trace::dump_histogram();
+    }
 }
 
 type MidiEditParseResult = (

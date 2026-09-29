@@ -13,11 +13,13 @@ pub mod audio_devices {
 }
 pub mod client;
 pub mod connectable;
+mod cycle_trace;
 mod engine;
 pub use engine::Engine;
 pub mod executor;
 pub mod history;
 mod hw;
+mod inline_render;
 pub mod kind;
 pub mod message;
 pub mod meter;

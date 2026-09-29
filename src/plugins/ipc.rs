@@ -21,6 +21,43 @@ const BLOCK_RESPONSE_SPIN_BUDGET: Duration = Duration::from_millis(2);
 /// host may run "eventless" and never write the completion byte).
 const BLOCK_RESPONSE_WAIT_SLICE: Duration = Duration::from_millis(5);
 
+/// Fallback plugin-wait ceiling before any audio device period is known (and
+/// after the device closes). Matches the historical fixed timeout.
+const DEFAULT_PLUGIN_WAIT_BOUND: Duration = Duration::from_millis(100);
+
+/// Current plugin-wait ceiling in nanoseconds, shared by every plugin proc.
+/// Updated by the engine when the audio device opens/closes; read on the RT
+/// cycle thread once per plugin block wait.
+static PLUGIN_WAIT_BOUND_NS: AtomicU64 = AtomicU64::new(100_000_000);
+
+/// Update the process-wide plugin-wait ceiling.
+pub fn set_plugin_wait_bound(bound: Duration) {
+    PLUGIN_WAIT_BOUND_NS.store(
+        bound.as_nanos().min(u64::MAX as u128) as u64,
+        Ordering::Release,
+    );
+}
+
+/// Restore the default no-device plugin-wait ceiling (100 ms). Called when
+/// the audio device closes or is replaced by one whose period is unknown
+/// (e.g. JACK, which paces externally).
+pub fn reset_plugin_wait_bound() {
+    set_plugin_wait_bound(DEFAULT_PLUGIN_WAIT_BOUND);
+}
+
+/// The plugin-wait ceiling the plugin procs must pass to
+/// [`wait_block_response`]: `min(100 ms, 2 × period)` when an audio device is
+/// open, 100 ms otherwise.
+pub fn plugin_wait_timeout() -> Duration {
+    Duration::from_nanos(PLUGIN_WAIT_BOUND_NS.load(Ordering::Acquire))
+}
+
+/// Compute the wait bound for a device period: `min(100 ms, 2 × period)`.
+pub fn plugin_wait_bound_for_period(cycle_samples: usize, sample_rate: usize) -> Duration {
+    let period = Duration::from_secs_f64(cycle_samples as f64 / sample_rate.max(1) as f64);
+    DEFAULT_PLUGIN_WAIT_BOUND.min(period.saturating_mul(2))
+}
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -377,6 +414,27 @@ pub unsafe fn configure_shm_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_wait_bound_scales_with_period_until_capped() {
+        // 512 frames @ 48 kHz: 2 × period ≈ 21.3 ms, well under the cap.
+        let small = plugin_wait_bound_for_period(512, 48_000);
+        assert!(
+            small > Duration::from_millis(21) && small < Duration::from_millis(22),
+            "512@48k bound should be ~21.3 ms, got {small:?}"
+        );
+        // 4096 frames @ 48 kHz: 2 × period ≈ 170.7 ms, capped at 100 ms.
+        let large = plugin_wait_bound_for_period(4096, 48_000);
+        assert_eq!(large, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn plugin_wait_bound_setter_updates_timeout() {
+        set_plugin_wait_bound(Duration::from_millis(21));
+        assert_eq!(plugin_wait_timeout(), Duration::from_millis(21));
+        set_plugin_wait_bound(DEFAULT_PLUGIN_WAIT_BOUND);
+        assert_eq!(plugin_wait_timeout(), Duration::from_millis(100));
+    }
 
     #[test]
     fn wait_block_response_fast_path_notices_counter() {

@@ -19,6 +19,17 @@ pub trait HwWorkerDriver {
     /// do not support plan-based I/O yet ignore it.
     fn set_plan_slot(&mut self, _slot: std::sync::Arc<crate::render_plan::PlanSlot>) {}
 
+    /// Give the driver the RT-inline render context. When set, the driver's
+    /// cycle must invoke `InlineRender::render_cycle` on the cycle thread
+    /// after filling the capture arena and before draining the playback
+    /// arena. Backends without the mid-cycle hook ignore it (the engine then
+    /// keeps the worker-pool render pipeline).
+    fn set_inline_render(
+        &mut self,
+        _ctx: Option<std::sync::Arc<crate::inline_render::InlineRender>>,
+    ) {
+    }
+
     /// File descriptors for async I/O via kqueue/AsyncFd.
     /// When both return `Some`, the HW worker uses an async select loop
     /// instead of the blocking assist thread.

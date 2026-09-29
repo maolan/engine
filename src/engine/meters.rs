@@ -6,54 +6,53 @@ impl Engine {
         {}
     }
 
-    pub(crate) async fn apply_hw_out_gain_and_meter(&mut self) {
+    /// Current hardware-output gain/balance as configured by the user.
+    pub(crate) fn hw_out_gain_balance(&self) -> (f32, f32) {
         let gain = if self.meters.hw_out_muted {
             0.0
         } else {
             10.0_f32.powf(self.meters.hw_out_level_db / 20.0)
         };
+        (gain, self.meters.hw_out_balance)
+    }
 
-        // Send master gain/balance to the driver. If there is no active audio
-        // backend there is nothing further to meter.
+    /// Send the master gain/balance to the driver. Called on the pre-Go path
+    /// so the value reaches the driver before the cycle that applies it.
+    pub(crate) async fn send_hw_out_gain_balance(&mut self) {
+        let (gain, balance) = self.hw_out_gain_balance();
         if let Some(worker) = &self.hw_worker {
             let _ = worker
                 .tx
-                .send(Message::HWSetOutputGainBalance {
-                    gain,
-                    balance: self.meters.hw_out_balance,
-                })
+                .send(Message::HWSetOutputGainBalance { gain, balance })
                 .await;
         } else {
             #[cfg(unix)]
             {
                 if let Some(jack) = self.jack_runtime.as_ref() {
                     jack.set_output_gain_linear(gain);
-                    jack.set_output_balance(self.meters.hw_out_balance);
-                } else {
-                    return;
+                    jack.set_output_balance(balance);
                 }
             }
-            #[cfg(not(unix))]
-            {
-                return;
-            }
         }
+    }
 
+    /// Peak-hold meter over a plan's hardware-output arena. On the pool path
+    /// this is the render that just finished; on the inline path the arena
+    /// still holds the cycle's render output when the `HWFinished` handler
+    /// runs (the next render only happens after the next Go).
+    pub(crate) async fn apply_hw_out_meter_from_plan(
+        &mut self,
+        plan: &crate::render_plan::RenderPlan,
+    ) {
         if self.meters.meter_decay_after_stop.is_some() {
             return;
         }
-
         let should_notify_interval = self.meters.should_publish_hw_out_meters();
         if !should_notify_interval {
             return;
         }
-
-        let plan = self.executor.plan().clone();
-        let peaks_linear = crate::hw::common::output_meter_linear_from_plan(
-            &plan,
-            gain,
-            self.meters.hw_out_balance,
-        );
+        let (gain, balance) = self.hw_out_gain_balance();
+        let peaks_linear = crate::hw::common::output_meter_linear_from_plan(plan, gain, balance);
         if self.meters.hw_out_peak_hold_linear.len() != peaks_linear.len() {
             self.meters
                 .hw_out_peak_hold_linear
@@ -77,6 +76,16 @@ impl Engine {
         }
     }
 
+    pub(crate) async fn apply_hw_out_gain_and_meter(&mut self) {
+        self.send_hw_out_gain_balance().await;
+        if self.hw_worker.is_none() && !self.jack_runtime_is_some() {
+            // No active audio backend: gain sent (no-op), nothing to meter.
+            return;
+        }
+        let plan = self.executor.plan().clone();
+        self.apply_hw_out_meter_from_plan(&plan).await;
+    }
+
     pub(crate) async fn publish_track_meters(&mut self) {
         if !self.meters.should_publish_track_meters() {
             return;
@@ -94,12 +103,16 @@ impl Engine {
             .collect();
         let mut snapshot = Vec::with_capacity(tracks.len());
         for (name, track) in &tracks {
-            let linear = self
-                .meters
-                .track_meter_linear_by_track
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| track.lock().output_meter_linear());
+            let track = track.lock();
+            let linear = if track.muted() {
+                vec![0.0; track.audio.outs.len()]
+            } else {
+                self.meters
+                    .track_meter_linear_by_track
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| track.output_meter_linear())
+            };
             let output_db = linear
                 .iter()
                 .copied()

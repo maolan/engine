@@ -59,6 +59,11 @@ impl Engine {
             collector,
         );
         let executor = crate::executor::CycleExecutor::new(plan_slot.clone());
+        // RT-inline render context (Phase 2 of the latency rearchitecture):
+        // always constructed (it also carries the shared audio preview);
+        // `rt_inline_enabled` gates the actual inline cycle path and is set
+        // when an audio device with the mid-cycle render hook opens.
+        let inline_render = crate::inline_render::InlineRender::new(plan_slot.clone());
         Self {
             rx,
             tx,
@@ -97,7 +102,8 @@ impl Engine {
             history_group: None,
             history_suspended: false,
             midi_learn: Default::default(),
-            audio_preview: None,
+            inline_render,
+            rt_inline_enabled: false,
             #[cfg(target_os = "windows")]
             _windows_timer_guard: crate::enable_windows_high_resolution_timer(),
             node_result_notify: Arc::new(Notify::new()),
@@ -280,6 +286,7 @@ impl Engine {
         }
         self.hw_driver = None;
         self.hw_driver_info = None;
+        crate::plugins::ipc::reset_plugin_wait_bound();
         self.hw_input_ports.clear();
         self.hw_output_ports.clear();
         self.notify_clients(Ok(Action::Quit)).await;

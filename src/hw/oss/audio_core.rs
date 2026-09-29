@@ -212,6 +212,19 @@ impl DoubleBufferedChannel {
         }
     }
 
+    /// Read cursor in the device's cumulative frame base (the same base as
+    /// `SNDCTL_DSP_GETIPTR`): the end of the capture window consumed so far.
+    /// For the inline render staleness check this is the correct anchor — it
+    /// names the frames the current cycle actually read, unlike the raw
+    /// GETIPTR head, which leads it by the ring backlog. `None` for write
+    /// channels.
+    pub(super) fn read_data_end_frame(&self) -> Option<i64> {
+        match &self.kind {
+            ChannelKind::Read(read) => Some(read.read_position),
+            ChannelKind::Write(_) => None,
+        }
+    }
+
     pub(super) fn process(&mut self, audio: &mut Audio, now: i64) -> std::io::Result<()> {
         let now = now - (now % audio.stepping());
         match &mut self.kind {

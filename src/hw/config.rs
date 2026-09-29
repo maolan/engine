@@ -19,6 +19,20 @@ pub fn env_flag(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Opt-out flag: true only when the variable is set to a disabling value
+/// (`0`, `false`, `no`, `off`). Unset means enabled — the inverse of
+/// [`env_flag`]. Used for features that are on by default (e.g.
+/// `MAOLAN_RT_INLINE`).
+pub fn env_opt_out(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            s == "0" || s == "false" || s == "no" || s == "off"
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

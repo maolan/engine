@@ -112,11 +112,25 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(unix)]
+    /// Shared `HWFinished` handling for the hw-worker path
+    /// (`Message::HWFinished`) and the JACK poll path
+    /// (`poll_jack_hw_finished`). Post-cycle work runs here: record taps,
+    /// meters/notifications (may lag a cycle on the inline path), transport
+    /// advance, then the next cycle is scheduled — a plan dispatch on the
+    /// pool path, a Go on the RT-inline path.
     pub(crate) async fn handle_hw_finished(&mut self) {
         if !self.transport.awaiting_hwfinished {
+            tracing::debug!(
+                playing = self.transport.playing,
+                transport_running = self.transport.transport_running,
+                transport_sample = self.transport.transport_sample,
+                session_transport_sample = self.transport.session_transport_sample,
+                cycle_samples = self.current_cycle_samples(),
+                "HWFinished ignored because engine was not awaiting it"
+            );
             return;
         }
+        crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwFinishedReceived);
         tracing::debug!(
             playing = self.transport.playing,
             transport_running = self.transport.transport_running,
@@ -127,6 +141,14 @@ impl Engine {
         );
         self.transport.handling_hwfinished = true;
         self.transport.awaiting_hwfinished = false;
+        if self.rt_inline_enabled {
+            // Collect the cycle thread's outcome (meters, parameter echoes,
+            // forwarded MIDI-in) and hand deferred bounce jobs to their
+            // workers — both replace `on_all_tracks_finished`, which only
+            // runs on the pool path.
+            self.drain_inline_outcome().await;
+            self.handoff_pending_bounce_starts().await;
+        }
         #[cfg(unix)]
         {
             if let Some(jack) = self.jack_runtime.as_mut() {
@@ -157,6 +179,12 @@ impl Engine {
         self.apply_mute_solo_policy();
         self.append_recorded_cycle();
         self.flush_completed_recordings().await;
+        if self.rt_inline_enabled {
+            // MIDI-out collection replaces `on_all_tracks_finished`; it must
+            // run before the transport advance (the loop-wrap note-off math
+            // is relative to the position the cycle just rendered).
+            self.collect_hw_midi_out_for_next_cycle();
+        }
         let hw_in_routes = self.hw_midi.midi_hw_in_routes.clone();
         let pending_hw_in_by_device = self.hw_midi.pending_hw_midi_events_by_device.clone();
         let mut reconfigured_tracks = Vec::new();
@@ -167,7 +195,9 @@ impl Engine {
                 if !self.hw_midi.pending_hw_midi_events.is_empty() {
                     track_lock.push_hw_midi_events(&self.hw_midi.pending_hw_midi_events);
                 }
-            } else {
+            } else if !self.rt_inline_enabled {
+                // Inline: the Go sender delivers buffered MIDI-in events to
+                // the ports right before the cycle that renders them.
                 for route in hw_in_routes.iter().filter(|r| &r.to_track == track_name) {
                     if let Some(events) = pending_hw_in_by_device.get(&route.device) {
                         track_lock.push_hw_midi_events_to_port(route.to_port, events);
@@ -202,13 +232,21 @@ impl Engine {
             }
         }
         self.hw_midi.pending_hw_midi_events.clear();
-        self.hw_midi.pending_hw_midi_events_by_device.clear();
+        if !self.rt_inline_enabled {
+            self.hw_midi.pending_hw_midi_events_by_device.clear();
+        }
         let cycle_samples = self.current_cycle_samples();
         if self.transport.transport_running {
             if self.transport.transport_panic_flush_pending {
                 self.transport.transport_panic_flush_pending = false;
+                // The transport did not advance: the next Go repeats the
+                // tag while the device moved on. Re-anchor the inline
+                // staleness check so the repeated tag is not flagged stale.
+                self.inline_render.invalidate_anchor();
             } else if self.transport.transport_restart_pending {
                 self.transport.transport_restart_pending = false;
+                // Same re-anchoring for the transport-restart priming cycle.
+                self.inline_render.invalidate_anchor();
             } else {
                 let before = self.transport.transport_sample;
                 let next = self
@@ -262,6 +300,10 @@ impl Engine {
                 "session transport advanced after HWFinished"
             );
         }
+        crate::cycle_trace::mark(crate::cycle_trace::TracePoint::TransportAdvanced);
+        if let Some(due) = crate::cycle_trace::take_summary_due() {
+            crate::cycle_trace::log_summary(due);
+        }
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
             self.dispatch_automation_echoes(echoes).await;
@@ -272,7 +314,7 @@ impl Engine {
         // hardware cycle. Requesting here would replay stale arena buffers.
         if self.hw_worker.is_some()
             && !cycle_started
-            && (self.transport.playing || self.audio_preview.is_some())
+            && (self.transport.playing || self.inline_render.preview_active())
             && self.executor.cycle_complete()
         {
             self.request_hw_cycle().await;
@@ -471,6 +513,7 @@ impl Engine {
         };
 
         self.transport.playing = false;
+        crate::cycle_trace::dump_histogram();
         self.bump_prepare_generation();
         self.transport.transport_running = false;
         self.transport.transport_panic_flush_pending = false;
@@ -767,46 +810,6 @@ impl Engine {
 }
 
 impl Engine {
-    pub(crate) fn mix_audio_preview_into_hw_outputs(&mut self) {
-        let cycle_samples = self.current_cycle_samples();
-        if cycle_samples == 0 {
-            return;
-        }
-        let plan = self.executor.plan().clone();
-        let Some(preview) = self.audio_preview.as_mut() else {
-            return;
-        };
-        let channels = preview.channels.max(1);
-        let total_frames = preview.samples.len() / channels;
-        if preview.cursor >= total_frames {
-            self.audio_preview = None;
-            return;
-        }
-
-        for &(buffer, channel) in &plan.hw_out_map {
-            // Safety: request_hw_cycle runs after all render-plan producers
-            // completed for this hardware cycle and before the hardware
-            // backend reads the output arena.
-            let dst = unsafe { &mut *plan.buffer_ptr(buffer) };
-            let frames = cycle_samples.min(dst.len());
-            dst[..frames].fill(0.0);
-            let source_channel = channel.min(channels - 1);
-            for (frame, out) in dst.iter_mut().take(frames).enumerate() {
-                let source_frame = preview.cursor + frame;
-                if source_frame >= total_frames {
-                    break;
-                }
-                let sample_index = source_frame * channels + source_channel;
-                *out = preview.samples.get(sample_index).copied().unwrap_or(0.0);
-            }
-        }
-
-        preview.cursor = preview.cursor.saturating_add(cycle_samples);
-        if preview.cursor >= total_frames {
-            self.audio_preview = None;
-        }
-    }
-
     /// Start the next audio cycle: pull any published plan, copy hardware
     /// inputs, and dispatch the seed jobs. Returns true when the cycle
     /// completed instantly (empty plan) and `on_all_tracks_finished` ran.

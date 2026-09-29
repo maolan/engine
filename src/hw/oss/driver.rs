@@ -174,6 +174,11 @@ impl HwDriver {
         self.playback.set_plan_slot(slot);
     }
 
+    pub fn set_inline_render(&mut self, ctx: Option<Arc<crate::inline_render::InlineRender>>) {
+        self.capture.set_inline_render(ctx.clone());
+        self.playback.set_inline_render(ctx);
+    }
+
     pub fn output_meter_linear(&self, gain: f32, balance: f32) -> Vec<f32> {
         if let Some(slot) = &self.playback.plan_slot {
             let plan = slot.load();

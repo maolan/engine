@@ -9,7 +9,7 @@ use crate::hw::wasapi::MidiHub;
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
     history::UndoEntry,
-    message::{Action, HwMidiEvent, Message, ProcessTask},
+    message::{Action, Message, ProcessTask},
 };
 use std::{
     sync::atomic::Ordering,
@@ -121,6 +121,10 @@ impl Engine {
     }
 
     pub(crate) async fn request_hw_cycle(&mut self) {
+        if self.rt_inline_enabled {
+            self.request_inline_cycle().await;
+            return;
+        }
         if self.transport.awaiting_hwfinished {
             tracing::debug!(
                 playing = self.transport.playing,
@@ -132,7 +136,11 @@ impl Engine {
             );
             return;
         }
-        self.mix_audio_preview_into_hw_outputs();
+        crate::inline_render::mix_preview_into_hw_outs(
+            &self.inline_render,
+            self.executor.plan(),
+            self.current_cycle_samples(),
+        );
         tracing::debug!(
             playing = self.transport.playing,
             transport_running = self.transport.transport_running,
@@ -166,6 +174,7 @@ impl Engine {
             match worker.tx.send(Message::TracksFinished).await {
                 Ok(_) => {
                     self.transport.awaiting_hwfinished = true;
+                    crate::cycle_trace::mark(crate::cycle_trace::TracePoint::GoSent);
                 }
                 Err(e) => {
                     error!("Error sending TracksFinished {e}");
@@ -305,6 +314,12 @@ impl Engine {
     }
 
     pub(crate) async fn start_plan_cycle(&mut self) -> bool {
+        if self.rt_inline_enabled {
+            // The render executes on the cycle thread; the Go sender
+            // prepares the plan's task tracks and arms the render flag.
+            self.request_inline_cycle().await;
+            return false;
+        }
         // While a bounce job exists, plan cycles are suspended: the bounce
         // worker renders through live track bodies and must be their only
         // mutator (LOCKLESS.md Phase 5, 5b-iii).
@@ -324,7 +339,9 @@ impl Engine {
             self.clear_processing_buffers_before_playback();
         }
         let jobs = self.executor.start_cycle(Instant::now());
-        if self.dispatch_node_jobs(jobs).await {
+        let completed = self.dispatch_node_jobs(jobs).await;
+        crate::cycle_trace::mark(crate::cycle_trace::TracePoint::RenderDispatched);
+        if completed {
             self.on_all_tracks_finished().await;
             return true;
         }
@@ -453,51 +470,11 @@ impl Engine {
     }
 
     pub(crate) async fn on_all_tracks_finished(&mut self) {
+        crate::cycle_trace::mark(crate::cycle_trace::TracePoint::RenderEnd);
         // Hand deferred bounce jobs to their workers now that no plan cycle
         // is in flight (see handle_track_offline_bounce).
-        let pending = std::mem::take(&mut self.dispatch.pending_bounce_starts);
-        for (worker_index, job) in pending {
-            self.send_bounce_job(worker_index, job).await;
-        }
-        if self.transport.transport_restart_pending {
-            let state = self.state_snapshot.load_full();
-            for track in state.tracks.values() {
-                track.lock().take_hw_midi_out_events();
-            }
-        } else if self.hw_worker.is_some() {
-            self.hw_midi.active_hw_notes_cycle_start =
-                self.hw_midi.active_hw_notes_by_track.clone();
-            let mut out_events = self.collect_hw_midi_output_events_by_device();
-            if self.transport.loop_enabled
-                && let Some((_, loop_end)) = self.transport.loop_range_samples
-            {
-                let cycle_end = self
-                    .transport
-                    .transport_sample
-                    .saturating_add(self.current_cycle_samples());
-                if self.transport.transport_sample < loop_end && cycle_end >= loop_end {
-                    let wrap_frame = loop_end
-                        .saturating_sub(self.transport.transport_sample)
-                        .min(self.current_cycle_samples())
-                        as u32;
-                    out_events.extend(self.note_off_events_for_active_snapshot(
-                        &self.hw_midi.active_hw_notes_cycle_start,
-                        wrap_frame,
-                    ));
-                    out_events.sort_by(|a, b| {
-                        a.event
-                            .frame
-                            .cmp(&b.event.frame)
-                            .then_with(|| a.device.cmp(&b.device))
-                    });
-                }
-            }
-            self.hw_midi
-                .pending_hw_midi_out_events_by_device
-                .extend(out_events);
-        } else {
-            self.hw_midi.pending_hw_midi_out_events = self.collect_hw_midi_output_events();
-        }
+        self.handoff_pending_bounce_starts().await;
+        self.collect_hw_midi_out_for_next_cycle();
         self.request_hw_cycle().await;
     }
 
@@ -986,254 +963,25 @@ impl Engine {
                     self.drain_pending_requests_if_idle().await;
                 }
                 Message::HWFinished => {
-                    if !self.transport.awaiting_hwfinished {
-                        tracing::debug!(
-                            playing = self.transport.playing,
-                            transport_running = self.transport.transport_running,
-                            transport_sample = self.transport.transport_sample,
-                            session_transport_sample = self.transport.session_transport_sample,
-                            cycle_samples = self.current_cycle_samples(),
-                            "HWFinished ignored because engine was not awaiting it"
-                        );
-                        continue;
-                    }
-                    tracing::debug!(
-                        playing = self.transport.playing,
-                        transport_running = self.transport.transport_running,
-                        transport_sample = self.transport.transport_sample,
-                        session_transport_sample = self.transport.session_transport_sample,
-                        cycle_samples = self.current_cycle_samples(),
-                        "HWFinished handling"
-                    );
-                    self.transport.handling_hwfinished = true;
-                    self.transport.awaiting_hwfinished = false;
-                    #[cfg(unix)]
-                    {
-                        if let Some(jack) = self.jack_runtime.as_mut() {
-                            if !self.hw_midi.pending_hw_midi_out_events.is_empty() {
-                                let out_events =
-                                    std::mem::take(&mut self.hw_midi.pending_hw_midi_out_events);
-                                jack.write_events(&out_events);
-                            }
-                            let mut in_events = vec![];
-                            jack.read_events_into(&mut in_events);
-                            if !in_events.is_empty() {
-                                self.hw_midi.pending_hw_midi_events.extend(in_events);
-                            }
-                            let dropped = jack.take_midi_events_dropped();
-                            if dropped > 0 {
-                                tracing::warn!(
-                                    "JACK MIDI ring full; {dropped} events dropped since last cycle"
-                                );
-                            }
-                        }
-                    }
-                    #[cfg(unix)]
-                    if self.jack_runtime.is_some() {
-                        self.sync_from_jack_transport().await;
-                    }
-                    while let Some(a) = self.dispatch.pending_requests.pop_front() {
-                        self.handle_request(a).await;
-                    }
-                    self.apply_mute_solo_policy();
-                    self.append_recorded_cycle();
-                    self.flush_completed_recordings().await;
-                    let hw_in_routes = self.hw_midi.midi_hw_in_routes.clone();
-                    let pending_hw_in_by_device =
-                        self.hw_midi.pending_hw_midi_events_by_device.clone();
-                    let mut reconfigured_tracks = Vec::new();
-                    let state = self.state_snapshot.load_full();
-                    for (track_name, track) in state.tracks.iter() {
-                        let mut track_lock = track.lock();
-                        if self.jack_runtime_is_some() {
-                            if !self.hw_midi.pending_hw_midi_events.is_empty() {
-                                track_lock
-                                    .push_hw_midi_events(&self.hw_midi.pending_hw_midi_events);
-                            }
-                        } else {
-                            for route in hw_in_routes.iter().filter(|r| &r.to_track == track_name) {
-                                if let Some(events) = pending_hw_in_by_device.get(&route.device) {
-                                    track_lock.push_hw_midi_events_to_port(route.to_port, events);
-                                }
-                            }
-                        }
-                        if track_lock.setup() {
-                            reconfigured_tracks.push(track_name.clone());
-                        }
-                    }
-                    self.publish_track_meters().await;
-                    self.publish_session_runtime_reports().await;
-                    self.publish_clap_state_dirty().await;
-                    for track_name in reconfigured_tracks {
-                        let track = state.tracks.get(&track_name).cloned();
-                        if let Some(track) = track {
-                            let (plugins, connections, connectable_connections) = {
-                                let track_lock = track.lock();
-                                (
-                                    track_lock.plugin_graph_plugins(false),
-                                    track_lock.plugin_graph_connections(),
-                                    track_lock.connectable_connections(),
-                                )
-                            };
-                            self.notify_query_reply(QueryReply::TrackPluginGraph {
-                                track_name: track_name.clone(),
-                                plugins,
-                                connections,
-                                connectable_connections,
-                            })
-                            .await;
-                        }
-                    }
-                    self.hw_midi.pending_hw_midi_events.clear();
-                    self.hw_midi.pending_hw_midi_events_by_device.clear();
-                    let cycle_samples = self.current_cycle_samples();
-                    if self.transport.transport_running {
-                        if self.transport.transport_panic_flush_pending {
-                            self.transport.transport_panic_flush_pending = false;
-                        } else if self.transport.transport_restart_pending {
-                            self.transport.transport_restart_pending = false;
-                        } else {
-                            let before = self.transport.transport_sample;
-                            let next = self
-                                .transport
-                                .transport_sample
-                                .saturating_add(cycle_samples);
-                            let normalized = self.transport.normalize_transport_sample(next);
-                            let wrapped = normalized != next;
-                            self.transport.transport_sample = normalized;
-                            // The per-cycle advance reaches tracks through
-                            // the mirrored lock-free snapshot; see
-                            // `handle_hw_finished`.
-                            tracing::debug!(
-                                before,
-                                delta = cycle_samples,
-                                next,
-                                normalized,
-                                wrapped,
-                                "transport advanced after HWFinished"
-                            );
-                            self.publish_transport_snapshot();
-                            if wrapped {
-                                if self.transport.notified_loop_wrap_sample
-                                    == Some(self.transport.transport_sample)
-                                {
-                                    self.transport.notified_loop_wrap_sample = None;
-                                } else {
-                                    self.notify_event(Event::TransportPosition(
-                                        self.transport.transport_sample,
-                                    ))
-                                    .await;
-                                }
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            playing = self.transport.playing,
-                            cycle_samples,
-                            "transport not advanced because transport_running is false"
-                        );
-                    }
-                    if self.transport.session_clip_playback_enabled && self.transport.playing {
-                        let before = self.transport.session_transport_sample;
-                        self.transport.session_transport_sample = self
-                            .transport
-                            .session_transport_sample
-                            .saturating_add(cycle_samples);
-                        tracing::debug!(
-                            before,
-                            delta = cycle_samples,
-                            after = self.transport.session_transport_sample,
-                            "session transport advanced after HWFinished"
-                        );
-                    }
-                    {
-                        let echoes = self.apply_modulators(self.active_transport_sample());
-                        self.dispatch_automation_echoes(echoes).await;
-                    }
-                    self.apply_mixosc_automation(self.active_transport_sample());
-                    let cycle_started = self.start_plan_cycle().await;
-                    // If a plan cycle is still running, its completion will request the
-                    // hardware cycle. Requesting here would replay stale arena buffers.
-                    if self.hw_worker.is_some()
-                        && !cycle_started
-                        && (self.transport.playing || self.audio_preview.is_some())
-                        && self.executor.cycle_complete()
-                    {
-                        self.request_hw_cycle().await;
-                    }
-                    tracing::debug!(
-                        cycle_started,
-                        hw_worker = self.hw_worker.is_some(),
-                        awaiting_hwfinished = self.transport.awaiting_hwfinished,
-                        executor_complete = self.executor.cycle_complete(),
-                        "HWFinished rearm decision"
-                    );
-                    #[cfg(unix)]
-                    {
-                        if self.jack_runtime.is_some() {
-                            self.transport.awaiting_hwfinished = true;
-                        }
-                    }
-                    self.transport.handling_hwfinished = false;
+                    self.handle_hw_finished().await;
                 }
                 Message::HWMidiEvents(events) => {
-                    for hw_event in events {
-                        let thru_targets: Vec<String> = self
-                            .hw_midi
-                            .midi_hw_thru_routes
-                            .iter()
-                            .filter(|route| route.from_device == hw_event.device)
-                            .map(|route| route.to_device.clone())
-                            .collect();
-                        for device in thru_targets {
-                            self.hw_midi
-                                .pending_hw_midi_out_events_by_device
-                                .push(HwMidiEvent {
-                                    device,
-                                    event: hw_event.event.clone(),
-                                });
-                        }
-                        if hw_event.event.data.len() >= 3 {
-                            let status = hw_event.event.data[0];
-                            if status & 0xF0 == 0xB0 {
-                                let channel = status & 0x0F;
-                                let cc = hw_event.event.data[1];
-                                let value = hw_event.event.data[2];
-                                self.handle_incoming_hw_cc(&hw_event.device, channel, cc, value)
-                                    .await;
-                            }
-                            if self.recording.step_recording_enabled && status & 0xF0 == 0x90 {
-                                let channel = status & 0x0F;
-                                let pitch = hw_event.event.data[1];
-                                let velocity = hw_event.event.data[2];
-                                if velocity > 0 {
-                                    self.notify_event(Event::StepRecordMidiNote {
-                                        device: hw_event.device.clone(),
-                                        channel,
-                                        pitch,
-                                        velocity,
-                                    })
-                                    .await;
-                                }
-                            }
-                        }
-                        self.hw_midi
-                            .pending_hw_midi_events_by_device
-                            .entry(hw_event.device)
-                            .or_default()
-                            .push(hw_event.event);
-                    }
+                    // Events from the hw worker's between-cycle drains; they
+                    // are buffered for the track-port push (which the pool
+                    // path runs in `handle_hw_finished` and the inline path
+                    // runs in the Go sender). Events forwarded by the inline
+                    // cycle thread arrive via `drain_inline_outcome` already
+                    // delivered to the ports and call this with
+                    // `buffer_for_ports = false`.
+                    self.handle_hw_midi_in_events(events, true).await;
                 }
                 Message::StartAudioPreview {
                     samples,
                     channels,
                     start_sample,
                 } => {
-                    self.audio_preview = Some(AudioPreviewPlayback {
-                        samples,
-                        channels: channels.max(1),
-                        cursor: start_sample,
-                    });
+                    self.inline_render
+                        .publish_preview(samples, channels, start_sample);
                     self.meters.meter_decay_after_stop = None;
                     self.set_hw_playing(true).await;
                     if !self.transport.awaiting_hwfinished && self.executor.cycle_complete() {
@@ -1241,7 +989,7 @@ impl Engine {
                     }
                 }
                 Message::StopAudioPreview => {
-                    self.audio_preview = None;
+                    self.inline_render.clear_preview();
                 }
                 _ => {}
             }

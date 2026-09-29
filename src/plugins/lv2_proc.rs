@@ -675,7 +675,8 @@ impl Lv2Processor {
             return Vec::new();
         }
 
-        let timeout = Duration::from_millis(100);
+        let timeout = ipc::plugin_wait_timeout();
+        let _plugin_wait = crate::cycle_trace::plugin_wait();
         match ipc::wait_block_response(unsafe { response_counter(ptr) }, events, timeout) {
             Ok(()) => {}
             Err(_) => {

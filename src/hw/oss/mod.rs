@@ -85,6 +85,14 @@ pub struct Audio {
     /// Current render plan; when set, the RT cycle reads/writes plan arena
     /// buffers instead of the legacy port buffers.
     plan_slot: Option<Arc<crate::render_plan::PlanSlot>>,
+    /// RT-inline render context; when set, the duplex cycle executes the
+    /// render plan on the cycle thread between the capture fill and the
+    /// playback drain.
+    inline_render: Option<Arc<crate::inline_render::InlineRender>>,
+    /// Phase 4 back-pressure: the cycle thread's inline render was stale and
+    /// this playback drain must emit silence instead of the arena. Set and
+    /// consumed on the cycle thread only.
+    stale_silence_once: bool,
 }
 
 // Manual impl: `basedrop::Owned` (inside `PlanSlot`) has no `Debug` impl.
@@ -456,6 +464,8 @@ impl Audio {
             stop_fade_remaining_frames: 0,
             stop_fade_total_frames: 0,
             plan_slot: None,
+            inline_render: None,
+            stale_silence_once: false,
         };
 
         initial_audio.last_underrun_count = initial_audio.get_play_underruns();
@@ -470,6 +480,16 @@ impl Audio {
 
     pub fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
         self.plan_slot = Some(slot);
+    }
+
+    pub fn set_inline_render(&mut self, ctx: Option<Arc<crate::inline_render::InlineRender>>) {
+        self.inline_render = ctx;
+    }
+
+    /// Phase 4 back-pressure: the next `fill_output_buffer` writes silence
+    /// instead of draining the arena (a stale inline render was silenced).
+    pub fn write_silence_once(&mut self) {
+        self.stale_silence_once = true;
     }
 
     fn frame_size(&self) -> usize {
@@ -644,6 +664,17 @@ impl Audio {
         Some((info.bytes.max(0) as i64) / (frame_size as i64))
     }
 
+    /// End of the capture window actually consumed, in the same cumulative
+    /// frame base as [`Audio::current_capture_frame`]. Unlike the raw
+    /// GETIPTR head this accounts for the ring backlog: it names the data
+    /// the current cycle read. Used as the Phase 4 staleness anchor.
+    pub fn current_read_frame(&self) -> Option<i64> {
+        if !self.input {
+            return None;
+        }
+        self.channel.read_data_end_frame()
+    }
+
     pub fn frame_size_bytes(&self) -> usize {
         self.frame_size_bytes
     }
@@ -768,6 +799,7 @@ impl Audio {
                 &self.f32_buffer,
                 num_channels,
             );
+            crate::cycle_trace::mark(crate::cycle_trace::TracePoint::CaptureReadDone);
         } else {
             let all_connected = self
                 .channels
@@ -784,6 +816,15 @@ impl Audio {
     }
 
     fn fill_output_buffer(&mut self) {
+        if self.stale_silence_once {
+            // Phase 4 back-pressure: the inline render for this cycle was
+            // stale (the device moved a full period past the tagged
+            // transport). Emit silence; the transport resyncs in the
+            // dispatcher and the ring resyncs via the xrun jump machinery.
+            self.stale_silence_once = false;
+            self.buffer.as_mut_slice().fill(0);
+            return;
+        }
         let num_channels = self.channels.len();
         let playing = self.playing.load(Ordering::Relaxed);
         if self.was_playing_last_cycle && !playing {
@@ -826,6 +867,7 @@ impl Audio {
                     self.output_balance,
                     &mut write_sample,
                 );
+                crate::cycle_trace::mark(crate::cycle_trace::TracePoint::PlaybackWriteDone);
             } else {
                 crate::hw::ports::write_interleaved_from_ports(
                     &self.channels,
@@ -946,88 +988,6 @@ impl Drop for Audio {
                 let _ = libc::munmap(self.map, self.buffer_info.bytes as usize);
             }
             self.map = std::ptr::null_mut();
-        }
-    }
-}
-
-#[cfg(all(test, target_os = "freebsd"))]
-mod trigger_probe_tests {
-    use super::consts::{PCM_ENABLE_INPUT, PCM_ENABLE_OUTPUT};
-    use super::driver::HwDriver;
-    use super::ioctl::{CountInfo, oss_get_iptr, oss_get_optr, oss_set_trigger};
-
-    fn ptr_counts(driver: &HwDriver) -> (i64, i64) {
-        let mut iptr = CountInfo::default();
-        let mut optr = CountInfo::default();
-        unsafe {
-            let _ = oss_get_iptr(driver.input_fd(), &mut iptr);
-            let _ = oss_get_optr(driver.output_fd(), &mut optr);
-        }
-        (iptr.bytes as i64, optr.bytes as i64)
-    }
-
-    /// TEMPORARY probe (not for CI): with capture+playback in a sync group,
-    /// does clearing only PCM_ENABLE_OUTPUT on the playback fd halt playback
-    /// while capture keeps running? And does OR-ing it back restart cleanly,
-    /// repeatedly? Run with OSS_TEST_DEVICE (default /dev/dsp5).
-    #[test]
-    fn trigger_mask_probe() {
-        let device = std::env::var("OSS_TEST_DEVICE").unwrap_or_else(|_| "/dev/dsp5".to_string());
-        let Ok(driver) = HwDriver::new(&device, 48_000, 32) else {
-            eprintln!("OSS test device {device} unavailable; skipping");
-            return;
-        };
-        eprintln!("start_duplex_sync={}", driver.start_duplex_sync());
-        let out_fd = driver.output_fd();
-        let nap = std::time::Duration::from_millis(300);
-
-        let (i0, o0) = ptr_counts(&driver);
-        std::thread::sleep(nap);
-        let (i1, o1) = ptr_counts(&driver);
-        eprintln!(
-            "baseline: iptr {i0}->{i1} ({} B/s), optr {o0}->{o1} ({} B/s)",
-            (i1 - i0) * 1000 / nap.as_millis() as i64,
-            (o1 - o0) * 1000 / nap.as_millis() as i64,
-        );
-
-        for round in 1..=3 {
-            // Clear only the output bit on the playback fd.
-            let mask = PCM_ENABLE_INPUT;
-            unsafe {
-                oss_set_trigger(out_fd, &mask)
-                    .unwrap_or_else(|e| panic!("round {round}: set_trigger INPUT: {e}"));
-            }
-            let (i2, o2) = ptr_counts(&driver);
-            std::thread::sleep(nap);
-            let (i3, o3) = ptr_counts(&driver);
-            let out_stopped = o3 == o2;
-            let cap_runs = i3 > i2;
-            eprintln!(
-                "round {round} output-cleared: iptr {i2}->{i3} ({}), optr {o2}->{o3} (stopped={out_stopped})",
-                (i3 - i2) * 1000 / nap.as_millis() as i64,
-            );
-
-            // Restart output.
-            let mask = PCM_ENABLE_INPUT | PCM_ENABLE_OUTPUT;
-            unsafe {
-                oss_set_trigger(out_fd, &mask)
-                    .unwrap_or_else(|e| panic!("round {round}: set_trigger INPUT|OUTPUT: {e}"));
-            }
-            let (i4, o4) = ptr_counts(&driver);
-            std::thread::sleep(nap);
-            let (i5, o5) = ptr_counts(&driver);
-            let out_restarted = o5 > o4;
-            eprintln!(
-                "round {round} output-restarted: iptr {i4}->{i5} ({}), optr {o4}->{o5} (restarted={out_restarted})",
-                (i5 - i4) * 1000 / nap.as_millis() as i64,
-            );
-
-            assert!(out_stopped, "round {round}: playback did not stop");
-            assert!(
-                cap_runs,
-                "round {round}: capture stalled when output bit cleared"
-            );
-            assert!(out_restarted, "round {round}: playback did not restart");
         }
     }
 }

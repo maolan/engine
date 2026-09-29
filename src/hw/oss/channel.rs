@@ -175,6 +175,17 @@ impl<'a> DuplexChannelApi<'a> {
             return Err(std::io::Error::other("failed to requeue capture buffer"));
         }
         self.capture.process_ports();
+        if let Some(ctx) = self.capture.inline_render.as_ref() {
+            ctx.render_cycle(
+                self.capture.chsamples as u32,
+                self.capture.current_read_frame(),
+            );
+        }
+        if let Some(ctx) = self.capture.inline_render.as_ref()
+            && ctx.take_stale_silence()
+        {
+            self.playback.write_silence_once();
+        }
 
         self.check_time_and_run()?;
 
@@ -256,6 +267,23 @@ impl<'a> DuplexChannelApi<'a> {
             }
             self.capture.process_ports();
             self.update_now()?;
+        }
+
+        if let Some(ctx) = self.capture.inline_render.as_ref() {
+            ctx.render_cycle(
+                self.capture.chsamples as u32,
+                self.capture.current_read_frame(),
+            );
+        }
+        if let Some(ctx) = self.capture.inline_render.as_ref()
+            && ctx.take_stale_silence()
+        {
+            // Phase 4 back-pressure: the inline render was stale (the device
+            // moved a full period past the tagged transport). Write silence
+            // for this cycle instead of draining the arena — never emit
+            // stale content. The ring resyncs via the existing xrun jump
+            // machinery at the next cycle start.
+            self.playback.write_silence_once();
         }
 
         self.wait_for_playback_primary(assist_lock)?;
