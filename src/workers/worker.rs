@@ -438,18 +438,20 @@ impl Worker {
 
     fn collect_arena_source_slices(
         plan: &crate::render_plan::RenderPlan,
+        sources: &[Arc<crate::audio::io::AudioIO>],
         writable: &[crate::render_plan::BufferId],
         out: &mut Vec<(usize, &'static [f32], usize)>,
     ) {
-        out.extend(plan.port_map.iter().filter_map(|(&key, &buf)| {
+        out.extend(sources.iter().filter_map(|source| {
+            let key = Arc::as_ptr(source) as usize;
+            let &buf = plan.port_map.get(&key)?;
             if writable.contains(&buf) {
                 return None;
             }
-            // Safety: every returned buffer is excluded from this node's
-            // writable outputs. Its producer completed before this task
-            // because the plan routes folder-output dependencies from
-            // child and plugin producer nodes. The unbound slice is only
-            // read while this node executes.
+            // Safety: only the folder's inputs, child outputs and plugin
+            // outputs are borrowed. Their producers precede folder output
+            // in the DAG. Borrowing every arena buffer here would alias
+            // writes from unrelated nodes running on other workers.
             let slice = unsafe { Self::unbound_slice(plan.buffer(buf)) };
             Some((key, slice, plan.buffer_latency(buf)))
         }));
@@ -517,6 +519,19 @@ impl Worker {
                         plan.set_buffer_latency(*output, 0);
                         (Vec::new(), Vec::new(), false)
                     }
+                    Op::IoDelayGenerator { node, output } => {
+                        // Safety: this worker owns the generator output buffer.
+                        let out_buf = unsafe { &mut *plan.buffer_ptr(*output) };
+                        node.process_generator(out_buf);
+                        plan.set_buffer_latency(*output, 0);
+                        (Vec::new(), Vec::new(), false)
+                    }
+                    Op::IoDelayMeasurement { node, input } => {
+                        // Safety: this worker reads the input after its Sum node completed.
+                        let in_buf = unsafe { plan.buffer(*input) };
+                        node.process(in_buf);
+                        (Vec::new(), Vec::new(), false)
+                    }
                     Op::Task { task, ins, outs } => {
                         let track = match task {
                             ProcessTask::Track(t)
@@ -549,11 +564,22 @@ impl Worker {
                                         .iter()
                                         .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
                                 );
-                                Self::collect_arena_source_slices(
-                                    &plan,
-                                    outs,
-                                    &mut scratch.source_buffers,
-                                );
+                                // The track body appends its own inputs and
+                                // inline plugin outputs after processing them.
+                                // Do not borrow arena inputs while inputs_mut
+                                // owns them, or unrelated workers' buffers.
+                                // Keep only input latency metadata here; the
+                                // track replaces the empty slices after its
+                                // in-place input processing has finished.
+                                scratch
+                                    .source_buffers
+                                    .extend(t.audio.ins.iter().zip(ins).map(|(port, &buffer)| {
+                                        (
+                                            Arc::as_ptr(port) as usize,
+                                            &[][..],
+                                            plan.buffer_latency(buffer),
+                                        )
+                                    }));
                                 // Safety: this worker executes the unique producer
                                 // node for each output buffer.
                                 scratch.output_ptrs.extend(
@@ -626,6 +652,7 @@ impl Worker {
                             ProcessTask::FolderOutput(_) => {
                                 Self::collect_arena_source_slices(
                                     &plan,
+                                    &t.internal_audio_sources(),
                                     outs,
                                     &mut scratch.source_buffers,
                                 );

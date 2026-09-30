@@ -671,6 +671,20 @@ impl Engine {
                     return;
                 }
             }
+            // In-engine MTDM latency measurement component.
+            Action::IoDelayCalibrate { measurement_id } => {
+                self.handle_iodelay_calibrate(measurement_id).await;
+            }
+            Action::IoDelayConfigure { enabled, gain } => {
+                self.handle_iodelay_configure(enabled, gain).await;
+            }
+            Action::IoDelayAddMeasurement {
+                measurement_id,
+                gain,
+            } => {
+                self.handle_iodelay_add_measurement(measurement_id, gain)
+                    .await;
+            }
             // MIDI: piano key input, MIDI clip edits, MIDI learn, hardware
             // MIDI device open, panic.
             Action::Panic
@@ -964,6 +978,7 @@ impl Engine {
                 }
                 Message::HWFinished => {
                     self.handle_hw_finished().await;
+                    self.drain_iodelay_report().await;
                 }
                 Message::HWMidiEvents(events) => {
                     // Events from the hw worker's between-cycle drains; they

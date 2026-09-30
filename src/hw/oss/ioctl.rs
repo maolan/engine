@@ -97,17 +97,9 @@ impl BufferInfo {
 
 #[repr(C)]
 #[derive(Debug, Default)]
-pub(super) struct CountInfo {
-    pub(super) bytes: libc::c_int,
-    pub(super) blocks: libc::c_int,
-    pub(super) ptr: libc::c_int,
-}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub(super) struct OssCount {
-    pub(super) samples: i64,
-    pub(super) fifo_samples: libc::c_int,
+pub(crate) struct OssCount {
+    pub(crate) samples: i64,
+    pub(crate) fifo_samples: libc::c_int,
     pub(super) filler: [libc::c_int; 32],
 }
 
@@ -199,8 +191,6 @@ const SNDCTL_DSP_GETOSPACE: u8 = 12;
 const SNDCTL_DSP_GETISPACE: u8 = 13;
 const SNDCTL_DSP_GETCAPS: u8 = 15;
 const SNDCTL_DSP_SETTRIGGER: u8 = 16;
-const SNDCTL_DSP_GETIPTR: u8 = 17;
-const SNDCTL_DSP_GETOPTR: u8 = 18;
 const SNDCTL_DSP_GETERROR: u8 = 25;
 const SNDCTL_DSP_SYNCGROUP: u8 = 28;
 const SNDCTL_DSP_SYNCSTART: u8 = 29;
@@ -237,18 +227,6 @@ nix::ioctl_write_ptr!(
     SNDCTL_DSP_MAGIC,
     SNDCTL_DSP_SETTRIGGER,
     i32
-);
-nix::ioctl_read!(
-    oss_get_iptr,
-    SNDCTL_DSP_MAGIC,
-    SNDCTL_DSP_GETIPTR,
-    CountInfo
-);
-nix::ioctl_read!(
-    oss_get_optr,
-    SNDCTL_DSP_MAGIC,
-    SNDCTL_DSP_GETOPTR,
-    CountInfo
 );
 nix::ioctl_read!(
     oss_get_error,
@@ -304,6 +282,68 @@ pub fn add_to_sync_group(fd: i32, group: i32, input: bool) -> i32 {
         let _ = oss_add_sync_group(fd, &mut sync_group);
     }
     sync_group.id
+}
+
+/// Thin `pub(crate)` wrappers over the ioctl macros above, so sibling
+/// modules (e.g. `iodelay`) share one source of truth for the OSS ABI.
+pub(crate) fn get_caps(fd: i32) -> std::io::Result<i32> {
+    let mut caps = 0;
+    unsafe { oss_get_caps(fd, &mut caps) }?;
+    Ok(caps)
+}
+
+pub(crate) fn set_format(fd: i32, format: u32) -> std::io::Result<u32> {
+    let mut fmt = format;
+    unsafe { oss_set_format(fd, &mut fmt) }?;
+    Ok(fmt)
+}
+
+pub(crate) fn set_channels(fd: i32, channels: i32) -> std::io::Result<i32> {
+    let mut channels = channels;
+    unsafe { oss_set_channels(fd, &mut channels) }?;
+    Ok(channels)
+}
+
+pub(crate) fn set_speed(fd: i32, rate: i32) -> std::io::Result<i32> {
+    let mut rate = rate;
+    unsafe { oss_set_speed(fd, &mut rate) }?;
+    Ok(rate)
+}
+
+pub(crate) fn set_cooked(fd: i32, enabled: bool) -> std::io::Result<()> {
+    let value = i32::from(enabled);
+    unsafe { oss_set_cooked(fd, &value) }?;
+    Ok(())
+}
+
+pub(crate) fn set_fragment(fd: i32, fragments: i32, frag_exp: i32) -> std::io::Result<()> {
+    let mut value = (fragments << 16) | frag_exp;
+    unsafe { oss_set_fragment(fd, &mut value) }?;
+    Ok(())
+}
+
+pub(crate) fn input_buffer_info(fd: i32) -> std::io::Result<BufferInfo> {
+    let mut info = BufferInfo::new();
+    unsafe { oss_input_buffer_info(fd, &mut info) }?;
+    Ok(info)
+}
+
+pub(crate) fn output_buffer_info(fd: i32) -> std::io::Result<BufferInfo> {
+    let mut info = BufferInfo::new();
+    unsafe { oss_output_buffer_info(fd, &mut info) }?;
+    Ok(info)
+}
+
+pub(crate) fn current_iptr(fd: i32) -> std::io::Result<OssCount> {
+    let mut info = OssCount::default();
+    unsafe { oss_current_iptr(fd, &mut info) }?;
+    Ok(info)
+}
+
+pub(crate) fn current_optr(fd: i32) -> std::io::Result<OssCount> {
+    let mut info = OssCount::default();
+    unsafe { oss_current_optr(fd, &mut info) }?;
+    Ok(info)
 }
 
 pub fn start_sync_group(fd: i32, group: i32) -> std::io::Result<()> {

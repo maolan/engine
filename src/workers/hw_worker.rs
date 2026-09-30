@@ -255,7 +255,10 @@ impl<B: Backend> HwWorker<B> {
     /// thread does not inherit the async worker thread's realtime priority,
     /// so configure it for every cycle — the pool may hand each cycle to a
     /// different thread.
-    fn run_cycle_blocking(mut driver: B::Driver) -> (B::Driver, Result<(), String>) {
+    fn run_cycle_blocking(
+        mut driver: B::Driver,
+        inline: Option<Arc<crate::inline_render::InlineRender>>,
+    ) -> (B::Driver, Result<(), String>) {
         let rt_start = std::time::Instant::now();
         if let Err(e) = Self::configure_rt_thread(B::WORKER_THREAD_NAME, RT_PRIORITY_WORKER) {
             static WARNED: std::sync::atomic::AtomicBool =
@@ -273,6 +276,9 @@ impl<B: Backend> HwWorker<B> {
         crate::cycle_trace::begin_cycle();
         crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwCycleStart);
         let result = driver.run_cycle_for_worker();
+        if let Some(inline) = inline {
+            inline.finish_pending_render();
+        }
         let _cycle_us = _cycle_start.elapsed().as_micros() as u64;
         (driver, result)
     }
@@ -334,8 +340,9 @@ impl<B: Backend> HwWorker<B> {
                         .driver
                         .take()
                         .expect("driver is only absent while a cycle is running");
+                    let inline = self.inline_render.clone();
                     tokio::task::spawn_blocking(move || {
-                        let _ = tx.blocking_send(Self::run_cycle_blocking(driver));
+                        let _ = tx.blocking_send(Self::run_cycle_blocking(driver, inline));
                     });
                 }
             }
@@ -538,8 +545,9 @@ impl<B: Backend> HwWorker<B> {
                     .driver
                     .take()
                     .expect("driver is only absent while a cycle is running");
+                let inline = self.inline_render.clone();
                 let mut cycle =
-                    tokio::task::spawn_blocking(move || Self::run_cycle_blocking(driver));
+                    tokio::task::spawn_blocking(move || Self::run_cycle_blocking(driver, inline));
                 // Watch for Quit while the cycle runs: a cycle blocked on
                 // device I/O would otherwise deadlock shutdown, because
                 // request_stop is only reachable from message handling.

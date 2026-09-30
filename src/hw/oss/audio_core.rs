@@ -1,6 +1,5 @@
+use super::Audio;
 use super::sync::ChannelState;
-use super::{Audio, CountInfo, oss_get_iptr, oss_get_optr};
-use std::os::fd::AsRawFd;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct Buffer {
@@ -212,12 +211,10 @@ impl DoubleBufferedChannel {
         }
     }
 
-    /// Read cursor in the device's cumulative frame base (the same base as
-    /// `SNDCTL_DSP_GETIPTR`): the end of the capture window consumed so far.
-    /// For the inline render staleness check this is the correct anchor — it
-    /// names the frames the current cycle actually read, unlike the raw
-    /// GETIPTR head, which leads it by the ring backlog. `None` for write
-    /// channels.
+    /// Read cursor in the channel's scheduling timeline, including its
+    /// resynchronization adjustments. Inline render anchors transport to
+    /// this cursor rather than the raw CURRENT_IPTR capture head, which
+    /// can lead it by the ring backlog. `None` for write channels.
     pub(super) fn read_data_end_frame(&self) -> Option<i64> {
         match &self.kind {
             ChannelKind::Read(read) => Some(read.read_position),
@@ -252,20 +249,13 @@ impl DoubleBufferedChannel {
     ) -> std::io::Result<()> {
         if read.st.last_processing != now {
             if audio.mapped {
-                let mut info = CountInfo::default();
-                let rc = unsafe { oss_get_iptr(audio.dsp.as_raw_fd(), &mut info) };
-                if rc.is_ok() {
-                    let progress = audio
-                        .update_map_progress_from_count(&info)
-                        .map(|delta| (delta / audio.frame_size()) as i64)
-                        .unwrap_or(0);
-                    read.map_progress += progress;
-                    let available = read.st.last_progress + progress - read.read_position;
-                    let loss = read.st.mark_loss(available - audio.buffer_frames());
-                    read.st.mark_progress(progress, now, audio.stepping());
-                    if loss > 0 {
-                        read.read_position = read.st.last_progress - audio.buffer_frames();
-                    }
+                let progress = audio.update_map_progress()?;
+                read.map_progress = audio.map_progress.frames;
+                let available = read.st.last_progress + progress - read.read_position;
+                let loss = read.st.mark_loss(available - audio.buffer_frames());
+                read.st.mark_progress(progress, now, audio.stepping());
+                if loss > 0 {
+                    read.read_position = read.st.last_progress - audio.buffer_frames();
                 }
             } else {
                 let queued = audio.queued_samples() as i64;
@@ -390,41 +380,22 @@ impl DoubleBufferedChannel {
     ) -> std::io::Result<()> {
         if write.st.last_processing != now {
             if audio.mapped {
-                let mut info = CountInfo::default();
-                let rc = unsafe { oss_get_optr(audio.dsp.as_raw_fd(), &mut info) };
-                if rc.is_ok() {
-                    let delta = audio.update_map_progress_from_count(&info).unwrap_or(0);
-                    let mut progress = (delta / audio.frame_size()) as i64;
-
-                    // FreeBSD sometimes reports a bogus extra buffer cycle at
-                    // playback start. Detect start by the transition from not
-                    // playing last cycle to playing now, in addition to the
-                    // short-time heuristic used during continuous cycling.
-                    let is_playback_start = !audio.was_playing_last_cycle
-                        && audio.playing.load(std::sync::atomic::Ordering::Relaxed);
-                    if progress > audio.buffer_frames()
-                        && (is_playback_start
-                            || (now - write.st.last_processing) < audio.buffer_frames() / 2)
-                    {
-                        let bogus_frames = progress - (progress % audio.buffer_frames());
-                        let bogus_bytes = (bogus_frames as usize) * audio.frame_size();
-                        audio.map_progress_bytes =
-                            audio.map_progress_bytes.saturating_sub(bogus_bytes);
-                        progress %= audio.buffer_frames();
-                    }
-                    if progress > 0 {
-                        let start = (write.map_progress as usize % audio.buffer_frames() as usize)
-                            * audio.frame_size();
-                        audio.write_map(None, start, (progress as usize) * audio.frame_size());
-                        write.map_progress = (audio.map_progress_bytes / audio.frame_size()) as i64;
-                    }
-                    let loss = write
-                        .st
-                        .mark_loss(write.st.last_progress + progress - write.write_position);
-                    write.st.mark_progress(progress, now, audio.stepping());
-                    if loss > 0 {
-                        write.write_position = write.st.last_progress;
-                    }
+                let progress = audio.update_map_progress()?;
+                if progress > 0 {
+                    let start = (write.map_progress.rem_euclid(audio.buffer_frames()) as usize)
+                        * audio.frame_size();
+                    // After a stall, at most one ring needs clearing. Keep
+                    // all elapsed frames in the progress/loss accounting.
+                    let length = progress.min(audio.buffer_frames()) as usize * audio.frame_size();
+                    audio.write_map(None, start, length);
+                    write.map_progress = audio.map_progress.frames;
+                }
+                let loss = write
+                    .st
+                    .mark_loss(write.st.last_progress + progress - write.write_position);
+                write.st.mark_progress(progress, now, audio.stepping());
+                if loss > 0 {
+                    write.write_position = write.st.last_progress;
                 }
             } else {
                 let queued = audio.queued_samples() as i64;

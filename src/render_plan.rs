@@ -72,6 +72,19 @@ pub enum Op {
     /// block (JACK `copy_audio_inputs`, `fill_ports_from_interleaved_buffer`).
     /// A pure source — no plan node produces it.
     HwInput { channel: usize, output: BufferId },
+    /// In-engine MTDM measurement component (`iodelay_node.rs`): writes the
+    /// multitone test signal into `output` and demodulates `input` against
+    /// the same absolute stream index. Tone out and measure in are separate
+    /// ports with no internal feed-through — the measured latency is defined
+    /// purely by where the session wires those ports.
+    IoDelayGenerator {
+        node: Arc<crate::iodelay_node::IoDelayRt>,
+        output: BufferId,
+    },
+    IoDelayMeasurement {
+        node: Arc<crate::iodelay_node::IoDelayMeasurementRt>,
+        input: BufferId,
+    },
 }
 
 /// A compiled, immutable render plan. Owns the whole buffer arena.
@@ -309,6 +322,9 @@ impl RenderPlan {
     ) -> Self {
         let mut b = Builder::new(buffer_size);
         b.add_hw(hw_inputs, hw_outputs);
+        if let Some(iodelay) = &state.iodelay {
+            b.add_iodelay(iodelay);
+        }
 
         let mut ordered: Vec<(String, TrackHandle)> = state
             .tracks
@@ -359,9 +375,13 @@ impl RenderPlan {
         for (idx, op) in self.nodes.iter().enumerate() {
             let idx = idx as NodeId;
             match op {
-                Op::Zero { output } | Op::Sum { output, .. } | Op::HwInput { output, .. } => {
+                Op::Zero { output }
+                | Op::Sum { output, .. }
+                | Op::HwInput { output, .. }
+                | Op::IoDelayGenerator { output, .. } => {
                     writers.entry(*output).or_default().push(idx);
                 }
+                Op::IoDelayMeasurement { .. } => {}
                 Op::Task { task, ins, outs } => {
                     let writes_ins =
                         matches!(task, ProcessTask::Track(_) | ProcessTask::FolderInput(_));
@@ -554,6 +574,26 @@ impl Builder {
     fn push_node(&mut self, op: Op) -> NodeId {
         self.nodes.push(op);
         (self.nodes.len() - 1) as NodeId
+    }
+
+    /// Register the shared tone source and each independent MTDM return input.
+    fn add_iodelay(&mut self, node: &Arc<crate::iodelay_node::IoDelayRt>) {
+        let output = self.buffer_for(&node.out_port);
+        let generator = self.push_node(Op::IoDelayGenerator {
+            node: node.clone(),
+            output,
+        });
+        self.producer.insert(output, generator);
+
+        for measurement in node.measurements() {
+            let input = self.buffer_for(&measurement.in_port);
+            self.consumer_ports.push(measurement.in_port.clone());
+            let reader = self.push_node(Op::IoDelayMeasurement {
+                node: measurement,
+                input,
+            });
+            self.port_readers.entry(input).or_default().push(reader);
+        }
     }
 
     fn add_hw(&mut self, hw_inputs: &[Arc<AudioIO>], hw_outputs: &[Arc<AudioIO>]) {
@@ -1224,6 +1264,104 @@ mod tests {
         assert_eq!(out_chan, 0);
         assert!(sums.iter().any(|(_, _, output)| *output == out_buf));
         assert!(plan.forced.is_empty());
+    }
+
+    fn state_with_iodelay(
+        tracks: Vec<TrackHandle>,
+        iodelay: Option<Arc<crate::iodelay_node::IoDelayRt>>,
+    ) -> StateSnapshot {
+        let mut snapshot = state_with(tracks);
+        snapshot.iodelay = iodelay;
+        snapshot
+    }
+
+    fn iodelay_node(plan: &RenderPlan) -> usize {
+        plan.nodes
+            .iter()
+            .position(|op| matches!(op, Op::IoDelayGenerator { .. }))
+            .expect("IoDelay node")
+    }
+
+    #[test]
+    fn iodelay_generator_and_measurement_have_independent_dependencies() {
+        let t = make_track("t", 1, 1);
+        let hw_in = Arc::new(AudioIO::new(64));
+        let hw_out = Arc::new(AudioIO::new(64));
+        let iodelay = Arc::new(crate::iodelay_node::IoDelayRt::new(1.0, 64, 48_000));
+        // Topology A: iodelay -> hw_out, hw_in -> iodelay.
+        AudioIO::connect(&iodelay.out_port, &hw_out);
+        AudioIO::connect(&hw_in, &iodelay.in_port);
+        let plan = RenderPlan::compile(
+            &state_with_iodelay(vec![t], Some(iodelay)),
+            std::slice::from_ref(&hw_in),
+            std::slice::from_ref(&hw_out),
+            64,
+        );
+        plan.verify().expect("invariants");
+
+        let node = iodelay_node(&plan);
+        let (measurement, measurement_input) = plan
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, op)| {
+                if let Op::IoDelayMeasurement { input, .. } = op {
+                    Some((index, *input))
+                } else {
+                    None
+                }
+            })
+            .expect("measurement node");
+        let hw_node = plan
+            .nodes
+            .iter()
+            .position(|op| matches!(op, Op::HwInput { .. }))
+            .expect("HwInput node");
+        let sums = sum_nodes(&plan);
+        // iodelay input sum + hw_out bridge sum (track input is unconnected).
+        assert_eq!(sums.len(), 2);
+        let in_sum = sums
+            .iter()
+            .find(|(_, _, output)| *output == measurement_input)
+            .map(|(idx, _, _)| *idx)
+            .expect("iodelay input sum fed by hw_in");
+        let out_sum = sums
+            .iter()
+            .find(|(_, _, output)| *output == plan.hw_out_map[0].0)
+            .map(|(idx, _, _)| *idx)
+            .expect("hw_out sum");
+        assert!(hw_node < in_sum, "hw_in before the iodelay input sum");
+        assert!(in_sum < measurement, "input sum before measurement");
+        assert!(node < out_sum, "IoDelay node before the hw_out sum");
+        assert!(plan.reachable(hw_node as NodeId, measurement as NodeId));
+        assert!(plan.reachable(node as NodeId, out_sum as NodeId));
+        assert!(!plan.reachable(node as NodeId, measurement as NodeId));
+        assert!(plan.forced.is_empty());
+    }
+
+    #[test]
+    fn iodelay_component_absent_or_unconnected_still_verifies() {
+        let t = make_track("t", 1, 1);
+        // Absent: no IoDelay node at all.
+        let without = RenderPlan::compile(&state_with(vec![t.clone()]), &[], &[], 64);
+        without.verify().expect("invariants");
+        assert!(
+            without
+                .nodes
+                .iter()
+                .all(|op| !matches!(op, Op::IoDelayGenerator { .. }))
+        );
+        // Present but unconnected: Zero input, output drains nowhere.
+        let iodelay = Arc::new(crate::iodelay_node::IoDelayRt::new(1.0, 64, 48_000));
+        let with = RenderPlan::compile(&state_with_iodelay(vec![t], Some(iodelay)), &[], &[], 64);
+        with.verify().expect("invariants");
+        assert!(
+            with.nodes.iter().any(|op| matches!(
+                op,
+                Op::IoDelayGenerator { .. } | Op::IoDelayMeasurement { .. }
+            )),
+            "unconnected component still participates"
+        );
     }
 
     /// Build a plan by hand for `verify` negative tests.

@@ -12,6 +12,44 @@ impl Engine {
         self.bump_prepare_generation();
     }
 
+    /// Rendering starts at the requested sample immediately; the audible
+    /// playhead begins advancing once that audio has traversed the output path.
+    pub(crate) fn audible_transport_sample(&self) -> usize {
+        self.audible_transport_sample_after(0)
+    }
+
+    fn audible_transport_sample_after(&self, frames: usize) -> usize {
+        match self.transport.render_clock {
+            Some((origin, elapsed)) if self.transport.transport_running => {
+                self.transport.normalize_transport_sample(
+                    origin.saturating_add(
+                        elapsed
+                            .saturating_add(frames)
+                            .saturating_sub(self.transport.hw_output_latency_frames),
+                    ),
+                )
+            }
+            _ => self
+                .transport
+                .normalize_transport_sample(self.transport.transport_sample.saturating_add(frames)),
+        }
+    }
+
+    pub(crate) fn restart_render_clock(&mut self) {
+        self.transport.render_clock = Some((self.transport.transport_sample, 0));
+    }
+
+    pub(crate) fn advance_render_clock(&mut self, frames: usize) {
+        if let Some((_, elapsed)) = self.transport.render_clock.as_mut() {
+            *elapsed = elapsed.saturating_add(frames);
+        }
+    }
+
+    fn stop_render_clock(&mut self) {
+        self.transport.transport_sample = self.audible_transport_sample();
+        self.transport.render_clock = None;
+    }
+
     pub(crate) fn active_transport_sample(&self) -> usize {
         if self.transport.session_clip_playback_enabled && self.transport.playing {
             self.transport.session_transport_sample
@@ -25,57 +63,43 @@ impl Engine {
             return None;
         }
         let (loop_start, loop_end) = self.transport.loop_range_samples?;
-        if loop_end <= loop_start || self.transport.transport_sample >= loop_end {
+        let position = self.audible_transport_sample();
+        if loop_end <= loop_start || position >= loop_end {
             return None;
         }
         let cycle_samples = self.current_cycle_samples();
         if cycle_samples == 0 {
             return None;
         }
-        let next = self
-            .transport
-            .transport_sample
-            .saturating_add(cycle_samples);
-        if next < loop_end {
+        let next = self.audible_transport_sample_after(cycle_samples);
+        if next >= position {
             return None;
         }
-        let after_frames = loop_end.saturating_sub(self.transport.transport_sample);
-        Some((
-            after_frames,
-            loop_start,
-            self.transport.normalize_transport_sample(next),
-        ))
+        let after_frames = loop_end.saturating_sub(position);
+        Some((after_frames, loop_start, next))
     }
 
-    pub(crate) fn cycle_segments(&self, frames: usize) -> Vec<(usize, usize, usize)> {
+    pub(crate) fn cycle_segments_at(
+        &self,
+        position: usize,
+        frames: usize,
+    ) -> Vec<(usize, usize, usize)> {
         if frames == 0 {
             return vec![];
         }
         if !self.transport.loop_enabled {
-            return vec![(
-                self.transport.transport_sample,
-                self.transport.transport_sample.saturating_add(frames),
-                0,
-            )];
+            return vec![(position, position.saturating_add(frames), 0)];
         }
         let Some((loop_start, loop_end)) = self.transport.loop_range_samples else {
-            return vec![(
-                self.transport.transport_sample,
-                self.transport.transport_sample.saturating_add(frames),
-                0,
-            )];
+            return vec![(position, position.saturating_add(frames), 0)];
         };
         if loop_end <= loop_start {
-            return vec![(
-                self.transport.transport_sample,
-                self.transport.transport_sample.saturating_add(frames),
-                0,
-            )];
+            return vec![(position, position.saturating_add(frames), 0)];
         }
         let mut segments = Vec::new();
         let mut remaining = frames;
         let mut out_offset = 0usize;
-        let mut current = self.transport.transport_sample;
+        let mut current = position;
         while remaining > 0 {
             let take = loop_end.saturating_sub(current).min(remaining);
             if take == 0 {
@@ -237,6 +261,15 @@ impl Engine {
         }
         let cycle_samples = self.current_cycle_samples();
         if self.transport.transport_running {
+            // An inline cycle has already rendered the current transport
+            // block. Pool-mode priming must not repeat it: a duplicate WAV
+            // read requests a seek while old read-ahead data is still queued.
+            // A seek received during this cycle leaves buffer clearing pending;
+            // retain priming then, until a cycle renders the new position.
+            if self.rt_inline_enabled && !self.transport.clear_processing_buffers_pending {
+                self.transport.transport_panic_flush_pending = false;
+                self.transport.transport_restart_pending = false;
+            }
             if self.transport.transport_panic_flush_pending {
                 self.transport.transport_panic_flush_pending = false;
                 // The transport did not advance: the next Go repeats the
@@ -248,6 +281,7 @@ impl Engine {
                 // Same re-anchoring for the transport-restart priming cycle.
                 self.inline_render.invalidate_anchor();
             } else {
+                let audible_before = self.audible_transport_sample();
                 let before = self.transport.transport_sample;
                 let next = self
                     .transport
@@ -256,6 +290,7 @@ impl Engine {
                 let normalized = self.transport.normalize_transport_sample(next);
                 let wrapped = normalized != next;
                 self.transport.transport_sample = normalized;
+                self.advance_render_clock(cycle_samples);
                 // The per-cycle advance reaches tracks through the mirrored
                 // lock-free snapshot, so no generation bump is needed here.
                 tracing::debug!(
@@ -267,14 +302,14 @@ impl Engine {
                     "transport advanced after HWFinished"
                 );
                 self.publish_transport_snapshot();
-                if wrapped {
+                if self.audible_transport_sample() < audible_before {
                     if self.transport.notified_loop_wrap_sample
-                        == Some(self.transport.transport_sample)
+                        == Some(self.audible_transport_sample())
                     {
                         self.transport.notified_loop_wrap_sample = None;
                     } else {
                         self.notify_event(Event::TransportPosition(
-                            self.transport.transport_sample,
+                            self.audible_transport_sample(),
                         ))
                         .await;
                     }
@@ -336,8 +371,9 @@ impl Engine {
     }
 
     pub(crate) fn publish_transport_snapshot(&mut self) {
+        let audible_sample = self.audible_transport_sample();
         let snapshot = self.transport.transport_snapshot_producer.write_buffer();
-        snapshot.sample = self.transport.transport_sample;
+        snapshot.sample = audible_sample;
         snapshot.tempo_bpm = self.transport.tempo_bpm;
         snapshot.playing = self.transport.playing;
         snapshot.transport_running = self.transport.transport_running;
@@ -425,6 +461,7 @@ impl Engine {
             self.transport.handling_hwfinished
         );
         self.meters.meter_decay_after_stop = None;
+        self.restart_render_clock();
         self.transport.playing = true;
         self.bump_prepare_generation();
         self.transport.clear_processing_buffers_pending = true;
@@ -443,7 +480,7 @@ impl Engine {
             self.notify_clients(Err(e)).await;
         }
         self.notify_clients(Ok(Action::Play)).await;
-        self.notify_event(Event::TransportPosition(self.transport.transport_sample))
+        self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
             .await;
         self.preload_track_clips().await;
         {
@@ -465,6 +502,7 @@ impl Engine {
             return false;
         };
 
+        self.stop_render_clock();
         self.transport.clip_playback_enabled = false;
         self.transport.session_clip_playback_enabled = false;
         self.bump_prepare_generation();
@@ -501,7 +539,7 @@ impl Engine {
             }
         }
         self.notify_clients(Ok(Action::Pause)).await;
-        self.notify_event(Event::TransportPosition(self.transport.transport_sample))
+        self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
             .await;
 
         false
@@ -512,6 +550,7 @@ impl Engine {
             return false;
         };
 
+        self.stop_render_clock();
         self.transport.playing = false;
         crate::cycle_trace::dump_histogram();
         self.bump_prepare_generation();
@@ -569,7 +608,7 @@ impl Engine {
         }
         self.reset_meters_after_stop();
         self.flush_recordings().await;
-        self.notify_event(Event::TransportPosition(self.transport.transport_sample))
+        self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
             .await;
 
         false
@@ -580,6 +619,7 @@ impl Engine {
             return false;
         };
 
+        self.stop_render_clock();
         self.transport.playing = true;
         self.transport.transport_running = false;
         self.transport.transport_restart_pending = true;
@@ -611,7 +651,7 @@ impl Engine {
         {
             self.notify_clients(Err(e)).await;
         }
-        self.notify_event(Event::TransportPosition(self.transport.transport_sample))
+        self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
             .await;
         self.preload_track_clips().await;
         {
@@ -634,6 +674,7 @@ impl Engine {
         };
 
         self.transport.transport_sample = self.transport.normalize_transport_sample(sample);
+        self.restart_render_clock();
         self.bump_prepare_generation();
         self.transport.notified_loop_wrap_sample = None;
         self.publish_transport_snapshot();
@@ -682,6 +723,7 @@ impl Engine {
             }
         });
         self.transport.loop_enabled = self.transport.loop_range_samples.is_some();
+        self.restart_render_clock();
         self.bump_prepare_generation();
         self.transport.notified_loop_wrap_sample = None;
         if self.transport.loop_enabled
@@ -689,8 +731,9 @@ impl Engine {
             && self.transport.transport_sample >= loop_end
         {
             self.transport.transport_sample = loop_start;
+            self.restart_render_clock();
             self.bump_prepare_generation();
-            self.notify_event(Event::TransportPosition(self.transport.transport_sample))
+            self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
                 .await;
         }
 
@@ -727,9 +770,10 @@ impl Engine {
                 self.transport.transport_sample = self
                     .transport
                     .normalize_transport_sample(self.session_end_sample());
+                self.restart_render_clock();
                 self.bump_prepare_generation();
                 self.publish_transport_snapshot();
-                self.notify_event(Event::TransportPosition(self.transport.transport_sample))
+                self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
                     .await;
             }
             Action::TransportPosition(..) => {
@@ -740,6 +784,7 @@ impl Engine {
             Action::SetLoopEnabled(enabled) => {
                 self.transport.loop_enabled =
                     enabled && self.transport.loop_range_samples.is_some();
+                self.restart_render_clock();
                 self.bump_prepare_generation();
                 self.transport.notified_loop_wrap_sample = None;
             }

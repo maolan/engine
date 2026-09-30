@@ -20,12 +20,17 @@ pub mod executor;
 pub mod history;
 mod hw;
 mod inline_render;
+#[cfg(target_os = "freebsd")]
+pub mod iodelay;
+pub mod iodelay_node;
 pub mod kind;
 pub mod message;
 pub mod meter;
 pub mod midi;
 pub mod modulator;
+pub mod mtdm;
 mod osc;
+mod parallel_render;
 #[cfg(unix)]
 mod pitch_shift;
 mod plan_builder;

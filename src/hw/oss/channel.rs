@@ -14,6 +14,9 @@ pub struct OSSChannel<'a> {
 
 impl<'a> OSSChannel<'a> {
     pub fn run_cycle(&mut self) -> std::io::Result<()> {
+        if self.direct_mmap_enabled() {
+            return self.run_direct_mmap_cycle();
+        }
         if self.capture.is_mapped() || self.playback.is_mapped() {
             DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?.run_cycle()
         } else {
@@ -22,11 +25,20 @@ impl<'a> OSSChannel<'a> {
     }
 
     pub fn run_cycle_with_assist(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
+        if self.direct_mmap_enabled() {
+            let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
+            return self.run_direct_mmap_cycle();
+        }
         DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?
             .run_cycle_with_assist(assist_lock)
     }
 
     pub fn run_assist_step(&mut self) -> std::io::Result<bool> {
+        // Direct inline cycles are Go-paced; an autonomous assist must not
+        // consume their capture window or replay the previous render arena.
+        if self.direct_mmap_enabled() {
+            return Ok(false);
+        }
         if !self.capture.is_mapped() && !self.playback.is_mapped() {
             return self.run_cycle().map(|_| true);
         }
@@ -44,6 +56,9 @@ impl<'a> OSSChannel<'a> {
     }
 
     pub fn run_assist_step_with_lock(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<bool> {
+        if self.direct_mmap_enabled() {
+            return Ok(false);
+        }
         if !self.capture.is_mapped() && !self.playback.is_mapped() {
             return self.run_cycle().map(|_| true);
         }

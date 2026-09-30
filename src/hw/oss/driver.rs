@@ -189,12 +189,12 @@ impl HwDriver {
     }
 
     /// Current capture frame position reported by the OSS driver
-    /// (`SNDCTL_DSP_GETIPTR`), in frames since the input stream started.
+    /// (`SNDCTL_DSP_CURRENT_IPTR`), in frames since the input stream started.
     pub fn current_capture_frame(&self) -> Option<i64> {
         self.capture.current_capture_frame()
     }
 
-    /// Total capture buffer capacity in frames. The GETIPTR counter is
+    /// Total capture buffer capacity in frames. The CURRENT_IPTR counter is
     /// monotonic since device open, so at a take start at most this many
     /// captured frames can still be pending in the ring; it bounds the
     /// record-start discard.
@@ -256,6 +256,16 @@ impl HwDriver {
     }
 
     pub fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {
+        if self.fresh_capture() {
+            let input = self.cycle_samples() + self.input_latency_frames;
+            let output = self.playback.mmap_write_ahead() as usize + self.output_latency_frames;
+            // Actual write-ahead is learned from the feeder quantum at
+            // startup. Report its bounds; these exclude the device FIFO
+            // and converters, for which user calibration is still needed.
+            let max_output = (self.playback.buffer_frames() as usize - self.cycle_samples())
+                + self.output_latency_frames;
+            return ((input, input), (output, max_output));
+        }
         latency::latency_ranges(
             self.cycle_samples(),
             self.nperiods,
@@ -266,6 +276,9 @@ impl HwDriver {
     }
 
     pub fn set_playing(&mut self, playing: bool) {
+        if self.playing.load(Ordering::Relaxed) != playing {
+            self.capture.mmap_cycle = super::mmap_cycle::CycleCursor::default();
+        }
         // State flag only: playback DMA never halts. While stopped, the
         // per-cycle render is silence (fill_output_buffer zeroes it when
         // !playing) and the ring is kept/-fed silent via
@@ -274,6 +287,12 @@ impl HwDriver {
         if !playing {
             self.playback.force_silence_now();
         }
+    }
+
+    /// Direct mmap cycles start with fresh capture; kernel uptime is not
+    /// invalid startup audio and must not seed the recording discard.
+    pub fn fresh_capture(&self) -> bool {
+        super::mmap_cycle::direct_enabled(&self.capture, &self.playback)
     }
 
     /// One full write of the persistent zero buffer into the mapped

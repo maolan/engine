@@ -269,6 +269,8 @@ impl CycleExecutor {
             Op::Zero { output } => (vec![*output], None),
             Op::Sum { output, .. } => (vec![*output], None),
             Op::HwInput { output, .. } => (vec![*output], None),
+            Op::IoDelayGenerator { output, .. } => (vec![*output], None),
+            Op::IoDelayMeasurement { .. } => (Vec::new(), None),
             Op::Task { task, outs, .. } => (outs.clone(), Some(task)),
         };
         for buf in outs {

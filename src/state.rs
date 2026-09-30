@@ -21,6 +21,9 @@ pub struct StateData {
     pub tracks: HashMap<String, TrackHandle>,
     pub unused_audio_clips: Vec<AudioClipData>,
     pub unused_midi_clips: Vec<MidiClipData>,
+    /// In-engine MTDM latency measurement component (the `"iodelay"`
+    /// connection endpoint); present while configured in the session.
+    pub iodelay: Option<Arc<crate::iodelay_node::IoDelayRt>>,
 }
 
 pub struct StateGuard<'a> {
@@ -72,6 +75,7 @@ impl StateData {
             tracks: self.tracks.clone(),
             unused_audio_clips: self.unused_audio_clips.clone(),
             unused_midi_clips: self.unused_midi_clips.clone(),
+            iodelay: self.iodelay.clone(),
         }
     }
 }
@@ -95,6 +99,8 @@ pub struct StateSnapshot {
     pub tracks: HashMap<String, TrackHandle>,
     pub unused_audio_clips: Vec<AudioClipData>,
     pub unused_midi_clips: Vec<MidiClipData>,
+    /// In-engine MTDM latency measurement component (see `iodelay_node.rs`).
+    pub iodelay: Option<Arc<crate::iodelay_node::IoDelayRt>>,
 }
 
 impl State {

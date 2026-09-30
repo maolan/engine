@@ -11,8 +11,9 @@
 //! consumer ([`SeekableStreamingClipBuffer::read_frames`]) only pops
 //! per-channel SPSC `rtrb` rings and silence-fills on underrun; the producer
 //! thread does all file I/O and sample conversion. Non-sequential reads post
-//! an absolute frame to the producer through the same lock-free atomic
-//! seek-request slot used by the compressed path.
+//! an absolute frame and generation to the producer through atomic fields.
+//! Queued samples carry that generation and their source positions so late
+//! disk responses and old read-ahead cannot shift the playback timeline.
 //!
 //! Random access for offline features (pitch correction, reversed playback)
 //! goes through [`SeekableStreamingClipBuffer::read_window`], which opens a
@@ -30,7 +31,7 @@ use std::time::Duration;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::streaming::{DECODE_CHUNK_FRAMES, ProducerControl, try_acquire_producer_slot};
+use super::streaming::{DECODE_CHUNK_FRAMES, try_acquire_producer_slot};
 use crate::audio_codec::probe_audio_file;
 
 /// On-disk layout of a PCM (integer or float) RIFF/WAVE stream.
@@ -189,14 +190,66 @@ fn read_exact_at(file: &File, position: u64, buf: &mut [u8]) -> io::Result<()> {
     clone.read_exact(buf)
 }
 
-/// Convert `frames` interleaved raw bytes into per-channel planes.
-fn deinterleave(data: &[f32], frames: usize, channels: usize, rings: &mut [Producer<f32>]) {
+/// Every queued sample retains its file position and seek generation. A
+/// producer underrun may produce silence, but must never delay later samples.
+#[derive(Debug, Clone, Copy)]
+struct QueuedSample {
+    frame: usize,
+    generation: u64,
+    value: f32,
+}
+
+#[derive(Clone)]
+struct SeekControl {
+    stop: Arc<AtomicBool>,
+    seek_request: Arc<AtomicUsize>,
+    generation: Arc<AtomicU64>,
+    eof: Arc<AtomicBool>,
+}
+
+fn deinterleave(
+    data: &[f32],
+    frames: usize,
+    channels: usize,
+    rings: &mut [Producer<QueuedSample>],
+    start: usize,
+    generation: u64,
+) {
     for (channel, ring) in rings.iter_mut().enumerate() {
         for frame in 0..frames {
-            // Lockstep: the same frame count is pushed to every ring.
-            let _ = ring.push(data[frame * channels + channel]);
+            let _ = ring.push(QueuedSample {
+                frame: start + frame,
+                generation,
+                value: data[frame * channels + channel],
+            });
         }
     }
+}
+
+fn read_queued_frames(
+    consumer: &mut Consumer<QueuedSample>,
+    generation: u64,
+    from: usize,
+    dst: &mut [f32],
+) -> usize {
+    dst.fill(0.0);
+    let end = from.saturating_add(dst.len());
+    let mut read = 0;
+    // Bound work to samples already queued at entry; never wait on disk I/O.
+    for _ in 0..consumer.slots() {
+        let Ok(sample) = consumer.peek().copied() else {
+            break;
+        };
+        if sample.generation == generation && sample.frame >= end {
+            break;
+        }
+        let _ = consumer.pop();
+        if sample.generation == generation && sample.frame >= from {
+            dst[sample.frame - from] = sample.value;
+            read += 1;
+        }
+    }
+    read
 }
 
 pub struct SeekableStreamingClipBuffer {
@@ -205,10 +258,10 @@ pub struct SeekableStreamingClipBuffer {
     total_frames: usize,
     path: PathBuf,
     layout: WavPcmLayout,
-    rings: Vec<Mutex<Consumer<f32>>>,
+    rings: Vec<Mutex<Consumer<QueuedSample>>>,
     eof: Arc<AtomicBool>,
     underruns: AtomicUsize,
-    control: ProducerControl,
+    control: SeekControl,
     /// Next source frame the consumer expects to read; `u64::MAX` until the
     /// first read. Used to detect non-sequential (seek) reads.
     expected_next: AtomicU64,
@@ -234,7 +287,7 @@ struct ProducerThread {
 
 impl SeekableStreamingClipBuffer {
     /// Start a seekable streaming producer for an engine-rate PCM/WAV
-    /// `path`. Each channel ring holds `multiplier * period_frames` floats.
+    /// `path`. Each channel ring holds `multiplier * period_frames` tagged samples.
     pub fn start(
         path: &Path,
         engine_rate: usize,
@@ -268,17 +321,14 @@ impl SeekableStreamingClipBuffer {
             producers.push(producer);
             rings.push(Mutex::new(consumer));
         }
-        let control = ProducerControl {
+        let control = SeekControl {
             stop: Arc::new(AtomicBool::new(false)),
             seek_request: Arc::new(AtomicUsize::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
             eof: Arc::new(AtomicBool::new(false)),
         };
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let thread_control = ProducerControl {
-            stop: control.stop.clone(),
-            seek_request: control.seek_request.clone(),
-            eof: control.eof.clone(),
-        };
+        let thread_control = control.clone();
         let path_buf = path.to_path_buf();
         let total_frames = layout.total_frames();
         let handle = std::thread::Builder::new()
@@ -338,45 +388,49 @@ impl SeekableStreamingClipBuffer {
     /// Returns the number of frames actually read from the rings (the rest
     /// of `out[..len]` is silence).
     pub fn read_frames(&self, from_frame: usize, len: usize, out: &mut [Vec<f32>]) -> usize {
-        let expected = self.expected_next.load(Ordering::Relaxed);
-        if expected != u64::MAX && expected != from_frame as u64 {
-            self.control
-                .seek_request
-                .store(from_frame.saturating_add(1), Ordering::Release);
-        }
-        self.expected_next
-            .store(from_frame as u64 + len as u64, Ordering::Relaxed);
-
         if len == 0 {
             return 0;
         }
-        let avail = self
-            .rings
-            .iter()
-            .filter_map(|ring| ring.lock().ok().map(|consumer| consumer.slots()))
-            .min()
-            .unwrap_or(0);
-        let frames = avail.min(len);
+        let expected = self.expected_next.load(Ordering::Relaxed);
+        if (expected == u64::MAX && from_frame != 0)
+            || (expected != u64::MAX && expected != from_frame as u64)
+        {
+            // Publish the target before the generation. The producer may
+            // race a newer request, but such samples carry an older generation
+            // and cannot be used by the consumer of that newer request.
+            self.control
+                .seek_request
+                .store(from_frame, Ordering::Relaxed);
+            self.control.generation.fetch_add(1, Ordering::Release);
+        }
+        let generation = self.control.generation.load(Ordering::Relaxed);
+        self.expected_next
+            .store(from_frame as u64 + len as u64, Ordering::Relaxed);
+        let mut frames = len;
         for (channel, ring) in self.rings.iter().enumerate() {
             let Some(dst) = out.get_mut(channel) else {
                 break;
             };
-            let Ok(mut consumer) = ring.lock() else { break };
-            let mut read = 0;
-            while read < frames {
-                match consumer.pop() {
-                    Ok(sample) => {
-                        dst[read] = sample;
-                        read += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
-            for sample in dst.iter_mut().take(len).skip(read) {
-                *sample = 0.0;
-            }
+            let Ok(mut consumer) = ring.lock() else {
+                dst[..len].fill(0.0);
+                frames = 0;
+                continue;
+            };
+            frames = frames.min(read_queued_frames(
+                &mut consumer,
+                generation,
+                from_frame,
+                &mut dst[..len],
+            ));
         }
         if frames < len {
+            let next = from_frame.saturating_add(len);
+            if next < self.total_frames {
+                // A ring as small as one callback must also recover: ask for
+                // the next deadline rather than refilling already missed audio.
+                self.control.seek_request.store(next, Ordering::Relaxed);
+                self.control.generation.fetch_add(1, Ordering::Release);
+            }
             let underruns = self.underruns.fetch_add(1, Ordering::Relaxed) + 1;
             if underruns % 100 == 1 {
                 tracing::warn!(
@@ -446,8 +500,8 @@ impl Drop for SeekableStreamingClipBuffer {
 fn producer_main(
     path: PathBuf,
     layout: WavPcmLayout,
-    mut rings: Vec<Producer<f32>>,
-    control: ProducerControl,
+    mut rings: Vec<Producer<QueuedSample>>,
+    control: SeekControl,
     done: std::sync::mpsc::Sender<()>,
 ) {
     let result = run_producer(&path, &layout, &mut rings, &control);
@@ -465,8 +519,8 @@ fn producer_main(
 fn run_producer(
     path: &Path,
     layout: &WavPcmLayout,
-    rings: &mut [Producer<f32>],
-    control: &ProducerControl,
+    rings: &mut [Producer<QueuedSample>],
+    control: &SeekControl,
 ) -> io::Result<()> {
     let file = File::open(path)?;
     let channels = layout.channels.max(1);
@@ -474,6 +528,8 @@ fn run_producer(
     let total_bytes = layout.data_len as usize;
     // Byte position inside the data chunk that the next read consumes.
     let mut position = 0u64;
+    let mut next_frame = 0usize;
+    let mut generation = 0u64;
     let mut pending: Option<(Vec<f32>, usize)> = None;
     let mut at_eof = false;
 
@@ -481,11 +537,11 @@ fn run_producer(
         if control.stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        let seek = control.seek_request.load(Ordering::Acquire);
-        if seek != 0 {
-            control.seek_request.store(0, Ordering::Release);
-            // O(1) seek: the next read starts at the requested frame.
-            position = (seek as u64 - 1).saturating_mul(block_align as u64);
+        let requested_generation = control.generation.load(Ordering::Acquire);
+        if requested_generation != generation {
+            generation = requested_generation;
+            next_frame = control.seek_request.load(Ordering::Relaxed);
+            position = (next_frame as u64).saturating_mul(block_align as u64);
             pending = None;
             at_eof = false;
             control.eof.store(false, Ordering::Release);
@@ -528,7 +584,8 @@ fn run_producer(
         let min_free = rings.iter().map(Producer::slots).min().unwrap_or(0);
         let push_frames = frames.min(min_free);
         if push_frames > 0 {
-            deinterleave(&data, push_frames, channels, rings);
+            deinterleave(&data, push_frames, channels, rings, next_frame, generation);
+            next_frame += push_frames;
         }
         if push_frames != frames {
             let rest: Vec<f32> = data[push_frames * channels..].to_vec();
@@ -618,9 +675,9 @@ mod tests {
             "seekable streaming clip must be audible through Track (peak {peak})"
         );
         let first_block = first_block.expect("second render block");
-        // First audible frames must equal the source samples exactly
-        // (float WAV round-trips bit-exactly through f32).
-        for (i, (&actual, &expected)) in first_block.iter().zip(source.iter()).enumerate() {
+        // Even if the first callback under-runs during initial loading,
+        // the second callback must play source frame 256, not delayed frame 0.
+        for (i, (&actual, &expected)) in first_block.iter().zip(source[256..].iter()).enumerate() {
             assert!(
                 (actual - expected).abs() < 1.0e-6,
                 "sample {i}: got {actual}, expected {expected}"
@@ -631,72 +688,96 @@ mod tests {
     #[test]
     fn seekable_stream_mid_buffer_seek_is_exact() {
         let (path, source) = tone_wav("maolan_seekstream_seek", 48_000, 0.5, 440.0);
-        let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 128, 4)
-            .expect("start seekable buffer");
+        let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 128, 4).unwrap();
         assert!(wait_for_frames(&buffer, 512, Duration::from_secs(5)) >= 512);
-
-        let mut out = vec![vec![0.0_f32; 256]; 1];
-        // Sequential read first.
-        buffer.read_frames(0, 256, &mut out);
-        assert_eq!(out[0][0], source[0]);
-
-        // Seek mid-file: drain the rings so the next pops observe only
-        // post-seek producer data, then post the seek request.
-        for ring in &buffer.rings {
-            let mut consumer = ring.lock().expect("ring lock");
-            while consumer.pop().is_ok() {}
+        let mut out = vec![vec![0.0; 256]];
+        assert_eq!(buffer.read_frames(0, 256, &mut out), 256);
+        // Leave old read-ahead queued: a seek must reject it itself.
+        let mut recovered = false;
+        for block in 0..20 {
+            let from = 12_000 + block * 256;
+            let read = buffer.read_frames(from, 256, &mut out);
+            for (actual, expected) in out[0].iter().zip(&source[from..from + 256]) {
+                assert!(*actual == 0.0 || (*actual - *expected).abs() < 1.0e-6);
+            }
+            if read == 256 {
+                recovered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        let seek_target = 12_000usize;
-        buffer.read_frames(seek_target, 256, &mut out);
-
-        // The seek read under-runs (rings drained, producer still seeking);
-        // the following sequential read receives exactly the frames the
-        // producer pushed from `seek_target` onward.
-        assert!(wait_for_frames(&buffer, 256, Duration::from_secs(5)) >= 256);
-        buffer.read_frames(seek_target + 256, 256, &mut out);
-        let _ = std::fs::remove_file(&path);
-
-        for (i, (&actual, &expected)) in out[0]
-            .iter()
-            .zip(&source[seek_target..seek_target + 256])
-            .enumerate()
-        {
-            assert!(
-                (actual - expected).abs() < 1.0e-6,
-                "post-seek sample {i}: got {actual}, expected {expected}"
-            );
-        }
+        assert!(recovered, "seek producer did not recover");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn seekable_stream_can_seek_again_after_eof() {
         let (path, source) = tone_wav("maolan_seekstream_after_eof", 48_000, 0.05, 440.0);
-        let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 128, 4)
-            .expect("start seekable buffer");
-        let total = source.len();
-        let mut out = vec![vec![0.0_f32; 256]; 1];
+        let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 128, 4).unwrap();
+        let mut out = vec![vec![0.0; 256]];
         let mut from = 0;
-        while from < total {
-            let n = (total - from).min(out[0].len());
+        while from < source.len() {
+            let n = (source.len() - from).min(256);
             wait_for_frames(&buffer, n, Duration::from_secs(5));
             buffer.read_frames(from, n, &mut out);
             from += n;
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !buffer.is_eof() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+        // Repeated restarts must resume at the requested source position even
+        // when the first callback misses the disk thread's seek response.
+        for _ in 0..3 {
+            let mut recovered = false;
+            for block in 0..8 {
+                let from = block * 256;
+                let read = buffer.read_frames(from, 256, &mut out);
+                for (actual, expected) in out[0].iter().zip(&source[from..from + 256]) {
+                    assert!(*actual == 0.0 || (*actual - *expected).abs() < 1.0e-6);
+                }
+                if read == 256 {
+                    recovered = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(recovered);
         }
+        let _ = std::fs::remove_file(path);
+    }
 
-        buffer.read_frames(0, out[0].len(), &mut out);
-        assert!(wait_for_frames(&buffer, out[0].len(), Duration::from_secs(5)) >= out[0].len());
-        buffer.read_frames(0, out[0].len(), &mut out);
-        assert!(wait_for_frames(&buffer, out[0].len(), Duration::from_secs(5)) >= out[0].len());
-        buffer.read_frames(out[0].len(), out[0].len(), &mut out);
-        let _ = std::fs::remove_file(&path);
-
-        for (actual, expected) in out[0].iter().zip(&source[out[0].len()..]) {
-            assert!((actual - expected).abs() < 1.0e-6);
+    #[test]
+    fn delayed_disk_response_does_not_shift_playback_by_a_period() {
+        let (mut producer, mut consumer) = RingBuffer::new(2048);
+        let mut output = vec![1.0; 512];
+        // Restart misses its first period while waiting for disk.
+        assert_eq!(read_queued_frames(&mut consumer, 1, 0, &mut output), 0);
+        assert!(output.iter().all(|&v| v == 0.0));
+        for frame in 0..1024 {
+            producer
+                .push(QueuedSample {
+                    frame,
+                    generation: 1,
+                    value: frame as f32,
+                })
+                .unwrap();
         }
+        assert_eq!(read_queued_frames(&mut consumer, 1, 512, &mut output), 512);
+        assert_eq!(output, (512..1024).map(|f| f as f32).collect::<Vec<_>>());
+        // A subsequent seek must discard old generations, including samples
+        // with the same source positions, and retain future current samples.
+        for generation in [1, 2] {
+            for frame in 0..1024 {
+                producer
+                    .push(QueuedSample {
+                        frame,
+                        generation,
+                        value: generation as f32,
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(read_queued_frames(&mut consumer, 2, 0, &mut output), 512);
+        assert!(output.iter().all(|&v| v == 2.0));
+        assert_eq!(consumer.slots(), 512);
+        assert_eq!(read_queued_frames(&mut consumer, 2, 512, &mut output), 512);
     }
 
     #[test]

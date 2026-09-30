@@ -2229,7 +2229,10 @@ mod undo_consistency {
             | Action::RequestMidiLearnMappingsReport
             | Action::TransportPositionAt { .. }
             | Action::StepRecordMidiNote { .. }
-            | Action::Log { .. } => false,
+            | Action::Log { .. }
+            | Action::IoDelayCalibrate { .. }
+            | Action::IoDelayConfigure { .. }
+            | Action::IoDelayAddMeasurement { .. } => false,
         }
     }
 

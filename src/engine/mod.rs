@@ -163,6 +163,8 @@ pub(crate) struct HwDriverInfo {
     /// transport rewinds, so it bounds the region of captured-but-not-yet-
     /// valid audio at a take start. `0` = unknown (no clamping).
     pub capture_buffer_frames: usize,
+    /// Backend supplies a fresh capture window on each (re)start.
+    pub fresh_capture: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +529,203 @@ mod tests {
         assert_eq!(engine.transport.prepare_generation, generation);
         handle.lock().apply_transport_sample_snapshot();
         assert_eq!(handle.lock().rt.transport_sample, 1_256);
+    }
+
+    #[tokio::test]
+    async fn inline_completion_advances_without_replaying_startup_block() {
+        for (inline, seek_pending, advances) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let (mut engine, _client_rx) = make_engine_with_client();
+            engine.rt_inline_enabled = inline;
+            engine.transport.transport_running = true;
+            engine.transport.awaiting_hwfinished = true;
+            engine.transport.transport_restart_pending = true;
+            engine.transport.clear_processing_buffers_pending = seek_pending;
+            let period = engine.current_cycle_samples();
+            engine.handle_hw_finished().await;
+            assert_eq!(
+                engine.transport.transport_sample,
+                if advances { period } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn playback_leads_audible_cursor_and_capture_is_behind_it() {
+        let (mut engine, _rx) = make_engine_with_client();
+        engine.transport.transport_running = true;
+        engine.transport.playing = true;
+        engine.transport.hw_output_latency_frames = 384;
+        engine.transport.hw_input_latency_frames = 128;
+        engine.transport.transport_sample = 1000;
+        engine.restart_render_clock();
+        // Playback starts at the requested sample, not 384 samples into it.
+        let track = Arc::new(Track::new("lead".into(), 1, 1, 0, 0, 128, 48_000.0));
+        let task = ProcessTask::Track(track.clone());
+        engine.prepare_task_track(&task);
+        track.lock().apply_transport_sample_snapshot();
+        assert_eq!(track.lock().rt.transport_sample, 1000);
+        assert_eq!(engine.audible_transport_sample(), 1000);
+        assert!(engine.recording_segments_for_cycle(128).is_empty());
+        engine.advance_render_clock(768);
+        engine.transport.transport_sample = 1768;
+        engine.prepare_task_track(&task);
+        track.lock().apply_transport_sample_snapshot();
+        assert_eq!(track.lock().rt.transport_sample, 1768);
+        assert_eq!(engine.audible_transport_sample(), 1384);
+        assert_eq!(
+            engine.recording_segments_for_cycle(128),
+            vec![(1256, 1384, 0)]
+        );
+    }
+
+    #[test]
+    fn delayed_capture_clips_startup_and_wraps_at_its_own_loop_boundary() {
+        let (mut engine, _rx) = make_engine_with_client();
+        engine.transport.transport_running = true;
+        engine.transport.hw_output_latency_frames = 384;
+        engine.transport.hw_input_latency_frames = 128;
+        engine.transport.loop_enabled = true;
+        engine.transport.loop_range_samples = Some((1000, 2000));
+        engine.transport.render_clock = Some((1000, 450));
+        assert_eq!(
+            engine.recording_segments_for_cycle(128),
+            vec![(1000, 1066, 62)]
+        );
+        engine.transport.render_clock = Some((1000, 1480));
+        assert_eq!(engine.audible_transport_sample(), 1096);
+        assert_eq!(
+            engine.recording_segments_for_cycle(128),
+            vec![(1968, 2000, 0), (1000, 1096, 32)]
+        );
+        engine.transport.punch_enabled = true;
+        engine.transport.punch_range_samples = Some((1010, 1080));
+        assert_eq!(
+            engine.recording_segments_for_cycle(128),
+            vec![(1010, 1080, 42)]
+        );
+        // A seek starts a new preroll and cannot retain the previous loop epoch.
+        engine.transport.transport_sample = 1500;
+        engine.restart_render_clock();
+        assert_eq!(engine.audible_transport_sample(), 1500);
+        assert!(engine.recording_segments_for_cycle(128).is_empty());
+    }
+
+    #[tokio::test]
+    async fn recording_flush_preserves_compensated_start_and_all_samples() {
+        let (mut engine, mut rx) = make_engine_with_client();
+        engine.transport.hw_output_latency_frames = 384;
+        let dir =
+            std::env::temp_dir().join(format!("maolan-calibrated-flush-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let samples: Vec<f32> = (0..1024).map(|i| i as f32 / 1024.0).collect();
+        let rec = RecordingSession {
+            start_sample: 1256,
+            samples: samples.clone(),
+            channels: 1,
+            file_name: "take.wav".into(),
+            stripe_peaks: vec![vec![[0.0, 1.0]; 4]],
+            current_stripe_frames: 1024,
+        };
+        engine
+            .flush_recording_entry(&dir, 48_000, "test".into(), rec)
+            .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Message::Response(Ok(Action::AddClip {
+                start: 1256,
+                length: 1024,
+                ..
+            })))
+        ));
+        let (saved, channels, _) =
+            crate::audio_codec::decode_audio_to_f32_interleaved_sync(&dir.join("take.wav"))
+                .unwrap();
+        assert_eq!(channels, 1);
+        assert_eq!(saved, samples);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn iodelay_calibration_applies_measured_total_and_blocks_during_recording() {
+        let (mut engine, mut client_rx) = make_engine_with_client();
+        engine.hw_driver_info = Some(HwDriverInfo {
+            cycle_samples: 128,
+            sample_rate: 48_000,
+            input_channels: 1,
+            output_channels: 1,
+            sample_bits: 32,
+            frame_size_bytes: 4,
+            capture_buffer_frames: 512,
+            fresh_capture: true,
+        });
+        engine.transport.hw_input_latency_frames = 128;
+        engine.transport.hw_output_latency_frames = 128;
+        let node = Arc::new(crate::iodelay_node::IoDelayRt::new(1.0, 128, 48_000));
+        let mut input = vec![0.0; 128];
+        let mut output = vec![0.0; 128];
+        for _ in 0..2000 {
+            node.process(&input, &mut output);
+            input.copy_from_slice(&output);
+        }
+        engine.state.lock().iodelay = Some(node);
+        engine.recording.record_enabled = true;
+        engine.handle_iodelay_calibrate(0).await;
+        assert!(matches!(
+            client_rx.try_recv(),
+            Ok(Message::Response(Err(_)))
+        ));
+        assert_eq!(engine.transport.hw_output_latency_frames, 128);
+        engine.recording.record_enabled = false;
+        engine.handle_iodelay_calibrate(0).await;
+        assert!(matches!(
+            client_rx.try_recv(),
+            Ok(Message::Event(Event::IoDelayCalibrated {
+                measurement_id: 0,
+                frames: 128,
+                playback_lead: 64,
+                record_back: 64
+            }))
+        ));
+        assert_eq!(
+            engine.transport.hw_input_latency_frames + engine.transport.hw_output_latency_frames,
+            128
+        );
+        // Applying again must not accumulate the measured delay.
+        engine.handle_iodelay_calibrate(0).await;
+        assert_eq!(
+            engine.transport.hw_input_latency_frames + engine.transport.hw_output_latency_frames,
+            128
+        );
+        engine.handle_iodelay_configure(false, 1.0).await;
+        assert_eq!(
+            engine.transport.hw_input_latency_frames + engine.transport.hw_output_latency_frames,
+            128
+        );
+    }
+
+    #[test]
+    fn fresh_capture_does_not_discard_kernel_uptime_or_ring_capacity() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        engine.hw_driver_info = Some(HwDriverInfo {
+            cycle_samples: 128,
+            sample_rate: 48_000,
+            input_channels: 32,
+            output_channels: 32,
+            sample_bits: 32,
+            frame_size_bytes: 128,
+            capture_buffer_frames: 512,
+            fresh_capture: true,
+        });
+        engine.recording.discard_remaining_frames = 512;
+        engine.seed_record_start_discard();
+        assert_eq!(engine.recording.discard_remaining_frames, 0);
+        engine.transport.transport_sample = 48_000;
+        engine.seed_record_start_discard();
+        assert_eq!(engine.recording.discard_remaining_frames, 0);
     }
 
     fn insert_track(engine: &mut Engine, track: Track) {
@@ -2275,6 +2474,45 @@ mod tests {
         ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
     )]
     #[tokio::test]
+    async fn offline_bounce_waits_for_inline_workers_to_retire() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("track".into(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        let (worker_tx, mut worker_rx) = channel(1);
+        engine
+            .workers
+            .push(WorkerData::new(worker_tx, tokio::spawn(async {})));
+        engine.dispatch.ready_workers.push(0);
+        engine.rt_inline_enabled = true;
+        engine.transport.awaiting_hwfinished = true;
+        engine
+            .handle_track_offline_bounce(Action::TrackOfflineBounce {
+                track_name: "track".into(),
+                output_path: "/tmp/out.wav".into(),
+                start_sample: 0,
+                length_samples: 128,
+                automation_lanes: vec![],
+                apply_fader: false,
+            })
+            .await;
+        assert!(worker_rx.try_recv().is_err());
+        assert_eq!(engine.dispatch.pending_bounce_starts.len(), 1);
+        // HWFinished is published only after the late-writer barrier.
+        engine.transport.awaiting_hwfinished = false;
+        engine.handoff_pending_bounce_starts().await;
+        assert!(matches!(
+            worker_rx.recv().await,
+            Some(Message::ProcessOfflineBounce(_))
+        ));
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
     async fn play_stop_play_keeps_clip_output_audible() {
         use crate::audio::clip::AudioClip;
         use crate::audio_codec::write_wav_f32;
@@ -3349,7 +3587,7 @@ mod tests {
             sample_rate_hz: 48_000,
             bits: 32,
             exclusive: false,
-            period_frames: 1024,
+            period_frames: 512,
             nperiods: 1,
             sync_mode: false,
             actual_period_frames: 0,

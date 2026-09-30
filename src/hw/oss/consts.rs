@@ -40,5 +40,5 @@ pub const AFMT_S32_NE: u32 = AFMT_S32_BE;
 pub const PCM_ENABLE_INPUT: i32 = 0x00000001;
 pub const PCM_ENABLE_OUTPUT: i32 = 0x00000002;
 
-pub(super) const PCM_CAP_TRIGGER: i32 = 0x00001000;
-pub(super) const PCM_CAP_MMAP: i32 = 0x00002000;
+pub(crate) const PCM_CAP_TRIGGER: i32 = 0x00001000;
+pub(crate) const PCM_CAP_MMAP: i32 = 0x00002000;

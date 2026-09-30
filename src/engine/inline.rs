@@ -85,7 +85,6 @@ impl Engine {
                 .collect()
         };
         self.inline_render.publish_midi_routes(routes);
-        self.inline_render.request_render(render);
         // Phase 4: tag the cycle with the transport position it renders for;
         // the cycle thread compares it against the device's capture progress
         // and silences + reports a skip when the render would be stale.
@@ -106,12 +105,15 @@ impl Engine {
             }
             // Transport mirroring and the generation-gated track push must
             // land before the cycle thread's render reads them.
-            let plan = self.plan_slot.load_full();
+            self.inline_render.request_render(true);
+            let plan = self.inline_render.cycle_plan();
             for op in &plan.nodes {
                 if let Op::Task { task, .. } = op {
                     self.prepare_task_track(task);
                 }
             }
+        } else {
+            self.inline_render.request_render(false);
         }
 
         if let Some(worker) = &self.hw_worker {
@@ -151,6 +153,7 @@ impl Engine {
                 .transport
                 .transport_sample
                 .saturating_add(outcome.skipped_frames as usize);
+            self.advance_render_clock(outcome.skipped_frames as usize);
             self.inline_render.invalidate_anchor();
         }
         if let Some(plan) = outcome.plan {

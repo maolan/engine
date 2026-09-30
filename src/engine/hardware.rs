@@ -333,6 +333,7 @@ impl Engine {
             self.bump_prepare_generation();
             self.transport.transport_running = self.transport.playing;
             if matches!(play_sync, JackTransportPlaySync::Start) {
+                self.restart_render_clock();
                 self.transport.transport_restart_pending = false;
                 self.transport.transport_panic_flush_pending = false;
                 self.notify_clients(Ok(Action::Play)).await;
@@ -350,6 +351,7 @@ impl Engine {
 
         if let Some(sample) = decision.position_sync {
             self.transport.transport_sample = sample;
+            self.restart_render_clock();
             self.bump_prepare_generation();
             self.notify_event(Event::TransportPosition(self.transport.transport_sample))
                 .await;
@@ -463,6 +465,8 @@ impl Engine {
         self.rt_inline_enabled = !config::env_opt_out("MAOLAN_RT_INLINE");
         d.set_inline_render(self.rt_inline_enabled.then(|| self.inline_render.clone()));
         let (in_channels, out_channels, rate, (in_lat, out_lat)) = Self::hw_device_info(&d);
+        self.inline_render
+            .configure_parallel(!config::env_opt_out("MAOLAN_RT_PARALLEL"), rate as u64);
         if hw_profile_enabled {
             let label = Self::hw_profile_backend_label(device);
             error!(
@@ -481,6 +485,7 @@ impl Engine {
         }
         self.transport.hw_input_latency_frames = in_lat.0;
         self.transport.hw_output_latency_frames = out_lat.0;
+        self.restart_render_clock();
         self.hw_input_ports = (0..in_channels)
             .filter_map(|idx| d.input_port(idx))
             .collect();
@@ -491,6 +496,10 @@ impl Engine {
         let capture_buffer_frames = d.capture_buffer_frames();
         #[cfg(not(target_os = "freebsd"))]
         let capture_buffer_frames = 0;
+        #[cfg(target_os = "freebsd")]
+        let fresh_capture = d.fresh_capture();
+        #[cfg(not(target_os = "freebsd"))]
+        let fresh_capture = false;
         self.hw_driver_info = Some(HwDriverInfo {
             cycle_samples: d.cycle_samples(),
             sample_rate: d.sample_rate(),
@@ -499,6 +508,7 @@ impl Engine {
             sample_bits: d.sample_bits(),
             frame_size_bytes: d.frame_size_bytes(),
             capture_buffer_frames,
+            fresh_capture,
         });
         // Bound the plugin-host wait by the device period (ARCHITECTURE.md
         // Phase 3): min(100 ms, 2 × period).

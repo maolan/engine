@@ -402,20 +402,24 @@ impl TrackData {
         // `process_folder_output_with_audio_buffers` call below, which is the
         // only consumer of the appended entries; the caller clears `sources`
         // afterwards (see doc comment).
-        sources.extend(
-            self.audio
-                .ins
-                .iter()
-                .zip(audio_inputs.iter())
-                .map(|(audio_in, buffer)| {
-                    let slice: &[f32] = buffer;
-                    (
-                        Arc::as_ptr(audio_in) as usize,
-                        unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) },
-                        0,
-                    )
-                }),
-        );
+        for (audio_in, buffer) in self.audio.ins.iter().zip(audio_inputs.iter()) {
+            let key = Arc::as_ptr(audio_in) as usize;
+            let slice: &[f32] = buffer;
+            // Safety: processing of these inputs has finished; the slice is
+            // consumed only by folder-output processing below, before the
+            // caller reuses its mutable input buffers.
+            let slice = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
+            if let Some((_, source, _)) = sources
+                .iter_mut()
+                .find(|(candidate, _, _)| *candidate == key)
+            {
+                // The worker supplied latency without borrowing the input
+                // during its in-place writes. Retain that latency here.
+                *source = slice;
+            } else {
+                sources.push((key, slice, 0));
+            }
+        }
         let graph_latencies = self.current_plugin_graph_source_latencies();
         sources.extend(plugin_outputs.iter().map(|(key, buffer)| {
             let slice = buffer.as_slice();

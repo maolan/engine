@@ -22,7 +22,12 @@ pub struct MeterDecay {
 /// Transport position, loop/punch ranges, tempo map, and per-dispatch
 /// transport bookkeeping.
 pub struct TransportFields {
+    /// Next playback block to render, ahead of the audible playhead.
     pub transport_sample: usize,
+    /// Unwrapped render clock (start position, elapsed frames) since play/seek.
+    /// Keeping elapsed time allows capture and the audible cursor to cross loops
+    /// at their own delayed boundaries without dropping the start of playback.
+    pub render_clock: Option<(usize, usize)>,
     pub transport_running: bool,
     pub playing: bool,
     pub notified_loop_wrap_sample: Option<usize>,
@@ -75,6 +80,7 @@ impl TransportFields {
     ) -> Self {
         Self {
             transport_sample: 0,
+            render_clock: None,
             transport_running: false,
             playing: false,
             notified_loop_wrap_sample: None,

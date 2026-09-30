@@ -347,7 +347,7 @@ impl Engine {
             }
             Action::RequestTransportState => {
                 self.notify_query_reply(QueryReply::TransportState {
-                    sample: self.transport.transport_sample,
+                    sample: self.audible_transport_sample(),
                     tempo_bpm: self.transport.tempo_bpm,
                     playing: self.transport.playing,
                     paused: !self.transport.transport_running && self.transport.playing,

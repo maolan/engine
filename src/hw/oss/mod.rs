@@ -18,11 +18,13 @@ pub use super::midi_hub::MidiHub;
 
 mod audio_core;
 mod channel;
-mod consts;
+pub(crate) mod consts;
 mod convert;
 mod driver;
 mod io_util;
-mod ioctl;
+pub(crate) mod ioctl;
+mod mmap_cycle;
+pub(crate) mod position;
 mod sync;
 
 pub use self::channel::OSSChannel;
@@ -35,6 +37,7 @@ use self::audio_core::DoubleBufferedChannel;
 use self::convert::*;
 use self::io_util::*;
 use self::ioctl::*;
+use self::position::{MmapProgress, stream_frame};
 use self::sync::{DuplexSync, FrameClock, get_or_create_duplex_sync};
 
 #[cfg(target_endian = "little")]
@@ -69,12 +72,15 @@ pub struct Audio {
     mapped: bool,
     map: *mut libc::c_void,
     zero_block: Vec<u8>,
-    map_progress_bytes: usize,
+    map_progress: MmapProgress,
     last_published_balance: i64,
     frame_clock: FrameClock,
     frame_stamp: i64,
     duplex_sync: Arc<std::sync::Mutex<DuplexSync>>,
     channel: DoubleBufferedChannel,
+    mmap_cycle: mmap_cycle::CycleCursor,
+    direct_mmap_allowed: bool,
+    mmap_scratch: Vec<u8>,
     last_underrun_count: i32,
     last_overrun_count: i32,
     xrun_count: u64,
@@ -332,8 +338,19 @@ impl Audio {
             .ok_or_else(|| std::io::Error::other(format!("Unsupported format: {format:#x}")))?;
         let frame_size = (channels as usize) * bytes_per_sample;
 
+        // Two periods of address space let the inline path write one period
+        // with deadline headroom learned from the feeder. Capacity is not a
+        // queue: the direct path consumes fresh capture without prefetching.
+        let ring_frames = options
+            .period_frames
+            .checked_mul(if crate::hw::config::env_opt_out("MAOLAN_RT_INLINE") {
+                1
+            } else {
+                2
+            })
+            .ok_or_else(|| std::io::Error::other("OSS ring size overflow"))?;
         let _requested_fragment_bytes =
-            Self::request_fragment_layout(dsp.as_raw_fd(), frame_size, options.period_frames)?;
+            Self::request_fragment_layout(dsp.as_raw_fd(), frame_size, ring_frames)?;
 
         let mut buffer_info = BufferInfo::new();
         unsafe {
@@ -450,12 +467,17 @@ impl Audio {
             mapped,
             map,
             zero_block: Vec::new(),
-            map_progress_bytes: 0,
+            map_progress: MmapProgress::default(),
             last_published_balance: i64::MIN,
             frame_clock,
             frame_stamp: 0,
             duplex_sync,
             channel,
+            mmap_cycle: mmap_cycle::CycleCursor::default(),
+            // Separate devices may drift even at the same nominal rate;
+            // retain the legacy clock-correction path for that configuration.
+            direct_mmap_allowed: path == sync_key,
+            mmap_scratch: vec![0; buffer_bytes],
             last_underrun_count: 0,
             last_overrun_count: 0,
             xrun_count: 0,
@@ -509,11 +531,10 @@ impl Audio {
         self.frame_clock.stepping()
     }
 
-    fn map_pointer(&self) -> usize {
-        if self.buffer_info.bytes <= 0 {
-            return 0;
-        }
-        self.map_progress_bytes % (self.buffer_info.bytes as usize)
+    fn mmap_write_ahead(&self) -> i64 {
+        // The software pointer already feeds the hardware FIFO. Reserve a
+        // short copy/scheduling margin, not another whole engine period.
+        (2 * self.stepping()).min(self.chsamples as i64)
     }
 
     fn shared_cycle_end_add(&self, delta: i64) -> i64 {
@@ -553,30 +574,19 @@ impl Audio {
         }
     }
 
-    fn update_map_progress_from_count(&mut self, info: &CountInfo) -> Option<usize> {
-        if self.buffer_info.bytes <= 0
-            || self.buffer_info.fragsize <= 0
-            || info.ptr < 0
-            || info.blocks < 0
-            || (info.ptr as usize) >= self.buffer_info.bytes as usize
-            || !(info.ptr as usize).is_multiple_of(self.frame_size())
-        {
-            return None;
+    fn stream_frame(&self) -> std::io::Result<i64> {
+        let mut info = OssCount::default();
+        if self.input {
+            unsafe { oss_current_iptr(self.fd(), &mut info) }?;
+        } else {
+            unsafe { oss_current_optr(self.fd(), &mut info) }?;
         }
-        let buf_bytes = self.buffer_info.bytes as usize;
-        let frag_bytes = self.buffer_info.fragsize as usize;
-        let ptr = info.ptr as usize;
-        let mut delta = (ptr + buf_bytes - self.map_pointer()) % buf_bytes;
-        let max_bytes = ((info.blocks as usize).saturating_add(1))
-            .saturating_mul(frag_bytes)
-            .saturating_sub(1);
-        if max_bytes >= delta {
-            let mut cycles = max_bytes - delta;
-            cycles -= cycles % buf_bytes;
-            delta += cycles;
-        }
-        self.map_progress_bytes = self.map_progress_bytes.saturating_add(delta);
-        Some(delta)
+        stream_frame(&info, self.input)
+    }
+
+    fn update_map_progress(&mut self) -> std::io::Result<i64> {
+        let frame = self.stream_frame()?;
+        self.map_progress.update(frame)
     }
 
     fn read_io(&self, dst: &mut [u8], len: usize, count: &mut usize) -> std::io::Result<()> {
@@ -649,30 +659,27 @@ impl Audio {
     }
 
     /// Current capture frame position reported by the OSS driver via
-    /// `SNDCTL_DSP_GETIPTR`, expressed in frames since the input stream
+    /// `SNDCTL_DSP_CURRENT_IPTR`, expressed in frames since the input stream
     /// started. Returns `None` on ioctl failure or for playback devices.
     pub fn current_capture_frame(&self) -> Option<i64> {
         if !self.input {
             return None;
         }
-        let mut info = CountInfo::default();
-        let rc = unsafe { oss_get_iptr(self.dsp.as_raw_fd(), &mut info) };
-        if rc.is_err() {
-            return None;
-        }
-        let frame_size = self.frame_size().max(1);
-        Some((info.bytes.max(0) as i64) / (frame_size as i64))
+        self.stream_frame().ok()
     }
 
-    /// End of the capture window actually consumed, in the same cumulative
-    /// frame base as [`Audio::current_capture_frame`]. Unlike the raw
-    /// GETIPTR head this accounts for the ring backlog: it names the data
-    /// the current cycle read. Used as the Phase 4 staleness anchor.
+    /// The direct mmap path reports its consumed absolute sample window.
+    /// Otherwise the cursor is in the channel's scheduling timeline (which can
+    /// be rebased during resynchronization). Unlike the raw device head from
+    /// [`Audio::current_capture_frame`], this accounts for the ring backlog.
+    /// Used as the Phase 4 staleness anchor, not as a hardware timestamp.
     pub fn current_read_frame(&self) -> Option<i64> {
         if !self.input {
             return None;
         }
-        self.channel.read_data_end_frame()
+        self.mmap_cycle
+            .capture_end
+            .or_else(|| self.channel.read_data_end_frame())
     }
 
     pub fn frame_size_bytes(&self) -> usize {
@@ -792,7 +799,10 @@ impl Audio {
             norm_factor,
         );
         if let Some(slot) = &self.plan_slot {
-            let plan = slot.load();
+            let plan = self
+                .inline_render
+                .as_ref()
+                .map_or_else(|| slot.load_full(), |inline| inline.cycle_plan());
             crate::hw::ports::fill_arena_from_interleaved(
                 &plan,
                 self.chsamples,
@@ -859,7 +869,10 @@ impl Audio {
                 data_i32[target_idx] = (sample.clamp(-1.0, 1.0) * fade_gain * scale_factor) as i32;
             };
             if let Some(slot) = &self.plan_slot {
-                let plan = slot.load();
+                let plan = self
+                    .inline_render
+                    .as_ref()
+                    .map_or_else(|| slot.load_full(), |inline| inline.cycle_plan());
                 crate::hw::ports::write_interleaved_from_arena(
                     &plan,
                     self.chsamples,
@@ -996,17 +1009,21 @@ impl Drop for Audio {
 mod tests {
 
     use super::driver::HwDriver;
-    use super::ioctl::{CountInfo, oss_get_iptr, oss_get_optr};
+    use super::ioctl::{OssCount, oss_current_iptr, oss_current_optr};
+    use super::position::stream_frame;
     use crate::hw::traits::HwWorkerDriver;
 
     fn ptr_counts(driver: &HwDriver) -> (i64, i64) {
-        let mut iptr = CountInfo::default();
-        let mut optr = CountInfo::default();
+        let mut iptr = OssCount::default();
+        let mut optr = OssCount::default();
         unsafe {
-            let _ = oss_get_iptr(driver.input_fd(), &mut iptr);
-            let _ = oss_get_optr(driver.output_fd(), &mut optr);
+            oss_current_iptr(driver.input_fd(), &mut iptr).expect("capture position");
+            oss_current_optr(driver.output_fd(), &mut optr).expect("playback position");
         }
-        (iptr.bytes as i64, optr.bytes as i64)
+        (
+            stream_frame(&iptr, true).unwrap(),
+            stream_frame(&optr, false).unwrap(),
+        )
     }
 
     /// Full transport sequence on a real device (default /dev/dsp5, override

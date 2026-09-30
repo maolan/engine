@@ -98,7 +98,9 @@ impl Engine {
             cancel,
             apply_fader,
         };
-        if self.executor.cycle_complete() {
+        if self.executor.cycle_complete()
+            && !(self.rt_inline_enabled && self.transport.awaiting_hwfinished)
+        {
             self.send_bounce_job(worker_index, job).await;
         } else {
             // A plan cycle is in flight; starting the bounce now would race

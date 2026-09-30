@@ -687,6 +687,19 @@ pub enum Event {
         track_name: String,
         output_db: Vec<f32>,
     },
+    /// Playback lead and recording offset calibrated for the open device.
+    IoDelayCalibrated {
+        measurement_id: u64,
+        frames: usize,
+        playback_lead: usize,
+        record_back: usize,
+    },
+    /// Live report from the in-engine MTDM latency measurement component
+    /// (see `iodelay_node.rs`), emitted about every 250 ms of stream time.
+    IoDelayReport {
+        measurement_id: u64,
+        report: crate::mtdm::IoDelayReport,
+    },
     /// Engine automation/modulator level echo. The *command* twin (GUI
     /// fader, OSC `/track/automation_level`) remains
     /// `Action::TrackAutomationLevel`.
@@ -901,6 +914,24 @@ pub enum Action {
     ClearHistory,
     BeginSessionRestore,
     EndSessionRestore,
+    /// Create or remove the in-engine MTDM latency measurement component
+    /// (the `"iodelay"` session endpoint; see `iodelay_node.rs`). Requires an
+    /// open audio device. Not part of undo history.
+    IoDelayConfigure {
+        enabled: bool,
+        gain: f32,
+    },
+    /// Add an independently routed MTDM measurement input to the active
+    /// IO Delay generator.
+    IoDelayAddMeasurement {
+        measurement_id: u64,
+        gain: f32,
+    },
+    /// Apply a resolved loopback measurement to playback/recording alignment.
+    /// Valid until the audio device is reopened; rejected during playback or recording.
+    IoDelayCalibrate {
+        measurement_id: u64,
+    },
     AddTrack {
         name: String,
         audio_ins: usize,

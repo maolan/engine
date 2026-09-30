@@ -23,7 +23,7 @@
 //! histogram account for this cross-slot layout.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Number of per-cycle slots in the timeline ring.
@@ -34,7 +34,7 @@ const HISTOGRAM_SLOTS: usize = 4096;
 const SUMMARY_INTERVAL: u64 = 100;
 
 /// Fixed pipeline measurement points. Order is part of the layout; do not
-/// reorder.
+/// reorder. Appending is safe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub(crate) enum TracePoint {
@@ -49,15 +49,37 @@ pub(crate) enum TracePoint {
     TransportAdvanced,
     GoSent,
     GoReceived,
+    /// Direct-mmap path only: the period was copied into the playback ring
+    /// and the post-copy deadline check passed.
+    PlaybackMapDone,
 }
 
-const N_POINTS: usize = TracePoint::GoReceived as usize + 1;
-const _: () = assert!(N_POINTS == 11);
+const N_POINTS: usize = TracePoint::PlaybackMapDone as usize + 1;
+const _: () = assert!(N_POINTS == 12);
 
-/// One per-cycle slot: one stamp per point plus the plugin-wait accumulator.
+/// Frame-delta metrics stored alongside the timestamps. These are not wall
+/// clock segments but ring/pointer distances measured by the cycle, and
+/// they form the measured latency budget: how stale the capture was when
+/// read, and how far ahead of the play pointer the playback was written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub(crate) enum FrameMetric {
+    /// Capture frames produced beyond the end of the period just read:
+    /// how old the data was when the engine consumed it.
+    CaptureOvershootFrames = 0,
+    /// Playback frames between the write position and the play pointer at
+    /// write time: how far ahead of the DAC the freshly rendered period sits.
+    PlaybackLeadFrames,
+}
+
+const N_FRAME_METRICS: usize = FrameMetric::PlaybackLeadFrames as usize + 1;
+
+/// One per-cycle slot: one stamp per point plus the plugin-wait accumulator
+/// and the frame-delta metrics.
 struct CycleSlot {
     points: [AtomicU64; N_POINTS],
     plugin_wait_ns: AtomicU64,
+    frame_metrics: [AtomicI64; N_FRAME_METRICS],
 }
 
 impl CycleSlot {
@@ -65,6 +87,7 @@ impl CycleSlot {
         Self {
             points: std::array::from_fn(|_| AtomicU64::new(0)),
             plugin_wait_ns: AtomicU64::new(0),
+            frame_metrics: std::array::from_fn(|_| AtomicI64::new(0)),
         }
     }
 
@@ -73,10 +96,17 @@ impl CycleSlot {
             point.store(0, Ordering::Relaxed);
         }
         self.plugin_wait_ns.store(0, Ordering::Relaxed);
+        for metric in &self.frame_metrics {
+            metric.store(0, Ordering::Relaxed);
+        }
     }
 
     fn point(&self, point: TracePoint) -> u64 {
         self.points[point as usize].load(Ordering::Relaxed)
+    }
+
+    fn frame_metric(&self, metric: FrameMetric) -> i64 {
+        self.frame_metrics[metric as usize].load(Ordering::Relaxed)
     }
 }
 
@@ -261,6 +291,19 @@ impl Drop for PluginWaitGuard {
     }
 }
 
+/// Store a frame-delta metric for the current sequence. Called from the
+/// cycle thread; a relaxed atomic store into preallocated storage.
+pub(crate) fn set_frame_metric(metric: FrameMetric, frames: i64) {
+    if !enabled() {
+        return;
+    }
+    let Some(storage) = STORAGE.get() else {
+        return;
+    };
+    let seq = CURRENT_SEQ.load(Ordering::Relaxed);
+    storage.slots[slot_index(seq)].frame_metrics[metric as usize].store(frames, Ordering::Relaxed);
+}
+
 /// Dispatcher side: return and clear the sequence whose summary is due, if
 /// any.
 pub(crate) fn take_summary_due() -> Option<u64> {
@@ -331,6 +374,8 @@ pub(crate) fn log_summary(due_seq: u64) {
     } else {
         "-".to_string()
     };
+    let capture_overshoot = cur.frame_metric(FrameMetric::CaptureOvershootFrames);
+    let playback_lead = cur.frame_metric(FrameMetric::PlaybackLeadFrames);
 
     tracing::info!(
         seq = due_seq,
@@ -342,6 +387,8 @@ pub(crate) fn log_summary(due_seq: u64) {
         hwfin_handoff = %hwfin_handoff,
         dispatch = %dispatch,
         plugin_wait = %plugin_wait,
+        capture_overshoot = capture_overshoot,
+        playback_lead = playback_lead,
         "cycle_trace summary"
     );
 }

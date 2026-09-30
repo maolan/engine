@@ -120,6 +120,14 @@ impl Engine {
         }
     }
 
+    fn iodelay_measurement_id(endpoint: &str) -> Option<u64> {
+        if endpoint == "iodelay" {
+            Some(0)
+        } else {
+            endpoint.strip_prefix("iodelay:measurement:")?.parse().ok()
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn audio_ports_connected(source: &Arc<AudioIO>, target: &Arc<AudioIO>) -> bool {
         source
@@ -151,6 +159,8 @@ impl Engine {
 
         let from_audio_io = if from_track == "hw:in" {
             self.hw_input_audio_port(from_port)
+        } else if from_track == "iodelay" {
+            state.iodelay.as_ref().map(|node| node.out_port.clone())
         } else {
             state.tracks.get(from_track).and_then(|t| {
                 let t = t.lock();
@@ -169,6 +179,11 @@ impl Engine {
         };
         let to_audio_io = if to_track == "hw:out" {
             self.hw_output_audio_port(to_port)
+        } else if let Some(measurement_id) = Self::iodelay_measurement_id(to_track) {
+            state.iodelay.as_ref().and_then(|node| {
+                node.measurement(measurement_id)
+                    .map(|measurement| measurement.in_port.clone())
+            })
         } else {
             state.tracks.get(to_track).and_then(|t| {
                 let t = t.lock();
@@ -1620,6 +1635,151 @@ impl Engine {
             self.notify_clients(Err(
                 "Engine needs to open audio device before adding audio track".to_string(),
             ))
+            .await;
+        }
+    }
+
+    /// Create or remove the in-engine MTDM latency measurement component
+    /// (the `"iodelay"` connection endpoint; see `iodelay_node.rs`). Wired
+    /// like any other endpoint via `Action::Connect`; reports drain off-RT
+    /// in `drain_iodelay_report`. Not undoable history — a measurement aid.
+    pub(crate) async fn handle_iodelay_configure(&mut self, enabled: bool, gain: f32) {
+        if enabled {
+            let Some(info) = self.hw_driver_info else {
+                self.notify_clients(Err(
+                    "Engine needs to open audio device before enabling iodelay".to_string(),
+                ))
+                .await;
+                return;
+            };
+            let node = crate::iodelay_node::IoDelayRt::new(
+                gain,
+                info.cycle_samples.max(1),
+                info.sample_rate.max(1) as usize,
+            );
+            self.state.lock().iodelay = Some(std::sync::Arc::new(node));
+        } else {
+            self.state.lock().iodelay = None;
+        }
+        self.notify_clients(Ok(Action::IoDelayConfigure { enabled, gain }))
+            .await;
+    }
+
+    /// Off-RT report drain for the `iodelay` component: runs once per
+    /// finished hw cycle while the component exists, logs the report, and
+    /// broadcasts it as an event for clients.
+    pub(crate) async fn handle_iodelay_add_measurement(&mut self, measurement_id: u64, gain: f32) {
+        let node = self.state.lock().iodelay.clone();
+        let Some(node) = node else {
+            self.notify_clients(Err("Enable IO Delay before adding a measurement".into()))
+                .await;
+            return;
+        };
+        node.add_measurement(measurement_id, gain);
+        self.notify_clients(Ok(Action::IoDelayAddMeasurement {
+            measurement_id,
+            gain,
+        }))
+        .await;
+    }
+
+    pub(crate) async fn handle_iodelay_calibrate(&mut self, measurement_id: u64) {
+        // A take must retain the same alignment from capture through flush.
+        if self.transport.transport_running
+            || self.recording.record_enabled
+            || !self.recording.audio_recordings.is_empty()
+            || !self.recording.completed_audio_recordings.is_empty()
+            || !self.recording.midi_recordings.is_empty()
+            || !self.recording.completed_midi_recordings.is_empty()
+        {
+            self.notify_clients(Err(
+                "Stop playback and recording before calibrating latency".into(),
+            ))
+            .await;
+            return;
+        }
+        let measurement = self
+            .state
+            .lock()
+            .iodelay
+            .as_ref()
+            .and_then(|node| node.measurement(measurement_id));
+        let Some(measurement) = measurement.filter(|_| self.hw_driver_info.is_some()) else {
+            self.notify_clients(Err(
+                "Enable IO Delay and connect a hardware loopback before calibrating".into(),
+            ))
+            .await;
+            return;
+        };
+        let report = measurement.calibration_report();
+        let Some((input, output)) = Self::calibrated_io_latencies(report) else {
+            self.notify_clients(Err(
+                "Wait for a resolved IO Delay measurement before calibrating".into(),
+            ))
+            .await;
+            return;
+        };
+        self.transport.hw_input_latency_frames = input;
+        self.transport.hw_output_latency_frames = output;
+        tracing::info!(
+            measurement_id,
+            frames = input + output,
+            playback_lead = output,
+            record_back = input,
+            "IO latency calibrated"
+        );
+        self.notify_event(Event::IoDelayCalibrated {
+            measurement_id,
+            frames: input + output,
+            playback_lead: output,
+            record_back: input,
+        })
+        .await;
+    }
+
+    /// Assume symmetric input/output latency: split the rounded round trip
+    /// equally, assigning the extra frame of an odd total to playback.
+    pub(crate) fn calibrated_io_latencies(
+        report: crate::mtdm::IoDelayReport,
+    ) -> Option<(usize, usize)> {
+        if report.status != crate::mtdm::IoDelayStatus::Resolved
+            || !report.delay_frames.is_finite()
+            || report.delay_frames < 0.0
+            || report.delay_frames >= usize::MAX as f64
+        {
+            return None;
+        }
+        let total = report.delay_frames.round() as usize;
+        let input = total / 2;
+        Some((input, total - input))
+    }
+
+    /// Drain each independent measurement's latest report off the RT thread.
+    pub(crate) async fn drain_iodelay_report(&mut self) {
+        let reports = self
+            .state
+            .lock()
+            .iodelay
+            .as_ref()
+            .map(|node| {
+                node.measurements()
+                    .into_iter()
+                    .filter_map(|measurement| {
+                        measurement
+                            .take_report()
+                            .map(|report| (measurement.id, report))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if reports.is_empty() {
+            return;
+        }
+        for (measurement_id, report) in reports {
+            self.notify_event(Event::IoDelayReport {
+                measurement_id,
+                report,
+            })
             .await;
         }
     }

@@ -16,7 +16,7 @@ impl Engine {
     /// capture stream. Uses the backend's exact first-valid capture frame
     /// when one is reported, otherwise the buffer-size + input-latency
     /// heuristic (JACK2 reports only static capture latency and gives no
-    /// validity signal). This is additional to the `hw_input_latency_frames`
+    /// validity signal). This is additional to the round-trip latency
     /// segment compensation in `recording_segments_for_cycle`: the
     /// compensation aligns capture with the monitored signal, while the
     /// discard removes the capture frames before even that region is valid.
@@ -35,6 +35,10 @@ impl Engine {
     /// Seed `discard_remaining_frames` for a take starting at the current
     /// transport position. Runs synchronously on the engine dispatcher.
     pub(crate) fn seed_record_start_discard(&mut self) {
+        if self.hw_driver_info.is_some_and(|info| info.fresh_capture) {
+            self.recording.discard_remaining_frames = 0;
+            return;
+        }
         let buffer_size = self.current_cycle_samples();
         let input_latency = self.transport.hw_input_latency_frames;
         let position = self.transport.transport_sample;
@@ -61,9 +65,8 @@ impl Engine {
     /// Split one transport segment at the take-start discard: returns
     /// `(skip, start, offset, keep)` — how many captured frames to drop, the
     /// shifted take `start_sample`, the shifted capture buffer offset, and
-    /// the kept length. Shifting `start` in the same direction as the
-    /// flush-time output-latency trim keeps the recorded region aligned with
-    /// what was monitored.
+    /// the kept length. Advancing both start and buffer offset preserves the
+    /// alignment of the retained audio.
     pub(crate) fn segment_discard_split(
         discard: usize,
         segment_start: usize,
@@ -80,18 +83,26 @@ impl Engine {
     }
 
     pub(crate) fn recording_segments_for_cycle(&self, frames: usize) -> Vec<(usize, usize, usize)> {
-        let segments = self.cycle_segments(frames);
-        let comp = self.transport.hw_input_latency_frames;
-        let segments: Vec<_> = if comp > 0 {
-            segments
-                .into_iter()
-                .map(|(start, end, offset)| {
-                    (start.saturating_sub(comp), end.saturating_sub(comp), offset)
-                })
-                .collect()
-        } else {
-            segments
-        };
+        // Capture is input-latency behind the audible timeline, which is
+        // itself output-latency behind the render clock. Apply both here so
+        // live stripes, punch/loop boundaries and saved audio share a timeline.
+        let delay = self
+            .transport
+            .hw_output_latency_frames
+            .saturating_add(self.transport.hw_input_latency_frames);
+        let (origin, elapsed) = self
+            .transport
+            .render_clock
+            .unwrap_or((0, self.transport.transport_sample));
+        let skip = delay.saturating_sub(elapsed).min(frames);
+        let position = self.transport.normalize_transport_sample(
+            origin.saturating_add(elapsed.saturating_add(skip).saturating_sub(delay)),
+        );
+        let segments: Vec<_> = self
+            .cycle_segments_at(position, frames - skip)
+            .into_iter()
+            .map(|(start, end, offset)| (start, end, offset + skip))
+            .collect();
         if !self.transport.punch_enabled {
             return segments;
         }
@@ -458,13 +469,9 @@ impl Engine {
             return;
         }
 
-        let trim_frames = self.transport.hw_output_latency_frames;
-        let trim_samples = trim_frames * rec.channels;
-        let samples = if trim_samples > 0 && rec.samples.len() > trim_samples {
-            &rec.samples[trim_samples..]
-        } else {
-            &rec.samples[..]
-        };
+        // Placement was compensated at capture time. Trimming output latency
+        // here would compensate it twice and discard the start of the take.
+        let samples = &rec.samples[..];
         if samples.is_empty() {
             return;
         }
@@ -500,7 +507,7 @@ impl Engine {
             tracing::warn!("Failed to write peaks file {}: {}", path.display(), e);
         }
         let length = samples.len() / rec.channels;
-        let start_sample = rec.start_sample.saturating_add(trim_frames);
+        let start_sample = rec.start_sample;
         let clip_rel_name = format!("audio/{}", rec.file_name);
         let mut clip = AudioClip::new(
             clip_rel_name.clone(),
@@ -839,6 +846,36 @@ mod tests {
     use super::Engine;
 
     #[test]
+    fn calibration_splits_rounded_total_equally_with_odd_frame_for_playback() {
+        use crate::mtdm::{IoDelayReport, IoDelayStatus};
+        let mut report = IoDelayReport {
+            status: IoDelayStatus::Resolved,
+            delay_frames: 1217.574,
+            error: 0.004,
+            inverted: false,
+            final_report: false,
+        };
+        assert_eq!(Engine::calibrated_io_latencies(report), Some((609, 609)));
+        report.delay_frames = 100.2;
+        assert_eq!(Engine::calibrated_io_latencies(report), Some((50, 50)));
+        report.delay_frames = 799.0;
+        assert_eq!(Engine::calibrated_io_latencies(report), Some((399, 400)));
+        report.delay_frames = 1.0;
+        assert_eq!(Engine::calibrated_io_latencies(report), Some((0, 1)));
+        report.delay_frames = 0.0;
+        assert_eq!(Engine::calibrated_io_latencies(report), Some((0, 0)));
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, usize::MAX as f64] {
+            report.delay_frames = invalid;
+            assert_eq!(Engine::calibrated_io_latencies(report), None);
+        }
+        report.delay_frames = 1217.574;
+        for status in [IoDelayStatus::Collecting, IoDelayStatus::BelowThreshold] {
+            report.status = status;
+            assert_eq!(Engine::calibrated_io_latencies(report), None);
+        }
+    }
+
+    #[test]
     fn discard_seed_uses_first_valid_capture_frame_when_reported() {
         // 480 frames captured ahead of the transport position: the first 480
         // captured frames of the take are not yet valid and must be dropped.
@@ -872,7 +909,7 @@ mod tests {
     fn segment_discard_split_shifts_start_and_offset_like_the_flush_trim() {
         // 100 frames to drop from a 256-frame segment starting at transport
         // sample 1000 with capture offset 0: the take starts 100 samples
-        // later (same direction as the flush-time output-latency trim).
+        // later, matching the retained samples in the capture buffer.
         let (skip, start, offset, keep) = Engine::segment_discard_split(100, 1000, 0, 256);
         assert_eq!(skip, 100);
         assert_eq!(start, 1100);

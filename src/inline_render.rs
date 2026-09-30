@@ -3,16 +3,17 @@
 //!
 //! When the engine runs in RT-inline mode (an audio device is open, the
 //! backend supports the mid-cycle render hook, and `MAOLAN_RT_INLINE` is not
-//! `0`), the per-cycle render plan executes on the hardware cycle thread
-//! itself, between the capture fill and the playback drain:
+//! `0`), the hardware cycle thread coordinates the per-cycle render plan
+//! between the capture fill and the playback drain:
 //!
 //! 1. The dispatcher sends `TracksFinished` — the "Go" signal — after
 //!    advancing the transport and preparing task tracks.
 //! 2. The backend cycle reads capture into the plan arena, then calls
 //!    [`InlineRender::render_cycle`].
 //! 3. `render_cycle` drains hardware MIDI input into routed track ports,
-//!    executes every plan node in topological order (skipping `Op::HwInput`,
-//!    which the driver just filled), mixes any audio preview into the
+//!    rendezvous with the node workers by default, or executes nodes serially
+//!    when `MAOLAN_RT_PARALLEL=0` (skipping the already-filled `Op::HwInput`),
+//!    mixes any audio preview into the
 //!    hardware-output arena, and publishes the per-cycle outcome (node
 //!    results, the plan that ran, forwarded MIDI-in events).
 //! 4. The backend cycle drains the arena to the playback device and the hw
@@ -112,6 +113,9 @@ struct OutcomeMailbox {
 /// into the hw worker (which installs the MIDI source).
 pub struct InlineRender {
     plan_slot: Arc<PlanSlot>,
+    /// Pinned at Go: capture, node jobs, and playback must use one arena
+    /// even if the background builder publishes a replacement mid-cycle.
+    cycle_plan: PlanSlot,
     /// Set by the dispatcher with each Go; consumed (swapped out) by the
     /// cycle thread when the render hook runs. Cycles never overlap, so a
     /// plain flag is sufficient.
@@ -137,11 +141,15 @@ pub struct InlineRender {
     /// Set by `render_cycle` when a stale render was silenced; consumed by
     /// the driver, which writes silence instead of draining the arena.
     stale_silence: AtomicBool,
+    parallel_enabled: AtomicBool,
+    sample_rate: AtomicU64,
+    parallel: Mutex<crate::parallel_render::ParallelRender>,
 }
 
 impl InlineRender {
     pub fn new(plan_slot: Arc<PlanSlot>) -> Arc<Self> {
         Arc::new(Self {
+            cycle_plan: PlanSlot::from(plan_slot.load_full()),
             plan_slot,
             render_requested: AtomicBool::new(false),
             mailbox: Mutex::new(OutcomeMailbox { ready: None }),
@@ -154,7 +162,46 @@ impl InlineRender {
             anchor_transport: AtomicI64::new(0),
             anchor_valid: AtomicBool::new(false),
             stale_silence: AtomicBool::new(false),
+            parallel_enabled: AtomicBool::new(false),
+            sample_rate: AtomicU64::new(48_000),
+            parallel: Mutex::new(crate::parallel_render::ParallelRender::new()),
         })
+    }
+
+    pub(crate) fn add_parallel_worker(
+        &self,
+        mailbox: crate::parallel_render::WorkerMailbox,
+        thread: std::thread::Thread,
+    ) {
+        self.parallel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add_worker(mailbox, thread);
+    }
+
+    /// Configured at device open, before any Go can be issued.
+    pub(crate) fn configure_parallel(&self, enabled: bool, sample_rate: u64) {
+        self.sample_rate
+            .store(sample_rate.max(1), Ordering::Release);
+        self.parallel_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// The hardware worker calls this AFTER the driver's playback drain,
+    /// even on driver failure, and BEFORE publishing HWFinished. Silence is
+    /// already committed on deadline miss; this barrier prevents late jobs
+    /// racing the next capture, recording tap, plan reuse, or offline work.
+    pub(crate) fn finish_pending_render(&self) {
+        let skipped = self
+            .parallel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_pending();
+        if let Some(skipped) = skipped {
+            if let Some(outcome) = self.lock_mailbox().ready.as_mut() {
+                outcome.skipped_frames = outcome.skipped_frames.max(skipped);
+            }
+            self.invalidate_anchor();
+        }
     }
 
     /// RT thread was configured: the hw worker installs its MIDI hub share.
@@ -165,7 +212,12 @@ impl InlineRender {
     /// Dispatcher (Go path): whether the upcoming cycle should execute the
     /// render plan inline.
     pub fn request_render(&self, render: bool) {
+        self.cycle_plan.store(self.plan_slot.load_full());
         self.render_requested.store(render, Ordering::Release);
+    }
+
+    pub(crate) fn cycle_plan(&self) -> SharedPlan {
+        self.cycle_plan.load_full()
     }
 
     /// Dispatcher (Go path): publish the resolved MIDI-in routes for the
@@ -222,6 +274,20 @@ impl InlineRender {
     /// re-establishes it (after a stale skip the mapping is undefined).
     pub fn invalidate_anchor(&self) {
         self.anchor_valid.store(false, Ordering::Release);
+    }
+
+    /// Backend deadline check after render/copy. The output missed its safe
+    /// playback window, so report the gap through the same Phase 4 mailbox
+    /// as a pre-render stale cycle. Called before HWFinished is published.
+    #[cfg(any(target_os = "freebsd", test))]
+    pub(crate) fn discard_completed_cycle(&self, skipped_frames: u64) {
+        if let Some(outcome) = self.lock_mailbox().ready.as_mut() {
+            outcome.stale = true;
+            outcome.skipped_frames = outcome.skipped_frames.max(skipped_frames);
+            outcome.plan = None;
+            outcome.results.clear();
+        }
+        self.invalidate_anchor();
     }
 
     fn lock_mailbox(&self) -> std::sync::MutexGuard<'_, OutcomeMailbox> {
@@ -315,32 +381,53 @@ impl InlineRender {
         };
 
         if !stale && (render || self.preview_active()) {
-            let plan = self.plan_slot.load_full();
+            let plan = self.cycle_plan();
             if render {
                 crate::cycle_trace::mark(crate::cycle_trace::TracePoint::RenderDispatched);
-                outcome
-                    .results
-                    .reserve(plan.nodes.len().saturating_sub(plan.hw_in_map.len()));
-                for node in 0..plan.nodes.len() as NodeId {
-                    if matches!(&plan.nodes[node as usize], Op::HwInput { .. }) {
-                        continue;
+                if self.parallel_enabled.load(Ordering::Acquire) {
+                    let period = std::time::Duration::from_secs_f64(
+                        f64::from(frames) / self.sample_rate.load(Ordering::Acquire).max(1) as f64,
+                    );
+                    let results = self
+                        .parallel
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .render(plan.clone(), period);
+                    if let Some(results) = results {
+                        outcome.results = results;
+                    } else {
+                        outcome.stale = true;
+                        outcome.skipped_frames = u64::from(frames);
+                        self.stale_silence.store(true, Ordering::Release);
+                        self.invalidate_anchor();
                     }
-                    outcome.results.push(Worker::process_node_job_result(
-                        INLINE_WORKER_ID,
-                        crate::executor::NodeJob {
-                            epoch: 0,
-                            plan: plan.clone(),
-                            node,
-                        },
-                    ));
+                } else {
+                    outcome
+                        .results
+                        .reserve(plan.nodes.len().saturating_sub(plan.hw_in_map.len()));
+                    for node in 0..plan.nodes.len() as NodeId {
+                        if matches!(&plan.nodes[node as usize], Op::HwInput { .. }) {
+                            continue;
+                        }
+                        outcome.results.push(Worker::process_node_job_result(
+                            INLINE_WORKER_ID,
+                            crate::executor::NodeJob {
+                                epoch: 0,
+                                plan: plan.clone(),
+                                node,
+                            },
+                        ));
+                    }
                 }
                 crate::cycle_trace::mark(crate::cycle_trace::TracePoint::RenderEnd);
             }
             // Audio preview overwrites the hardware-output arena even when
             // the transport is paused (no render), so preview-only cycles
             // still mix it here.
-            mix_preview_into_hw_outs(self, &plan, frames as usize);
-            outcome.plan = Some(plan);
+            if !outcome.stale {
+                mix_preview_into_hw_outs(self, &plan, frames as usize);
+                outcome.plan = Some(plan);
+            }
         }
 
         self.lock_mailbox().ready = Some(outcome);
@@ -511,6 +598,67 @@ mod tests {
     }
 
     #[test]
+    fn go_pins_one_plan_across_capture_render_and_playback() {
+        let guard = TestSlotGuard::new(sum_plan());
+        let slot = guard.slot();
+        let ctx = InlineRender::new(slot.clone());
+        ctx.request_render(true);
+        let captured_plan = ctx.cycle_plan();
+        // Safety: capture fill before rendering, on the only test thread.
+        unsafe {
+            (&mut *captured_plan.buffer_ptr(0)).fill(0.75);
+        }
+        let replacement = Arc::new(basedrop::Owned::new(
+            &guard.collector.as_ref().unwrap().handle(),
+            sum_plan(),
+        ));
+        slot.store(replacement.clone());
+        ctx.render_cycle(8, None);
+        let outcome = ctx.take_outcome().unwrap();
+        assert!(Arc::ptr_eq(outcome.plan.as_ref().unwrap(), &captured_plan));
+        assert!(Arc::ptr_eq(&ctx.cycle_plan(), &captured_plan));
+        // Safety: render completed; playback uses the same capture arena.
+        let playback_plan = ctx.cycle_plan();
+        assert_eq!(unsafe { playback_plan.buffer(2) }, &[0.75; 8]);
+        ctx.request_render(true);
+        assert!(Arc::ptr_eq(&ctx.cycle_plan(), &replacement));
+    }
+
+    #[test]
+    fn parallel_failure_requests_silence_and_suppresses_preview_until_retired() {
+        let guard = TestSlotGuard::new(sum_plan());
+        let ctx = InlineRender::new(guard.slot());
+        ctx.configure_parallel(true, 48_000);
+        ctx.publish_preview(Arc::new(vec![0.5; 16]), 1, 0);
+        ctx.publish_go(0, true);
+        ctx.request_render(true);
+        ctx.render_cycle(8, Some(1000));
+        assert!(ctx.take_stale_silence());
+        // This is the hardware-worker barrier, after submitting silence.
+        ctx.finish_pending_render();
+        let outcome = ctx.take_outcome().unwrap();
+        assert!(outcome.stale);
+        assert!(outcome.skipped_frames >= 8);
+        assert!(outcome.plan.is_none());
+        assert!(outcome.results.is_empty());
+        assert_eq!(
+            ctx.preview
+                .load_full()
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .cursor
+                .load(Ordering::Relaxed),
+            0
+        );
+        ctx.configure_parallel(false, 48_000);
+        ctx.publish_go(16, false);
+        ctx.request_render(true);
+        ctx.render_cycle(8, Some(1016));
+        assert!(!ctx.take_outcome().unwrap().stale);
+    }
+
+    #[test]
     fn render_cycle_executes_non_hwinput_nodes_and_publishes_outcome() {
         let guard = TestSlotGuard::new(sum_plan());
         let slot = guard.slot();
@@ -667,6 +815,25 @@ mod tests {
             None,
             "zero frames: no check"
         );
+    }
+
+    #[test]
+    fn completed_render_can_be_discarded_when_backend_deadline_is_missed() {
+        let guard = TestSlotGuard::new(sum_plan());
+        let ctx = InlineRender::new(guard.slot());
+        ctx.publish_go(0, true);
+        ctx.request_render(true);
+        ctx.render_cycle(8, Some(1000));
+        ctx.discard_completed_cycle(16);
+        let outcome = ctx.take_outcome().expect("completed cycle");
+        assert!(outcome.stale);
+        assert_eq!(outcome.skipped_frames, 16);
+        assert!(outcome.plan.is_none());
+        assert!(outcome.results.is_empty());
+        ctx.publish_go(24, false);
+        ctx.request_render(true);
+        ctx.render_cycle(8, Some(1024));
+        assert!(!ctx.take_outcome().unwrap().stale);
     }
 
     #[test]

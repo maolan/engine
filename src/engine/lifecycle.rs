@@ -124,6 +124,7 @@ impl Engine {
             let node_quit = Arc::new(AtomicBool::new(false));
             let node_quit_thread = node_quit.clone();
             let node_result_notify = self.node_result_notify.clone();
+            let (inline_mailbox, mut inline_worker) = crate::parallel_render::worker_mailbox();
             let node_thread_handle = std::thread::Builder::new()
                 .name(format!("maolan-node-worker-{id}"))
                 .spawn(move || {
@@ -136,7 +137,13 @@ impl Engine {
                             e
                         );
                     }
-                    while !node_quit_thread.load(std::sync::atomic::Ordering::Acquire) {
+                    loop {
+                        if inline_worker.process_one(id) {
+                            continue;
+                        }
+                        if node_quit_thread.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
                         match node_job_rx.pop() {
                             Ok(job) => {
                                 let mut result = Worker::process_node_job_result(id, job);
@@ -166,6 +173,8 @@ impl Engine {
                 })
                 .expect("failed to spawn node worker thread");
             let node_thread = node_thread_handle.thread().clone();
+            self.inline_render
+                .add_parallel_worker(inline_mailbox, node_thread.clone());
             std::mem::forget(node_thread_handle);
             self.workers.push(WorkerData::with_node_mailbox(
                 tx.clone(),
