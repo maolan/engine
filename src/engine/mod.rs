@@ -553,6 +553,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recording_peaks_query_reports_real_take_bounds_and_channel_extrema() {
+        let (mut engine, mut rx) = make_engine_with_client();
+        engine.transport.playing = true;
+        engine.recording.record_enabled = true;
+        engine.recording.audio_recordings.insert(
+            "capture".into(),
+            RecordingSession {
+                start_sample: 4096,
+                samples: vec![0.0; 257 * 2],
+                channels: 2,
+                file_name: "unfinished.wav".into(),
+                stripe_peaks: vec![
+                    vec![[-0.3, 0.7], [-0.9, 0.1]],
+                    vec![[-0.2, 0.8], [-0.6, 0.4]],
+                ],
+                current_stripe_frames: 257,
+            },
+        );
+        engine
+            .handle_query_request(Action::RequestRecordingPeaks)
+            .await;
+        let Message::QueryReply(QueryReply::RecordingPeaks(previews)) = rx.try_recv().unwrap()
+        else {
+            panic!("expected recording peaks");
+        };
+        assert_eq!(previews.len(), 1);
+        let preview = &previews[0];
+        assert_eq!(preview.track_name, "capture");
+        assert_eq!(preview.start_sample, 4096);
+        assert_eq!(preview.length_samples, 257);
+        assert_eq!(preview.peaks.len(), 2);
+        assert!(preview.peaks[0].len() <= 4096);
+        assert_eq!(preview.peaks[0].first(), Some(&[-0.3, 0.7]));
+        assert_eq!(preview.peaks[0].last(), Some(&[-0.9, 0.1]));
+        assert_eq!(preview.peaks[1].last(), Some(&[-0.6, 0.4]));
+        engine.recording.record_enabled = false;
+        assert!(engine.recording_peak_previews().is_empty());
+    }
+
     #[test]
     fn playback_leads_audible_cursor_and_capture_is_behind_it() {
         let (mut engine, _rx) = make_engine_with_client();

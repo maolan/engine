@@ -335,6 +335,10 @@ impl Engine {
     /// Read-only query request arms answered with a client notification.
     pub(crate) async fn handle_query_request(&mut self, a: Action) -> bool {
         match a {
+            Action::RequestRecordingPeaks => {
+                self.notify_query_reply(QueryReply::RecordingPeaks(self.recording_peak_previews()))
+                    .await;
+            }
             Action::RequestTrackList => {
                 let names: Vec<String> = self
                     .state_snapshot

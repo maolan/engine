@@ -424,11 +424,41 @@ impl Engine {
         total_frames: usize,
         channels: usize,
     ) -> serde_json::Value {
-        const MAX_PEAK_BINS: usize = 32_768;
-        if total_frames == 0 || stripe_peaks.is_empty() {
-            return serde_json::json!({"peaks": []});
+        serde_json::json!({ "peaks": Self::recording_peak_bins(stripe_peaks, total_frames, channels, 32_768) })
+    }
+
+    pub(crate) fn recording_peak_previews(&self) -> Vec<crate::message::RecordingPeakPreview> {
+        if !self.recording.record_enabled || !self.transport.playing {
+            return Vec::new();
         }
-        let target_bins = total_frames.clamp(1024, MAX_PEAK_BINS);
+        self.recording
+            .audio_recordings
+            .iter()
+            .filter(|(_, rec)| rec.current_stripe_frames > 0)
+            .map(|(track_name, rec)| crate::message::RecordingPeakPreview {
+                track_name: track_name.clone(),
+                start_sample: rec.start_sample,
+                length_samples: rec.current_stripe_frames,
+                peaks: Arc::new(Self::recording_peak_bins(
+                    &rec.stripe_peaks,
+                    rec.current_stripe_frames,
+                    rec.channels,
+                    4096,
+                )),
+            })
+            .collect()
+    }
+
+    fn recording_peak_bins(
+        stripe_peaks: &[Vec<[f32; 2]>],
+        total_frames: usize,
+        channels: usize,
+        max_bins: usize,
+    ) -> Vec<Vec<[f32; 2]>> {
+        if total_frames == 0 || stripe_peaks.is_empty() {
+            return Vec::new();
+        }
+        let target_bins = total_frames.clamp(1024, max_bins);
         let mut peaks = vec![vec![[0.0_f32, 0.0_f32]; target_bins]; channels];
         for (ch, channel_peaks) in peaks.iter_mut().enumerate() {
             let mut touched = vec![false; target_bins];
@@ -438,7 +468,9 @@ impl Engine {
                 let stripe_start = stripe_idx * RECORDING_STRIPE_FRAMES;
                 let stripe_end = ((stripe_idx + 1) * RECORDING_STRIPE_FRAMES).min(total_frames);
                 let start_bin = (stripe_start * target_bins) / total_frames.max(1);
-                let end_bin = ((stripe_end.saturating_sub(1)) * target_bins / total_frames.max(1))
+                let end_bin = (stripe_end * target_bins)
+                    .div_ceil(total_frames)
+                    .saturating_sub(1)
                     .min(target_bins - 1);
                 for bin in start_bin..=end_bin {
                     if !touched[bin] {
@@ -451,11 +483,7 @@ impl Engine {
                 }
             }
         }
-        serde_json::json!({
-            "peaks": peaks.iter().map(|ch| {
-                ch.iter().map(|pair| serde_json::json!([pair[0], pair[1]])).collect::<Vec<_>>()
-            }).collect::<Vec<_>>()
-        })
+        peaks
     }
 
     pub(crate) async fn flush_recording_entry(

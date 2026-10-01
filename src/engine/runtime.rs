@@ -58,6 +58,7 @@ impl Engine {
             | Action::OpenMidiInputDevice(_)
             | Action::OpenMidiOutputDevice(_)
             | Action::RequestMeterSnapshot
+            | Action::RequestRecordingPeaks
             | Action::RequestTrackList
             | Action::RequestTransportState
             | Action::Quit
@@ -649,7 +650,8 @@ impl Engine {
                 }
             }
             // Read-only queries.
-            Action::RequestTrackList
+            Action::RequestRecordingPeaks
+            | Action::RequestTrackList
             | Action::RequestTransportState
             | Action::RequestSessionDiagnostics
             | Action::RequestMidiLearnMappingsReport => {

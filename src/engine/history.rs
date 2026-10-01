@@ -2153,6 +2153,7 @@ mod undo_consistency {
             | Action::TrackAutomationBalance(_, _)
             | Action::TrackMidiCc { .. }
             | Action::RequestMeterSnapshot
+            | Action::RequestRecordingPeaks
             | Action::RequestTrackList
             | Action::RequestTransportState
             | Action::TrackArmMidiLearn { .. }

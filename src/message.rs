@@ -720,11 +720,21 @@ pub enum Event {
     OfflineBounceFinished(Box<Result<Action, String>>),
 }
 
+/// Waveform snapshot of an unfinished audio take, collected off the audio thread.
+#[derive(Clone, Debug)]
+pub struct RecordingPeakPreview {
+    pub track_name: String,
+    pub start_sample: usize,
+    pub length_samples: usize,
+    pub peaks: Arc<Vec<Vec<[f32; 2]>>>,
+}
+
 /// Answers to `Request*`/`Get*` queries. Formerly `Action` variants echoed
 /// in `Ok(...)`; now delivered as `Message::QueryReply`. The queries
 /// themselves remain `Action` variants.
 #[derive(Clone, Debug)]
 pub enum QueryReply {
+    RecordingPeaks(Vec<RecordingPeakPreview>),
     TrackList(Vec<String>),
     TransportState {
         sample: usize,
@@ -1094,6 +1104,7 @@ pub enum Action {
         value: u8,
     },
     RequestMeterSnapshot,
+    RequestRecordingPeaks,
     RequestTrackList,
     RequestTransportState,
     TrackToggleArm(String),
