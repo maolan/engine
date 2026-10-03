@@ -1719,8 +1719,7 @@ impl Engine {
             .await;
             return;
         };
-        self.transport.hw_input_latency_frames = input;
-        self.transport.hw_output_latency_frames = output;
+        self.apply_io_latency_calibration(input, output);
         tracing::info!(
             measurement_id,
             frames = input + output,
@@ -1735,6 +1734,12 @@ impl Engine {
             record_back: input,
         })
         .await;
+    }
+
+    /// Restore exactly the totals applied by the IO Delay calibration button.
+    pub(crate) fn apply_io_latency_calibration(&mut self, input: usize, output: usize) {
+        self.transport.hw_input_latency_frames = input;
+        self.transport.hw_output_latency_frames = output;
     }
 
     /// Assume symmetric input/output latency: split the rounded round trip

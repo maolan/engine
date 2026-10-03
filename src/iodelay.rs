@@ -33,6 +33,8 @@ pub struct IoDelayOptions {
     /// 1-based channel index in the device's interleaved frames.
     pub output_channel: usize,
     pub sample_rate: usize,
+    /// Requested OSS period size in frames.
+    pub period_frames: usize,
     /// Extra gain applied to the captured signal before demodulation.
     pub gain: f32,
     /// Run duration in seconds; 0 runs until [`Self::stop`] is set.
@@ -54,6 +56,7 @@ impl IoDelayOptions {
             output_device: output_device.into(),
             output_channel,
             sample_rate: DEFAULT_RATE,
+            period_frames: 1024,
             gain: 1.0,
             seconds: 0.0,
             stop: Arc::new(AtomicBool::new(false)),
@@ -131,7 +134,13 @@ struct MmapStream {
 }
 
 impl MmapStream {
-    fn open(path: &str, input: bool, needed_channel: usize, rate: usize) -> Result<Self, String> {
+    fn open(
+        path: &str,
+        input: bool,
+        needed_channel: usize,
+        rate: usize,
+        period_frames: usize,
+    ) -> Result<Self, String> {
         let flags = if input {
             libc::O_RDONLY | libc::O_EXCL | libc::O_NONBLOCK
         } else {
@@ -166,16 +175,30 @@ impl MmapStream {
             return Err(format!("{path}: device reported a zero sample rate"));
         }
         let frame_size = 4 * channels;
-        // Same policy as the standalone tool: two fragments sized to one
-        // frame each; the driver expands this to its ring geometry.
-        let frag_exp = u32::BITS - (frame_size as u32).leading_zeros() - 1;
-        let frag_exp = if 1 << frag_exp == frame_size {
-            frag_exp
+        let fragment_bytes = frame_size
+            .checked_next_power_of_two()
+            .ok_or_else(|| "OSS minimum fragment size overflow".to_string())?;
+        let ring_periods = if crate::hw::config::env_opt_out("MAOLAN_RT_INLINE") {
+            1
         } else {
-            frag_exp + 1
+            2
         };
-        ioctl::set_fragment(fd.fd(), 2, frag_exp as i32)
-            .map_err(|e| format!("{path}: SETFRAGMENT: {e}"))?;
+        let ring_frames = period_frames
+            .max(1)
+            .checked_mul(ring_periods)
+            .ok_or_else(|| "OSS ring frame count overflow".to_string())?;
+        let ring_bytes = ring_frames
+            .checked_mul(frame_size)
+            .ok_or_else(|| "OSS ring size overflow".to_string())?
+            .checked_next_power_of_two()
+            .ok_or_else(|| "OSS ring size overflow".to_string())?;
+        let fragments = ring_bytes.div_ceil(fragment_bytes).clamp(1, 0xffff);
+        ioctl::set_fragment(
+            fd.fd(),
+            fragments as i32,
+            fragment_bytes.trailing_zeros() as i32,
+        )
+        .map_err(|e| format!("{path}: SETFRAGMENT: {e}"))?;
         let mut info = if input {
             ioctl::input_buffer_info(fd.fd())
         } else {
@@ -244,12 +267,14 @@ impl IoDelay {
             true,
             needed_channels,
             options.sample_rate,
+            options.period_frames,
         )?;
         let output = MmapStream::open(
             &options.output_device,
             false,
             needed_channels,
             options.sample_rate,
+            options.period_frames,
         )?;
         if input.channels != output.channels
             || input.buffer_bytes != output.buffer_bytes

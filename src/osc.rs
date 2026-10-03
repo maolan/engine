@@ -2267,6 +2267,7 @@ fn parse_open_audio_device(mut args: OscArgs<'_>) -> Result<Action, String> {
         period_frames: get_usize("period_frames")?,
         nperiods: get_usize("nperiods")?,
         sync_mode: get_bool("sync_mode")?,
+        io_latency_calibration: None,
         actual_period_frames: get_usize("actual_period_frames")?,
         input_channels: get_usize("input_channels")?,
         output_channels: get_usize("output_channels")?,

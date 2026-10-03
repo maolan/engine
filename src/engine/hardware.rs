@@ -232,6 +232,7 @@ impl Engine {
                     period_frames: request.period_frames,
                     nperiods: request.nperiods,
                     sync_mode: request.sync_mode,
+                    io_latency_calibration: request.io_latency_calibration,
                     actual_period_frames: request.period_frames,
                     input_channels,
                     output_channels,
@@ -600,6 +601,7 @@ impl Engine {
             period_frames,
             nperiods,
             sync_mode,
+            io_latency_calibration,
             ring_buffer_multiplier,
             auto_open_midi_devices,
             ..
@@ -620,6 +622,7 @@ impl Engine {
                 period_frames,
                 nperiods,
                 sync_mode,
+                io_latency_calibration,
                 ring_buffer_multiplier,
             };
             if self.maybe_open_jack_runtime(request).await.is_some() {
@@ -644,6 +647,9 @@ impl Engine {
                 return (true, None);
             }
         }
+        if let Some((input, output)) = io_latency_calibration {
+            self.apply_io_latency_calibration(input, output);
+        }
         self.finalize_open_audio_device().await;
         if let Some(info) = self.hw_driver_info {
             let effective_action = Action::OpenAudioDevice {
@@ -655,6 +661,7 @@ impl Engine {
                 period_frames,
                 nperiods,
                 sync_mode,
+                io_latency_calibration,
                 actual_period_frames: info.cycle_samples,
                 input_channels: info.input_channels,
                 output_channels: info.output_channels,

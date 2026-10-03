@@ -1648,6 +1648,8 @@ pub enum Action {
         period_frames: usize,
         nperiods: usize,
         sync_mode: bool,
+        /// Optional measured (input, output) totals, replacing backend latency estimates.
+        io_latency_calibration: Option<(usize, usize)>,
         actual_period_frames: usize,
         input_channels: usize,
         output_channels: usize,

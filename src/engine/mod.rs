@@ -230,6 +230,7 @@ pub(crate) struct AudioOpenRequest<'a> {
     period_frames: usize,
     nperiods: usize,
     sync_mode: bool,
+    io_latency_calibration: Option<(usize, usize)>,
     ring_buffer_multiplier: usize,
 }
 
@@ -687,6 +688,26 @@ mod tests {
         assert_eq!(channels, 1);
         assert_eq!(saved, samples);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restored_io_calibration_replaces_baseline_including_zero_totals() {
+        let (mut engine, _rx) = make_engine_with_client();
+        engine.transport.hw_input_latency_frames = 512;
+        engine.transport.hw_output_latency_frames = 160;
+        engine.apply_io_latency_calibration(615, 616);
+        assert_eq!(engine.transport.hw_input_latency_frames, 615);
+        assert_eq!(engine.transport.hw_output_latency_frames, 616);
+        engine.apply_io_latency_calibration(615, 616);
+        assert_eq!(
+            engine.transport.hw_input_latency_frames + engine.transport.hw_output_latency_frames,
+            1231
+        );
+        engine.apply_io_latency_calibration(0, 0);
+        assert_eq!(
+            engine.transport.hw_input_latency_frames + engine.transport.hw_output_latency_frames,
+            0
+        );
     }
 
     #[tokio::test]
@@ -3630,6 +3651,7 @@ mod tests {
             period_frames: 512,
             nperiods: 1,
             sync_mode: false,
+            io_latency_calibration: None,
             actual_period_frames: 0,
             input_channels: 0,
             output_channels: 0,
