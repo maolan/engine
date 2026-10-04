@@ -463,15 +463,13 @@ impl Engine {
         let hw_profile_enabled = config::env_flag(config::HW_PROFILE_ENV);
         let mut d = Self::open_hw_driver(device, input_device, sample_rate_hz, bits, hw_opts)?;
         d.set_plan_slot(self.plan_slot.clone());
-        // RT-inline render (ARCHITECTURE.md Phase 2): when the backend has
-        // the mid-cycle hook (currently OSS) and MAOLAN_RT_INLINE is not
-        // disabled, the render plan executes on the cycle thread between the
-        // capture fill and the playback drain.
-        // Only OSS implements the mid-cycle render hook. Enabling inline
-        // mode on other backends disables the worker-pool render without
-        // actually executing the plan (including the IO Delay nodes).
-        self.rt_inline_enabled =
-            cfg!(target_os = "freebsd") && !config::env_opt_out("MAOLAN_RT_INLINE");
+        // Enable inline processing only when the selected backend implements
+        // capture -> render -> playback within one hardware cycle.
+        #[cfg(target_os = "macos")]
+        let supports_inline = d.supports_inline_render();
+        #[cfg(not(target_os = "macos"))]
+        let supports_inline = cfg!(target_os = "freebsd");
+        self.rt_inline_enabled = supports_inline && !config::env_opt_out("MAOLAN_RT_INLINE");
         d.set_inline_render(self.rt_inline_enabled.then(|| self.inline_render.clone()));
         let (in_channels, out_channels, rate, (in_lat, out_lat)) = Self::hw_device_info(&d);
         self.inline_render

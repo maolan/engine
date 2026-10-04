@@ -1,9 +1,13 @@
-//! Hand-rolled CoreAudio backend (HALOutput AudioUnit).
+//! CoreAudio native HAL IOProc backend with HALOutput AudioUnit fallback.
+//!
+//! The direct path in `direct` renders into HAL buffers in the device callback
+//! for native float32 output and same-device duplex. The description below
+//! applies to the compatibility AudioUnit path.
 //!
 //! Callback-driven like WASAPI: the engine's cycle is paced by the HAL
 //! render callback consuming interleaved f32 periods from bounded rtrb
 //! SPSC rings (backpressure mirrors `wasapi::HwDriver`). The producer half
-//! of the output ring lives in `HwDriver`; the consumer half lives in the
+//! of the output ring lives in `BufferedDriver`; the consumer half lives in the
 //! render callback context. For input the halves are swapped. Tiny
 //! mutex+condvar gates cover wake/backpressure signalling only; sample
 //! data itself is moved through the lock-free rings.
@@ -236,6 +240,8 @@ impl Default for HwOptions {
             exclusive: false,
             period_frames: 1024,
             nperiods: 2,
+            input_channels: 0,
+            output_channels: 0,
             ignore_hwbuf: false,
             sync_mode: false,
             input_latency_frames: 0,
@@ -377,10 +383,18 @@ fn device_name(device: AudioDeviceId) -> Option<String> {
 }
 
 fn device_stream_ids(device: AudioDeviceId) -> Vec<AudioObjectId> {
-    let address = property_address(
-        K_AUDIO_DEVICE_PROPERTY_STREAMS,
-        K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
-    );
+    let mut streams = device_stream_ids_for_scope(device, u32::from_be_bytes(*b"inpt"));
+    streams.extend(device_stream_ids_for_scope(
+        device,
+        u32::from_be_bytes(*b"outp"),
+    ));
+    streams.sort_unstable();
+    streams.dedup();
+    streams
+}
+
+fn device_stream_ids_for_scope(device: AudioDeviceId, scope: u32) -> Vec<AudioObjectId> {
+    let address = property_address(K_AUDIO_DEVICE_PROPERTY_STREAMS, scope);
     let mut size = 0_u32;
     // SAFETY: pure size query on a device id returned by the HAL.
     let status =
@@ -1241,7 +1255,7 @@ unsafe extern "C" fn input_callback(
     0
 }
 
-pub struct HwDriver {
+pub struct BufferedDriver {
     output_unit: AudioUnitRef,
     input_unit: Option<AudioUnitRef>,
     output_context: Option<*mut OutputCallbackContext>,
@@ -1270,7 +1284,7 @@ pub struct HwDriver {
     plan_slot: Option<Arc<crate::render_plan::PlanSlot>>,
 }
 
-impl HwDriver {
+impl BufferedDriver {
     pub fn new_with_options(
         device: &str,
         input_device: Option<&str>,
@@ -1787,15 +1801,15 @@ impl HwDriver {
     }
 }
 
-unsafe impl Send for HwDriver {}
+unsafe impl Send for BufferedDriver {}
 
-impl Drop for HwDriver {
+impl Drop for BufferedDriver {
     fn drop(&mut self) {
         self.close_fds();
     }
 }
 
-impl traits::HwWorkerDriver for HwDriver {
+impl traits::HwWorkerDriver for BufferedDriver {
     fn cycle_samples(&self) -> usize {
         self.cycle_samples()
     }
@@ -1838,7 +1852,7 @@ impl traits::HwWorkerDriver for HwDriver {
     }
 }
 
-crate::impl_hw_device_for_driver!(HwDriver);
+crate::impl_hw_device_for_driver!(BufferedDriver);
 
 #[cfg(test)]
 mod stop_silence_tests {
@@ -2015,3 +2029,190 @@ mod descriptor_tests {
         );
     }
 }
+
+mod direct;
+
+/// Direct HAL access for a single device, with AudioUnit compatibility fallback.
+pub enum HwDriver {
+    Direct(Box<direct::DirectDriver>),
+    Buffered(Box<BufferedDriver>),
+}
+
+impl HwDriver {
+    pub fn new_with_options(
+        device: &str,
+        input_device: Option<&str>,
+        rate: i32,
+        bits: i32,
+        options: HwOptions,
+    ) -> Result<Self, String> {
+        match direct::DirectDriver::open(device, input_device, rate, options) {
+            Ok(driver) => Ok(Self::Direct(Box::new(driver))),
+            Err(reason) => {
+                debug!(%reason, "Direct HAL unavailable; using AudioUnit backend");
+                BufferedDriver::new_with_options(device, input_device, rate, bits, options)
+                    .map(|driver| Self::Buffered(Box::new(driver)))
+            }
+        }
+    }
+
+    pub fn supports_inline_render(&self) -> bool {
+        matches!(self, Self::Direct(_))
+    }
+    pub fn channel(&mut self) -> &mut Self {
+        self
+    }
+
+    pub fn input_channels(&self) -> usize {
+        match self {
+            Self::Direct(driver) => driver.input_channels(),
+            Self::Buffered(driver) => driver.input_channels(),
+        }
+    }
+    pub fn output_channels(&self) -> usize {
+        match self {
+            Self::Direct(driver) => driver.output_channels(),
+            Self::Buffered(driver) => driver.output_channels(),
+        }
+    }
+    pub fn sample_rate(&self) -> i32 {
+        match self {
+            Self::Direct(driver) => driver.sample_rate(),
+            Self::Buffered(driver) => driver.sample_rate(),
+        }
+    }
+    pub fn cycle_samples(&self) -> usize {
+        match self {
+            Self::Direct(driver) => driver.cycle_samples(),
+            Self::Buffered(driver) => driver.cycle_samples(),
+        }
+    }
+    pub fn sample_bits(&self) -> i32 {
+        match self {
+            Self::Direct(driver) => driver.sample_bits(),
+            Self::Buffered(driver) => driver.sample_bits(),
+        }
+    }
+    pub fn frame_size_bytes(&self) -> usize {
+        match self {
+            Self::Direct(driver) => driver.frame_size_bytes(),
+            Self::Buffered(driver) => driver.frame_size_bytes(),
+        }
+    }
+    pub fn input_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
+        match self {
+            Self::Direct(driver) => driver.input_port(idx),
+            Self::Buffered(driver) => driver.input_port(idx),
+        }
+    }
+    pub fn output_port(&self, idx: usize) -> Option<Arc<AudioIO>> {
+        match self {
+            Self::Direct(driver) => driver.output_port(idx),
+            Self::Buffered(driver) => driver.output_port(idx),
+        }
+    }
+    pub fn set_output_gain_balance(&mut self, gain: f32, balance: f32) {
+        match self {
+            Self::Direct(driver) => driver.set_output_gain_balance(gain, balance),
+            Self::Buffered(driver) => driver.set_output_gain_balance(gain, balance),
+        }
+    }
+    pub fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
+        match self {
+            Self::Direct(driver) => driver.set_plan_slot(slot),
+            Self::Buffered(driver) => driver.set_plan_slot(slot),
+        }
+    }
+    pub fn output_meter_db(&self, gain: f32, balance: f32) -> Vec<f32> {
+        match self {
+            Self::Direct(driver) => driver.output_meter_db(gain, balance),
+            Self::Buffered(driver) => driver.output_meter_db(gain, balance),
+        }
+    }
+    pub fn output_meter_linear(&self, gain: f32, balance: f32) -> Vec<f32> {
+        match self {
+            Self::Direct(driver) => driver.output_meter_linear(gain, balance),
+            Self::Buffered(driver) => driver.output_meter_linear(gain, balance),
+        }
+    }
+    pub fn run_cycle(&mut self) -> Result<(), String> {
+        match self {
+            Self::Direct(driver) => driver.run_cycle(),
+            Self::Buffered(driver) => driver.run_cycle(),
+        }
+    }
+    pub fn run_assist_step(&mut self) -> Result<bool, String> {
+        match self {
+            Self::Direct(driver) => driver.run_assist_step(),
+            Self::Buffered(driver) => driver.run_assist_step(),
+        }
+    }
+    pub fn set_playing(&mut self, playing: bool) {
+        match self {
+            Self::Direct(driver) => driver.set_playing(playing),
+            Self::Buffered(driver) => driver.set_playing(playing),
+        }
+    }
+    pub fn close_fds(&mut self) {
+        match self {
+            Self::Direct(driver) => driver.close_fds(),
+            Self::Buffered(driver) => driver.close_fds(),
+        }
+    }
+    pub fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {
+        match self {
+            Self::Direct(driver) => driver.latency_ranges(),
+            Self::Buffered(driver) => driver.latency_ranges(),
+        }
+    }
+}
+
+impl traits::HwWorkerDriver for HwDriver {
+    fn cycle_samples(&self) -> usize {
+        self.cycle_samples()
+    }
+    fn sample_rate(&self) -> i32 {
+        self.sample_rate()
+    }
+    fn close_fds(&mut self) {
+        self.close_fds();
+    }
+    fn set_playing(&mut self, playing: bool) {
+        self.set_playing(playing);
+    }
+    fn set_output_gain_balance(&mut self, gain: f32, balance: f32) {
+        self.set_output_gain_balance(gain, balance);
+    }
+    fn run_cycle_for_worker(&mut self) -> Result<(), String> {
+        self.run_cycle()
+    }
+    fn run_assist_step_for_worker(&mut self) -> Result<bool, String> {
+        self.run_assist_step()
+    }
+    fn set_plan_slot(&mut self, slot: Arc<crate::render_plan::PlanSlot>) {
+        self.set_plan_slot(slot);
+    }
+    fn set_inline_render(&mut self, ctx: Option<Arc<crate::inline_render::InlineRender>>) {
+        if let Self::Direct(driver) = self {
+            driver.set_inline_render(ctx);
+        }
+    }
+    fn request_stop(&mut self) {
+        self.close_fds();
+    }
+    fn stop_signaller(&self) -> Option<Arc<AtomicBool>> {
+        Some(match self {
+            Self::Direct(driver) => driver.stop.clone(),
+            Self::Buffered(driver) => driver.stop_requested.clone(),
+        })
+    }
+    fn xrun_count(&self) -> Option<u64> {
+        match self {
+            Self::Direct(driver) => Some(driver.xrun_count()),
+            Self::Buffered(driver) => {
+                Some(driver.output_shared.xruns.load(Ordering::Relaxed) as u64)
+            }
+        }
+    }
+}
+crate::impl_hw_device_for_driver!(HwDriver);
