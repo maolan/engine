@@ -694,6 +694,10 @@ pub enum Event {
         playback_lead: usize,
         record_back: usize,
     },
+    /// Cumulative hardware xruns since the current device was opened.
+    AudioXruns {
+        count: u64,
+    },
     /// Live report from the in-engine MTDM latency measurement component
     /// (see `iodelay_node.rs`), emitted about every 250 ms of stream time.
     IoDelayReport {

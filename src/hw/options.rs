@@ -3,6 +3,12 @@ pub struct HwOptions {
     pub exclusive: bool,
     pub period_frames: usize,
     pub nperiods: usize,
+    /// Minimum ALSA capture channels requested by the client; zero keeps the
+    /// backend's normal stereo default.
+    pub input_channels: usize,
+    /// Minimum ALSA playback channels requested by the client; zero keeps the
+    /// backend's normal stereo default.
+    pub output_channels: usize,
     pub ignore_hwbuf: bool,
     pub sync_mode: bool,
     pub input_latency_frames: usize,
@@ -28,6 +34,8 @@ mod tests {
             exclusive: true,
             period_frames: 512,
             nperiods: 3,
+            input_channels: 0,
+            output_channels: 0,
             ignore_hwbuf: true,
             sync_mode: false,
             input_latency_frames: 100,
@@ -49,6 +57,8 @@ mod tests {
             exclusive: true,
             period_frames: 512,
             nperiods: 3,
+            input_channels: 0,
+            output_channels: 0,
             ignore_hwbuf: true,
             sync_mode: false,
             input_latency_frames: 100,

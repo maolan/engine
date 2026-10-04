@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(target_os = "linux")]
-use crate::hw::alsa::MidiHub;
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "windows")]
@@ -977,6 +975,9 @@ impl Engine {
                     }
                     self.notify_clients(result).await;
                     self.drain_pending_requests_if_idle().await;
+                }
+                Message::Event(event @ Event::AudioXruns { .. }) => {
+                    self.notify_event(event).await;
                 }
                 Message::HWFinished => {
                     self.handle_hw_finished().await;

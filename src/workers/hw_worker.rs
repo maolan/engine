@@ -52,6 +52,8 @@ pub struct HwWorker<B: Backend> {
     /// Shared with the engine dispatcher; refreshed from the driver's
     /// `current_capture_frame` after every audio cycle. `CAPTURE_FRAME_UNKNOWN`
     /// when the backend reports nothing.
+    last_xrun_count: Option<u64>,
+    last_xrun_report: Option<std::time::Instant>,
     capture_frame: Arc<AtomicI64>,
     /// RT-inline render context. When armed, `TracksFinished` is the Go
     /// signal for a cycle that executes the render plan on the cycle thread;
@@ -224,8 +226,28 @@ impl<B: Backend> HwWorker<B> {
             pending_midi_out_sorted: true,
             midi_stop: Arc::new(AtomicBool::new(false)),
             playing: false,
+            last_xrun_count: None,
+            last_xrun_report: None,
             capture_frame,
             inline_render,
+        }
+    }
+
+    async fn publish_xruns(&mut self) {
+        let count = self.driver.as_ref().and_then(|driver| driver.xrun_count());
+        if count != self.last_xrun_count
+            || self
+                .last_xrun_report
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(250))
+        {
+            self.last_xrun_report = Some(std::time::Instant::now());
+            self.last_xrun_count = count;
+            if let Some(count) = count {
+                let _ = self
+                    .tx
+                    .send(Message::Event(crate::message::Event::AudioXruns { count }))
+                    .await;
+            }
         }
     }
 
@@ -463,6 +485,7 @@ impl<B: Backend> HwWorker<B> {
                         return;
                     }
                     self.publish_capture_frame();
+                        self.publish_xruns().await;
                     crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwCycleEnd);
                     crate::cycle_trace::mark(crate::cycle_trace::TracePoint::HwFinishedSent);
                     if let Err(e) = self.tx.send(Message::HWFinished).await {
@@ -583,6 +606,7 @@ impl<B: Backend> HwWorker<B> {
                     Ok((driver, result)) => {
                         self.driver = Some(driver);
                         self.publish_capture_frame();
+                        self.publish_xruns().await;
                         if let Err(e) = result {
                             error!("{} assist cycle error: {}", B::LABEL, e);
                             let _ = self

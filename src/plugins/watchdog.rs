@@ -424,7 +424,7 @@ mod imp {
             {
                 let registry = inner.registry.lock().unwrap();
                 for (&pid, reg) in registry.iter() {
-                    if !registered.contains_key(&pid) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = registered.entry(pid) {
                         let mut ev = libc::epoll_event {
                             events: libc::EPOLLIN as u32,
                             u64: u64::from(pid),
@@ -432,7 +432,7 @@ mod imp {
                         let rc =
                             unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, reg.fd, &mut ev) };
                         if rc == 0 {
-                            registered.insert(pid, reg.fd);
+                            e.insert(reg.fd);
                         } else {
                             tracing::warn!(
                                 error = %io::Error::last_os_error(),

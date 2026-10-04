@@ -4,7 +4,7 @@ use super::error_fmt;
 use super::latency;
 use super::ports;
 use crate::audio::io::AudioIO;
-use alsa::pcm::{Access, Format, HwParams, PCM, State};
+use alsa::pcm::{Access, Format, HwParams, IO, PCM, State};
 use alsa::{Direction, ValueOr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,8 @@ impl Default for HwOptions {
             exclusive: false,
             period_frames: 1024,
             nperiods: 2,
+            input_channels: 0,
+            output_channels: 0,
             ignore_hwbuf: false,
             sync_mode: false,
             input_latency_frames: 0,
@@ -27,6 +29,8 @@ impl Default for HwOptions {
 }
 
 pub struct HwDriver {
+    capture_mmap: bool,
+    playback_mmap: bool,
     capture: PCM,
     playback: PCM,
     audio_ins: Vec<Arc<AudioIO>>,
@@ -97,8 +101,20 @@ impl HwDriver {
         let nperiods = options.nperiods.max(1);
         let buffer_frames = period.saturating_mul(nperiods);
 
-        let capture_target = desired_channels(&capture, rate as usize, period, buffer_frames);
-        let playback_target = desired_channels(&playback, rate as usize, period, buffer_frames);
+        let capture_target = desired_channels(
+            &capture,
+            rate as usize,
+            period,
+            buffer_frames,
+            options.input_channels,
+        );
+        let playback_target = desired_channels(
+            &playback,
+            rate as usize,
+            period,
+            buffer_frames,
+            options.output_channels,
+        );
 
         let (channels_in, capture_format, capture_period) = configure_pcm(
             &capture,
@@ -142,7 +158,22 @@ impl HwDriver {
             .map(|_| Arc::new(AudioIO::new(actual_period)))
             .collect();
 
+        let capture_mmap = capture
+            .hw_params_current()
+            .map_err(|e| e.to_string())?
+            .get_access()
+            .map_err(|e| e.to_string())?
+            == Access::MMapInterleaved;
+        let playback_mmap = playback
+            .hw_params_current()
+            .map_err(|e| e.to_string())?
+            .get_access()
+            .map_err(|e| e.to_string())?
+            == Access::MMapInterleaved;
+        tracing::info!(capture_mmap, playback_mmap, "ALSA access modes");
         let mut driver = Self {
+            capture_mmap,
+            playback_mmap,
             capture,
             playback,
             audio_ins,
@@ -235,13 +266,27 @@ impl HwDriver {
             SampleFormat::S8 => {
                 let silence = vec![0i8; total_frames * self.channels_out];
                 if let Ok(out_io) = self.playback.io_i8() {
-                    let _ = out_io.writei(&silence);
+                    let _ = write_interleaved(
+                        &self.playback,
+                        &out_io,
+                        &silence,
+                        self.channels_out,
+                        self.playback_mmap,
+                        &self.stop_requested,
+                    );
                 }
             }
             SampleFormat::S16LE | SampleFormat::S16BE => {
                 let silence = vec![0i16; total_frames * self.channels_out];
                 if let Ok(out_io) = self.playback.io_i16() {
-                    let _ = out_io.writei(&silence);
+                    let _ = write_interleaved(
+                        &self.playback,
+                        &out_io,
+                        &silence,
+                        self.channels_out,
+                        self.playback_mmap,
+                        &self.stop_requested,
+                    );
                 }
             }
             SampleFormat::S24LE
@@ -250,7 +295,14 @@ impl HwDriver {
             | SampleFormat::S32BE => {
                 let silence = vec![0i32; total_frames * self.channels_out];
                 if let Ok(out_io) = self.playback.io_i32() {
-                    let _ = out_io.writei(&silence);
+                    let _ = write_interleaved(
+                        &self.playback,
+                        &out_io,
+                        &silence,
+                        self.channels_out,
+                        self.playback_mmap,
+                        &self.stop_requested,
+                    );
                 }
             }
         }
@@ -307,6 +359,21 @@ impl HwDriver {
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self.run_active_cycle();
+        // The worker raises this flag to interrupt an in-flight mmap transfer
+        // during Quit. The transfer must unwind without processing partial
+        // capture data, but cancellation is not a hardware failure.
+        if self.stop_requested.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            result
+        }
+    }
+
+    fn run_active_cycle(&mut self) -> Result<(), String> {
         let frames = self.period_frames;
 
         match self.capture_format {
@@ -315,7 +382,14 @@ impl HwDriver {
                     .capture
                     .io_i8()
                     .map_err(|e| error_fmt::backend_io_error("ALSA", "capture", e))?;
-                if let Err(e) = in_io.readi(&mut self.capture_buffer_i8) {
+                if let Err(e) = read_interleaved(
+                    &self.capture,
+                    &in_io,
+                    &mut self.capture_buffer_i8,
+                    self.channels_in,
+                    self.capture_mmap,
+                    &self.stop_requested,
+                ) {
                     if self.capture.state() == State::XRun {
                         self.xrun_count += 1;
                         tracing::warn!("ALSA capture xrun #{}", self.xrun_count);
@@ -331,7 +405,14 @@ impl HwDriver {
                     .capture
                     .io_i16()
                     .map_err(|e| error_fmt::backend_io_error("ALSA", "capture", e))?;
-                if let Err(e) = in_io.readi(&mut self.capture_buffer_i16) {
+                if let Err(e) = read_interleaved(
+                    &self.capture,
+                    &in_io,
+                    &mut self.capture_buffer_i16,
+                    self.channels_in,
+                    self.capture_mmap,
+                    &self.stop_requested,
+                ) {
                     if self.capture.state() == State::XRun {
                         self.xrun_count += 1;
                         tracing::warn!("ALSA capture xrun #{}", self.xrun_count);
@@ -350,7 +431,14 @@ impl HwDriver {
                     .capture
                     .io_i32()
                     .map_err(|e| error_fmt::backend_io_error("ALSA", "capture", e))?;
-                if let Err(e) = in_io.readi(&mut self.capture_buffer_i32) {
+                if let Err(e) = read_interleaved(
+                    &self.capture,
+                    &in_io,
+                    &mut self.capture_buffer_i32,
+                    self.channels_in,
+                    self.capture_mmap,
+                    &self.stop_requested,
+                ) {
                     if self.capture.state() == State::XRun {
                         self.xrun_count += 1;
                         tracing::warn!("ALSA capture xrun #{}", self.xrun_count);
@@ -608,7 +696,14 @@ impl HwDriver {
                     .playback
                     .io_i8()
                     .map_err(|e| error_fmt::backend_io_error("ALSA", "playback", e))?;
-                if let Err(e) = out_io.writei(&self.playback_buffer_i8) {
+                if let Err(e) = write_interleaved(
+                    &self.playback,
+                    &out_io,
+                    &self.playback_buffer_i8,
+                    self.channels_out,
+                    self.playback_mmap,
+                    &self.stop_requested,
+                ) {
                     if self.playback.state() == State::XRun {
                         self.xrun_count += 1;
                         tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
@@ -660,7 +755,14 @@ impl HwDriver {
                     .playback
                     .io_i16()
                     .map_err(|e| error_fmt::backend_io_error("ALSA", "playback", e))?;
-                if let Err(e) = out_io.writei(&self.playback_buffer_i16) {
+                if let Err(e) = write_interleaved(
+                    &self.playback,
+                    &out_io,
+                    &self.playback_buffer_i16,
+                    self.channels_out,
+                    self.playback_mmap,
+                    &self.stop_requested,
+                ) {
                     if self.playback.state() == State::XRun {
                         self.xrun_count += 1;
                         tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
@@ -726,7 +828,14 @@ impl HwDriver {
                     .playback
                     .io_i32()
                     .map_err(|e| error_fmt::backend_io_error("ALSA", "playback", e))?;
-                if let Err(e) = out_io.writei(&self.playback_buffer_i32) {
+                if let Err(e) = write_interleaved(
+                    &self.playback,
+                    &out_io,
+                    &self.playback_buffer_i32,
+                    self.channels_out,
+                    self.playback_mmap,
+                    &self.stop_requested,
+                ) {
                     if self.playback.state() == State::XRun {
                         self.xrun_count += 1;
                         tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
@@ -778,7 +887,14 @@ impl HwDriver {
                     .playback
                     .io_i32()
                     .map_err(|e| error_fmt::backend_io_error("ALSA", "playback", e))?;
-                if let Err(e) = out_io.writei(&self.playback_buffer_i32) {
+                if let Err(e) = write_interleaved(
+                    &self.playback,
+                    &out_io,
+                    &self.playback_buffer_i32,
+                    self.channels_out,
+                    self.playback_mmap,
+                    &self.stop_requested,
+                ) {
                     if self.playback.state() == State::XRun {
                         self.xrun_count += 1;
                         tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
@@ -809,6 +925,9 @@ impl HwDriver {
 }
 
 impl crate::hw::traits::HwWorkerDriver for HwDriver {
+    fn xrun_count(&self) -> Option<u64> {
+        Some(self.xrun_count)
+    }
     fn cycle_samples(&self) -> usize {
         self.cycle_samples()
     }
@@ -865,8 +984,17 @@ impl<'a> AlsaChannel<'a> {
     }
 }
 
-fn desired_channels(pcm: &PCM, rate: usize, period_frames: usize, buffer_frames: usize) -> usize {
+fn desired_channels(
+    pcm: &PCM,
+    rate: usize,
+    period_frames: usize,
+    buffer_frames: usize,
+    requested: usize,
+) -> usize {
     let _ = (rate, period_frames, buffer_frames);
+    if requested > 0 {
+        return requested;
+    }
     let Ok(hwp) = HwParams::any(pcm) else {
         return 2;
     };
@@ -888,9 +1016,132 @@ fn configure_pcm(
     buffer_frames: usize,
     bits: i32,
 ) -> Result<(usize, SampleFormat, usize), String> {
+    match configure_pcm_access(
+        pcm,
+        rate,
+        channels,
+        period_frames,
+        buffer_frames,
+        bits,
+        Access::MMapInterleaved,
+    ) {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            tracing::debug!(%error, "ALSA mmap unavailable; falling back to read/write access");
+            pcm.hw_free().map_err(|e| e.to_string())?;
+            configure_pcm_access(
+                pcm,
+                rate,
+                channels,
+                period_frames,
+                buffer_frames,
+                bits,
+                Access::RWInterleaved,
+            )
+        }
+    }
+}
+
+// Keep conversion in the existing preallocated buffers. The safe ALSA wrapper
+// limits each mapping to the contiguous region before the ring wraps.
+fn read_interleaved<T: Copy>(
+    pcm: &PCM,
+    io: &IO<'_, T>,
+    buffer: &mut [T],
+    channels: usize,
+    mmap: bool,
+    stop: &AtomicBool,
+) -> alsa::Result<usize> {
+    if !mmap {
+        return io.readi(buffer);
+    }
+    if pcm.state() == State::Prepared {
+        pcm.start()?;
+    }
+    let frames = buffer.len() / channels;
+    let mut done = 0;
+    while done < frames {
+        if stop.load(Ordering::Acquire) {
+            return Err(alsa::Error::new("mmap capture stopped", libc::EINTR));
+        }
+        if pcm.avail_update()? == 0 {
+            pcm.wait(Some(100))?;
+            continue;
+        }
+        let mut copied = 0;
+        let committed = io.mmap(frames - done, |area| {
+            copied = area.len() / channels;
+            buffer[done * channels..(done + copied) * channels].copy_from_slice(area);
+            copied
+        })?;
+        if committed != copied {
+            return Err(alsa::Error::new("short mmap capture commit", libc::EPIPE));
+        }
+        done += committed;
+        if committed == 0 {
+            pcm.wait(Some(100))?;
+        }
+    }
+    Ok(done)
+}
+
+fn write_interleaved<T: Copy>(
+    pcm: &PCM,
+    io: &IO<'_, T>,
+    buffer: &[T],
+    channels: usize,
+    mmap: bool,
+    stop: &AtomicBool,
+) -> alsa::Result<usize> {
+    if !mmap {
+        return io.writei(buffer);
+    }
+    let frames = buffer.len() / channels;
+    let mut done = 0;
+    while done < frames {
+        if stop.load(Ordering::Acquire) {
+            return Err(alsa::Error::new("mmap playback stopped", libc::EINTR));
+        }
+        if pcm.avail_update()? == 0 {
+            pcm.wait(Some(100))?;
+            continue;
+        }
+        let mut copied = 0;
+        let committed = io.mmap(frames - done, |area| {
+            copied = area.len() / channels;
+            area.copy_from_slice(&buffer[done * channels..(done + copied) * channels]);
+            copied
+        })?;
+        if committed != copied {
+            return Err(alsa::Error::new("short mmap playback commit", libc::EPIPE));
+        }
+        done += committed;
+        // mmap_commit does not perform writei's automatic stream start.
+        if pcm.state() == State::Prepared {
+            let buffer_frames = pcm.hw_params_current()?.get_buffer_size()?;
+            let queued = buffer_frames - pcm.avail_update()?;
+            if queued >= pcm.sw_params_current()?.get_start_threshold()? {
+                pcm.start()?;
+            }
+        }
+        if committed == 0 {
+            pcm.wait(Some(100))?;
+        }
+    }
+    Ok(done)
+}
+
+fn configure_pcm_access(
+    pcm: &PCM,
+    rate: usize,
+    channels: usize,
+    period_frames: usize,
+    buffer_frames: usize,
+    bits: i32,
+    access: Access,
+) -> Result<(usize, SampleFormat, usize), String> {
     let hwp = HwParams::any(pcm).map_err(|e| e.to_string())?;
-    hwp.set_access(Access::RWInterleaved)
-        .map_err(|e| e.to_string())?;
+    hwp.set_access(access).map_err(|e| e.to_string())?;
     let format = choose_best_format(&hwp, bits)?;
     let target = (channels.max(1)) as u32;
     let _chosen_channels = match hwp.set_channels_near(target) {
@@ -1076,4 +1327,106 @@ fn foreign_s32() -> SampleFormat {
 #[cfg(target_endian = "big")]
 fn foreign_s32() -> SampleFormat {
     SampleFormat::S32LE
+}
+
+#[cfg(test)]
+mod mmap_tests {
+    use super::*;
+
+    #[test]
+    fn capture_transfers_and_restarts_in_both_access_modes() {
+        for access in [Access::MMapInterleaved, Access::RWInterleaved] {
+            let pcm = PCM::new("null", Direction::Capture, false).unwrap();
+            let (channels, _, period) =
+                configure_pcm_access(&pcm, 48000, 2, 64, 128, 16, access).unwrap();
+            let io = pcm.io_i16().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let timeout_stop = stop.clone();
+            let (finished, done) = std::sync::mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                if done
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .is_err()
+                {
+                    timeout_stop.store(true, Ordering::Release);
+                }
+            });
+            let mut buffer = vec![0i16; period * channels];
+            for _ in 0..2 {
+                for _ in 0..8 {
+                    assert_eq!(
+                        read_interleaved(
+                            &pcm,
+                            &io,
+                            &mut buffer,
+                            channels,
+                            access == Access::MMapInterleaved,
+                            &stop
+                        )
+                        .unwrap(),
+                        period
+                    );
+                }
+                assert_eq!(pcm.state(), State::Running);
+                pcm.drop().unwrap();
+                pcm.prepare().unwrap();
+            }
+            finished.send(()).unwrap();
+            watchdog.join().unwrap();
+        }
+    }
+
+    // ALSA's null PCM exercises access negotiation and mmap begin/commit
+    // without requiring a sound card or emitting audio.
+    #[test]
+    fn playback_transfers_and_restarts_in_both_access_modes() {
+        for access in [Access::MMapInterleaved, Access::RWInterleaved] {
+            let pcm = PCM::new("null", Direction::Playback, false).unwrap();
+            let (channels, _, period) =
+                configure_pcm_access(&pcm, 48000, 2, 64, 128, 16, access).unwrap();
+            let io = pcm.io_i16().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let timeout_stop = stop.clone();
+            let (finished, done) = std::sync::mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                if done
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .is_err()
+                {
+                    timeout_stop.store(true, Ordering::Release);
+                }
+            });
+            let buffer = vec![0i16; period * channels];
+            for _ in 0..2 {
+                for _ in 0..8 {
+                    assert_eq!(
+                        write_interleaved(
+                            &pcm,
+                            &io,
+                            &buffer,
+                            channels,
+                            access == Access::MMapInterleaved,
+                            &stop
+                        )
+                        .unwrap(),
+                        period
+                    );
+                }
+                assert_eq!(pcm.state(), State::Running);
+                pcm.drop().unwrap();
+                pcm.prepare().unwrap();
+            }
+            stop.store(true, Ordering::Release);
+            if access == Access::MMapInterleaved {
+                assert_eq!(
+                    write_interleaved(&pcm, &io, &buffer, channels, true, &stop)
+                        .unwrap_err()
+                        .errno(),
+                    libc::EINTR
+                );
+            }
+            finished.send(()).unwrap();
+            watchdog.join().unwrap();
+        }
+    }
 }

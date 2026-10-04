@@ -42,8 +42,9 @@ pub(crate) enum TracePoint {
     CaptureReadDone,
     RenderDispatched,
     RenderEnd,
-    PlaybackWriteDone,
-    HwCycleEnd,
+    #[cfg(target_os = "freebsd")]
+    PlaybackWriteDone = 4,
+    HwCycleEnd = 5,
     HwFinishedSent,
     HwFinishedReceived,
     TransportAdvanced,
@@ -51,10 +52,11 @@ pub(crate) enum TracePoint {
     GoReceived,
     /// Direct-mmap path only: the period was copied into the playback ring
     /// and the post-copy deadline check passed.
-    PlaybackMapDone,
+    #[cfg(target_os = "freebsd")]
+    PlaybackMapDone = 11,
 }
 
-const N_POINTS: usize = TracePoint::PlaybackMapDone as usize + 1;
+const N_POINTS: usize = 12;
 const _: () = assert!(N_POINTS == 12);
 
 /// Frame-delta metrics stored alongside the timestamps. These are not wall
@@ -293,6 +295,7 @@ impl Drop for PluginWaitGuard {
 
 /// Store a frame-delta metric for the current sequence. Called from the
 /// cycle thread; a relaxed atomic store into preallocated storage.
+#[cfg(target_os = "freebsd")]
 pub(crate) fn set_frame_metric(metric: FrameMetric, frames: i64) {
     if !enabled() {
         return;
@@ -457,6 +460,7 @@ mod tests {
         assert_eq!(seq2, seq1 + 1);
         mark(TracePoint::HwCycleStart);
         mark(TracePoint::CaptureReadDone);
+        #[cfg(target_os = "freebsd")]
         mark(TracePoint::PlaybackWriteDone);
         mark(TracePoint::HwCycleEnd);
         mark(TracePoint::HwFinishedSent);

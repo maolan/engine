@@ -3,6 +3,10 @@ use crate::message::HwMidiEvent;
 pub trait HwWorkerDriver {
     fn cycle_samples(&self) -> usize;
     fn sample_rate(&self) -> i32;
+    /// Cumulative xruns since device open, or None when unavailable.
+    fn xrun_count(&self) -> Option<u64> {
+        None
+    }
     fn request_stop(&mut self) {}
     fn close_fds(&mut self) {}
     fn set_playing(&mut self, _playing: bool) {}
