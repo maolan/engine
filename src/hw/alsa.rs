@@ -29,6 +29,7 @@ impl Default for HwOptions {
 }
 
 pub struct HwDriver {
+    duplex_linked: bool,
     capture_mmap: bool,
     playback_mmap: bool,
     capture: PCM,
@@ -171,7 +172,9 @@ impl HwDriver {
             .map_err(|e| e.to_string())?
             == Access::MMapInterleaved;
         tracing::info!(capture_mmap, playback_mmap, "ALSA access modes");
+        let duplex_linked = playback.link(&capture).is_ok();
         let mut driver = Self {
+            duplex_linked,
             capture_mmap,
             playback_mmap,
             capture,
@@ -204,7 +207,7 @@ impl HwDriver {
             xrun_count: 0,
             plan_slot: None,
         };
-        driver.prefill_playback();
+        driver.start_duplex()?;
         Ok(driver)
     }
 
@@ -219,25 +222,10 @@ impl HwDriver {
     pub fn set_playing(&mut self, playing: bool) {
         self.playing.store(playing, Ordering::Relaxed);
         if playing {
-            match self.capture.state() {
-                State::Running => {}
-                State::Prepared => {
-                    let _ = self.capture.start();
-                }
-                _ => {
-                    let _ = self.capture.prepare();
-                    let _ = self.capture.start();
-                }
-            }
-            match self.playback.state() {
-                State::Running => {}
-                State::Prepared => {
-                    let _ = self.playback.start();
-                }
-                _ => {
-                    let _ = self.playback.prepare();
-                    let _ = self.playback.start();
-                }
+            if (self.capture.state() != State::Running || self.playback.state() != State::Running)
+                && let Err(error) = self.restart_duplex()
+            {
+                tracing::error!(%error, "ALSA duplex restart failed");
             }
         } else {
             self.force_silence_now();
@@ -260,52 +248,74 @@ impl HwDriver {
         }
     }
 
-    fn prefill_playback(&mut self) {
-        let total_frames = self.period_frames * self.nperiods.max(1);
-        match self.playback_format {
-            SampleFormat::S8 => {
-                let silence = vec![0i8; total_frames * self.channels_out];
-                if let Ok(out_io) = self.playback.io_i8() {
-                    let _ = write_interleaved(
-                        &self.playback,
-                        &out_io,
-                        &silence,
-                        self.channels_out,
-                        self.playback_mmap,
-                        &self.stop_requested,
-                    );
+    // Like JACK2's ALSA startup: silence and commit the complete playback
+    // ring before starting the linked duplex pair. Respect each mmap region
+    // rather than assuming the whole ring is contiguous.
+    fn start_duplex(&mut self) -> Result<(), String> {
+        if self.playback_mmap {
+            let io = self.playback.io_bytes();
+            let frame_bytes = self.playback.frames_to_bytes(1) as usize;
+            let frames = self
+                .playback
+                .hw_params_current()
+                .map_err(|e| e.to_string())?
+                .get_buffer_size()
+                .map_err(|e| e.to_string())? as usize;
+            let mut done = 0;
+            while done < frames {
+                self.playback.avail_update().map_err(|e| e.to_string())?;
+                let mut copied = 0;
+                let committed = io
+                    .mmap(frames - done, |area| {
+                        area.fill(0);
+                        copied = area.len() / frame_bytes;
+                        copied
+                    })
+                    .map_err(|e| e.to_string())?;
+                if committed == 0 || committed != copied {
+                    return Err("ALSA could not prefill the playback ring".into());
                 }
+                done += committed;
             }
-            SampleFormat::S16LE | SampleFormat::S16BE => {
-                let silence = vec![0i16; total_frames * self.channels_out];
-                if let Ok(out_io) = self.playback.io_i16() {
-                    let _ = write_interleaved(
-                        &self.playback,
-                        &out_io,
-                        &silence,
-                        self.channels_out,
-                        self.playback_mmap,
-                        &self.stop_requested,
-                    );
+        } else {
+            let frames = self
+                .playback
+                .hw_params_current()
+                .map_err(|e| e.to_string())?
+                .get_buffer_size()
+                .map_err(|e| e.to_string())?;
+            let silence = vec![0u8; self.playback.frames_to_bytes(frames) as usize];
+            let io = self.playback.io_bytes();
+            let mut done = 0;
+            while done < frames as usize {
+                let offset = self.playback.frames_to_bytes(done as i64) as usize;
+                let written = io.writei(&silence[offset..]).map_err(|e| e.to_string())?;
+                if written == 0 {
+                    return Err("ALSA playback prefill made no progress".into());
                 }
-            }
-            SampleFormat::S24LE
-            | SampleFormat::S24BE
-            | SampleFormat::S32LE
-            | SampleFormat::S32BE => {
-                let silence = vec![0i32; total_frames * self.channels_out];
-                if let Ok(out_io) = self.playback.io_i32() {
-                    let _ = write_interleaved(
-                        &self.playback,
-                        &out_io,
-                        &silence,
-                        self.channels_out,
-                        self.playback_mmap,
-                        &self.stop_requested,
-                    );
-                }
+                done += written;
             }
         }
+        if self.playback.state() == State::Prepared {
+            self.playback.start().map_err(|e| e.to_string())?;
+        }
+        if !self.duplex_linked && self.capture.state() == State::Prepared {
+            self.capture.start().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn restart_duplex(&mut self) -> Result<(), String> {
+        let _ = self.playback.drop();
+        if !self.duplex_linked {
+            let _ = self.capture.drop();
+        }
+        self.playback.prepare().map_err(|e| e.to_string())?;
+        if self.capture.state() != State::Prepared {
+            self.capture.prepare().map_err(|e| e.to_string())?;
+        }
+        self.force_silence_now();
+        self.start_duplex()
     }
 
     pub fn input_channels(&self) -> usize {
@@ -368,6 +378,19 @@ impl HwDriver {
         // capture data, but cancellation is not a hardware failure.
         if self.stop_requested.load(Ordering::Acquire) {
             Ok(())
+        } else if result.is_err()
+            && (matches!(self.capture.state(), State::XRun | State::Suspended)
+                || matches!(self.playback.state(), State::XRun | State::Suspended)
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("short mmap")))
+        {
+            self.xrun_count += 1;
+            tracing::warn!(
+                count = self.xrun_count,
+                "ALSA duplex xrun; restarting both streams"
+            );
+            self.restart_duplex()
         } else {
             result
         }
@@ -390,14 +413,7 @@ impl HwDriver {
                     self.capture_mmap,
                     &self.stop_requested,
                 ) {
-                    if self.capture.state() == State::XRun {
-                        self.xrun_count += 1;
-                        tracing::warn!("ALSA capture xrun #{}", self.xrun_count);
-                        let _ = self.capture.prepare();
-                        self.capture_buffer_i8.fill(0);
-                    } else {
-                        return Err(error_fmt::backend_rw_error("ALSA", "capture", "read", e));
-                    }
+                    return Err(error_fmt::backend_rw_error("ALSA", "capture", "read", e));
                 }
             }
             SampleFormat::S16LE | SampleFormat::S16BE => {
@@ -413,14 +429,7 @@ impl HwDriver {
                     self.capture_mmap,
                     &self.stop_requested,
                 ) {
-                    if self.capture.state() == State::XRun {
-                        self.xrun_count += 1;
-                        tracing::warn!("ALSA capture xrun #{}", self.xrun_count);
-                        let _ = self.capture.prepare();
-                        self.capture_buffer_i16.fill(0);
-                    } else {
-                        return Err(error_fmt::backend_rw_error("ALSA", "capture", "read", e));
-                    }
+                    return Err(error_fmt::backend_rw_error("ALSA", "capture", "read", e));
                 }
             }
             SampleFormat::S24LE
@@ -439,14 +448,7 @@ impl HwDriver {
                     self.capture_mmap,
                     &self.stop_requested,
                 ) {
-                    if self.capture.state() == State::XRun {
-                        self.xrun_count += 1;
-                        tracing::warn!("ALSA capture xrun #{}", self.xrun_count);
-                        let _ = self.capture.prepare();
-                        self.capture_buffer_i32.fill(0);
-                    } else {
-                        return Err(error_fmt::backend_rw_error("ALSA", "capture", "read", e));
-                    }
+                    return Err(error_fmt::backend_rw_error("ALSA", "capture", "read", e));
                 }
             }
         }
@@ -704,13 +706,7 @@ impl HwDriver {
                     self.playback_mmap,
                     &self.stop_requested,
                 ) {
-                    if self.playback.state() == State::XRun {
-                        self.xrun_count += 1;
-                        tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
-                        let _ = self.playback.prepare();
-                    } else {
-                        return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
-                    }
+                    return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
                 }
             }
             SampleFormat::S16LE | SampleFormat::S16BE => {
@@ -763,13 +759,7 @@ impl HwDriver {
                     self.playback_mmap,
                     &self.stop_requested,
                 ) {
-                    if self.playback.state() == State::XRun {
-                        self.xrun_count += 1;
-                        tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
-                        let _ = self.playback.prepare();
-                    } else {
-                        return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
-                    }
+                    return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
                 }
             }
             SampleFormat::S24LE | SampleFormat::S24BE => {
@@ -836,13 +826,7 @@ impl HwDriver {
                     self.playback_mmap,
                     &self.stop_requested,
                 ) {
-                    if self.playback.state() == State::XRun {
-                        self.xrun_count += 1;
-                        tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
-                        let _ = self.playback.prepare();
-                    } else {
-                        return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
-                    }
+                    return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
                 }
             }
             SampleFormat::S32LE | SampleFormat::S32BE => {
@@ -895,13 +879,7 @@ impl HwDriver {
                     self.playback_mmap,
                     &self.stop_requested,
                 ) {
-                    if self.playback.state() == State::XRun {
-                        self.xrun_count += 1;
-                        tracing::warn!("ALSA playback xrun #{}", self.xrun_count);
-                        let _ = self.playback.prepare();
-                    } else {
-                        return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
-                    }
+                    return Err(error_fmt::backend_rw_error("ALSA", "playback", "write", e));
                 }
             }
         }
@@ -1165,7 +1143,13 @@ fn configure_pcm_access(
     let cur = pcm.hw_params_current().map_err(|e| e.to_string())?;
     let actual_buffer = cur.get_buffer_size().map_err(|e| e.to_string())?;
     let actual_period = cur.get_period_size().map_err(|e| e.to_string())?;
-    let start_threshold = actual_buffer.saturating_sub(actual_period) as u32;
+    let start_threshold = if access == Access::MMapInterleaved {
+        0
+    } else {
+        actual_buffer.saturating_sub(actual_period) as u32
+    };
+    swp.set_stop_threshold(actual_buffer)
+        .map_err(|e| e.to_string())?;
     swp.set_start_threshold(start_threshold as i64)
         .map_err(|e| e.to_string())?;
     swp.set_avail_min(actual_period)
@@ -1332,6 +1316,29 @@ fn foreign_s32() -> SampleFormat {
 #[cfg(test)]
 mod mmap_tests {
     use super::*;
+
+    #[test]
+    fn duplex_start_and_restart_prime_playback_and_start_capture() {
+        let mut driver = HwDriver::new_with_options(
+            "null",
+            Some("null"),
+            48000,
+            16,
+            HwOptions {
+                period_frames: 512,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(driver.capture.state(), State::Running);
+            assert_eq!(driver.playback.state(), State::Running);
+            for _ in 0..8 {
+                driver.run_cycle().unwrap();
+            }
+            driver.restart_duplex().unwrap();
+        }
+    }
 
     #[test]
     fn capture_transfers_and_restarts_in_both_access_modes() {

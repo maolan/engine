@@ -59,6 +59,8 @@ impl Default for HwOptions {
             exclusive: false,
             period_frames: 1024,
             nperiods: 1,
+            input_channels: 0,
+            output_channels: 0,
             ignore_hwbuf: false,
             sync_mode: false,
             input_latency_frames: 0,
