@@ -151,6 +151,9 @@ impl Engine {
                 self.history.clear();
                 self.history_suspended = false;
                 self.preload_track_clips_spawn();
+                if !self.transport.playing && self.state.lock().iodelay.is_some() {
+                    self.handle_pause(Action::Pause).await;
+                }
             }
             Action::Undo | Action::Redo | Action::ApplyGroupedActions(_) => {}
             _ => {}

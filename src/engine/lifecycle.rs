@@ -298,7 +298,6 @@ impl Engine {
         crate::plugins::ipc::reset_plugin_wait_bound();
         self.hw_input_ports.clear();
         self.hw_output_ports.clear();
-        self.notify_clients(Ok(Action::Quit)).await;
         self.dispatch.ready_workers.clear();
         while !self.workers.is_empty() {
             let mut worker = self.workers.remove(0);
@@ -316,5 +315,11 @@ impl Engine {
             self.jack_runtime = None;
         }
         self.osc_server = None;
+        // A Quit response is also the shutdown barrier for clients that keep
+        // the engine process alive (for example, the calibration utility).
+        // Do not acknowledge until the render workers have stopped as well as
+        // the hardware worker, otherwise a client may open another device
+        // while the previous engine is still retiring workers.
+        self.notify_clients(Ok(Action::Quit)).await;
     }
 }

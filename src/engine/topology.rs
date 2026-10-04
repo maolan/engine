@@ -1658,12 +1658,6 @@ impl Engine {
                 info.sample_rate.max(1) as usize,
             );
             self.state.lock().iodelay = Some(std::sync::Arc::new(node));
-            // IO Delay needs continuous hardware monitoring even while the
-            // timeline is stopped. GUI clients do not issue Pause as the
-            // standalone calibrator does. Preserve an already running transport.
-            if !self.transport.playing {
-                self.handle_pause(Action::Pause).await;
-            }
         } else {
             self.state.lock().iodelay = None;
         }

@@ -1022,6 +1022,35 @@ fn configure_pcm(
 
 // Keep conversion in the existing preallocated buffers. The safe ALSA wrapper
 // limits each mapping to the contiguous region before the ring wraps.
+fn transfer_mmap_period(
+    frames: usize,
+    stop: &AtomicBool,
+    mut available: impl FnMut() -> alsa::Result<i64>,
+    mut wait: impl FnMut() -> alsa::Result<bool>,
+    mut transfer: impl FnMut(usize, usize) -> alsa::Result<usize>,
+) -> alsa::Result<usize> {
+    let mut done = 0;
+    while done < frames {
+        if stop.load(Ordering::Acquire) {
+            return Err(alsa::Error::new("mmap transfer stopped", libc::EINTR));
+        }
+        // avail_min is one period. Consuming a partial period before waiting
+        // would require another whole period to arrive (or drain), even when
+        // only a few frames remain. Like JACK2, wait for a complete block
+        // first, then commit its contiguous regions across the ring wrap.
+        if available()? < (frames - done) as i64 {
+            wait()?;
+            continue;
+        }
+        let committed = transfer(done, frames - done)?;
+        done += committed;
+        if committed == 0 {
+            wait()?;
+        }
+    }
+    Ok(done)
+}
+
 fn read_interleaved<T: Copy>(
     pcm: &PCM,
     io: &IO<'_, T>,
@@ -1036,31 +1065,24 @@ fn read_interleaved<T: Copy>(
     if pcm.state() == State::Prepared {
         pcm.start()?;
     }
-    let frames = buffer.len() / channels;
-    let mut done = 0;
-    while done < frames {
-        if stop.load(Ordering::Acquire) {
-            return Err(alsa::Error::new("mmap capture stopped", libc::EINTR));
-        }
-        if pcm.avail_update()? == 0 {
-            pcm.wait(Some(100))?;
-            continue;
-        }
-        let mut copied = 0;
-        let committed = io.mmap(frames - done, |area| {
-            copied = area.len() / channels;
-            buffer[done * channels..(done + copied) * channels].copy_from_slice(area);
-            copied
-        })?;
-        if committed != copied {
-            return Err(alsa::Error::new("short mmap capture commit", libc::EPIPE));
-        }
-        done += committed;
-        if committed == 0 {
-            pcm.wait(Some(100))?;
-        }
-    }
-    Ok(done)
+    transfer_mmap_period(
+        buffer.len() / channels,
+        stop,
+        || pcm.avail_update(),
+        || pcm.wait(Some(100)),
+        |done, remaining| {
+            let mut copied = 0;
+            let committed = io.mmap(remaining, |area| {
+                copied = area.len() / channels;
+                buffer[done * channels..(done + copied) * channels].copy_from_slice(area);
+                copied
+            })?;
+            if committed != copied {
+                return Err(alsa::Error::new("short mmap capture commit", libc::EPIPE));
+            }
+            Ok(committed)
+        },
+    )
 }
 
 fn write_interleaved<T: Copy>(
@@ -1074,39 +1096,32 @@ fn write_interleaved<T: Copy>(
     if !mmap {
         return io.writei(buffer);
     }
-    let frames = buffer.len() / channels;
-    let mut done = 0;
-    while done < frames {
-        if stop.load(Ordering::Acquire) {
-            return Err(alsa::Error::new("mmap playback stopped", libc::EINTR));
-        }
-        if pcm.avail_update()? == 0 {
-            pcm.wait(Some(100))?;
-            continue;
-        }
-        let mut copied = 0;
-        let committed = io.mmap(frames - done, |area| {
-            copied = area.len() / channels;
-            area.copy_from_slice(&buffer[done * channels..(done + copied) * channels]);
-            copied
-        })?;
-        if committed != copied {
-            return Err(alsa::Error::new("short mmap playback commit", libc::EPIPE));
-        }
-        done += committed;
-        // mmap_commit does not perform writei's automatic stream start.
-        if pcm.state() == State::Prepared {
-            let buffer_frames = pcm.hw_params_current()?.get_buffer_size()?;
-            let queued = buffer_frames - pcm.avail_update()?;
-            if queued >= pcm.sw_params_current()?.get_start_threshold()? {
-                pcm.start()?;
+    transfer_mmap_period(
+        buffer.len() / channels,
+        stop,
+        || pcm.avail_update(),
+        || pcm.wait(Some(100)),
+        |done, remaining| {
+            let mut copied = 0;
+            let committed = io.mmap(remaining, |area| {
+                copied = area.len() / channels;
+                area.copy_from_slice(&buffer[done * channels..(done + copied) * channels]);
+                copied
+            })?;
+            if committed != copied {
+                return Err(alsa::Error::new("short mmap playback commit", libc::EPIPE));
             }
-        }
-        if committed == 0 {
-            pcm.wait(Some(100))?;
-        }
-    }
-    Ok(done)
+            // mmap_commit does not perform writei's automatic stream start.
+            if pcm.state() == State::Prepared {
+                let buffer_frames = pcm.hw_params_current()?.get_buffer_size()?;
+                let queued = buffer_frames - pcm.avail_update()?;
+                if queued >= pcm.sw_params_current()?.get_start_threshold()? {
+                    pcm.start()?;
+                }
+            }
+            Ok(committed)
+        },
+    )
 }
 
 fn configure_pcm_access(
@@ -1316,6 +1331,55 @@ fn foreign_s32() -> SampleFormat {
 #[cfg(test)]
 mod mmap_tests {
     use super::*;
+
+    #[test]
+    fn partial_availability_waits_for_a_period_before_committing_across_ring_wrap() {
+        use std::cell::Cell;
+
+        // A USB update exposes only part of a 512-frame period. Poll wakes
+        // when avail_min (512) is reached; mmap also splits at the ring end.
+        let available = Cell::new(240usize);
+        let waits = Cell::new(0);
+        let mut commits = Vec::new();
+        let frames = transfer_mmap_period(
+            512,
+            &AtomicBool::new(false),
+            || Ok(available.get() as i64),
+            || {
+                waits.set(waits.get() + 1);
+                available.set(512);
+                Ok(true)
+            },
+            |offset, remaining| {
+                let count = remaining.min(256).min(available.get());
+                available.set(available.get() - count);
+                commits.push((offset, count));
+                Ok(count)
+            },
+        )
+        .unwrap();
+        assert_eq!(frames, 512);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(commits, [(0, 256), (256, 256)]);
+        assert_eq!(available.get(), 0);
+    }
+
+    #[test]
+    fn stopping_while_waiting_for_a_period_does_not_commit_partial_data() {
+        let stop = AtomicBool::new(false);
+        let error = transfer_mmap_period(
+            512,
+            &stop,
+            || Ok(240),
+            || {
+                stop.store(true, Ordering::Release);
+                Ok(false)
+            },
+            |_, _| panic!("a partial period must not be committed"),
+        )
+        .unwrap_err();
+        assert_eq!(error.errno(), libc::EINTR);
+    }
 
     #[test]
     fn duplex_start_and_restart_prime_playback_and_start_capture() {
