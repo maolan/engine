@@ -6,7 +6,7 @@
 
 It provides:
 
-- Audio and MIDI track processing
+- Real-time Audio and MIDI track processing
 - Timeline-oriented recording and clip playback
 - Track routing and plugin graph routing
 - Offline bounce and export helpers
