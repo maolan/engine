@@ -3748,12 +3748,15 @@ pub(crate) fn undo_should_record(action: &Action) -> bool {
             | Action::TrackDisconnectAudio { .. }
             | Action::TrackConnectMidi { .. }
             | Action::TrackDisconnectMidi { .. }
-            | Action::TrackUnloadLv2PluginInstance { .. }
-            | Action::TrackSetLv2ControlValue { .. }
     ) || {
         #[cfg(unix)]
         {
-            matches!(action, Action::TrackLoadLv2Plugin { .. })
+            matches!(
+                action,
+                Action::TrackUnloadLv2PluginInstance { .. }
+                    | Action::TrackSetLv2ControlValue { .. }
+                    | Action::TrackLoadLv2Plugin { .. }
+            )
         }
         #[cfg(not(unix))]
         {
@@ -4537,6 +4540,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(unix)]
         Action::TrackLoadLv2Plugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -4630,6 +4634,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(unix)]
         Action::TrackSetLv2ControlValue { .. } => None,
         _ => None,
     }
@@ -4760,28 +4765,31 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
         ]);
     }
 
-    if let Action::TrackUnloadLv2PluginInstance {
-        track_name,
-        instance_id,
-    } = action
+    #[cfg(unix)]
     {
-        let track = state.tracks.get(track_name)?;
-        let track = track.lock();
-        let instance = track.lv2_plugins.iter().find(|p| p.id == *instance_id)?;
-        let uri = instance.processor.uri().to_string();
-        let state_snapshot = instance.processor.snapshot_state().ok()?;
-        return Some(vec![
-            Action::TrackLoadLv2Plugin {
-                track_name: track_name.clone(),
-                plugin_uri: uri,
-                instance_id: Some(*instance_id),
-            },
-            Action::TrackSetLv2PluginState {
-                track_name: track_name.clone(),
-                instance_id: *instance_id,
-                state: state_snapshot,
-            },
-        ]);
+        if let Action::TrackUnloadLv2PluginInstance {
+            track_name,
+            instance_id,
+        } = action
+        {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            let instance = track.lv2_plugins.iter().find(|p| p.id == *instance_id)?;
+            let uri = instance.processor.uri().to_string();
+            let state_snapshot = instance.processor.snapshot_state().ok()?;
+            return Some(vec![
+                Action::TrackLoadLv2Plugin {
+                    track_name: track_name.clone(),
+                    plugin_uri: uri,
+                    instance_id: Some(*instance_id),
+                },
+                Action::TrackSetLv2PluginState {
+                    track_name: track_name.clone(),
+                    instance_id: *instance_id,
+                    state: state_snapshot,
+                },
+            ]);
+        }
     }
 
     if let Action::RemoveTrack(track_name) = action {

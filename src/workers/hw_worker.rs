@@ -334,6 +334,7 @@ impl<B: Backend> HwWorker<B> {
     /// Handle one worker message outside of a running cycle. `cycle_tx` and
     /// `cycle_running` let `TracksFinished` launch a cycle. Returns true when
     /// the worker should exit (Quit or a closed channel).
+    #[cfg(unix)]
     async fn handle_async_msg(
         &mut self,
         msg: Message,

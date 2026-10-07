@@ -184,7 +184,6 @@ fn read_exact_at(file: &File, position: u64, buf: &mut [u8]) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn read_exact_at(file: &File, position: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut file = file;
     let mut clone = file.try_clone()?;
     clone.seek(SeekFrom::Start(position))?;
     clone.read_exact(buf)

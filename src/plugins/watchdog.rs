@@ -492,21 +492,36 @@ mod imp {
     use super::{Arc, AtomicBool, Inner, Ordering};
     use std::io;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::System::Threading::{OpenProcess, SYNCHRONIZE, WaitForMultipleObjects};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForMultipleObjects,
+    };
+
+    /// `HANDLE` is a raw pointer and therefore not `Send`/`Sync` in windows
+    /// 0.62. The watchdog owns each handle exclusively and only passes copies
+    /// to synchronous Win32 calls, so moving/sharing them across threads is
+    /// safe here.
+    #[derive(Clone, Copy)]
+    struct SendHandle(HANDLE);
+    unsafe impl Send for SendHandle {}
+    unsafe impl Sync for SendHandle {}
 
     /// Registration holds the process handle waited on.
     pub struct Registration {
-        handle: HANDLE,
+        handle: SendHandle,
         bypass: Arc<AtomicBool>,
     }
 
     impl Registration {
         pub fn new(pid: u32, bypass: Arc<AtomicBool>) -> Result<Self, io::Error> {
-            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) };
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             if handle.is_invalid() {
                 Err(io::Error::last_os_error())
             } else {
-                Ok(Self { handle, bypass })
+                Ok(Self {
+                    handle: SendHandle(handle),
+                    bypass,
+                })
             }
         }
 
@@ -516,7 +531,7 @@ mod imp {
 
         pub fn deregister(&mut self, _poller: &Poller) {
             unsafe {
-                let _ = CloseHandle(self.handle);
+                let _ = CloseHandle(self.handle.0);
             }
         }
     }
@@ -524,28 +539,31 @@ mod imp {
     /// Auto-reset event used to wake the waiter when the registry changes.
     #[derive(Clone)]
     pub struct Wake {
-        event: HANDLE,
+        event: SendHandle,
     }
 
     impl Wake {
         pub fn wake(&self) {
             unsafe {
-                let _ = windows::Win32::System::Threading::SetEvent(self.event);
+                let _ = windows::Win32::System::Threading::SetEvent(self.event.0);
             }
         }
     }
 
     #[derive(Clone)]
     pub struct Poller {
-        wake_event: HANDLE,
+        wake_event: SendHandle,
     }
 
     impl Poller {
         pub fn new() -> Self {
             use windows::Win32::System::Threading::CreateEventW;
-            let event = unsafe { CreateEventW(None, false, false, None) };
-            assert!(!event.is_invalid(), "CreateEventW failed");
-            Self { wake_event: event }
+            let event =
+                unsafe { CreateEventW(None, false, false, None) }.expect("CreateEventW failed");
+            assert!(!event.is_invalid(), "CreateEventW returned a null handle");
+            Self {
+                wake_event: SendHandle(event),
+            }
         }
 
         pub fn wake(&self) -> Wake {
@@ -560,7 +578,7 @@ mod imp {
             // Snapshot up to 63 process handles (plus the wake event at index
             // 0). When more are registered the remainder is picked up on the
             // next pass after a handle fires or a wake arrives.
-            let mut handles: Vec<HANDLE> = vec![inner.poller.wake_event];
+            let mut handles: Vec<HANDLE> = vec![inner.poller.wake_event.0];
             let mut pids: Vec<u32> = Vec::new();
             {
                 let registry = inner.registry.lock().unwrap();
@@ -569,11 +587,11 @@ mod imp {
                         break;
                     }
                     pids.push(pid);
-                    handles.push(reg.handle);
+                    handles.push(reg.handle.0);
                 }
             }
 
-            let n = unsafe { WaitForMultipleObjects(&handles, false, u32::MAX) } as usize;
+            let n = unsafe { WaitForMultipleObjects(&handles, false, u32::MAX) }.0 as usize;
             if n == 0 {
                 // Wake event: registry changed; re-scan.
                 continue;
