@@ -193,7 +193,14 @@ mod imp {
     /// On macOS, kqueue does not deliver `NOTE_EXIT` for a process that
     /// already exited before `EVFILT_PROC` was registered, so a fast-crashing
     /// host would go undetected. `proc_pidinfo` returns 0 for an exited
-    /// (zombie) process, letting us close that race.
+    /// (zombie) process, letting us close that race. FreeBSD attaches
+    /// `EVFILT_PROC` to the still-existing zombie child, so the exit event
+    /// is delivered there and no probe is needed.
+    #[cfg(target_os = "freebsd")]
+    fn pid_already_exited(_pid: u32) -> bool {
+        false
+    }
+
     #[cfg(target_os = "macos")]
     fn pid_already_exited(pid: u32) -> bool {
         unsafe extern "C" {
@@ -261,7 +268,6 @@ mod imp {
                                 libc::NOTE_EXIT,
                             );
                             registered.insert(pid);
-                            #[cfg(target_os = "macos")]
                             if pid_already_exited(pid) {
                                 // The process exited before we could watch it,
                                 // so no kqueue event will ever fire; fail safe.
