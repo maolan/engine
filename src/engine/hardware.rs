@@ -139,29 +139,48 @@ impl Engine {
 
     pub(crate) async fn open_discovered_midi_hw_devices(&mut self) {
         for device in Self::discover_midi_hw_devices() {
+            // Prefixed ids (e.g. `coremidi:in:0:name`, `wasapi:out:1:name`)
+            // are direction-specific; opening them the other way is a
+            // spurious failure. Plain device nodes (e.g. /dev/snd/midiC0D0)
+            // support both directions.
+            let is_input = device.contains(":in:");
+            let is_output = device.contains(":out:");
+            let (want_input, want_output) = if is_input || is_output {
+                (is_input, is_output)
+            } else {
+                (true, true)
+            };
             if let Some(worker) = &self.hw_worker {
                 // The worker performs the actual open and responds with the
                 // real result via Message::Response, which is forwarded to
                 // clients; notifying an optimistic Ok here would produce a
                 // spurious success followed by a contradictory Err when the
                 // open fails in the worker.
-                let _ = worker
-                    .tx
-                    .send(Message::HWOpenMidiInputDevice(device.clone()))
-                    .await;
-                let _ = worker
-                    .tx
-                    .send(Message::HWOpenMidiOutputDevice(device.clone()))
-                    .await;
+                if want_input {
+                    let _ = worker
+                        .tx
+                        .send(Message::HWOpenMidiInputDevice(device.clone()))
+                        .await;
+                }
+                if want_output {
+                    let _ = worker
+                        .tx
+                        .send(Message::HWOpenMidiOutputDevice(device.clone()))
+                        .await;
+                }
             } else {
-                let (opened_in, opened_out) = if let Some(midi_hub) = self.midi_hub.as_mut() {
-                    (
-                        midi_hub.open_input(&device).is_ok(),
-                        midi_hub.open_output(&device).is_ok(),
-                    )
-                } else {
-                    (false, false)
-                };
+                let opened_in = want_input
+                    && self
+                        .midi_hub
+                        .as_mut()
+                        .and_then(|midi_hub| midi_hub.open_input(&device).ok())
+                        .is_some();
+                let opened_out = want_output
+                    && self
+                        .midi_hub
+                        .as_mut()
+                        .and_then(|midi_hub| midi_hub.open_output(&device).ok())
+                        .is_some();
                 if opened_in {
                     self.notify_clients(Ok(Action::OpenMidiInputDevice(device.clone())))
                         .await;

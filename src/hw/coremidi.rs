@@ -3,26 +3,32 @@
 //!
 //! Same shape as `wasapi::MidiHub`: prefixed device ids
 //! (`coremidi:in:<index>:<name>` / `coremidi:out:<index>:<name>`), an
-//! `input_events` queue fed by the `MIDIReadProc`, and `MIDISend` for
-//! output. The classic `MIDIPacketList` API
-//! (`MIDIInputPortCreate`/`MIDISend`) is formally deprecated since macOS 11
-//! in favor of the block-based `MIDIReceiveBlock` API, but remains fully
-//! functional and is what the deprecated-free hand-rolled approach binds.
+//! `input_events` queue fed by the receive block, and `MIDISend` for
+//! output.
+//!
+//! Input uses the block-based `MIDIReceiveBlock` API
+//! (`MIDIInputPortCreateWithBlock`), not the classic `MIDIReadProc`: on
+//! recent macOS the read-proc path is no longer invoked at all, and block
+//! delivery requires a running CoreFoundation run loop. A single
+//! process-wide daemon thread runs `CFRunLoopRun` (started lazily on the
+//! first input open); delivery does not depend on which thread created the
+//! client or port.
 //!
 //! Ownership invariants (all `unsafe` below hinges on these):
-//! - Each open input boxes one heap allocation and passes it as the
-//!   `MIDIReadProc` refcon; CoreMIDI hands it back on its own thread. It
-//!   stays valid until `close_all` disconnects and disposes the port and
-//!   client (after which no read proc can run), then reclaims the box.
-//! - The read proc only locks the shared event queue; it never calls back
-//!   into hub code.
+//! - Each open input holds one `Arc<InputCallbackContext>`; the receive
+//!   block holds a clone, so the context stays alive until `close` disposes
+//!   the port (after which no block can run) and the device struct drops.
+//! - The block only locks the shared event queue; it never calls back into
+//!   hub code.
 
 use crate::message::HwMidiEvent;
 use crate::midi::io::MidiEvent;
+use block::{Block, ConcreteBlock, RcBlock};
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::mem::{offset_of, size_of};
+use std::mem::offset_of;
 use std::ptr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::error;
 
 const MIDI_IN_PREFIX: &str = "coremidi:in:";
@@ -43,29 +49,33 @@ type ItemCount = usize;
 type ByteCount = usize;
 type MidiTimeStamp = u64;
 
-#[repr(C)]
+// CoreMIDI declares its packet structures under `#pragma pack(4)` (see
+// CoreMIDI.h): `MIDIPacket.timeStamp` is an *unaligned* u64, `length` sits
+// at offset 8, `data` at offset 10, and a `MIDIPacketList`'s first packet
+// starts at offset 4, immediately after `numPackets`. Rust's default
+// alignment would insert padding (timestamp at 0/8-aligned, data at 16) and
+// corrupt both reception and sending, so the packed layout is mandatory.
+// Never take references to fields of these structs; use `addr_of!` plus
+// unaligned reads.
+#[repr(C, packed(4))]
 struct MidiPacket {
     time_stamp: MidiTimeStamp,
     length: u16,
     data: [u8; MIDI_PACKET_DATA_LEN],
 }
 
-#[repr(C)]
+#[repr(C, packed(4))]
 struct MidiPacketList {
     num_packets: u32,
     packet: [MidiPacket; 1],
-}
-
-#[repr(C, align(8))]
-struct MidiSendBuffer {
-    bytes: [u8; SEND_LIST_CAPACITY],
 }
 
 const fn midi_packet_stride() -> usize {
     (offset_of!(MidiPacket, data) + MIDI_PACKET_DATA_LEN + 3) & !3
 }
 
-const SEND_LIST_CAPACITY: usize = size_of::<u32>() + midi_packet_stride() * SEND_LIST_PACKETS + 8;
+const SEND_LIST_CAPACITY: usize =
+    offset_of!(MidiPacketList, packet) + midi_packet_stride() * SEND_LIST_PACKETS + 8;
 
 struct InputCallbackContext {
     device: String,
@@ -90,12 +100,11 @@ unsafe extern "C" {
         notify_ref_con: *mut c_void,
         out_client: *mut MidiClientRef,
     ) -> OsStatus;
-    fn MIDIInputPortCreate(
+    fn MIDIInputPortCreateWithBlock(
         client: MidiClientRef,
         port_name: *const c_void,
-        read_proc: Option<MidiReadProcFn>,
-        ref_con: *mut c_void,
         out_port: *mut MidiPortRef,
+        read_block: *const c_void,
     ) -> OsStatus;
     fn MIDIOutputPortCreate(
         client: MidiClientRef,
@@ -141,13 +150,46 @@ unsafe extern "C" {
         buffer_size: isize,
         encoding: u32,
     ) -> bool;
+    fn CFRunLoopRun() -> ();
+    fn CFRunLoopGetCurrent() -> *const c_void;
     fn CFRelease(cf: *const c_void);
 }
 
-type MidiReadProcFn = unsafe extern "C" fn(*const MidiPacketList, *mut c_void, *mut c_void);
-
 fn os_error(context: &str, status: OsStatus) -> String {
     format!("{context} failed with OSStatus {status}")
+}
+
+/// CoreMIDI on recent macOS no longer delivers classic `MIDIReadProc`
+/// input at all; even the block-based `MIDIReceiveBlock` API only
+/// dispatches while a CoreFoundation run loop is running. Delivery does not
+/// depend on which thread created the client/port (verified on macOS 26),
+/// so a single process-wide daemon thread running `CFRunLoopRun` serves all
+/// hubs. Started lazily on the first input open; lives for the process.
+mod runloop {
+    use super::*;
+    use std::sync::{Mutex, Once};
+
+    static START: Once = Once::new();
+    static RUNLOOP: Mutex<usize> = Mutex::new(0);
+
+    pub(crate) fn ensure() {
+        START.call_once(|| {
+            std::thread::Builder::new()
+                .name("coremidi-runloop".to_string())
+                .spawn(|| {
+                    // SAFETY: publishes this thread's run loop so tests and
+                    // shutdown paths can stop it; then runs until stopped.
+                    unsafe {
+                        *RUNLOOP.lock().expect("runloop lock") = CFRunLoopGetCurrent() as usize;
+                        CFRunLoopRun();
+                    }
+                })
+                .expect("spawn coremidi-runloop");
+            while *RUNLOOP.lock().expect("runloop lock") == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
 }
 
 fn cf_string_from_rust(text: &str) -> Result<*const c_void, String> {
@@ -264,28 +306,29 @@ struct MidiInputDevice {
     client: MidiClientRef,
     port: MidiPortRef,
     source: MidiEndpointRef,
-    context: *mut InputCallbackContext,
+    // Ownership-only clone of the receive block's context: kept alive until
+    // `close` disposes the port (after which no block can run).
+    _context: Arc<InputCallbackContext>,
+    // Keeps the heap-copied receive block alive for the port's lifetime.
+    _block: RcBlock<(*const MidiPacketList, *mut c_void), ()>,
 }
 
-// Safety: the raw context pointer is owned by this device; CoreMIDI invokes
-// the read proc on its own serialized thread and `close` reclaims the box
-// only after disconnect/dispose guarantee no further invocations. Moving the
-// device between threads does not race with either side.
+// Safety: the `RcBlock` is an opaque heap block owned by this device; the
+// code never invokes it directly (only CoreMIDI does, on the run-loop
+// thread) and `close` drops it only after disconnect/dispose guarantee no
+// further invocations. Moving the device between threads does not race
+// with either side.
 unsafe impl Send for MidiInputDevice {}
 
 impl MidiInputDevice {
     fn close(&mut self) {
         // SAFETY: the port/client are valid open refs owned by this device;
-        // disposing them guarantees no further read-proc invocations, so the
-        // boxed context can be reclaimed afterwards.
+        // disposing them guarantees no further block invocations, so the
+        // shared context is reclaimed when this struct drops.
         unsafe {
             let _ = MIDIPortDisconnectSource(self.port, self.source);
             let _ = MIDIPortDispose(self.port);
             let _ = MIDIClientDispose(self.client);
-            if !self.context.is_null() {
-                drop(Box::from_raw(self.context));
-                self.context = ptr::null_mut();
-            }
         }
     }
 }
@@ -327,24 +370,38 @@ impl MidiHub {
             return Err(format!("MIDI input device index out of range: {index}"));
         }
 
+        runloop::ensure();
+
         let client = create_client("maolan-midi-in")?;
 
-        let context = Box::into_raw(Box::new(InputCallbackContext {
+        let context = Arc::new(InputCallbackContext {
             device: device.to_string(),
             queue: self.input_events.clone(),
-        }));
+        });
+        let block = {
+            let context = context.clone();
+            ConcreteBlock::new(
+                move |packet_list: *const MidiPacketList, _src_conn: *mut c_void| {
+                    // SAFETY: `packet_list` is a valid MIDIPacketList owned by
+                    // CoreMIDI for the duration of the call; `context` is
+                    // kept alive by the device's RcBlock until the port is
+                    // disposed.
+                    unsafe { collect_packets(&context, packet_list) };
+                },
+            )
+            .copy()
+        };
         let port_name = create_port_name("maolan-midi-input")?;
         let mut port: MidiPortRef = 0;
         // SAFETY: `client` is valid; `port_name` is valid for the call and
-        // released below; `context` outlives the port and is only reclaimed
-        // in `close` after the port is disposed.
+        // released below; the copied block is consumed by CoreMIDI and also
+        // retained in the device struct.
         let status = unsafe {
-            MIDIInputPortCreate(
+            MIDIInputPortCreateWithBlock(
                 client,
                 port_name,
-                Some(input_read_proc),
-                context.cast::<c_void>(),
                 &mut port,
+                &*block as *const Block<(*const MidiPacketList, *mut c_void), ()> as *const c_void,
             )
         };
         // SAFETY: `port_name` is no longer needed after port creation.
@@ -352,22 +409,17 @@ impl MidiHub {
             CFRelease(port_name);
         }
         if status != 0 || port == 0 {
-            // SAFETY: the port was never created; the box is uniquely owned.
-            unsafe {
-                drop(Box::from_raw(context));
-            }
             let _ = unsafe { MIDIClientDispose(client) };
-            return Err(os_error("MIDIInputPortCreate", status));
+            return Err(os_error("MIDIInputPortCreateWithBlock", status));
         }
 
         // SAFETY: `port` and `source` are valid; the connection context is
-        // unused (events carry the device string from the refcon box).
+        // unused (events carry the device string from the captured context).
         let status = unsafe { MIDIPortConnectSource(port, source, ptr::null_mut()) };
         if status != 0 {
             unsafe {
                 let _ = MIDIPortDispose(port);
                 let _ = MIDIClientDispose(client);
-                drop(Box::from_raw(context));
             }
             return Err(os_error("MIDIPortConnectSource", status));
         }
@@ -377,7 +429,8 @@ impl MidiHub {
             client,
             port,
             source,
-            context,
+            _context: context,
+            _block: block,
         });
         Ok(())
     }
@@ -437,10 +490,9 @@ impl MidiHub {
                     continue;
                 }
                 let data_len = event.event.data.len().min(MIDI_PACKET_DATA_LEN);
-                let mut buffer = MidiSendBuffer {
-                    bytes: [0_u8; SEND_LIST_CAPACITY],
-                };
-                let list = buffer.bytes.as_mut_ptr().cast::<MidiPacketList>();
+                // 8-byte alignment satisfies the packed(4) packet layout.
+                let mut buffer = [0_u8; SEND_LIST_CAPACITY];
+                let list = buffer.as_mut_ptr().cast::<MidiPacketList>();
                 // SAFETY: `list` points at the head of the aligned send
                 // buffer which is sized for SEND_LIST_PACKETS packets.
                 let mut packet = unsafe { MIDIPacketListInit(list) };
@@ -452,7 +504,7 @@ impl MidiHub {
                 packet = unsafe {
                     MIDIPacketListAdd(
                         list,
-                        buffer.bytes.len(),
+                        buffer.len(),
                         packet,
                         0,
                         data_len,
@@ -509,6 +561,18 @@ impl Drop for MidiHub {
 // the macro forwards the optional fd-waiter hooks to inherent methods this
 // hub does not implement, which would recurse.
 impl crate::hw::traits::HwMidiHub for MidiHub {
+    fn open_input(&mut self, device: &str) -> Result<(), String> {
+        self.open_input(device)
+    }
+
+    fn open_output(&mut self, device: &str) -> Result<(), String> {
+        self.open_output(device)
+    }
+
+    fn close_all(&mut self) {
+        self.close_all();
+    }
+
     fn read_events_into(&mut self, out: &mut Vec<HwMidiEvent>) {
         self.read_events_into(out);
     }
@@ -518,27 +582,24 @@ impl crate::hw::traits::HwMidiHub for MidiHub {
     }
 }
 
-unsafe extern "C" fn input_read_proc(
-    packet_list: *const MidiPacketList,
-    read_proc_ref_con: *mut c_void,
-    _src_conn_ref_con: *mut c_void,
-) {
-    if packet_list.is_null() || read_proc_ref_con.is_null() {
+/// Appends every packet in a `MIDIPacketList` to the shared event queue.
+/// Shared by the receive block; `context` outlives the port that invokes it.
+///
+/// SAFETY: `packet_list` must be a valid `MIDIPacketList` provided by
+/// CoreMIDI for the duration of the call.
+unsafe fn collect_packets(context: &InputCallbackContext, packet_list: *const MidiPacketList) {
+    if packet_list.is_null() {
         return;
     }
-    // SAFETY: the refcon box lives until the owning input is closed (after
-    // the port is disposed, so no read proc can still be running).
-    let context = unsafe { &*(read_proc_ref_con as *const InputCallbackContext) };
     // SAFETY: `packet_list` is a valid MIDIPacketList provided by CoreMIDI.
     let list = unsafe { &*packet_list };
-    let count = list.num_packets as usize;
+    // SAFETY: unaligned read of the packed `num_packets` field.
+    let count = unsafe { ptr::addr_of!(list.num_packets).read_unaligned() } as usize;
     let mut cursor = ptr::addr_of!(list.packet[0]).cast::<u8>();
     for _ in 0..count {
         let packet = cursor.cast::<MidiPacket>();
-        // SAFETY: `cursor` walks the packet list using the documented
-        // MIDIPacketNext 4-byte-aligned offset arithmetic.
-        let (length,) = unsafe { ((*packet).length,) };
-        let length = length as usize;
+        // SAFETY: unaligned read of the packed `length` field.
+        let length = unsafe { ptr::addr_of!((*packet).length).read_unaligned() } as usize;
         if length > 0 {
             let data_ptr = unsafe { ptr::addr_of!((*packet).data).cast::<u8>() };
             // SAFETY: the packet payload is `length` bytes within the list.
@@ -567,4 +628,53 @@ fn parse_prefixed_index(device: &str, prefix: &str) -> Result<usize, String> {
     index_str
         .parse::<usize>()
         .map_err(|_| format!("Invalid MIDI device id '{device}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trait_open_input_uses_inherent_impl_not_default() {
+        let mut hub = MidiHub::default();
+        let err = <MidiHub as crate::hw::traits::HwMidiHub>::open_input(
+            &mut hub,
+            "coremidi:in:999999:no-such-device",
+        )
+        .unwrap_err();
+        // The trait default would report "not supported by this backend";
+        // reaching the inherent impl means the trait forwards correctly.
+        assert!(
+            !err.contains("not supported by this backend"),
+            "trait open_input hit the default impl: {err}"
+        );
+    }
+
+    #[test]
+    fn trait_open_output_uses_inherent_impl_not_default() {
+        let mut hub = MidiHub::default();
+        let err = <MidiHub as crate::hw::traits::HwMidiHub>::open_output(
+            &mut hub,
+            "coremidi:out:999999:no-such-device",
+        )
+        .unwrap_err();
+        assert!(
+            !err.contains("not supported by this backend"),
+            "trait open_output hit the default impl: {err}"
+        );
+    }
+
+    #[test]
+    fn packet_layout_matches_coremidi_packing() {
+        // CoreMIDI.h packs its packet structures to 4 bytes: an unaligned
+        // u64 timestamp, u16 length at offset 8, data at offset 10, and the
+        // first packet of a list immediately after numPackets (offset 4).
+        // Rust's natural 8-byte alignment would insert padding and corrupt
+        // every packet walked or sent.
+        assert_eq!(offset_of!(MidiPacketList, packet), 4);
+        assert_eq!(offset_of!(MidiPacket, time_stamp), 0);
+        assert_eq!(offset_of!(MidiPacket, length), 8);
+        assert_eq!(offset_of!(MidiPacket, data), 10);
+        assert_eq!(midi_packet_stride(), 268);
+    }
 }

@@ -2233,13 +2233,14 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "alsa",
  "arc-swap",
  "audioadapter",
  "audioadapter-buffers",
  "basedrop",
+ "block",
  "byteorder",
  "jack",
  "libc",
