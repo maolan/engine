@@ -190,6 +190,35 @@ mod imp {
         }
     }
 
+    /// On macOS, kqueue does not deliver `NOTE_EXIT` for a process that
+    /// already exited before `EVFILT_PROC` was registered, so a fast-crashing
+    /// host would go undetected. `proc_pidinfo` returns 0 for an exited
+    /// (zombie) process, letting us close that race.
+    #[cfg(target_os = "macos")]
+    fn pid_already_exited(pid: u32) -> bool {
+        unsafe extern "C" {
+            fn proc_pidinfo(
+                pid: libc::c_int,
+                flavor: libc::c_int,
+                arg: u64,
+                buffer: *mut libc::c_void,
+                buffersize: libc::c_int,
+            ) -> libc::c_int;
+        }
+        const PROC_PIDTASKINFO: libc::c_int = 4;
+        let mut info = [0u8; 128];
+        let ret = unsafe {
+            proc_pidinfo(
+                pid as libc::c_int,
+                PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                info.len() as libc::c_int,
+            )
+        };
+        ret == 0
+    }
+
     /// Put a pipe fd into non-blocking mode so `drain_fd` terminates.
     fn set_nonblocking(fd: RawFd) {
         unsafe {
@@ -219,25 +248,48 @@ mod imp {
         loop {
             // Sync kqueue registrations with the registry.
             {
-                let registry = inner.registry.lock().unwrap();
-                for &pid in registry.keys() {
-                    if !registered.contains(&pid) {
-                        kevent_add(
-                            kq,
-                            pid as usize,
-                            libc::EVFILT_PROC,
-                            libc::EV_ADD,
-                            libc::NOTE_EXIT,
-                        );
-                        registered.insert(pid);
+                let mut raced: Vec<u32> = Vec::new();
+                {
+                    let registry = inner.registry.lock().unwrap();
+                    for &pid in registry.keys() {
+                        if !registered.contains(&pid) {
+                            kevent_add(
+                                kq,
+                                pid as usize,
+                                libc::EVFILT_PROC,
+                                libc::EV_ADD,
+                                libc::NOTE_EXIT,
+                            );
+                            registered.insert(pid);
+                            #[cfg(target_os = "macos")]
+                            if pid_already_exited(pid) {
+                                // The process exited before we could watch it,
+                                // so no kqueue event will ever fire; fail safe.
+                                // Defer registry removal until the lock is
+                                // released below.
+                                raced.push(pid);
+                            }
+                        }
                     }
+                }
+                for pid in raced {
+                    if let Some(reg) = inner.registry.lock().unwrap().remove(&pid) {
+                        reg.bypass().store(true, Ordering::Relaxed);
+                    }
+                    kevent_add(
+                        kq,
+                        pid as usize,
+                        libc::EVFILT_PROC,
+                        libc::EV_DELETE,
+                        libc::NOTE_EXIT,
+                    );
+                    registered.remove(&pid);
                 }
                 let stale: Vec<u32> = registered
                     .iter()
                     .copied()
-                    .filter(|pid| !registry.contains_key(pid))
+                    .filter(|pid| !inner.registry.lock().unwrap().contains_key(pid))
                     .collect();
-                drop(registry);
                 for pid in stale {
                     kevent_add(
                         kq,
