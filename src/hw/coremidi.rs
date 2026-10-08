@@ -340,6 +340,60 @@ struct MidiOutputDevice {
     destination: MidiEndpointRef,
 }
 
+// Safety: CoreMIDI port/client/destination refs are documented as usable
+// from any thread. Every access (send, dispose) is serialized through the
+// hub's output mutex, and the blocking-writer thread is joined before the
+// refs are disposed in `Drop`.
+unsafe impl Send for MidiOutputDevice {}
+
+enum BlockingWriterMsg {
+    Write(Vec<HwMidiEvent>, std::sync::mpsc::Sender<()>),
+    Shutdown,
+}
+
+/// Helper thread for `write_events_blocking`: `MIDISend` has no deadline
+/// parameter and may block internally (e.g. when a destination's queue is
+/// full), so blocking writes run here where the caller can bound the wait.
+struct BlockingWriter {
+    tx: std::sync::mpsc::Sender<BlockingWriterMsg>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BlockingWriter {
+    fn spawn(outputs: Arc<Mutex<Vec<MidiOutputDevice>>>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<BlockingWriterMsg>();
+        let handle = std::thread::Builder::new()
+            .name("maolan-coremidi-blocking-writer".to_string())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        BlockingWriterMsg::Write(events, ack) => {
+                            if let Ok(mut outputs) = outputs.lock() {
+                                send_output_events(&mut outputs, &events);
+                            }
+                            let _ = ack.send(());
+                        }
+                        BlockingWriterMsg::Shutdown => break,
+                    }
+                }
+            })
+            .expect("failed to spawn CoreMIDI blocking writer thread");
+        Self {
+            tx,
+            handle: Some(handle),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(BlockingWriterMsg::Shutdown);
+        if let Some(handle) = self.handle.take()
+            && let Err(e) = handle.join()
+        {
+            error!("CoreMIDI blocking writer thread panicked: {e:?}");
+        }
+    }
+}
+
 impl MidiOutputDevice {
     fn close(&mut self) {
         // SAFETY: the port/client are valid open refs owned by this device.
@@ -353,8 +407,9 @@ impl MidiOutputDevice {
 #[derive(Default)]
 pub struct MidiHub {
     inputs: Vec<MidiInputDevice>,
-    outputs: Vec<MidiOutputDevice>,
+    outputs: Arc<Mutex<Vec<MidiOutputDevice>>>,
     input_events: Arc<Mutex<Vec<HwMidiEvent>>>,
+    blocking_writer: Option<BlockingWriter>,
 }
 
 impl MidiHub {
@@ -436,7 +491,11 @@ impl MidiHub {
     }
 
     pub fn open_output(&mut self, device: &str) -> Result<(), String> {
-        if self.outputs.iter().any(|d| d.device == device) {
+        if self
+            .outputs
+            .lock()
+            .is_ok_and(|outputs| outputs.iter().any(|d| d.device == device))
+        {
             return Ok(());
         }
 
@@ -463,12 +522,14 @@ impl MidiHub {
             return Err(os_error("MIDIOutputPortCreate", status));
         }
 
-        self.outputs.push(MidiOutputDevice {
-            device: device.to_string(),
-            client,
-            port,
-            destination,
-        });
+        if let Ok(mut outputs) = self.outputs.lock() {
+            outputs.push(MidiOutputDevice {
+                device: device.to_string(),
+                client,
+                port,
+                destination,
+            });
+        }
         Ok(())
     }
 
@@ -484,75 +545,117 @@ impl MidiHub {
         if events.is_empty() {
             return;
         }
-        for output in &mut self.outputs {
-            for event in events {
-                if event.device != output.device || event.event.data.is_empty() {
-                    continue;
-                }
-                let data_len = event.event.data.len().min(MIDI_PACKET_DATA_LEN);
-                // 8-byte alignment satisfies the packed(4) packet layout.
-                let mut buffer = [0_u8; SEND_LIST_CAPACITY];
-                let list = buffer.as_mut_ptr().cast::<MidiPacketList>();
-                // SAFETY: `list` points at the head of the aligned send
-                // buffer which is sized for SEND_LIST_PACKETS packets.
-                let mut packet = unsafe { MIDIPacketListInit(list) };
-                if packet.is_null() {
-                    continue;
-                }
-                // SAFETY: capacity matches the buffer; data is readable for
-                // data_len bytes.
-                packet = unsafe {
-                    MIDIPacketListAdd(
-                        list,
-                        buffer.len(),
-                        packet,
-                        0,
-                        data_len,
-                        event.event.data.as_ptr(),
-                    )
-                };
-                if packet.is_null() {
-                    error!("MIDI write dropped for {}: packet list full", output.device);
-                    continue;
-                }
-                // SAFETY: `list` is a well-formed packet list; port and
-                // destination are valid open refs.
-                let status = unsafe { MIDISend(output.port, output.destination, list) };
-                if status != 0 {
-                    error!(
-                        "MIDI write error on {}: {}",
-                        output.device,
-                        os_error("MIDISend", status)
-                    );
-                    break;
-                }
-            }
+        if let Ok(mut outputs) = self.outputs.lock() {
+            send_output_events(&mut outputs, events);
         }
     }
 
-    pub fn write_events_blocking(&mut self, events: &[HwMidiEvent], _timeout: std::time::Duration) {
-        self.write_events(events);
+    /// Write events, waiting up to `timeout` for the sends to complete.
+    /// `MIDISend` has no deadline parameter and may block internally, so the
+    /// sends run on a dedicated helper thread; on timeout this returns with
+    /// the events still delivered once the thread unblocks.
+    pub fn write_events_blocking(&mut self, events: &[HwMidiEvent], timeout: Duration) {
+        if events.is_empty() {
+            return;
+        }
+        if self.blocking_writer.is_none() {
+            self.blocking_writer = Some(BlockingWriter::spawn(self.outputs.clone()));
+        }
+        let writer = self.blocking_writer.as_mut().expect("initialized above");
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if writer
+            .tx
+            .send(BlockingWriterMsg::Write(events.to_vec(), ack_tx))
+            .is_err()
+        {
+            // Writer thread is gone; deliver directly as a fallback.
+            if let Ok(mut outputs) = self.outputs.lock() {
+                send_output_events(&mut outputs, events);
+            }
+            return;
+        }
+        let _ = ack_rx.recv_timeout(timeout);
     }
 
     pub fn close_all(&mut self) {
         while let Some(mut input) = self.inputs.pop() {
             input.close();
         }
-        while let Some(mut output) = self.outputs.pop() {
-            output.close();
+        if let Ok(mut outputs) = self.outputs.lock() {
+            while let Some(mut output) = outputs.pop() {
+                output.close();
+            }
         }
     }
 
     pub fn output_devices(&self) -> Vec<String> {
         self.outputs
-            .iter()
-            .map(|output| output.device.clone())
-            .collect()
+            .lock()
+            .map(|outputs| {
+                outputs
+                    .iter()
+                    .map(|output| output.device.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Send each event to every matching open output, one `MIDISend` per event.
+fn send_output_events(outputs: &mut [MidiOutputDevice], events: &[HwMidiEvent]) {
+    for output in outputs.iter_mut() {
+        for event in events {
+            if event.device != output.device || event.event.data.is_empty() {
+                continue;
+            }
+            let data_len = event.event.data.len().min(MIDI_PACKET_DATA_LEN);
+            // 8-byte alignment satisfies the packed(4) packet layout.
+            let mut buffer = [0_u8; SEND_LIST_CAPACITY];
+            let list = buffer.as_mut_ptr().cast::<MidiPacketList>();
+            // SAFETY: `list` points at the head of the aligned send
+            // buffer which is sized for SEND_LIST_PACKETS packets.
+            let mut packet = unsafe { MIDIPacketListInit(list) };
+            if packet.is_null() {
+                continue;
+            }
+            // SAFETY: capacity matches the buffer; data is readable for
+            // data_len bytes.
+            packet = unsafe {
+                MIDIPacketListAdd(
+                    list,
+                    buffer.len(),
+                    packet,
+                    0,
+                    data_len,
+                    event.event.data.as_ptr(),
+                )
+            };
+            if packet.is_null() {
+                error!("MIDI write dropped for {}: packet list full", output.device);
+                continue;
+            }
+            // SAFETY: `list` is a well-formed packet list; port and
+            // destination are valid open refs.
+            let status = unsafe { MIDISend(output.port, output.destination, list) };
+            if status != 0 {
+                error!(
+                    "MIDI write error on {}: {}",
+                    output.device,
+                    os_error("MIDISend", status)
+                );
+                break;
+            }
+        }
     }
 }
 
 impl Drop for MidiHub {
     fn drop(&mut self) {
+        // Stop the blocking writer first: joining it guarantees no send is
+        // in flight before the output ports are disposed below.
+        if let Some(mut writer) = self.blocking_writer.take() {
+            writer.shutdown();
+        }
         self.close_all();
     }
 }

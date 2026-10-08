@@ -1647,7 +1647,13 @@ impl Engine {
                 if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
                     let status = if on { 0x90 } else { 0x80 };
                     let event = MidiEvent::new(0, vec![status, note.min(127), velocity.min(127)]);
-                    track.lock().push_hw_midi_events(&[event]);
+                    if self.transport.playing {
+                        track.lock().push_hw_midi_events(&[event]);
+                    } else if !self.send_hw_midi_note_while_stopped(track_name, &event).await {
+                        // No hardware route to deliver to directly; keep the
+                        // event in the track input for the next cycle.
+                        track.lock().push_hw_midi_events(&[event]);
+                    }
                 }
             }
             Action::ModifyMidiNotes { .. }
@@ -1719,6 +1725,41 @@ impl Engine {
             _ => {}
         }
         false
+    }
+
+    /// Deliver a live note straight to the hardware MIDI-out routes of
+    /// `track_name` without going through a render cycle. While the
+    /// transport is stopped no cycles run, so events pushed onto the track
+    /// input would never reach the hardware; the hw worker flushes
+    /// `HWMidiOutEvents` immediately while stopped. Returns false when there
+    /// is no hw worker or no matching route, in which case the caller should
+    /// keep the existing track-input behavior.
+    pub(crate) async fn send_hw_midi_note_while_stopped(
+        &mut self,
+        track_name: &str,
+        event: &MidiEvent,
+    ) -> bool {
+        let devices: Vec<String> = self
+            .hw_midi
+            .midi_hw_out_routes
+            .iter()
+            .filter(|route| route.from_track == track_name && route.from_port == 0)
+            .map(|route| route.device.clone())
+            .collect();
+        if devices.is_empty() {
+            return false;
+        }
+        let Some(worker) = &self.hw_worker else {
+            return false;
+        };
+        let events: Vec<HwMidiEvent> = devices
+            .into_iter()
+            .map(|device| HwMidiEvent {
+                device,
+                event: event.clone(),
+            })
+            .collect();
+        worker.tx.send(Message::HWMidiOutEvents(events)).await.is_ok()
     }
 }
 
