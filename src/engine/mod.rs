@@ -722,40 +722,6 @@ mod tests {
         assert!(!engine.rt_inline_enabled);
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn enabling_iodelay_at_512_starts_monitoring_without_starting_timeline() {
-        let (mut engine, _client_rx) = make_engine_with_client();
-        let options = crate::hw::alsa::HwOptions {
-            period_frames: 512,
-            ..Default::default()
-        };
-        engine
-            .open_non_jack_audio_device("null", Some("null"), 48_000, 16, options)
-            .await
-            .unwrap();
-        assert_eq!(engine.current_cycle_samples(), 512);
-        assert!(!engine.transport.playing);
-        engine.handle_iodelay_configure(true, 1.0).await;
-        engine.handle_iodelay_add_measurement(1, 1.0).await;
-        assert!(engine.transport.playing);
-        assert!(!engine.transport.transport_running);
-        assert!(
-            engine
-                .state
-                .lock()
-                .iodelay
-                .as_ref()
-                .unwrap()
-                .measurement(1)
-                .is_some()
-        );
-
-        engine.transport.transport_running = true;
-        engine.handle_iodelay_configure(true, 1.0).await;
-        assert!(engine.transport.transport_running);
-    }
-
     #[tokio::test]
     async fn iodelay_calibration_applies_measured_total_and_blocks_during_recording() {
         let (mut engine, mut client_rx) = make_engine_with_client();

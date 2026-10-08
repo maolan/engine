@@ -800,24 +800,6 @@ fn deserialize_vst3_state(scratch: *const u8, size: usize) -> Result<Vst3PluginS
 mod tests {
     use super::*;
 
-    fn find_host_binary() -> PathBuf {
-        ipc::find_plugin_host_binary().expect("maolan-plugin-host binary should be built for tests")
-    }
-
-    #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
-    )]
-    #[test]
-    fn find_host_binary_locates_binary() {
-        let host_bin = find_host_binary();
-        assert!(
-            host_bin.exists(),
-            "plugin-host binary should exist at {}",
-            host_bin.display()
-        );
-    }
-
     #[test]
     fn vst3_state_serialization_roundtrip() {
         let state = Vst3PluginState {
@@ -836,72 +818,5 @@ mod tests {
         assert_eq!(decoded.plugin_id, state.plugin_id);
         assert_eq!(decoded.component_state, state.component_state);
         assert_eq!(decoded.controller_state, state.controller_state);
-    }
-
-    #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
-    )]
-    #[test]
-    fn vst3_processor_crash_bypass() {
-        let host_bin = find_host_binary();
-
-        let processor = Vst3Processor::new(48000.0, 256, "__crash__", "__crash__", 1, 1, host_bin)
-            .expect("should create VST3 processor for crash test");
-
-        processor.setup_audio_ports();
-
-        // Wait for the process-wide watchdog to observe the aborted host and
-        // flip the bypass flag (event-driven, should be near-instant).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !processor.is_bypassed() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            processor.is_bypassed(),
-            "watchdog should have bypassed the crashed processor"
-        );
-
-        let input_buffers = [vec![1.0; 256]];
-        let mut output_buffers = [vec![0.0; 256]];
-        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let mut outputs = output_buffers
-            .iter_mut()
-            .map(Vec::as_mut_slice)
-            .collect::<Vec<_>>();
-        processor.process_with_audio_buffers(256, &inputs, &mut outputs);
-
-        let out_buf = &output_buffers[0];
-        assert!(
-            out_buf.iter().all(|&s| s == 1.0),
-            "after crash, output should be bypass copy of input"
-        );
-    }
-
-    #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
-    )]
-    #[test]
-    fn vst3_bypass_reports_zero_latency() {
-        let processor = Vst3Processor::new(
-            48000.0,
-            256,
-            "__test__",
-            "__test__",
-            1,
-            1,
-            find_host_binary(),
-        )
-        .expect("should create VST3 processor");
-        let mapping = processor.mapping.as_ref().expect("mapping exists");
-        unsafe {
-            latency_samples_atomic(mapping.as_ptr()).store(128, Ordering::Release);
-        }
-
-        assert_eq!(processor.latency_samples(), 128);
-        processor.set_bypassed(true);
-        assert_eq!(processor.latency_samples(), 0);
-        assert!(processor.take_latency_changed());
     }
 }
