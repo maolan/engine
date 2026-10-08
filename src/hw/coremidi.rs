@@ -591,12 +591,7 @@ impl MidiHub {
     pub fn output_devices(&self) -> Vec<String> {
         self.outputs
             .lock()
-            .map(|outputs| {
-                outputs
-                    .iter()
-                    .map(|output| output.device.clone())
-                    .collect()
-            })
+            .map(|outputs| outputs.iter().map(|output| output.device.clone()).collect())
             .unwrap_or_default()
     }
 }

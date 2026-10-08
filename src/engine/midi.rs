@@ -1649,7 +1649,10 @@ impl Engine {
                     let event = MidiEvent::new(0, vec![status, note.min(127), velocity.min(127)]);
                     if self.transport.playing {
                         track.lock().push_hw_midi_events(&[event]);
-                    } else if !self.send_hw_midi_note_while_stopped(track_name, &event).await {
+                    } else if !self
+                        .send_hw_midi_note_while_stopped(track_name, &event)
+                        .await
+                    {
                         // No hardware route to deliver to directly; keep the
                         // event in the track input for the next cycle.
                         track.lock().push_hw_midi_events(&[event]);
@@ -1759,7 +1762,11 @@ impl Engine {
                 event: event.clone(),
             })
             .collect();
-        worker.tx.send(Message::HWMidiOutEvents(events)).await.is_ok()
+        worker
+            .tx
+            .send(Message::HWMidiOutEvents(events))
+            .await
+            .is_ok()
     }
 }
 

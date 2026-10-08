@@ -248,7 +248,7 @@ mod imp {
         loop {
             // Sync kqueue registrations with the registry.
             {
-                let mut raced: Vec<u32> = Vec::new();
+                let raced: Vec<u32> = Vec::new();
                 {
                     let registry = inner.registry.lock().unwrap();
                     for &pid in registry.keys() {
