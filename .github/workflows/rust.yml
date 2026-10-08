@@ -12,7 +12,11 @@ env:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
 
@@ -25,6 +29,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cache apt packages
+        if: contains(matrix.os, 'ubuntu')
         uses: actions/cache@v4
         with:
           path: ~/apt-cache
@@ -33,11 +38,13 @@ jobs:
             ${{ runner.os }}-apt-
 
       - name: Restore apt cache
+        if: contains(matrix.os, 'ubuntu')
         run: |
           sudo mkdir -p /var/cache/apt/archives
           sudo cp -r ~/apt-cache/. /var/cache/apt/archives/ 2>/dev/null || true
 
       - name: Install system packages
+        if: contains(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y software-properties-common
@@ -50,6 +57,7 @@ jobs:
             libasound2-dev
 
       - name: Save apt cache
+        if: contains(matrix.os, 'ubuntu')
         run: |
           mkdir -p ~/apt-cache
           cp /var/cache/apt/archives/*.deb ~/apt-cache/ 2>/dev/null || true
