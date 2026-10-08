@@ -1494,7 +1494,7 @@ mod undo_consistency {
     /// pipeline). Patterns only classify; these instances feed the inverse
     /// assertions, so payloads reference the fixture track "t1" / clip 0.
     fn undoable_command_instances() -> Vec<Action> {
-        let mut v = vec![
+        let v = vec![
             Action::SetTempo(128.0),
             Action::SetLoopEnabled(true),
             Action::SetLoopRange(Some((0, 48000))),
@@ -1921,6 +1921,8 @@ mod undo_consistency {
             },
         ];
         #[cfg(unix)]
+        let mut v = v;
+        #[cfg(unix)]
         v.extend([
             Action::TrackLoadLv2Plugin {
                 track_name: "t1".to_string(),
@@ -1974,7 +1976,7 @@ mod undo_consistency {
     /// declines to record when the target instance is absent, so only the
     /// record/ignore classification is asserted.
     fn fixture_limited(action: &Action) -> bool {
-        matches!(
+        if matches!(
             action,
             Action::TrackUnloadClapPlugin { .. }
                 | Action::TrackUnloadClapPluginInstance { .. }
@@ -1983,10 +1985,19 @@ mod undo_consistency {
                 | Action::ClipSetClapParameter { .. }
                 | Action::TrackSetVst3Parameter { .. }
                 | Action::TrackSetPluginBypassed { .. }
-                | Action::TrackLoadLv2Plugin { .. }
+        ) {
+            return true;
+        }
+        #[cfg(unix)]
+        if matches!(
+            action,
+            Action::TrackLoadLv2Plugin { .. }
                 | Action::TrackUnloadLv2PluginInstance { .. }
                 | Action::TrackSetLv2ControlValue { .. }
-        )
+        ) {
+            return true;
+        }
+        false
     }
 
     #[test]
@@ -2177,27 +2188,17 @@ mod undo_consistency {
             | Action::PianoKey { .. }
             | Action::TrackClearDefaultPassthrough { .. }
             | Action::TrackClearPlugins { .. }
-            | Action::ListLv2Plugins
             | Action::ListVst3Plugins
             | Action::ListClapPlugins
             | Action::ListClapPluginsWithCapabilities
             | Action::TrackGetPluginGraph { .. }
             | Action::TrackGetClapNoteNames { .. }
-            | Action::TrackGetLv2Midnam { .. }
             | Action::TrackShowClapGui { .. }
             | Action::ClipShowClapGui { .. }
             | Action::TrackShowVst3Gui { .. }
             | Action::ClipShowVst3Gui { .. }
             | Action::TrackShowLv2Gui { .. }
             | Action::ClipShowLv2Gui { .. }
-            | Action::TrackUnloadLv2Plugin { .. }
-            | Action::TrackSetLv2PluginState { .. }
-            | Action::ClipSetLv2PluginState { .. }
-            | Action::ClipSetLv2ControlValue { .. }
-            | Action::TrackLv2SnapshotState { .. }
-            | Action::ClipLv2SnapshotState { .. }
-            | Action::TrackGetLv2PluginControls { .. }
-            | Action::ClipGetLv2PluginControls { .. }
             | Action::TrackSetPluginResourceDir { .. }
             | Action::TrackClapCollectResources { .. }
             | Action::ClipSetPluginResourceDir { .. }
@@ -2237,6 +2238,20 @@ mod undo_consistency {
             | Action::IoDelayCalibrate { .. }
             | Action::IoDelayConfigure { .. }
             | Action::IoDelayAddMeasurement { .. } => false,
+
+            // LV2 actions exist only on Unix (LV2 support is not built on
+            // Windows).
+            #[cfg(unix)]
+            Action::ListLv2Plugins
+            | Action::TrackGetLv2Midnam { .. }
+            | Action::TrackUnloadLv2Plugin { .. }
+            | Action::TrackSetLv2PluginState { .. }
+            | Action::ClipSetLv2PluginState { .. }
+            | Action::ClipSetLv2ControlValue { .. }
+            | Action::TrackLv2SnapshotState { .. }
+            | Action::ClipLv2SnapshotState { .. }
+            | Action::TrackGetLv2PluginControls { .. }
+            | Action::ClipGetLv2PluginControls { .. } => false,
         }
     }
 

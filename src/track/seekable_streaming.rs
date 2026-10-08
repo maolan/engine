@@ -391,9 +391,20 @@ impl SeekableStreamingClipBuffer {
             return 0;
         }
         let expected = self.expected_next.load(Ordering::Relaxed);
-        if (expected == u64::MAX && from_frame != 0)
-            || (expected != u64::MAX && expected != from_frame as u64)
-        {
+        // A repeat of the exact previous window (the transport position did
+        // not advance — e.g. a re-render at the same position without a
+        // hardware clock). Reposting a seek on every such read would restart
+        // the producer each time and starve it permanently; only repost when
+        // the producer is headed elsewhere, and never skip ahead on the
+        // underrun path below.
+        let repeat_window = expected == from_frame as u64 + len as u64;
+        let seek_needed = if repeat_window {
+            self.control.seek_request.load(Ordering::Relaxed) != from_frame
+        } else {
+            (expected == u64::MAX && from_frame != 0)
+                || (expected != u64::MAX && expected != from_frame as u64)
+        };
+        if seek_needed {
             // Publish the target before the generation. The producer may
             // race a newer request, but such samples carry an older generation
             // and cannot be used by the consumer of that newer request.
@@ -423,12 +434,14 @@ impl SeekableStreamingClipBuffer {
             ));
         }
         if frames < len {
-            let next = from_frame.saturating_add(len);
-            if next < self.total_frames {
-                // A ring as small as one callback must also recover: ask for
-                // the next deadline rather than refilling already missed audio.
-                self.control.seek_request.store(next, Ordering::Relaxed);
-                self.control.generation.fetch_add(1, Ordering::Release);
+            if !repeat_window {
+                let next = from_frame.saturating_add(len);
+                if next < self.total_frames {
+                    // A ring as small as one callback must also recover: ask for
+                    // the next deadline rather than refilling already missed audio.
+                    self.control.seek_request.store(next, Ordering::Relaxed);
+                    self.control.generation.fetch_add(1, Ordering::Release);
+                }
             }
             let underruns = self.underruns.fetch_add(1, Ordering::Relaxed) + 1;
             if underruns % 100 == 1 {

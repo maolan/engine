@@ -514,7 +514,7 @@ mod imp {
     impl Registration {
         pub fn new(pid: u32, bypass: Arc<AtomicBool>) -> Result<Self, io::Error> {
             let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             if handle.is_invalid() {
                 Err(io::Error::last_os_error())
             } else {
@@ -626,6 +626,30 @@ mod tests {
         true
     }
 
+    /// A child process that sleeps for `secs` seconds and then exits on its
+    /// own (long enough to be killed early, short enough to not leak when it
+    /// is). `sleep(1)` exists only on Unix; Windows gets `timeout` through
+    /// cmd.exe (System32).
+    fn spawn_sleep(secs: u32) -> std::process::Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/c")
+                .arg("timeout")
+                .arg("/t")
+                .arg(secs.to_string())
+                .arg("/nobreak");
+            c
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut c = Command::new("sleep");
+            c.arg(secs.to_string());
+            c
+        };
+        command.spawn().expect("spawn sleep")
+    }
+
     #[cfg_attr(
         all(miri, target_os = "freebsd"),
         ignore = "process facilities not supported by Miri on FreeBSD"
@@ -633,10 +657,7 @@ mod tests {
     #[test]
     fn watchdog_sets_flag_on_killed_child() {
         let wd = ProcessWatchdog::start();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
+        let mut child = spawn_sleep(30);
         let flag = Arc::new(AtomicBool::new(false));
         wd.watch(child.id(), flag.clone());
         let _ = child.kill();
@@ -654,7 +675,7 @@ mod tests {
     #[test]
     fn watchdog_unwatched_clean_exit_does_not_set_flag() {
         let wd = ProcessWatchdog::start();
-        let mut child = Command::new("sleep").arg("2").spawn().expect("spawn sleep");
+        let mut child = spawn_sleep(2);
         let flag = Arc::new(AtomicBool::new(false));
         wd.watch(child.id(), flag.clone());
         wd.unwatch(child.id());
