@@ -159,6 +159,10 @@ pub struct AuPluginInfo {
     pub category: String,
     pub version: String,
     pub is_apple: bool,
+    /// True for AUv3 app-extension components; drives the AUv2/AUv3 dispatch
+    /// in the plugin host. Older caches deserialize to `false`.
+    #[serde(default)]
+    pub is_v3: bool,
     pub audio_inputs: usize,
     pub audio_outputs: usize,
     #[serde(default)]
