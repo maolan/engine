@@ -44,6 +44,8 @@ pub mod triple_buffer;
 pub mod workers;
 pub use workers::worker;
 
+#[cfg(target_os = "macos")]
+pub use plugins::au_proc;
 pub use plugins::clap_proc;
 #[cfg(unix)]
 pub use plugins::lv2_proc;
@@ -70,6 +72,10 @@ pub mod vst3 {
 #[cfg(unix)]
 pub mod lv2 {
     pub use crate::plugins::types::Lv2PluginInfo;
+}
+#[cfg(target_os = "macos")]
+pub mod au {
+    pub use crate::plugins::types::{AuParamInfo, AuPluginInfo, AuPluginState};
 }
 
 use tokio::sync::mpsc::{Sender, channel};

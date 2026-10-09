@@ -133,3 +133,39 @@ pub struct Lv2PluginInfo {
     pub midi_inputs: usize,
     pub midi_outputs: usize,
 }
+
+/// One enumerable AudioUnit parameter, as serialized by the plugin-host scan
+/// and by the `REQUEST_AU_PARAMETERS` scratch payload. `index` is a dense
+/// table index; the protocol's u32 `ParameterEvent::param_index` carries
+/// exactly this index.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuParamInfo {
+    pub index: u32,
+    pub scope: u32,
+    pub element: u32,
+    pub param_id: u32,
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+    pub flags: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuPluginInfo {
+    pub id: String,
+    pub name: String,
+    pub manufacturer: String,
+    pub category: String,
+    pub version: String,
+    pub is_apple: bool,
+    pub audio_inputs: usize,
+    pub audio_outputs: usize,
+    #[serde(default)]
+    pub parameters: Vec<AuParamInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuPluginState {
+    pub bytes: Vec<u8>,
+}

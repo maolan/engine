@@ -1976,6 +1976,13 @@ mod undo_consistency {
     /// declines to record when the target instance is absent, so only the
     /// record/ignore classification is asserted.
     fn fixture_limited(action: &Action) -> bool {
+        #[cfg(target_os = "macos")]
+        if matches!(
+            action,
+            Action::TrackUnloadAuPluginInstance { .. } | Action::TrackSetAuParameter { .. }
+        ) {
+            return true;
+        }
         if matches!(
             action,
             Action::TrackUnloadClapPlugin { .. }
@@ -2137,6 +2144,12 @@ mod undo_consistency {
             Action::TrackLoadLv2Plugin { .. }
             | Action::TrackUnloadLv2PluginInstance { .. }
             | Action::TrackSetLv2ControlValue { .. } => true,
+            #[cfg(target_os = "macos")]
+            Action::TrackLoadAuPlugin { .. }
+            | Action::TrackUnloadAuPlugin { .. }
+            | Action::TrackUnloadAuPluginInstance { .. }
+            | Action::TrackSetAuParameter { .. }
+            | Action::ClipSetAuParameter { .. } => true,
 
             // Intentionally never recorded: transport commands, queries and
             // their echo responses, realtime echoes, history control, session
@@ -2252,6 +2265,19 @@ mod undo_consistency {
             | Action::ClipLv2SnapshotState { .. }
             | Action::TrackGetLv2PluginControls { .. }
             | Action::ClipGetLv2PluginControls { .. } => false,
+
+            // AU actions exist only on macOS (AUv2 support is not built on
+            // other platforms).
+            #[cfg(target_os = "macos")]
+            Action::ListAuPlugins
+            | Action::TrackShowAuGui { .. }
+            | Action::ClipShowAuGui { .. }
+            | Action::TrackGetAuParameters { .. }
+            | Action::ClipGetAuParameters { .. }
+            | Action::TrackAuSnapshotState { .. }
+            | Action::ClipAuSnapshotState { .. }
+            | Action::TrackAuRestoreState { .. }
+            | Action::ClipAuRestoreState { .. } => false,
         }
     }
 

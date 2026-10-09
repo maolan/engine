@@ -181,6 +181,18 @@ impl Engine {
                         &build_osc_packet("/response/vst3_plugins", &types, &args),
                     );
                 }
+                #[cfg(target_os = "macos")]
+                QueryReply::AuPlugins(plugins) => {
+                    let args: Vec<OscArg> = plugins
+                        .iter()
+                        .map(|p| OscArg::String(format!("{}|{}", p.id, p.name)))
+                        .collect();
+                    let types = "s".repeat(args.len());
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet("/response/au_plugins", &types, &args),
+                    );
+                }
                 #[cfg(unix)]
                 QueryReply::Lv2Plugins(plugins) => {
                     let args: Vec<OscArg> = plugins
@@ -192,6 +204,10 @@ impl Engine {
                         reply_to,
                         &build_osc_packet("/response/lv2_plugins", &types, &args),
                     );
+                }
+                #[cfg(target_os = "macos")]
+                QueryReply::AuPluginsUnavailable { error } => {
+                    self.send_osc_reply(reply_to, &build_error_packet(error));
                 }
                 QueryReply::ClapPluginsUnavailable { error }
                 | QueryReply::Vst3PluginsUnavailable { error } => {
@@ -229,6 +245,27 @@ impl Engine {
                                 OscArg::String(track_name.clone()),
                                 OscArg::Int(*instance_id as i32),
                                 OscArg::String("clap".to_string()),
+                                OscArg::String(json),
+                            ],
+                        ),
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                QueryReply::TrackAuParameters {
+                    track_name,
+                    instance_id,
+                    parameters,
+                } => {
+                    let json = serde_json::to_string(parameters).unwrap_or_default();
+                    self.send_osc_reply(
+                        reply_to,
+                        &build_osc_packet(
+                            "/response/plugin_parameters",
+                            "siss",
+                            &[
+                                OscArg::String(track_name.clone()),
+                                OscArg::Int(*instance_id as i32),
+                                OscArg::String("au".to_string()),
                                 OscArg::String(json),
                             ],
                         ),

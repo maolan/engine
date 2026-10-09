@@ -813,6 +813,26 @@ impl Engine {
                     return;
                 }
             }
+            // Plugins (AU, macOS only).
+            #[cfg(target_os = "macos")]
+            Action::ListAuPlugins
+            | Action::TrackLoadAuPlugin { .. }
+            | Action::TrackUnloadAuPlugin { .. }
+            | Action::TrackUnloadAuPluginInstance { .. }
+            | Action::TrackShowAuGui { .. }
+            | Action::ClipShowAuGui { .. }
+            | Action::TrackSetAuParameter { .. }
+            | Action::ClipSetAuParameter { .. }
+            | Action::TrackGetAuParameters { .. }
+            | Action::ClipGetAuParameters { .. }
+            | Action::TrackAuSnapshotState { .. }
+            | Action::ClipAuSnapshotState { .. }
+            | Action::TrackAuRestoreState { .. }
+            | Action::ClipAuRestoreState { .. } => {
+                if self.handle_plugin_request(a.clone()).await {
+                    return;
+                }
+            }
             // Plugins (LV2, Unix only).
             #[cfg(unix)]
             Action::TrackSetLv2PluginState { .. }

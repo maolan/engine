@@ -93,6 +93,13 @@ impl Worker {
                 } => {
                     let _ = track.set_vst3_parameter(instance_id, param_id, value.clamp(0.0, 1.0));
                 }
+                #[cfg(target_os = "macos")]
+                OfflineAutomationTarget::AuParameter {
+                    instance_id,
+                    param_index,
+                } => {
+                    let _ = track.set_au_parameter(instance_id, param_index, value.clamp(0.0, 1.0));
+                }
                 OfflineAutomationTarget::ClapParameter {
                     instance_id,
                     param_id,

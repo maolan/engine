@@ -310,6 +310,12 @@ fn silence_task_ports(track: &TrackHandle, task: &ProcessTask) {
                 .get(*index)
                 .map(|p| p.processor.audio_outputs().to_vec())
                 .unwrap_or_default(),
+            #[cfg(target_os = "macos")]
+            PluginKind::Au => t
+                .au_plugins
+                .get(*index)
+                .map(|p| p.processor.audio_outputs().to_vec())
+                .unwrap_or_default(),
             #[cfg(unix)]
             PluginKind::Lv2 => t
                 .lv2_plugins

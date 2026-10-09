@@ -1057,6 +1057,12 @@ fn parse_plugin_load(track_name: String, format: &str, path: String) -> Result<A
             plugin_id: path,
             instance_id: None,
         }),
+        #[cfg(target_os = "macos")]
+        "au" => Ok(Action::TrackLoadAuPlugin {
+            track_name,
+            plugin_id: path,
+            instance_id: None,
+        }),
         #[cfg(unix)]
         "lv2" => Ok(Action::TrackLoadLv2Plugin {
             track_name,
@@ -1074,6 +1080,11 @@ fn parse_plugin_unload(track_name: String, format: &str, path: String) -> Result
             plugin_id: path,
         }),
         "vst3" => Ok(Action::TrackUnloadVst3Plugin {
+            track_name,
+            plugin_id: path,
+        }),
+        #[cfg(target_os = "macos")]
+        "au" => Ok(Action::TrackUnloadAuPlugin {
             track_name,
             plugin_id: path,
         }),
@@ -1100,6 +1111,11 @@ fn parse_plugin_unload_instance(
             track_name,
             instance_id,
         }),
+        #[cfg(target_os = "macos")]
+        "au" => Ok(Action::TrackUnloadAuPluginInstance {
+            track_name,
+            instance_id,
+        }),
         #[cfg(unix)]
         "lv2" => Ok(Action::TrackUnloadLv2PluginInstance {
             track_name,
@@ -1120,6 +1136,11 @@ fn parse_plugin_parameters_query(
             instance_id,
         }),
         "vst3" => Ok(Action::TrackGetVst3Parameters {
+            track_name,
+            instance_id,
+        }),
+        #[cfg(target_os = "macos")]
+        "au" => Ok(Action::TrackGetAuParameters {
             track_name,
             instance_id,
         }),
@@ -1168,6 +1189,11 @@ fn parse_plugin_show_gui(
             track_name,
             instance_id,
         }),
+        #[cfg(target_os = "macos")]
+        "au" => Ok(Action::TrackShowAuGui {
+            track_name,
+            instance_id,
+        }),
         #[cfg(unix)]
         "lv2" => Ok(Action::TrackShowLv2Gui {
             track_name,
@@ -1188,6 +1214,11 @@ fn parse_plugin_snapshot_state(
             instance_id,
         }),
         "vst3" => Ok(Action::TrackVst3SnapshotState {
+            track_name,
+            instance_id,
+        }),
+        #[cfg(target_os = "macos")]
+        "au" => Ok(Action::TrackAuSnapshotState {
             track_name,
             instance_id,
         }),
@@ -1223,6 +1254,15 @@ fn parse_plugin_restore_state(
                 state,
             })
         }
+        #[cfg(target_os = "macos")]
+        "au" => {
+            let state = parse_au_state(state_json)?;
+            Ok(Action::TrackAuRestoreState {
+                track_name,
+                instance_id,
+                state,
+            })
+        }
         #[cfg(unix)]
         "lv2" => Ok(Action::TrackSetLv2PluginState {
             track_name,
@@ -1246,6 +1286,12 @@ fn parse_clip_plugin_snapshot_state(
             instance_id,
         }),
         "vst3" => Ok(Action::ClipVst3SnapshotState {
+            track_name,
+            clip_idx,
+            instance_id,
+        }),
+        #[cfg(target_os = "macos")]
+        "au" => Ok(Action::ClipAuSnapshotState {
             track_name,
             clip_idx,
             instance_id,
@@ -1282,6 +1328,16 @@ fn parse_clip_plugin_restore_state(
         "vst3" => {
             let state = parse_vst3_state(state_json)?;
             Ok(Action::ClipVst3RestoreState {
+                track_name,
+                clip_idx,
+                instance_id,
+                state,
+            })
+        }
+        #[cfg(target_os = "macos")]
+        "au" => {
+            let state = parse_au_state(state_json)?;
+            Ok(Action::ClipAuRestoreState {
                 track_name,
                 clip_idx,
                 instance_id,
@@ -1346,6 +1402,22 @@ fn parse_vst3_state(json: &str) -> Result<crate::vst3::state::Vst3PluginState, S
         component_state,
         controller_state,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_au_state(json: &str) -> Result<crate::au::AuPluginState, String> {
+    let value: serde_json::Value = parse_json(json)?;
+    let bytes = value
+        .get("bytes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64())
+                .map(|v| v as u8)
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| "Missing or invalid bytes array".to_string())?;
+    Ok(crate::au::AuPluginState { bytes })
 }
 
 fn parse_tempo_map(json: &str) -> Result<Action, String> {
@@ -1847,6 +1919,13 @@ fn parse_plugin_graph_node(value: &str) -> Result<PluginGraphNode, String> {
                     .map_err(|_| format!("Invalid vst3 instance id: {rest}"))?;
                 return Ok(PluginGraphNode::Vst3PluginInstance(id));
             }
+            #[cfg(target_os = "macos")]
+            if let Some(rest) = value.strip_prefix("au_") {
+                let id = rest
+                    .parse()
+                    .map_err(|_| format!("Invalid au instance id: {rest}"))?;
+                return Ok(PluginGraphNode::AuPluginInstance(id));
+            }
             #[cfg(unix)]
             if let Some(rest) = value.strip_prefix("lv2_") {
                 let id = rest
@@ -2006,6 +2085,16 @@ fn parse_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> {
                 track_name,
                 instance_id,
                 param_id,
+                value,
+            })
+        }
+        #[cfg(target_os = "macos")]
+        "au" => {
+            let value = args.next_float()?;
+            Ok(Action::TrackSetAuParameter {
+                track_name,
+                instance_id,
+                param_index: param_id,
                 value,
             })
         }

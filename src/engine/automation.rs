@@ -65,6 +65,8 @@ impl Engine {
         let mut per_track: HashMap<String, (Option<f32>, Option<f32>)> = HashMap::new();
         let mut clap_params: HashMap<(String, usize, u32), f64> = HashMap::new();
         let mut vst3_params: HashMap<(String, usize, u32), f32> = HashMap::new();
+        #[cfg(target_os = "macos")]
+        let mut au_params: HashMap<(String, usize, u32), f32> = HashMap::new();
         #[cfg(unix)]
         let mut lv2_params: HashMap<(String, usize, u32), f32> = HashMap::new();
         let mut midi_cc_events: HashMap<String, Vec<MidiEvent>> = HashMap::new();
@@ -142,6 +144,20 @@ impl Engine {
                         let param_value = map_f32(value, *min, *max);
                         vst3_params
                             .insert((track_name.clone(), *instance_id, *param_id), param_value);
+                    }
+                    #[cfg(target_os = "macos")]
+                    ModulatorTarget::AuParameter {
+                        track_name,
+                        instance_id,
+                        param_index,
+                        min,
+                        max,
+                    } => {
+                        let param_value = map_f32(value, *min, *max);
+                        au_params.insert(
+                            (track_name.clone(), *instance_id, *param_index),
+                            param_value,
+                        );
                     }
                     #[cfg(unix)]
                     ModulatorTarget::Lv2Parameter {
@@ -235,6 +251,24 @@ impl Engine {
                         track_name,
                         instance_id,
                         param_id,
+                        value,
+                    },
+                )));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        for ((track_name, instance_id, param_index), value) in au_params {
+            if let Some(track) = state.tracks.get(&track_name).cloned()
+                && track
+                    .lock()
+                    .set_au_parameter(instance_id, param_index, value)
+                    .is_ok()
+            {
+                echoes.push(AutomationEcho::Action(Box::new(
+                    Action::TrackSetAuParameter {
+                        track_name,
+                        instance_id,
+                        param_index,
                         value,
                     },
                 )));

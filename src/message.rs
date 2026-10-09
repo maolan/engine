@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::au::AuPluginInfo;
 use crate::clap::{ClapParameterInfo, ClapPluginInfo};
 pub use crate::connectable::{ConnectableConnection, ConnectableRef};
 #[cfg(unix)]
@@ -113,6 +115,11 @@ pub enum OfflineAutomationTarget {
     Vst3Parameter {
         instance_id: usize,
         param_id: u32,
+    },
+    #[cfg(target_os = "macos")]
+    AuParameter {
+        instance_id: usize,
+        param_index: u32,
     },
     ClapParameter {
         instance_id: usize,
@@ -302,6 +309,8 @@ pub enum PluginGraphNode {
     Vst3PluginInstance(usize),
     #[cfg(unix)]
     Lv2PluginInstance(usize),
+    #[cfg(target_os = "macos")]
+    AuPluginInstance(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -372,6 +381,8 @@ pub enum PluginKind {
     Vst3,
     #[cfg(unix)]
     Lv2,
+    #[cfg(target_os = "macos")]
+    Au,
 }
 
 #[derive(Clone, Debug)]
@@ -650,6 +661,19 @@ pub enum Event {
         instance_id: usize,
         state: Box<crate::vst3::state::Vst3PluginState>,
     },
+    #[cfg(target_os = "macos")]
+    TrackAuStateSnapshot {
+        track_name: String,
+        instance_id: usize,
+        state: Box<crate::au::AuPluginState>,
+    },
+    #[cfg(target_os = "macos")]
+    ClipAuStateSnapshot {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        state: Box<crate::au::AuPluginState>,
+    },
     #[cfg(unix)]
     TrackLv2StateSnapshot {
         track_name: String,
@@ -760,6 +784,12 @@ pub enum QueryReply {
     Vst3PluginsUnavailable {
         error: String,
     },
+    #[cfg(target_os = "macos")]
+    AuPlugins(Vec<AuPluginInfo>),
+    #[cfg(target_os = "macos")]
+    AuPluginsUnavailable {
+        error: String,
+    },
     #[cfg(unix)]
     Lv2Plugins(Vec<Lv2PluginInfo>),
     #[cfg(unix)]
@@ -798,6 +828,19 @@ pub enum QueryReply {
         clip_idx: usize,
         instance_id: usize,
         parameters: Vec<crate::vst3::port::ParameterInfo>,
+    },
+    #[cfg(target_os = "macos")]
+    TrackAuParameters {
+        track_name: String,
+        instance_id: usize,
+        parameters: Vec<crate::au::AuParamInfo>,
+    },
+    #[cfg(target_os = "macos")]
+    ClipAuParameters {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        parameters: Vec<crate::au::AuParamInfo>,
     },
     #[cfg(unix)]
     TrackLv2PluginControls {
@@ -1399,6 +1442,8 @@ pub enum Action {
     #[cfg(unix)]
     ListLv2Plugins,
     ListVst3Plugins,
+    #[cfg(target_os = "macos")]
+    ListAuPlugins,
     ListClapPlugins,
     ListClapPluginsWithCapabilities,
     TrackSetClapParameter {
@@ -1509,6 +1554,33 @@ pub enum Action {
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(target_os = "macos")]
+    TrackLoadAuPlugin {
+        track_name: String,
+        plugin_id: String,
+        instance_id: Option<usize>,
+    },
+    #[cfg(target_os = "macos")]
+    TrackUnloadAuPlugin {
+        track_name: String,
+        plugin_id: String,
+    },
+    #[cfg(target_os = "macos")]
+    TrackUnloadAuPluginInstance {
+        track_name: String,
+        instance_id: usize,
+    },
+    #[cfg(target_os = "macos")]
+    TrackShowAuGui {
+        track_name: String,
+        instance_id: usize,
+    },
+    #[cfg(target_os = "macos")]
+    ClipShowAuGui {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
     #[cfg(unix)]
     TrackLoadLv2Plugin {
         track_name: String,
@@ -1608,6 +1680,56 @@ pub enum Action {
         clip_idx: usize,
         instance_id: usize,
         state: crate::vst3::state::Vst3PluginState,
+    },
+    #[cfg(target_os = "macos")]
+    TrackSetAuParameter {
+        track_name: String,
+        instance_id: usize,
+        param_index: u32,
+        value: f32,
+    },
+    #[cfg(target_os = "macos")]
+    ClipSetAuParameter {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        param_index: u32,
+        value: f32,
+    },
+    #[cfg(target_os = "macos")]
+    TrackGetAuParameters {
+        track_name: String,
+        instance_id: usize,
+    },
+    #[cfg(target_os = "macos")]
+    ClipGetAuParameters {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    #[cfg(target_os = "macos")]
+    TrackAuSnapshotState {
+        track_name: String,
+        instance_id: usize,
+    },
+    #[cfg(target_os = "macos")]
+    ClipAuSnapshotState {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+    },
+    #[cfg(target_os = "macos")]
+    TrackAuRestoreState {
+        track_name: String,
+        instance_id: usize,
+        state: crate::au::AuPluginState,
+    },
+    #[cfg(target_os = "macos")]
+    ClipAuRestoreState {
+        track_name: String,
+        clip_idx: usize,
+        instance_id: usize,
+        state: crate::au::AuPluginState,
     },
     TrackConnectVst3Audio {
         track_name: String,

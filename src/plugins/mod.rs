@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+pub mod au_proc;
 pub mod clap_proc;
 pub mod ipc;
 #[cfg(unix)]
@@ -70,6 +72,16 @@ pub fn resolve_plugin_identifier(kind: PluginKind, identifier: &str) -> Result<S
                 .find(|p| p.uri == identifier)
                 .map(|p| p.uri)
                 .ok_or_else(|| format!("LV2 plugin URI not found: {identifier}"))
+        }
+        #[cfg(target_os = "macos")]
+        PluginKind::Au => {
+            let plugins = scan_plugins::<AuPluginInfo>("au")
+                .map_err(|e| format!("failed to scan AU plugins: {e}"))?;
+            plugins
+                .into_iter()
+                .find(|p| p.id == identifier)
+                .map(|p| p.id)
+                .ok_or_else(|| format!("AU plugin ID not found: {identifier}"))
         }
     }
 }

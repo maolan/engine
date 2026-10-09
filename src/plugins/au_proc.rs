@@ -1,8 +1,12 @@
+//! AudioUnit (AUv2) processor: drives the out-of-process plugin host over the
+//! shared-memory protocol, mirroring [`crate::vst3_proc::Vst3Processor`].
+//! The plugin spec is `au:<type>:<subtype>:<manufacturer>` with literal
+//! fourccs, e.g. `au:aufx:dely:appl`.
+
 use crate::audio::io::AudioIO;
 use crate::midi::io::{MIDIIO, MidiEvent};
 use crate::plugins::ipc;
-use crate::plugins::types::ParameterInfo;
-use crate::plugins::types::Vst3PluginState;
+use crate::plugins::types::{AuParamInfo, AuPluginState};
 use arc_swap::ArcSwapOption;
 use maolan_plugin_protocol::events::EventPair;
 use maolan_plugin_protocol::protocol::*;
@@ -25,8 +29,84 @@ unsafe fn response_counter(ptr: *mut u8) -> &'static AtomicU32 {
     unsafe { &header_ref(ptr).response_counter }
 }
 
-pub struct Vst3Processor {
-    path: String,
+/// Magic + record layout for the `REQUEST_AU_PARAMETERS` scratch payload.
+/// Must stay in sync with `au::write_au_params_to_scratch` in
+/// maolan-plugin-host.
+const AU_PARAMS_MAGIC: u32 = 0x4155_5052; // "AUPR"
+const AU_PARAMS_OFFSET: usize = 3072;
+const AU_PARAMS_MAX_SIZE: usize = SCRATCH_SIZE - AU_PARAMS_OFFSET;
+/// Fixed part of one serialized param record: index, scope, element, paramID,
+/// min, max, default, flags (8 x u32) plus name_len (u32); name bytes follow.
+const AU_PARAM_RECORD_FIXED: usize = 36;
+
+/// Read the parameter table written by the host's `REQUEST_AU_PARAMETERS`
+/// handler. Duplicated from plugin-host (same as the CLAP scratch readers)
+/// so the engine does not depend on the host crate.
+///
+/// # Safety
+/// `ptr` must point to a valid SHM allocation.
+unsafe fn read_au_params_from_scratch(ptr: *mut u8) -> Option<Vec<AuParamInfo>> {
+    unsafe {
+        let mut src = scratch_ptr(ptr).add(AU_PARAMS_OFFSET);
+        let mut remaining = AU_PARAMS_MAX_SIZE;
+        if remaining < 8 {
+            return None;
+        }
+        if std::ptr::read_unaligned(src as *mut u32) != AU_PARAMS_MAGIC {
+            return None;
+        }
+        src = src.add(4);
+        remaining -= 4;
+        let count = std::ptr::read_unaligned(src as *mut u32) as usize;
+        src = src.add(4);
+        remaining -= 4;
+        let mut params = Vec::with_capacity(count);
+        for _ in 0..count {
+            if remaining < AU_PARAM_RECORD_FIXED {
+                return None;
+            }
+            let index = std::ptr::read_unaligned(src as *mut u32);
+            let scope = std::ptr::read_unaligned(src.add(4) as *mut u32);
+            let element = std::ptr::read_unaligned(src.add(8) as *const u32);
+            let param_id = std::ptr::read_unaligned(src.add(12) as *const u32);
+            let min = f32::from_bits(std::ptr::read_unaligned(src.add(16) as *const u32)) as f64;
+            let max = f32::from_bits(std::ptr::read_unaligned(src.add(20) as *const u32)) as f64;
+            let default =
+                f32::from_bits(std::ptr::read_unaligned(src.add(24) as *const u32)) as f64;
+            let flags = u64::from(std::ptr::read_unaligned(src.add(28) as *const u32));
+            src = src.add(32);
+            remaining -= 32;
+            if remaining < 4 {
+                return None;
+            }
+            let name_len = std::ptr::read_unaligned(src as *mut u32) as usize;
+            src = src.add(4);
+            remaining -= 4;
+            if name_len > remaining {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(src, name_len);
+            let name = String::from_utf8(bytes.to_vec()).ok()?;
+            src = src.add(name_len);
+            remaining -= name_len;
+            params.push(AuParamInfo {
+                index,
+                scope,
+                element,
+                param_id,
+                name,
+                min,
+                max,
+                default,
+                flags,
+            });
+        }
+        Some(params)
+    }
+}
+
+pub struct AuProcessor {
+    spec: String,
     plugin_id: String,
     name: String,
     audio_inputs: Vec<Arc<AudioIO>>,
@@ -35,10 +115,10 @@ pub struct Vst3Processor {
     main_audio_outputs: usize,
     midi_input_ports: Vec<Arc<MIDIIO>>,
     midi_output_ports: Vec<Arc<MIDIIO>>,
-    param_infos: Vec<ParameterInfo>,
-    /// Current value of every known parameter, keyed by parameter id and
-    /// stored as `f64` bits. Pre-populated from `param_infos` at construction
-    /// and only ever touched through atomic loads/stores.
+    param_infos: Vec<AuParamInfo>,
+    /// Current value of every known parameter, keyed by the dense table
+    /// index and stored as `f64` bits. Pre-populated from `param_infos` at
+    /// construction and only ever touched through atomic loads/stores.
     param_values: HashMap<u32, AtomicU64>,
     bypassed: Arc<AtomicBool>,
 
@@ -58,9 +138,9 @@ pub struct Vst3Processor {
     latency_changed: AtomicBool,
 }
 
-pub type SharedVst3Processor = Arc<Vst3Processor>;
+pub type SharedAuProcessor = Arc<AuProcessor>;
 
-impl Vst3Processor {
+impl AuProcessor {
     #[cfg(test)]
     pub(crate) fn new_for_test(
         input_count: usize,
@@ -68,9 +148,9 @@ impl Vst3Processor {
         buffer_size: usize,
     ) -> Self {
         Self {
-            path: "test.vst3".to_string(),
-            plugin_id: "test.plugin.vst3".to_string(),
-            name: "Test VST3".to_string(),
+            spec: "au:aufx:pass:appl".to_string(),
+            plugin_id: "au:aufx:pass:appl".to_string(),
+            name: "Test AU".to_string(),
             audio_inputs: (0..input_count)
                 .map(|_| Arc::new(AudioIO::new(buffer_size)))
                 .collect(),
@@ -97,7 +177,7 @@ impl Vst3Processor {
     pub fn new(
         sample_rate: f64,
         buffer_size: usize,
-        plugin_path: &str,
+        plugin_spec: &str,
         plugin_id: &str,
         input_count: usize,
         output_count: usize,
@@ -110,13 +190,13 @@ impl Vst3Processor {
             .map(|_| Arc::new(AudioIO::new(buffer_size)))
             .collect::<Vec<_>>();
 
-        let instance_id = ipc::unique_instance_id("vst3");
+        let instance_id = ipc::unique_instance_id("au");
         let num_inputs = input_count.max(1);
         let num_outputs = output_count.max(1);
         let (mut child, mapping, events, shm_name, stderr) = ipc::spawn_host(ipc::HostSpawnArgs {
             host_binary: &host_binary,
-            format: "vst3",
-            plugin_spec: plugin_path,
+            format: "au",
+            plugin_spec,
             instance_id: &instance_id,
             extra_args: &[
                 &sample_rate.to_string(),
@@ -129,24 +209,28 @@ impl Vst3Processor {
         let header = unsafe { header_ref(mapping.as_ptr()) };
         if !ipc::wait_for_ready(header, &mut child, Duration::from_secs(10)) {
             let _ = child.kill();
-            return Err("VST3 host did not signal ready".to_string());
+            return Err("AU host did not signal ready".to_string());
         }
 
         let name = unsafe {
             maolan_plugin_protocol::protocol::read_plugin_name_from_scratch(mapping.as_ptr())
                 .unwrap_or_else(|| {
-                    Path::new(plugin_path)
+                    Path::new(plugin_spec)
                         .file_stem()
                         .and_then(|s| s.to_str())
-                        .unwrap_or("VST3")
+                        .unwrap_or("AudioUnit")
                         .to_string()
                 })
         };
 
-        let param_infos: Vec<ParameterInfo> = Vec::new();
+        let param_infos: Vec<AuParamInfo> = Self::fetch_parameter_infos(&mapping, &events)
+            .unwrap_or_else(|e| {
+                tracing::warn!("AU parameter enumeration failed for '{plugin_spec}': {e}");
+                Vec::new()
+            });
         let param_values = param_infos
             .iter()
-            .map(|info| (info.id, AtomicU64::new(info.default_value.to_bits())))
+            .map(|info| (info.index, AtomicU64::new(info.default.to_bits())))
             .collect();
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
@@ -166,7 +250,7 @@ impl Vst3Processor {
             .watch(child.id(), Arc::clone(&bypassed));
 
         Ok(Self {
-            path: plugin_path.to_string(),
+            spec: plugin_spec.to_string(),
             plugin_id: plugin_id.to_string(),
             name,
             audio_inputs,
@@ -186,6 +270,37 @@ impl Vst3Processor {
             last_latency_samples: AtomicUsize::new(0),
             latency_changed: AtomicBool::new(false),
         })
+    }
+
+    /// Ask the host to serialize the unit's parameter table into scratch
+    /// (request 13, "AUPR" magic at offset 3072) and read it back.
+    fn fetch_parameter_infos(
+        mapping: &ShmMapping,
+        events: &EventPair,
+    ) -> Result<Vec<AuParamInfo>, String> {
+        let ptr = mapping.as_ptr();
+        let header = unsafe { header_mut(ptr) };
+        header.request_status.store(0, Ordering::Release);
+        header
+            .request_type
+            .store(REQUEST_AU_PARAMETERS, Ordering::Release);
+        if let Err(e) = events.signal_host() {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!("Failed to signal host for AU parameters: {e}"));
+        }
+        if let Err(e) = events.wait_host(Duration::from_secs(5)) {
+            header.request_type.store(0, Ordering::Release);
+            return Err(format!(
+                "Host did not respond to AU parameters request: {e}"
+            ));
+        }
+        let status = header.request_status.load(Ordering::Acquire);
+        header.request_type.store(0, Ordering::Release);
+        if status != 1 {
+            return Err("AU parameter enumeration failed in host".to_string());
+        }
+        unsafe { read_au_params_from_scratch(ptr) }
+            .ok_or_else(|| "Failed to read AU parameters from scratch".to_string())
     }
 
     pub fn setup_audio_ports(&self) {
@@ -279,7 +394,7 @@ impl Vst3Processor {
         self.latency_changed.swap(false, Ordering::AcqRel)
     }
 
-    pub fn parameter_infos(&self) -> Vec<ParameterInfo> {
+    pub fn parameter_infos(&self) -> Vec<AuParamInfo> {
         self.param_infos.clone()
     }
 
@@ -290,15 +405,22 @@ impl Vst3Processor {
             .collect()
     }
 
-    pub fn set_parameter(&self, param_id: u32, value: f64) -> Result<(), String> {
-        self.set_parameter_at(param_id, value, 0)
+    /// `param_index` is the dense index into the unit's enumerated parameter
+    /// table, exactly as published in `parameter_infos`.
+    pub fn set_parameter(&self, param_index: u32, value: f64) -> Result<(), String> {
+        self.set_parameter_at(param_index, value, 0)
     }
 
-    pub fn set_parameter_at(&self, param_id: u32, value: f64, _frame: u32) -> Result<(), String> {
-        if let Some(slot) = self.param_values.get(&param_id) {
+    pub fn set_parameter_at(
+        &self,
+        param_index: u32,
+        value: f64,
+        _frame: u32,
+    ) -> Result<(), String> {
+        if let Some(slot) = self.param_values.get(&param_index) {
             slot.store(value.to_bits(), Ordering::Relaxed);
         } else {
-            tracing::warn!("VST3 set_parameter_at: unknown parameter id {param_id}");
+            tracing::warn!("AU set_parameter_at: unknown parameter index {param_index}");
         }
 
         if let Some(ref mapping) = self.mapping {
@@ -308,7 +430,7 @@ impl Vst3Processor {
                 RingBuffer::new(buf, w, r, RING_CAPACITY)
             };
             let ev = ParameterEvent {
-                param_index: param_id,
+                param_index,
                 value: value as f32,
                 sample_offset: 0,
                 event_kind: maolan_plugin_protocol::PARAM_EVENT_VALUE,
@@ -318,22 +440,10 @@ impl Vst3Processor {
         Ok(())
     }
 
-    pub fn begin_parameter_edit(&self, _param_id: u32) -> Result<(), String> {
-        Ok(())
-    }
-
-    pub fn end_parameter_edit(&self, _param_id: u32) -> Result<(), String> {
-        Ok(())
-    }
-
-    pub fn is_parameter_edit_active(&self, _param_id: u32) -> bool {
-        false
-    }
-
-    pub fn snapshot_state(&self) -> Result<Vst3PluginState, String> {
+    pub fn snapshot_state(&self) -> Result<AuPluginState, String> {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
-            _ => return Err("VST3 processor not initialized".to_string()),
+            _ => return Err("AU processor not initialized".to_string()),
         };
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
@@ -342,12 +452,12 @@ impl Vst3Processor {
         header.request_status.store(0, Ordering::Release);
         if let Err(e) = events.signal_host() {
             header.request_type.store(0, Ordering::Release);
-            return Err(format!("Failed to signal host for state save: {}", e));
+            return Err(format!("Failed to signal host for state save: {e}"));
         }
 
         if let Err(e) = events.wait_host(Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
-            return Err(format!("Host did not respond to state save: {}", e));
+            return Err(format!("Host did not respond to state save: {e}"));
         }
 
         let status = header.request_status.load(Ordering::Acquire);
@@ -358,33 +468,33 @@ impl Vst3Processor {
         }
 
         let scratch = unsafe { scratch_ptr(ptr) };
-        let state = deserialize_vst3_state(scratch, size)?;
+        let bytes = deserialize_au_state(scratch, size)?;
         header.request_type.store(0, Ordering::Release);
-        Ok(state)
+        Ok(AuPluginState { bytes })
     }
 
-    pub fn restore_state(&self, state: &Vst3PluginState) -> Result<(), String> {
+    pub fn restore_state(&self, state: &AuPluginState) -> Result<(), String> {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(m), Some(e)) => (m, e),
-            _ => return Err("VST3 processor not initialized".to_string()),
+            _ => return Err("AU processor not initialized".to_string()),
         };
         let ptr = mapping.as_ptr();
         let header = unsafe { header_mut(ptr) };
 
         let scratch = unsafe { scratch_ptr(ptr) };
-        let size = serialize_vst3_state(scratch, state)?;
+        let size = serialize_au_state(scratch, &state.bytes)?;
         header.scratch_size.store(size as u32, Ordering::Release);
 
         header.request_type.store(2, Ordering::Release);
         header.request_status.store(0, Ordering::Release);
         if let Err(e) = events.signal_host() {
             header.request_type.store(0, Ordering::Release);
-            return Err(format!("Failed to signal host for state restore: {}", e));
+            return Err(format!("Failed to signal host for state restore: {e}"));
         }
 
         if let Err(e) = events.wait_host(Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
-            return Err(format!("Host did not respond to state restore: {}", e));
+            return Err(format!("Host did not respond to state restore: {e}"));
         }
 
         let status = header.request_status.load(Ordering::Acquire);
@@ -501,8 +611,8 @@ impl Vst3Processor {
         }
     }
 
-    pub fn path(&self) -> &str {
-        &self.path
+    pub fn spec(&self) -> &str {
+        &self.spec
     }
 
     pub fn plugin_id(&self) -> &str {
@@ -519,51 +629,23 @@ impl Vst3Processor {
         self.stderr.swap(None).and_then(|s| Arc::try_unwrap(s).ok())
     }
 
-    pub fn begin_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {
-        Ok(())
+    pub fn drain_echoed_parameters(&self) -> Vec<ParameterEvent> {
+        let mut result = Vec::new();
+        if let Some(ref mapping) = self.mapping {
+            let ring = unsafe {
+                let buf = echo_ring_ptr(mapping.as_ptr());
+                let (w, r) = echo_indices(mapping.as_ptr());
+                RingBuffer::new(buf, w, r, RING_CAPACITY)
+            };
+            while let Some(ev) = ring.pop() {
+                result.push(ev);
+            }
+        }
+        result
     }
 
-    pub fn end_parameter_edit_at(&self, _param_id: u32, _frame: u32) -> Result<(), String> {
-        Ok(())
-    }
-
-    pub fn run_host_callbacks_main_thread(&self) {}
-
-    pub fn reconfigure_ports_if_needed(&self) -> Result<bool, String> {
-        Ok(false)
-    }
-
-    pub fn ui_begin_session(&self) {}
-    pub fn ui_end_session(&self) {}
-    pub fn ui_should_close(&self) -> bool {
-        false
-    }
-    pub fn ui_take_due_timers(&self) -> Vec<u32> {
-        Vec::new()
-    }
-    pub fn ui_take_param_updates(&self) -> Vec<(u32, f64)> {
-        Vec::new()
-    }
-    pub fn ui_take_state_update(&self) -> Option<Vst3PluginState> {
-        None
-    }
-
-    pub fn gui_info(&self) -> Result<crate::plugins::types::Vst3GuiInfo, String> {
-        Err("GUI not yet supported for VST3 plugins".to_string())
-    }
-
-    pub fn gui_create(&self, _platform_type: &str) -> Result<(), String> {
-        Err("GUI not yet supported for VST3 plugins".to_string())
-    }
-
-    pub fn gui_get_size(&self) -> Result<(i32, i32), String> {
-        Err("GUI not yet supported for VST3 plugins".to_string())
-    }
-
-    pub fn gui_set_parent(&self, _window: usize, _platform_type: &str) -> Result<(), String> {
-        Err("GUI not yet supported for VST3 plugins".to_string())
-    }
-
+    /// AU editors run in a floating `NSWindow` owned by the host; the DAW
+    /// side only toggles visibility (requests 3/4).
     pub fn gui_set_floating_mode(&self, floating: bool) -> Result<(), String> {
         if let Some(ref mapping) = self.mapping {
             let header = unsafe { header_mut(mapping.as_ptr()) };
@@ -581,10 +663,6 @@ impl Vst3Processor {
         Err("No active host to set GUI mode".to_string())
     }
 
-    pub fn gui_on_size(&self, _width: i32, _height: i32) -> Result<(), String> {
-        Err("GUI not yet supported for VST3 plugins".to_string())
-    }
-
     pub fn gui_show(&self) -> Result<(), String> {
         let (mapping, events) = match (&self.mapping, &self.events) {
             (Some(mapping), Some(events)) => (mapping, events),
@@ -596,18 +674,18 @@ impl Vst3Processor {
         header.request_type.store(3, Ordering::Release);
         if let Err(e) = events.signal_host() {
             header.request_type.store(0, Ordering::Release);
-            return Err(format!("Failed to signal host for VST3 GUI show: {e}"));
+            return Err(format!("Failed to signal host for AU GUI show: {e}"));
         }
 
         if let Err(e) = events.wait_host(Duration::from_secs(5)) {
             header.request_type.store(0, Ordering::Release);
-            return Err(format!("Host did not respond to VST3 GUI show: {e}"));
+            return Err(format!("Host did not respond to AU GUI show: {e}"));
         }
 
         let status = header.request_status.load(Ordering::Acquire);
         header.request_type.store(0, Ordering::Release);
         if status != 1 {
-            return Err("VST3 GUI show failed in host".to_string());
+            return Err("AU GUI show failed in host".to_string());
         }
         Ok(())
     }
@@ -621,34 +699,9 @@ impl Vst3Processor {
             let _ = events.signal_host();
         }
     }
-
-    pub fn gui_destroy(&self) {}
-
-    pub fn gui_on_main_thread(&self) {}
-
-    pub fn gui_on_timer(&self, _timer_id: u32) {}
-
-    pub fn gui_check_resize(&self) -> Option<(i32, i32)> {
-        None
-    }
-
-    pub fn drain_echoed_parameters(&self) -> Vec<ParameterEvent> {
-        let mut result = Vec::new();
-        if let Some(ref mapping) = self.mapping {
-            let ring = unsafe {
-                let buf = echo_ring_ptr(mapping.as_ptr());
-                let (w, r) = echo_indices(mapping.as_ptr());
-                RingBuffer::new(buf, w, r, RING_CAPACITY)
-            };
-            while let Some(ev) = ring.pop() {
-                result.push(ev);
-            }
-        }
-        result
-    }
 }
 
-impl Drop for Vst3Processor {
+impl Drop for AuProcessor {
     fn drop(&mut self) {
         if let Some(ref child) = self.child {
             crate::plugins::watchdog::ProcessWatchdog::global().unwatch(child.id());
@@ -661,139 +714,40 @@ impl Drop for Vst3Processor {
     }
 }
 
-fn serialize_vst3_state(scratch: *mut u8, state: &Vst3PluginState) -> Result<usize, String> {
+/// Layout: u32 length followed by the state bytes.
+fn serialize_au_state(scratch: *mut u8, bytes: &[u8]) -> Result<usize, String> {
     let max_len = maolan_plugin_protocol::protocol::SCRATCH_SIZE;
     let mut offset = 0usize;
-
-    let plugin_id_bytes = state.plugin_id.as_bytes();
     if offset + 4 > max_len {
         return Err("scratch overflow".to_string());
     }
     unsafe {
-        std::ptr::write_unaligned(
-            scratch.add(offset) as *mut u32,
-            plugin_id_bytes.len() as u32,
-        );
+        std::ptr::write_unaligned(scratch as *mut u32, bytes.len() as u32);
     }
     offset += 4;
-    if offset + plugin_id_bytes.len() > max_len {
+    if offset + bytes.len() > max_len {
         return Err("scratch overflow".to_string());
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            plugin_id_bytes.as_ptr(),
-            scratch.add(offset),
-            plugin_id_bytes.len(),
-        );
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.add(offset), bytes.len());
     }
-    offset += plugin_id_bytes.len();
-
-    if offset + 4 > max_len {
-        return Err("scratch overflow".to_string());
-    }
-    unsafe {
-        std::ptr::write_unaligned(
-            scratch.add(offset) as *mut u32,
-            state.component_state.len() as u32,
-        );
-    }
-    offset += 4;
-    if offset + state.component_state.len() > max_len {
-        return Err("scratch overflow".to_string());
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            state.component_state.as_ptr(),
-            scratch.add(offset),
-            state.component_state.len(),
-        );
-    }
-    offset += state.component_state.len();
-
-    if offset + 4 > max_len {
-        return Err("scratch overflow".to_string());
-    }
-    unsafe {
-        std::ptr::write_unaligned(
-            scratch.add(offset) as *mut u32,
-            state.controller_state.len() as u32,
-        );
-    }
-    offset += 4;
-    if offset + state.controller_state.len() > max_len {
-        return Err("scratch overflow".to_string());
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            state.controller_state.as_ptr(),
-            scratch.add(offset),
-            state.controller_state.len(),
-        );
-    }
-    offset += state.controller_state.len();
-
+    offset += bytes.len();
     Ok(offset)
 }
 
-fn deserialize_vst3_state(scratch: *const u8, size: usize) -> Result<Vst3PluginState, String> {
-    if size < 12 {
-        return Err("scratch too small for VST3 state".to_string());
+fn deserialize_au_state(scratch: *const u8, size: usize) -> Result<Vec<u8>, String> {
+    if size < 4 {
+        return Err("scratch too small for AU state".to_string());
     }
-    let mut offset = 0usize;
-
-    let plugin_id_len =
-        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
-    offset += 4;
-    if offset + plugin_id_len > size {
+    let len = unsafe { std::ptr::read_unaligned(scratch as *const u32) } as usize;
+    if 4 + len > size {
         return Err("scratch underflow".to_string());
     }
-    let mut plugin_id_bytes = vec![0u8; plugin_id_len];
+    let mut bytes = vec![0u8; len];
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            scratch.add(offset),
-            plugin_id_bytes.as_mut_ptr(),
-            plugin_id_len,
-        );
+        std::ptr::copy_nonoverlapping(scratch.add(4), bytes.as_mut_ptr(), len);
     }
-    offset += plugin_id_len;
-    let plugin_id = String::from_utf8(plugin_id_bytes).map_err(|e| e.to_string())?;
-
-    let component_state_len =
-        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
-    offset += 4;
-    if offset + component_state_len > size {
-        return Err("scratch underflow".to_string());
-    }
-    let mut component_state = vec![0u8; component_state_len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            scratch.add(offset),
-            component_state.as_mut_ptr(),
-            component_state_len,
-        );
-    }
-    offset += component_state_len;
-
-    let controller_state_len =
-        unsafe { std::ptr::read_unaligned(scratch.add(offset) as *const u32) } as usize;
-    offset += 4;
-    if offset + controller_state_len > size {
-        return Err("scratch underflow".to_string());
-    }
-    let mut controller_state = vec![0u8; controller_state_len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            scratch.add(offset),
-            controller_state.as_mut_ptr(),
-            controller_state_len,
-        );
-    }
-
-    Ok(Vst3PluginState {
-        plugin_id,
-        component_state,
-        controller_state,
-    })
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -801,22 +755,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vst3_state_serialization_roundtrip() {
-        let state = Vst3PluginState {
-            plugin_id: "test.plugin.vst3".to_string(),
-            component_state: vec![1, 2, 3, 4, 5],
-            controller_state: vec![10, 20, 30],
-        };
+    fn au_state_serialization_roundtrip() {
+        let bytes = vec![1u8, 2, 3, 4, 5, 6, 7];
         let mut scratch = vec![0u8; SCRATCH_SIZE];
-        let size =
-            serialize_vst3_state(scratch.as_mut_ptr(), &state).expect("serialize should succeed");
+        let size = serialize_au_state(scratch.as_mut_ptr(), &bytes).expect("serialize");
         assert!(size > 0);
         assert!(size < SCRATCH_SIZE);
 
-        let decoded =
-            deserialize_vst3_state(scratch.as_ptr(), size).expect("deserialize should succeed");
-        assert_eq!(decoded.plugin_id, state.plugin_id);
-        assert_eq!(decoded.component_state, state.component_state);
-        assert_eq!(decoded.controller_state, state.controller_state);
+        let decoded = deserialize_au_state(scratch.as_ptr(), size).expect("deserialize");
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn au_params_scratch_roundtrip() {
+        let params = vec![
+            AuParamInfo {
+                index: 0,
+                scope: 0,
+                element: 0,
+                param_id: 1,
+                name: "Gain".to_string(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.5,
+                flags: 1,
+            },
+            AuParamInfo {
+                index: 1,
+                scope: 0,
+                element: 0,
+                param_id: 2,
+                name: "Delay Time".to_string(),
+                min: 0.0,
+                max: 2000.0,
+                default: 250.0,
+                flags: 0,
+            },
+        ];
+        let mut scratch = vec![0u8; SCRATCH_SIZE];
+        unsafe {
+            write_test_au_params(scratch.as_mut_ptr(), &params).expect("write");
+            let decoded = read_au_params_from_scratch(scratch.as_mut_ptr()).expect("read");
+            assert_eq!(decoded, params);
+        }
+    }
+
+    /// Test-only writer mirroring the plugin-host's
+    /// `write_au_params_to_scratch` so the reader can be exercised in-tree.
+    ///
+    /// # Safety
+    /// `ptr` must point to a `SCRATCH_SIZE` allocation.
+    unsafe fn write_test_au_params(ptr: *mut u8, params: &[AuParamInfo]) -> Result<(), String> {
+        unsafe {
+            let mut dest = scratch_ptr(ptr).add(AU_PARAMS_OFFSET);
+            std::ptr::write_unaligned(dest as *mut u32, AU_PARAMS_MAGIC);
+            dest = dest.add(4);
+            std::ptr::write_unaligned(dest as *mut u32, params.len() as u32);
+            dest = dest.add(4);
+            for p in params {
+                std::ptr::write_unaligned(dest as *mut u32, p.index);
+                std::ptr::write_unaligned(dest.add(4) as *mut u32, p.scope);
+                std::ptr::write_unaligned(dest.add(8) as *mut u32, p.element);
+                std::ptr::write_unaligned(dest.add(12) as *mut u32, p.param_id);
+                std::ptr::write_unaligned(dest.add(16) as *mut u32, (p.min as f32).to_bits());
+                std::ptr::write_unaligned(dest.add(20) as *mut u32, (p.max as f32).to_bits());
+                std::ptr::write_unaligned(dest.add(24) as *mut u32, (p.default as f32).to_bits());
+                std::ptr::write_unaligned(dest.add(28) as *mut u32, p.flags as u32);
+                dest = dest.add(32);
+                let bytes = p.name.as_bytes();
+                std::ptr::write_unaligned(dest as *mut u32, bytes.len() as u32);
+                dest = dest.add(4);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len());
+                dest = dest.add(bytes.len());
+            }
+            Ok(())
+        }
     }
 }

@@ -256,6 +256,12 @@ impl TrackData {
                 .and_then(|node| {
                     matches!(node, PluginGraphNode::Vst3PluginInstance(_)).then(|| node.clone())
                 }),
+            #[cfg(target_os = "macos")]
+            "au_plugin" => runtime_nodes
+                .get(value.get("plugin_index")?.as_u64()? as usize)
+                .and_then(|node| {
+                    matches!(node, PluginGraphNode::AuPluginInstance(_)).then(|| node.clone())
+                }),
             "clap_plugin" => runtime_nodes
                 .get(value.get("plugin_index")?.as_u64()? as usize)
                 .and_then(|node| {
@@ -350,6 +356,8 @@ impl TrackData {
             outputs,
             clap_plugins: Vec::new(),
             vst3_plugins: Vec::new(),
+            #[cfg(target_os = "macos")]
+            au_plugins: Vec::new(),
             #[cfg(unix)]
             lv2_plugins: Vec::new(),
             plugin_midi_connections: Vec::new(),
@@ -430,6 +438,34 @@ impl TrackData {
                             .vst3_plugins
                             .push(Vst3Instance::new(id, Arc::new(processor)));
                         runtime_nodes.push(PluginGraphNode::Vst3PluginInstance(id));
+                    }
+                    #[cfg(target_os = "macos")]
+                    "AU" | "au" => {
+                        let host_binary = match crate::plugins::ipc::find_plugin_host_binary() {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        let plugin_spec =
+                            match crate::plugins::resolve_plugin_identifier(PluginKind::Au, uri) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                        let processor = match crate::au_proc::AuProcessor::new(
+                            self.sample_rate,
+                            buffer_size,
+                            &plugin_spec,
+                            uri,
+                            channels.max(1),
+                            channels.max(1),
+                            host_binary,
+                        ) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        runtime
+                            .au_plugins
+                            .push(AuInstance::new(id, Arc::new(processor)));
+                        runtime_nodes.push(PluginGraphNode::AuPluginInstance(id));
                     }
                     #[cfg(unix)]
                     "LV2" | "lv2" => {

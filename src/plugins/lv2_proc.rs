@@ -20,7 +20,7 @@ unsafe fn latency_samples_atomic(ptr: *mut u8) -> &'static AtomicU32 {
 }
 
 unsafe fn response_counter(ptr: *mut u8) -> &'static AtomicU32 {
-    unsafe { response_counter_ref(ptr) }
+    unsafe { &header_ref(ptr).response_counter }
 }
 
 fn wait_for_host_request_complete(

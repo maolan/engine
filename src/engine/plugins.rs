@@ -58,6 +58,17 @@ impl Engine {
                     .map(|p| p.uri)
                     .ok_or_else(|| format!("LV2 plugin URI not found: {identifier}"))
             }
+            #[cfg(target_os = "macos")]
+            PluginKind::Au => {
+                let plugins =
+                    crate::plugins::scan_plugins::<crate::plugins::types::AuPluginInfo>("au")
+                        .map_err(|e| format!("failed to scan AU plugins: {e}"))?;
+                plugins
+                    .into_iter()
+                    .find(|p| p.id == identifier)
+                    .map(|p| p.id)
+                    .ok_or_else(|| format!("AU plugin ID not found: {identifier}"))
+            }
         }
     }
 
@@ -339,6 +350,125 @@ impl Engine {
             return true;
         }
         if let Err(e) = track.unload_vst3_plugin_instance(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_load_au_plugin(
+        &mut self,
+        track_name: &str,
+        plugin_id: &str,
+        instance_id: Option<usize>,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "AU plugin loading")
+            .await
+        {
+            return true;
+        }
+        let resolved_plugin_spec = match self.resolve_plugin_identifier(PluginKind::Au, plugin_id) {
+            Ok(spec) => spec,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let mut track = track.lock();
+        if track.audio.processing() {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before loading AU plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.load_au_plugin(plugin_id, &resolved_plugin_spec, instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        if let Some(instance) = track.au_plugins.last()
+            && let Some(stderr) = instance.processor.take_stderr()
+        {
+            let source = format!("au:{resolved_plugin_spec}");
+            self.spawn_plugin_host_stderr_reader(stderr, source);
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_unload_au_plugin(
+        &mut self,
+        track_name: &str,
+        plugin_id: &str,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "AU plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let mut track = track.lock();
+        if track.audio.processing() {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading AU plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_au_plugin(plugin_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_unload_au_plugin_instance(
+        &mut self,
+        track_name: &str,
+        instance_id: usize,
+    ) -> bool {
+        if self
+            .reject_if_track_frozen(track_name, "AU plugin unloading")
+            .await
+        {
+            return true;
+        }
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        let mut track = track.lock();
+        if track.audio.processing() {
+            self.notify_clients(Err(format!(
+                "Track '{}' is currently processing audio; stop playback before unloading AU plugins",
+                track_name
+            )))
+            .await;
+            return true;
+        }
+        if let Err(e) = track.unload_au_plugin_instance(instance_id) {
             self.notify_clients(Err(e)).await;
             return true;
         }
@@ -1224,6 +1354,43 @@ impl Engine {
         false
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_set_au_parameter(&mut self, a: Action) -> bool {
+        let Action::TrackSetAuParameter {
+            ref track_name,
+            instance_id,
+            param_index,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "AU parameter changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .set_au_parameter(instance_id, param_index, value)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
     pub(crate) async fn handle_track_set_plugin_bypassed(&mut self, a: Action) -> bool {
         let Action::TrackSetPluginBypassed {
             ref track_name,
@@ -1239,6 +1406,8 @@ impl Engine {
                 let result = match format.as_str() {
                     "CLAP" => track.lock().set_clap_plugin_bypassed(instance_id, bypassed),
                     "VST3" => track.lock().set_vst3_plugin_bypassed(instance_id, bypassed),
+                    #[cfg(target_os = "macos")]
+                    "AU" => track.lock().set_au_plugin_bypassed(instance_id, bypassed),
                     #[cfg(unix)]
                     "LV2" => track.lock().set_lv2_plugin_bypassed(instance_id, bypassed),
                     _ => Err(format!("Unknown plugin format for bypass: {format}")),
@@ -1510,6 +1679,45 @@ impl Engine {
         false
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_clip_set_au_parameter(&mut self, a: Action) -> bool {
+        let Action::ClipSetAuParameter {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            param_index,
+            value,
+        } = a
+        else {
+            return false;
+        };
+
+        if self
+            .reject_if_track_frozen(track_name, "AU parameter changes")
+            .await
+        {
+            return true;
+        }
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) =
+                    track
+                        .lock()
+                        .clip_set_au_parameter(clip_idx, instance_id, param_index, value)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        }
+
+        false
+    }
+
     pub(crate) async fn handle_track_get_vst3_parameters(&mut self, a: Action) -> bool {
         let Action::TrackGetVst3Parameters {
             ref track_name,
@@ -1552,6 +1760,68 @@ impl Engine {
             Ok(track) => match track.lock().clip_get_vst3_parameters(clip_idx, instance_id) {
                 Ok(parameters) => {
                     self.notify_query_reply(QueryReply::ClipVst3Parameters {
+                        track_name: track_name.clone(),
+                        clip_idx,
+                        instance_id,
+                        parameters,
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_get_au_parameters(&mut self, a: Action) -> bool {
+        let Action::TrackGetAuParameters {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().get_au_parameters(instance_id) {
+                Ok(parameters) => {
+                    self.notify_query_reply(QueryReply::TrackAuParameters {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        parameters,
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_clip_get_au_parameters(&mut self, a: Action) -> bool {
+        let Action::ClipGetAuParameters {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().clip_get_au_parameters(clip_idx, instance_id) {
+                Ok(parameters) => {
+                    self.notify_query_reply(QueryReply::ClipAuParameters {
                         track_name: track_name.clone(),
                         clip_idx,
                         instance_id,
@@ -1759,6 +2029,68 @@ impl Engine {
         false
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_au_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::TrackAuSnapshotState {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().au_snapshot_state(instance_id) {
+                Ok(state) => {
+                    self.notify_event(Event::TrackAuStateSnapshot {
+                        track_name: track_name.clone(),
+                        instance_id,
+                        state: Box::new(state),
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_clip_au_snapshot_state(&mut self, a: Action) -> bool {
+        let Action::ClipAuSnapshotState {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => match track.lock().clip_au_snapshot_state(clip_idx, instance_id) {
+                Ok(state) => {
+                    self.notify_event(Event::ClipAuStateSnapshot {
+                        track_name: track_name.clone(),
+                        clip_idx,
+                        instance_id,
+                        state: Box::new(state),
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    self.notify_clients(Err(e)).await;
+                }
+            },
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
     pub(crate) async fn handle_track_get_clap_note_names(&mut self, a: Action) -> bool {
         let Action::TrackGetClapNoteNames { ref track_name } = a else {
             return false;
@@ -1837,6 +2169,26 @@ impl Engine {
             Err(e) => {
                 tracing::error!("VST3 plugin scan failed: {e}");
                 self.notify_query_reply(QueryReply::Vst3PluginsUnavailable { error: e })
+                    .await;
+            }
+        }
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_list_au_plugins(&mut self, a: Action) -> bool {
+        let Action::ListAuPlugins = a else {
+            return false;
+        };
+
+        match crate::plugins::scan_plugins::<crate::plugins::types::AuPluginInfo>("au") {
+            Ok(plugins) => {
+                self.notify_query_reply(QueryReply::AuPlugins(plugins))
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!("AU plugin scan failed: {e}");
+                self.notify_query_reply(QueryReply::AuPluginsUnavailable { error: e })
                     .await;
             }
         }
@@ -1973,6 +2325,59 @@ impl Engine {
             }
         };
         if let Err(e) = track.lock().clip_show_vst3_gui(clip_idx, instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        self.notify_clients(Ok(a.clone())).await;
+
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_show_au_gui(&mut self, a: Action) -> bool {
+        let Action::TrackShowAuGui {
+            ref track_name,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().show_au_gui(instance_id) {
+            self.notify_clients(Err(e)).await;
+            return true;
+        }
+        self.notify_clients(Ok(a.clone())).await;
+
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_clip_show_au_gui(&mut self, a: Action) -> bool {
+        let Action::ClipShowAuGui {
+            ref track_name,
+            clip_idx,
+            instance_id,
+        } = a
+        else {
+            return false;
+        };
+
+        let track = match self.track_handle_or_err(track_name) {
+            Ok(track) => track,
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+                return true;
+            }
+        };
+        if let Err(e) = track.lock().clip_show_au_gui(clip_idx, instance_id) {
             self.notify_clients(Err(e)).await;
             return true;
         }
@@ -2144,6 +2549,60 @@ impl Engine {
         };
         false
     }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_track_au_restore_state(&mut self, a: Action) -> bool {
+        let Action::TrackAuRestoreState {
+            ref track_name,
+            instance_id,
+            ref state,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track.lock().au_restore_state(instance_id, state) {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn handle_clip_au_restore_state(&mut self, a: Action) -> bool {
+        let Action::ClipAuRestoreState {
+            ref track_name,
+            clip_idx,
+            instance_id,
+            ref state,
+        } = a
+        else {
+            return false;
+        };
+        match self.track_handle_or_err(track_name) {
+            Ok(track) => {
+                if let Err(e) = track
+                    .lock()
+                    .clip_au_restore_state(clip_idx, instance_id, state)
+                {
+                    self.notify_clients(Err(e)).await;
+                    return true;
+                }
+                self.notify_clients(Ok(a.clone())).await;
+            }
+            Err(e) => {
+                self.notify_clients(Err(e)).await;
+            }
+        };
+        false
+    }
 }
 
 impl Engine {
@@ -2235,6 +2694,12 @@ impl Engine {
                     return true;
                 }
             }
+            #[cfg(target_os = "macos")]
+            Action::ListAuPlugins => {
+                if Self::box_bool(self.handle_list_au_plugins(a.clone())).await {
+                    return true;
+                }
+            }
             Action::ListClapPlugins => {
                 if Self::box_bool(self.handle_list_clap_plugins(a.clone())).await {
                     return true;
@@ -2296,6 +2761,43 @@ impl Engine {
                     return true;
                 }
             }
+            #[cfg(target_os = "macos")]
+            Action::TrackLoadAuPlugin {
+                ref track_name,
+                ref plugin_id,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_load_au_plugin(track_name, plugin_id, instance_id)
+                    .await
+                {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::TrackUnloadAuPlugin {
+                ref track_name,
+                ref plugin_id,
+            } => {
+                if self
+                    .handle_track_unload_au_plugin(track_name, plugin_id)
+                    .await
+                {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::TrackUnloadAuPluginInstance {
+                ref track_name,
+                instance_id,
+            } => {
+                if self
+                    .handle_track_unload_au_plugin_instance(track_name, instance_id)
+                    .await
+                {
+                    return true;
+                }
+            }
             Action::TrackLoadVst3Plugin {
                 ref track_name,
                 ref plugin_id,
@@ -2341,6 +2843,18 @@ impl Engine {
             }
             Action::ClipShowVst3Gui { .. } => {
                 if Self::box_bool(self.handle_clip_show_vst3_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::TrackShowAuGui { .. } => {
+                if Self::box_bool(self.handle_track_show_au_gui(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::ClipShowAuGui { .. } => {
+                if Self::box_bool(self.handle_clip_show_au_gui(a.clone())).await {
                     return true;
                 }
             }
@@ -2487,6 +3001,18 @@ impl Engine {
                     return true;
                 }
             }
+            #[cfg(target_os = "macos")]
+            Action::TrackSetAuParameter { .. } => {
+                if Self::box_bool(self.handle_track_set_au_parameter(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::ClipSetAuParameter { .. } => {
+                if Self::box_bool(self.handle_clip_set_au_parameter(a.clone())).await {
+                    return true;
+                }
+            }
             Action::ClipSetVst3Parameter { .. } => {
                 if Self::box_bool(self.handle_clip_set_vst3_parameter(a.clone())).await {
                     return true;
@@ -2504,6 +3030,18 @@ impl Engine {
             }
             Action::ClipGetVst3Parameters { .. } => {
                 if Self::box_bool(self.handle_clip_get_vst3_parameters(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::TrackGetAuParameters { .. } => {
+                if Self::box_bool(self.handle_track_get_au_parameters(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::ClipGetAuParameters { .. } => {
+                if Self::box_bool(self.handle_clip_get_au_parameters(a.clone())).await {
                     return true;
                 }
             }
@@ -2555,6 +3093,30 @@ impl Engine {
             }
             Action::TrackVst3RestoreState { .. } => {
                 if Self::box_bool(self.handle_track_vst3_restore_state(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::TrackAuSnapshotState { .. } => {
+                if Self::box_bool(self.handle_track_au_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::ClipAuSnapshotState { .. } => {
+                if Self::box_bool(self.handle_clip_au_snapshot_state(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::TrackAuRestoreState { .. } => {
+                if Self::box_bool(self.handle_track_au_restore_state(a.clone())).await {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::ClipAuRestoreState { .. } => {
+                if Self::box_bool(self.handle_clip_au_restore_state(a.clone())).await {
                     return true;
                 }
             }

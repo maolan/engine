@@ -536,6 +536,14 @@ impl Builder {
                     proc.midi_output_ports().to_vec(),
                 )
             }
+            #[cfg(target_os = "macos")]
+            PluginKind::Au => {
+                let proc = t.au_plugins[index].processor.clone();
+                (
+                    proc.midi_input_ports().to_vec(),
+                    proc.midi_output_ports().to_vec(),
+                )
+            }
             #[cfg(unix)]
             PluginKind::Lv2 => {
                 let proc = t.lv2_plugins[index].processor.clone();
@@ -665,6 +673,14 @@ impl Builder {
                 target_keys.insert(ConnectableRef::Vst3Plugin(id), node);
                 plugin_nodes.push(node);
             }
+            #[cfg(target_os = "macos")]
+            for idx in 0..t.au_plugins.len() {
+                let node = self.push_plugin(&track, &t, PluginKind::Au, idx, folder_input);
+                let id = t.au_plugins[idx].id;
+                source_keys.insert(ConnectableRef::AuPlugin(id), node);
+                target_keys.insert(ConnectableRef::AuPlugin(id), node);
+                plugin_nodes.push(node);
+            }
             #[cfg(unix)]
             for idx in 0..t.lv2_plugins.len() {
                 let node = self.push_plugin(&track, &t, PluginKind::Lv2, idx, folder_input);
@@ -743,6 +759,10 @@ impl Builder {
             for idx in 0..t.vst3_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Vst3, idx, task);
             }
+            #[cfg(target_os = "macos")]
+            for idx in 0..t.au_plugins.len() {
+                self.register_plugin_midi_ports(&t, PluginKind::Au, idx, task);
+            }
             #[cfg(unix)]
             for idx in 0..t.lv2_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Lv2, idx, task);
@@ -766,6 +786,11 @@ impl Builder {
             }
             PluginKind::Vst3 => {
                 let proc = t.vst3_plugins[index].processor.clone();
+                (proc.audio_inputs().to_vec(), proc.audio_outputs().to_vec())
+            }
+            #[cfg(target_os = "macos")]
+            PluginKind::Au => {
+                let proc = t.au_plugins[index].processor.clone();
                 (proc.audio_inputs().to_vec(), proc.audio_outputs().to_vec())
             }
             #[cfg(unix)]

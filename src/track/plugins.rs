@@ -37,6 +37,7 @@ impl TrackData {
                 !self.vst3_plugins.iter().any(|i| i.id == id)
                     && !self.clap_plugins.iter().any(|i| i.id == id)
                     && !self.lv2_instance_id_exists(id)
+                    && !self.au_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_lv2_instance_id
@@ -200,6 +201,35 @@ impl TrackData {
                 },
             );
         }
+        #[cfg(target_os = "macos")]
+        for instance in &self.au_plugins {
+            let proc = instance.processor.clone();
+            Self::push_plugin_graph_plugin(
+                &mut plugins,
+                PluginGraphPlugin {
+                    node: PluginGraphNode::AuPluginInstance(instance.id),
+                    instance_id: instance.id,
+                    format: "AU".to_string(),
+                    uri: proc.plugin_id().to_string(),
+                    plugin_id: proc.plugin_id().to_string(),
+                    name: proc.name().to_string(),
+                    main_audio_inputs: proc.main_audio_input_count(),
+                    main_audio_outputs: proc.main_audio_output_count(),
+                    audio_inputs: proc.audio_inputs().len(),
+                    audio_outputs: proc.audio_outputs().len(),
+                    midi_inputs: proc.midi_input_count(),
+                    midi_outputs: proc.midi_output_count(),
+                    state: include_state
+                        .then(|| {
+                            proc.snapshot_state()
+                                .ok()
+                                .and_then(|state| serde_json::to_value(state).ok())
+                        })
+                        .flatten(),
+                    bypassed: proc.is_bypassed(),
+                },
+            );
+        }
         for instance in &self.clap_plugins {
             let proc = instance.processor.clone();
             Self::push_plugin_graph_plugin(
@@ -335,6 +365,7 @@ impl TrackData {
                 !self.vst3_plugins.iter().any(|i| i.id == id)
                     && !self.clap_plugins.iter().any(|i| i.id == id)
                     && !self.lv2_instance_id_exists(id)
+                    && !self.au_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_clap_instance_id
@@ -466,6 +497,40 @@ impl TrackData {
             .ok_or_else(|| {
                 format!(
                     "Clip {clip_idx} on track '{}' does not have VST3 instance id: {instance_id}",
+                    track_name
+                )
+            })?;
+        let processor = instance.processor.clone();
+        processor.gui_set_floating_mode(true)?;
+        processor.gui_show()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn show_au_gui(&self, instance_id: usize) -> Result<(), String> {
+        if let Some(instance) = self.au_plugins.iter().find(|i| i.id == instance_id) {
+            let processor = instance.processor.clone();
+            processor.gui_set_floating_mode(true)?;
+            return processor.gui_show();
+        }
+        let available: Vec<_> = self.au_plugins.iter().map(|i| i.id).collect();
+        Err(format!(
+            "Track '{}' does not have AU instance id: {} (available: {:?})",
+            self.name, instance_id, available
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clip_show_au_gui(&mut self, clip_idx: usize, instance_id: usize) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let track_name = self.name.clone();
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .au_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| {
+                format!(
+                    "Clip {clip_idx} on track '{}' does not have AU instance id: {instance_id}",
                     track_name
                 )
             })?;
@@ -987,6 +1052,18 @@ impl TrackData {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        for instance in &self.au_plugins {
+            for ev in instance.processor.drain_echoed_parameters() {
+                updates.push(crate::message::Action::TrackSetAuParameter {
+                    track_name: track_name.clone(),
+                    instance_id: instance.id,
+                    param_index: ev.param_index,
+                    value: ev.value,
+                });
+            }
+        }
+
         #[cfg(unix)]
         for instance in &self.lv2_plugins {
             for ev in instance.processor.drain_echoed_parameters() {
@@ -1034,6 +1111,7 @@ impl TrackData {
                 !self.vst3_plugins.iter().any(|i| i.id == id)
                     && !self.clap_plugins.iter().any(|i| i.id == id)
                     && !self.lv2_instance_id_exists(id)
+                    && !self.au_instance_id_exists(id)
             })
             .unwrap_or_else(|| self.alloc_plugin_instance_id());
         self.next_vst3_instance_id
@@ -1095,6 +1173,324 @@ impl TrackData {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn load_au_plugin(
+        &mut self,
+        plugin_id: &str,
+        plugin_spec: &str,
+        instance_id: Option<usize>,
+    ) -> Result<(), String> {
+        let buffer_size = self
+            .audio
+            .ins
+            .first()
+            .map(|io| io.buffer_size())
+            .or_else(|| self.audio.outs.first().map(|io| io.buffer_size()))
+            .unwrap_or(64)
+            .max(1);
+        let input_count = self.audio.ins.len().max(1);
+        let output_count = self.audio.outs.len().max(1);
+        let host_binary = crate::plugins::ipc::find_plugin_host_binary()
+            .ok_or_else(|| "maolan-plugin-host binary not found".to_string())?;
+        let processor = crate::au_proc::AuProcessor::new(
+            self.sample_rate,
+            buffer_size,
+            plugin_spec,
+            plugin_id,
+            input_count,
+            output_count,
+            host_binary,
+        )?;
+        let id = instance_id
+            .filter(|&id| {
+                !self.vst3_plugins.iter().any(|i| i.id == id)
+                    && !self.clap_plugins.iter().any(|i| i.id == id)
+                    && !self.lv2_instance_id_exists(id)
+                    && !self.au_instance_id_exists(id)
+            })
+            .unwrap_or_else(|| self.alloc_plugin_instance_id());
+        self.next_au_instance_id
+            .fetch_max(id.saturating_add(1), Ordering::Relaxed);
+        self.next_plugin_instance_id
+            .fetch_max(id.saturating_add(1), Ordering::Relaxed);
+        self.au_plugins.push(AuInstance {
+            id,
+            processor: Arc::new(processor),
+        });
+        self.invalidate_audio_route_cache();
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn unload_au_plugin(&mut self, plugin_id: &str) -> Result<(), String> {
+        let Some(index) = self
+            .au_plugins
+            .iter()
+            .position(|instance| instance.processor.plugin_id() == plugin_id)
+        else {
+            return Err(format!(
+                "Track '{}' does not have AU plugin loaded: {}",
+                self.name, plugin_id
+            ));
+        };
+        let removed = self.au_plugins.remove(index);
+        let removed_id = removed.id;
+        for port in removed.processor.audio_inputs() {
+            Self::disconnect_all(port);
+        }
+        for port in removed.processor.audio_outputs() {
+            Self::disconnect_all(port);
+        }
+        self.prune_plugin_midi_connections(PluginGraphNode::AuPluginInstance(removed_id));
+        self.invalidate_audio_route_cache();
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn unload_au_plugin_instance(&mut self, instance_id: usize) -> Result<(), String> {
+        let Some(index) = self
+            .au_plugins
+            .iter()
+            .position(|instance| instance.id == instance_id)
+        else {
+            return Err(format!(
+                "Track '{}' does not have AU instance id: {}",
+                self.name, instance_id
+            ));
+        };
+        let removed = self.au_plugins.remove(index);
+        for port in removed.processor.audio_inputs() {
+            Self::disconnect_all(port);
+        }
+        for port in removed.processor.audio_outputs() {
+            Self::disconnect_all(port);
+        }
+        self.prune_plugin_midi_connections(PluginGraphNode::AuPluginInstance(instance_id));
+        self.invalidate_audio_route_cache();
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_au_plugin_bypassed(&self, instance_id: usize, bypassed: bool) -> Result<(), String> {
+        let instance = self
+            .au_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| format!("AU instance {} not found", instance_id))?;
+        instance.processor.set_bypassed(bypassed);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_au_parameter(
+        &mut self,
+        instance_id: usize,
+        param_index: u32,
+        value: f32,
+    ) -> Result<(), String> {
+        let instance = self
+            .au_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| format!("AU instance {} not found", instance_id))?;
+
+        instance
+            .processor
+            .set_parameter(param_index, f64::from(value))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clip_set_au_parameter(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        param_index: u32,
+        value: f32,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip AU instance {} not found", instance_id))?;
+
+        instance
+            .processor
+            .set_parameter(param_index, f64::from(value))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn get_au_parameters(
+        &self,
+        instance_id: usize,
+    ) -> Result<Vec<crate::au::AuParamInfo>, String> {
+        let instance = self
+            .au_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| format!("AU instance {} not found", instance_id))?;
+
+        Ok(instance.processor.parameter_infos())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clip_get_au_parameters(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<Vec<crate::au::AuParamInfo>, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip AU instance {} not found", instance_id))?;
+
+        Ok(instance.processor.parameter_infos())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn au_snapshot_state(
+        &self,
+        instance_id: usize,
+    ) -> Result<crate::au::AuPluginState, String> {
+        let instance = self
+            .au_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| format!("AU instance {} not found", instance_id))?;
+
+        instance.processor.snapshot_state()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clip_au_snapshot_state(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+    ) -> Result<crate::au::AuPluginState, String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip AU instance {} not found", instance_id))?;
+        instance.processor.snapshot_state()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clip_au_restore_state(
+        &mut self,
+        clip_idx: usize,
+        instance_id: usize,
+        state: &crate::au::AuPluginState,
+    ) -> Result<(), String> {
+        let channels = self.audio.ins.len().max(1);
+        let runtime = self.ensure_clip_plugin_runtime(clip_idx, channels)?;
+        let instance = runtime
+            .au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Clip AU instance {} not found", instance_id))?;
+        instance.processor.restore_state(state)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn au_restore_state(
+        &mut self,
+        instance_id: usize,
+        state: &crate::au::AuPluginState,
+    ) -> Result<(), String> {
+        let instance = self
+            .au_plugins
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| format!("AU instance {} not found", instance_id))?;
+
+        instance.processor.restore_state(state)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn au_audio_output_io(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<Arc<AudioIO>, String> {
+        self.au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| instance.processor.audio_outputs().get(port).cloned())
+            .ok_or_else(|| format!("AU instance {instance_id} output port {port} missing"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn au_audio_input_io(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<Arc<AudioIO>, String> {
+        self.au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| instance.processor.audio_inputs().get(port).cloned())
+            .ok_or_else(|| format!("AU instance {instance_id} input port {port} missing"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn au_validate_midi_output(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<(), String> {
+        self.au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| (port < instance.processor.midi_output_count()).then_some(()))
+            .ok_or_else(|| format!("AU instance {instance_id} MIDI output port {port} missing"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn au_validate_midi_input(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<(), String> {
+        self.au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| (port < instance.processor.midi_input_count()).then_some(()))
+            .ok_or_else(|| format!("AU instance {instance_id} MIDI input port {port} missing"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn au_midi_output_io(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<Arc<MIDIIO>, String> {
+        self.au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| instance.processor.midi_output_ports().get(port).cloned())
+            .ok_or_else(|| format!("AU instance {instance_id} MIDI output port {port} missing"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn au_midi_input_io(
+        &self,
+        instance_id: usize,
+        port: usize,
+    ) -> Result<Arc<MIDIIO>, String> {
+        self.au_plugins
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .and_then(|instance| instance.processor.midi_input_ports().get(port).cloned())
+            .ok_or_else(|| format!("AU instance {instance_id} MIDI input port {port} missing"))
+    }
+
     pub fn clear_plugins(&mut self) {
         let clap_ids: Vec<usize> = self.clap_plugins.iter().map(|i| i.id).collect();
         for id in clap_ids {
@@ -1103,6 +1499,13 @@ impl TrackData {
         let vst3_ids: Vec<usize> = self.vst3_plugins.iter().map(|i| i.id).collect();
         for id in vst3_ids {
             let _ = self.unload_vst3_plugin_instance(id);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let au_ids: Vec<usize> = self.au_plugins.iter().map(|i| i.id).collect();
+            for id in au_ids {
+                let _ = self.unload_au_plugin_instance(id);
+            }
         }
         #[cfg(unix)]
         {
@@ -1480,6 +1883,14 @@ impl TrackData {
                 idx,
             ));
         }
+        #[cfg(target_os = "macos")]
+        for (idx, instance) in self.au_plugins.iter().enumerate() {
+            entries.push((
+                PluginGraphNode::AuPluginInstance(instance.id),
+                PluginKind::Au,
+                idx,
+            ));
+        }
         #[cfg(unix)]
         for (idx, instance) in self.lv2_plugins.iter().enumerate() {
             entries.push((
@@ -1532,6 +1943,10 @@ impl TrackData {
             }
             for (idx, _) in self.vst3_plugins.iter().enumerate() {
                 order.push((PluginKind::Vst3, idx));
+            }
+            #[cfg(target_os = "macos")]
+            for (idx, _) in self.au_plugins.iter().enumerate() {
+                order.push((PluginKind::Au, idx));
             }
             #[cfg(unix)]
             for (idx, _) in self.lv2_plugins.iter().enumerate() {
@@ -1914,6 +2329,16 @@ impl TrackData {
         false
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn au_instance_id_exists(&self, id: usize) -> bool {
+        self.au_plugins.iter().any(|i| i.id == id)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn au_instance_id_exists(&self, _id: usize) -> bool {
+        false
+    }
+
     pub fn plugin_source_io(
         &self,
         node: &PluginGraphNode,
@@ -1932,6 +2357,10 @@ impl TrackData {
             }
             PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_audio_output_io(*instance_id, port)
+            }
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => {
+                self.au_audio_output_io(*instance_id, port)
             }
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => {
@@ -1958,6 +2387,10 @@ impl TrackData {
             }
             PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_audio_input_io(*instance_id, port)
+            }
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => {
+                self.au_audio_input_io(*instance_id, port)
             }
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => {
@@ -1987,6 +2420,10 @@ impl TrackData {
             PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_midi_output_io(*instance_id, port)
             }
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => {
+                self.au_midi_output_io(*instance_id, port)
+            }
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => {
                 self.lv2_midi_output_io(*instance_id, port)
@@ -2014,6 +2451,10 @@ impl TrackData {
             }
             PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_midi_input_io(*instance_id, port)
+            }
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => {
+                self.au_midi_input_io(*instance_id, port)
             }
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => {
@@ -2043,6 +2484,10 @@ impl TrackData {
             PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_validate_midi_output(*instance_id, port)
             }
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => {
+                self.au_validate_midi_output(*instance_id, port)
+            }
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => {
                 self.lv2_validate_midi_output(*instance_id, port)
@@ -2070,6 +2515,10 @@ impl TrackData {
             }
             PluginGraphNode::Vst3PluginInstance(instance_id) => {
                 self.vst3_validate_midi_input(*instance_id, port)
+            }
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => {
+                self.au_validate_midi_input(*instance_id, port)
             }
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => {
@@ -2239,6 +2688,16 @@ impl TrackData {
                     .map(|port| Arc::as_ptr(port) as usize),
             );
         }
+        #[cfg(target_os = "macos")]
+        for instance in &self.au_plugins {
+            keys.extend(
+                instance
+                    .processor
+                    .audio_outputs()
+                    .iter()
+                    .map(|port| Arc::as_ptr(port) as usize),
+            );
+        }
         #[cfg(unix)]
         for instance in &self.lv2_plugins {
             keys.extend(
@@ -2264,6 +2723,16 @@ impl TrackData {
             );
         }
         for instance in &self.vst3_plugins {
+            buffers.extend(
+                instance
+                    .processor
+                    .audio_outputs()
+                    .iter()
+                    .map(|port| (Arc::as_ptr(port) as usize, vec![0.0; frames])),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        for instance in &self.au_plugins {
             buffers.extend(
                 instance
                     .processor
@@ -2356,6 +2825,13 @@ impl TrackData {
                 .find(|instance| instance.id == *instance_id)
                 .map(|instance| instance.processor.audio_inputs().to_vec())
                 .unwrap_or_default(),
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => self
+                .au_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_inputs().to_vec())
+                .unwrap_or_default(),
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => self
                 .lv2_plugins
@@ -2379,6 +2855,12 @@ impl TrackData {
                 .get(index)
                 .map(|instance| instance.processor.latency_samples())
                 .unwrap_or(0),
+            #[cfg(target_os = "macos")]
+            PluginKind::Au => self
+                .au_plugins
+                .get(index)
+                .map(|instance| instance.processor.latency_samples())
+                .unwrap_or(0),
             #[cfg(unix)]
             PluginKind::Lv2 => self
                 .lv2_plugins
@@ -2397,6 +2879,13 @@ impl TrackData {
             .vst3_plugins
             .iter()
             .any(|instance| instance.processor.take_latency_changed());
+        #[cfg(target_os = "macos")]
+        let au_changed = self
+            .au_plugins
+            .iter()
+            .any(|instance| instance.processor.take_latency_changed());
+        #[cfg(not(target_os = "macos"))]
+        let au_changed = false;
         #[cfg(unix)]
         let lv2_changed = self
             .lv2_plugins
@@ -2405,7 +2894,7 @@ impl TrackData {
         #[cfg(not(unix))]
         let lv2_changed = false;
 
-        clap_changed || vst3_changed || lv2_changed
+        clap_changed || vst3_changed || lv2_changed || au_changed
     }
 
     pub(crate) fn plugin_graph_latency_samples(&self) -> usize {
@@ -2436,6 +2925,11 @@ impl TrackData {
                     .vst3_plugins
                     .get(index)
                     .map(|instance| PluginGraphNode::Vst3PluginInstance(instance.id)),
+                #[cfg(target_os = "macos")]
+                PluginKind::Au => self
+                    .au_plugins
+                    .get(index)
+                    .map(|instance| PluginGraphNode::AuPluginInstance(instance.id)),
                 #[cfg(unix)]
                 PluginKind::Lv2 => self
                     .lv2_plugins
@@ -2465,6 +2959,13 @@ impl TrackData {
                 .unwrap_or_default(),
             PluginGraphNode::Vst3PluginInstance(instance_id) => self
                 .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.audio_outputs().to_vec())
+                .unwrap_or_default(),
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => self
+                .au_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .map(|instance| instance.processor.audio_outputs().to_vec())
@@ -2703,6 +3204,71 @@ impl TrackData {
                         }
                         self.rt.folder_processed_midi_plugins.insert(node);
                     }
+                    #[cfg(target_os = "macos")]
+                    PluginKind::Au => {
+                        let processor = self.au_plugins[idx].processor.clone();
+                        let input_ports = processor.audio_inputs();
+                        if !Self::graph_audio_inputs_ready(
+                            input_ports,
+                            &plugin_output_keys,
+                            &output_buffers,
+                        ) {
+                            continue;
+                        }
+                        let node = PluginGraphNode::AuPluginInstance(self.au_plugins[idx].id);
+                        let midi_inputs = self.plugin_midi_input_events(
+                            &node,
+                            processor.midi_input_count(),
+                            &track_input_events,
+                            &self.rt.folder_plugin_midi_node_events,
+                        );
+                        let _au_input = midi_inputs.first().cloned().unwrap_or_default();
+                        let input_buffers = self.sum_graph_audio_inputs(
+                            input_ports,
+                            frames,
+                            track_inputs,
+                            &output_buffers,
+                            &source_latencies,
+                        );
+                        let mut output_buffers_for_plugin =
+                            vec![vec![0.0; frames]; processor.audio_outputs().len()];
+                        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                        let mut outputs = output_buffers_for_plugin
+                            .iter_mut()
+                            .map(Vec::as_mut_slice)
+                            .collect::<Vec<_>>();
+                        let midi_outputs =
+                            processor.process_with_audio_buffers(frames, &inputs, &mut outputs);
+                        for (port, buffer) in processor
+                            .audio_outputs()
+                            .iter()
+                            .zip(output_buffers_for_plugin)
+                        {
+                            let key = Arc::as_ptr(port) as usize;
+                            output_buffers.insert(key, buffer);
+                            source_latencies.insert(
+                                key,
+                                self.plugin_node_input_latency(&node, &source_latencies)
+                                    .saturating_add(processor.latency_samples()),
+                            );
+                        }
+                        for ev in processor.drain_echoed_parameters() {
+                            self.rt.echoed_parameter_updates.push(
+                                crate::message::Action::TrackSetAuParameter {
+                                    track_name: track_name.clone(),
+                                    instance_id: self.au_plugins[idx].id,
+                                    param_index: ev.param_index,
+                                    value: ev.value,
+                                },
+                            );
+                        }
+                        if !midi_outputs.is_empty() {
+                            self.rt
+                                .folder_plugin_midi_node_events
+                                .insert((node.clone(), 0), midi_outputs);
+                        }
+                        self.rt.folder_processed_midi_plugins.insert(node);
+                    }
                     #[cfg(unix)]
                     PluginKind::Lv2 => {
                         let processor = self.lv2_plugins[idx].processor.clone();
@@ -2810,6 +3376,9 @@ impl TrackData {
                     conn.from_node,
                     PluginGraphNode::ClapPluginInstance(_) | PluginGraphNode::Vst3PluginInstance(_)
                 );
+                #[cfg(target_os = "macos")]
+                let is_plugin =
+                    is_plugin || matches!(conn.from_node, PluginGraphNode::AuPluginInstance(_));
                 #[cfg(unix)]
                 let is_plugin =
                     is_plugin || matches!(conn.from_node, PluginGraphNode::Lv2PluginInstance(_));
@@ -2856,6 +3425,13 @@ impl TrackData {
                 .unwrap_or_default(),
             PluginGraphNode::Vst3PluginInstance(instance_id) => self
                 .vst3_plugins
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .map(|instance| instance.processor.midi_input_ports().to_vec())
+                .unwrap_or_default(),
+            #[cfg(target_os = "macos")]
+            PluginGraphNode::AuPluginInstance(instance_id) => self
+                .au_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .map(|instance| instance.processor.midi_input_ports().to_vec())
@@ -2958,6 +3534,38 @@ mod tests {
             .into_iter()
             .filter(|connection| {
                 connection.from_node == PluginGraphNode::Vst3PluginInstance(7)
+                    && connection.to_node == PluginGraphNode::TrackOutput
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(plugin_output_routes.len(), 1);
+        assert_eq!(plugin_output_routes[0].from_port, 0);
+        assert_eq!(plugin_output_routes[0].to_port, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn au_plugin_output_route_reports_only_connected_ports() {
+        let mut track = TrackData::new("Synth".to_string(), 2, 2, 0, 0, 256, 48_000.0);
+        track.au_plugins.push(AuInstance::new(
+            7,
+            Arc::new(crate::au_proc::AuProcessor::new_for_test(2, 2, 256)),
+        ));
+
+        track
+            .connect_plugin_audio(
+                PluginGraphNode::AuPluginInstance(7),
+                0,
+                PluginGraphNode::TrackOutput,
+                0,
+            )
+            .expect("connect first output");
+
+        let plugin_output_routes = track
+            .plugin_graph_connections()
+            .into_iter()
+            .filter(|connection| {
+                connection.from_node == PluginGraphNode::AuPluginInstance(7)
                     && connection.to_node == PluginGraphNode::TrackOutput
             })
             .collect::<Vec<_>>();

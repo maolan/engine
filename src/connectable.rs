@@ -31,6 +31,8 @@ pub enum ConnectableRef {
     Vst3Plugin(usize),
     #[cfg(unix)]
     Lv2Plugin(usize),
+    #[cfg(target_os = "macos")]
+    AuPlugin(usize),
 }
 
 /// A connection between two `Connectable` objects inside a track.

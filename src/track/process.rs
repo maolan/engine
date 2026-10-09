@@ -59,11 +59,15 @@ impl TrackData {
             midi: MIDITrack::new(io.midi_ins, io.midi_outs),
             clap_plugins: Vec::new(),
             vst3_plugins: Vec::new(),
+            #[cfg(target_os = "macos")]
+            au_plugins: Vec::new(),
             #[cfg(unix)]
             lv2_plugins: Vec::new(),
             plugin_midi_connections: Vec::new(),
             next_clap_instance_id: AtomicUsize::new(0),
             next_vst3_instance_id: AtomicUsize::new(0),
+            #[cfg(target_os = "macos")]
+            next_au_instance_id: AtomicUsize::new(0),
             #[cfg(unix)]
             next_lv2_instance_id: AtomicUsize::new(0),
             next_plugin_instance_id: AtomicUsize::new(0),
@@ -729,6 +733,43 @@ impl TrackData {
                             track_name: track_name.clone(),
                             instance_id: self.vst3_plugins[index].id,
                             param_id: ev.param_index,
+                            value: ev.value,
+                        },
+                    );
+                }
+                if !outputs.is_empty() {
+                    self.rt
+                        .folder_plugin_midi_node_events
+                        .insert((node.clone(), 0), outputs);
+                }
+                self.rt.folder_processed_midi_plugins.insert(node);
+            }
+            #[cfg(target_os = "macos")]
+            PluginKind::Au => {
+                if index >= self.au_plugins.len() {
+                    return;
+                }
+                let processor = self.au_plugins[index].processor.clone();
+                let node = PluginGraphNode::AuPluginInstance(self.au_plugins[index].id);
+                if !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins) {
+                    return;
+                }
+                let midi_inputs = self.plugin_midi_input_events(
+                    &node,
+                    processor.midi_input_count(),
+                    &self.rt.folder_input_midi_events,
+                    &self.rt.folder_plugin_midi_node_events,
+                );
+                let _au_input = midi_inputs.first().cloned().unwrap_or_default();
+                let outputs =
+                    processor.process_with_audio_buffers(frames, audio_inputs, audio_outputs);
+                let track_name = self.name.clone();
+                for ev in processor.drain_echoed_parameters() {
+                    self.rt.echoed_parameter_updates.push(
+                        crate::message::Action::TrackSetAuParameter {
+                            track_name: track_name.clone(),
+                            instance_id: self.au_plugins[index].id,
+                            param_index: ev.param_index,
                             value: ev.value,
                         },
                     );

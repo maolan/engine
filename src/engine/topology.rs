@@ -3762,6 +3762,22 @@ pub(crate) fn undo_should_record(action: &Action) -> bool {
         {
             false
         }
+    } || {
+        #[cfg(target_os = "macos")]
+        {
+            matches!(
+                action,
+                Action::TrackLoadAuPlugin { .. }
+                    | Action::TrackUnloadAuPlugin { .. }
+                    | Action::TrackUnloadAuPluginInstance { .. }
+                    | Action::TrackSetAuParameter { .. }
+                    | Action::ClipSetAuParameter { .. }
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 }
 
@@ -4540,6 +4556,16 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(target_os = "macos")]
+        Action::TrackLoadAuPlugin { track_name, .. } => {
+            let track = state.tracks.get(track_name)?;
+            let track = track.lock();
+            Some(Action::TrackUnloadAuPluginInstance {
+                track_name: track_name.clone(),
+                instance_id: track.next_au_instance_id.load(Ordering::Relaxed),
+            })
+        }
+
         #[cfg(unix)]
         Action::TrackLoadLv2Plugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
@@ -4615,6 +4641,12 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
                     .map(|i| i.processor.is_bypassed()),
                 "VST3" => track
                     .vst3_plugins
+                    .iter()
+                    .find(|i| i.id == *instance_id)
+                    .map(|i| i.processor.is_bypassed()),
+                #[cfg(target_os = "macos")]
+                "AU" => track
+                    .au_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
                     .map(|i| i.processor.is_bypassed()),
