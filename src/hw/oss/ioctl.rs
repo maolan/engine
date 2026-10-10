@@ -40,7 +40,9 @@ pub struct AudioInfo {
 impl AudioInfo {
     pub fn new() -> Self {
         Self {
-            dev: 0,
+            // -1 selects the device the ioctl is issued on; a non-negative
+            // value is a global engine index across all pcm devices.
+            dev: -1,
             name: [0; 64],
             busy: 0,
             pid: 0,
