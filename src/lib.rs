@@ -11,6 +11,10 @@ pub mod audio_devices {
 pub mod audio_devices {
     pub use crate::hw::freebsd::{AudioDeviceDescriptor, discover_freebsd_audio_devices};
 }
+#[cfg(target_os = "windows")]
+pub mod audio_devices {
+    pub use crate::hw::wasapi::effective_period_frames;
+}
 pub mod client;
 pub mod connectable;
 mod cycle_trace;

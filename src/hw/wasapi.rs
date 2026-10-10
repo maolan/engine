@@ -902,6 +902,19 @@ fn build_float_mix_format(
         WasapiMode::Exclusive => None,
     };
     let supported = unsafe { client.IsFormatSupported(share_mode, &format.Format, closest_out) };
+    if supported.is_err() && share_mode == AUDCLNT_SHAREMODE_EXCLUSIVE {
+        // Exclusive mode validates the channel mask strictly: for more than
+        // eight channels the generated contiguous mask contains undefined
+        // speaker positions (multichannel USB interfaces reject it). Retry
+        // with a DIRECTOUT mask, which is the standard way to stream an
+        // arbitrary channel count without positional semantics.
+        format.dwChannelMask = 0;
+        let supported_directout =
+            unsafe { client.IsFormatSupported(share_mode, &format.Format, None) };
+        if supported_directout.is_ok() {
+            return Ok(format);
+        }
+    }
     if !closest.is_null() {
         unsafe {
             CoTaskMemFree(Some(closest.cast::<c_void>()));
@@ -1040,6 +1053,59 @@ fn align_low_latency_period(
     let steps = requested.div_ceil(fundamental_period);
     let aligned = steps.saturating_mul(fundamental_period);
     aligned.max(min_period).min(max_period)
+}
+
+/// Predicts the period (in frames) the engine will actually stream with for
+/// `requested_period_frames` on `device_id`, without opening the device.
+/// Mirrors `build_hw_options` (power-of-two rounding) and, in shared mode,
+/// the engine-range clamp and fundamental alignment from
+/// `initialise_low_latency`; exclusive mode streams the rounded request
+/// unchanged. Latency-calibration records are keyed by the negotiated period,
+/// so lookups use this to match whatever period the user requested.
+pub fn effective_period_frames(
+    device_id: &str,
+    requested_period_frames: usize,
+    sample_rate_hz: u32,
+    exclusive: bool,
+) -> Result<usize, String> {
+    let requested = requested_period_frames.max(1).next_power_of_two();
+    if exclusive {
+        return Ok(requested);
+    }
+    let _com = ComApartment::new()?;
+    let device = select_device(eRender, strip_wasapi_prefix(device_id))?;
+    let client = unsafe {
+        device
+            .Activate::<IAudioClient>(CLSCTX_ALL, None)
+            .map_err(|e| format!("Failed to activate WASAPI client: {e}"))?
+    };
+    // The input stream is opened at the output stream's negotiated period, so
+    // the output endpoint's engine period range governs both sides.
+    let format =
+        build_float_mix_format(&client, sample_rate_hz.max(1), WasapiMode::SharedLowLatency)?;
+    let client3 = client
+        .cast::<IAudioClient3>()
+        .map_err(|_| "WASAPI shared low-latency mode requires IAudioClient3".to_string())?;
+    let (mut default_period, mut fundamental_period, mut min_period, mut max_period) =
+        (0_u32, 0_u32, 0_u32, 0_u32);
+    unsafe {
+        client3
+            .GetSharedModeEnginePeriod(
+                &format.Format,
+                &mut default_period,
+                &mut fundamental_period,
+                &mut min_period,
+                &mut max_period,
+            )
+            .map_err(|e| format!("Failed to query WASAPI shared low-latency periods: {e}"))?;
+    }
+    Ok(align_low_latency_period(
+        requested.min(u32::MAX as usize) as u32,
+        default_period,
+        fundamental_period,
+        min_period,
+        max_period,
+    ) as usize)
 }
 
 fn frames_to_ref_time(frames: u32, sample_rate: u32) -> i64 {
