@@ -234,7 +234,9 @@ impl Engine {
         }
         self.publish_track_meters().await;
         self.publish_session_runtime_reports().await;
+        #[cfg(feature = "plugins")]
         self.publish_clap_state_dirty().await;
+        #[cfg(feature = "plugins")]
         for track_name in reconfigured_tracks {
             let track = state.tracks.get(&track_name).cloned();
             if let Some(track) = track {

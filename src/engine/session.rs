@@ -816,6 +816,7 @@ impl Engine {
     }
 
     pub(crate) async fn handle_request_session_diagnostics(&mut self) {
+        #[cfg(feature = "plugins")]
         let (
             track_count,
             frozen_track_count,
@@ -831,12 +832,18 @@ impl Engine {
             let mut frozen_track_count = 0usize;
             let mut audio_clip_count = 0usize;
             let mut midi_clip_count = 0usize;
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             let mut lv2_instance_count = 0usize;
-            #[cfg(not(unix))]
+            #[cfg(not(all(unix, feature = "plugins")))]
             let lv2_instance_count = 0usize;
+            #[cfg(feature = "plugins")]
             let mut vst3_instance_count = 0usize;
+            #[cfg(not(feature = "plugins"))]
+            let _vst3_instance_count = 0usize;
+            #[cfg(feature = "plugins")]
             let mut clap_instance_count = 0usize;
+            #[cfg(not(feature = "plugins"))]
+            let _clap_instance_count = 0usize;
             for track in tracks.values() {
                 let t = track.lock();
                 track_count += 1;
@@ -845,24 +852,77 @@ impl Engine {
                 }
                 audio_clip_count += t.audio.clips().len();
                 midi_clip_count += t.midi.clips().len();
-                #[cfg(unix)]
+                #[cfg(all(unix, feature = "plugins"))]
                 {
                     lv2_instance_count += t.lv2_plugins.len();
                 }
-                vst3_instance_count += t.vst3_plugins.len();
-                clap_instance_count += t.clap_plugins.len();
+                #[cfg(feature = "plugins")]
+                {
+                    vst3_instance_count += t.vst3_plugins.len();
+                    clap_instance_count += t.clap_plugins.len();
+                }
+            }
+            #[cfg(feature = "plugins")]
+            {
+                (
+                    track_count,
+                    frozen_track_count,
+                    audio_clip_count,
+                    midi_clip_count,
+                    lv2_instance_count,
+                    vst3_instance_count,
+                    clap_instance_count,
+                )
+            }
+            #[cfg(not(feature = "plugins"))]
+            {
+                (
+                    track_count,
+                    frozen_track_count,
+                    audio_clip_count,
+                    midi_clip_count,
+                    _lv2_unused,
+                    _vst3_unused,
+                    _clap_unused,
+                )
+            }
+        };
+        #[cfg(not(feature = "plugins"))]
+        let (
+            track_count,
+            frozen_track_count,
+            audio_clip_count,
+            midi_clip_count,
+            _lv2_instance_count,
+            _vst3_instance_count,
+            _clap_instance_count,
+        ) = {
+            let state = self.state_snapshot.load_full();
+            let tracks = &state.tracks;
+            let mut track_count = 0usize;
+            let mut frozen_track_count = 0usize;
+            let mut audio_clip_count = 0usize;
+            let mut midi_clip_count = 0usize;
+            for track in tracks.values() {
+                let t = track.lock();
+                track_count += 1;
+                if t.frozen() {
+                    frozen_track_count += 1;
+                }
+                audio_clip_count += t.audio.clips().len();
+                midi_clip_count += t.midi.clips().len();
             }
             (
                 track_count,
                 frozen_track_count,
                 audio_clip_count,
                 midi_clip_count,
-                lv2_instance_count,
-                vst3_instance_count,
-                clap_instance_count,
+                0usize,
+                0usize,
+                0usize,
             )
         };
-        #[cfg(not(unix))]
+        #[cfg(all(feature = "plugins", not(unix)))]
         let _lv2_instance_count = lv2_instance_count;
         let pending_hw_midi_events = self.hw_midi.pending_hw_midi_events.len()
             + self
@@ -890,9 +950,11 @@ impl Engine {
             frozen_track_count,
             audio_clip_count,
             midi_clip_count,
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             lv2_instance_count,
+            #[cfg(feature = "plugins")]
             vst3_instance_count,
+            #[cfg(feature = "plugins")]
             clap_instance_count,
             pending_requests: self.dispatch.pending_requests.len(),
             workers_total: self.workers.len(),

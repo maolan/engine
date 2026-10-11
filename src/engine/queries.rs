@@ -131,6 +131,7 @@ impl Engine {
                         &build_osc_packet("/response/meters", &types, &args),
                     );
                 }
+                #[cfg(feature = "plugins")]
                 QueryReply::TrackPluginGraph {
                     track_name,
                     plugins,
@@ -159,6 +160,7 @@ impl Engine {
                         &build_osc_packet("/response/plugins", &types, &args),
                     );
                 }
+                #[cfg(feature = "plugins")]
                 QueryReply::ClapPlugins(plugins) => {
                     let args: Vec<OscArg> = plugins
                         .iter()
@@ -170,6 +172,7 @@ impl Engine {
                         &build_osc_packet("/response/clap_plugins", &types, &args),
                     );
                 }
+                #[cfg(feature = "plugins")]
                 QueryReply::Vst3Plugins(plugins) => {
                     let args: Vec<OscArg> = plugins
                         .iter()
@@ -182,6 +185,7 @@ impl Engine {
                     );
                 }
                 #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "plugins"))]
                 QueryReply::AuPlugins(plugins) => {
                     let args: Vec<OscArg> = plugins
                         .iter()
@@ -194,6 +198,7 @@ impl Engine {
                     );
                 }
                 #[cfg(unix)]
+                #[cfg(all(unix, feature = "plugins"))]
                 QueryReply::Lv2Plugins(plugins) => {
                     let args: Vec<OscArg> = plugins
                         .iter()
@@ -206,17 +211,21 @@ impl Engine {
                     );
                 }
                 #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "plugins"))]
                 QueryReply::AuPluginsUnavailable { error } => {
                     self.send_osc_reply(reply_to, &build_error_packet(error));
                 }
+                #[cfg(feature = "plugins")]
                 QueryReply::ClapPluginsUnavailable { error }
                 | QueryReply::Vst3PluginsUnavailable { error } => {
                     self.send_osc_reply(reply_to, &build_error_packet(error));
                 }
                 #[cfg(unix)]
+                #[cfg(all(unix, feature = "plugins"))]
                 QueryReply::Lv2PluginsUnavailable { error } => {
                     self.send_osc_reply(reply_to, &build_error_packet(error));
                 }
+                #[cfg(feature = "plugins")]
                 QueryReply::TrackClapParameters {
                     track_name,
                     instance_id,
@@ -251,6 +260,7 @@ impl Engine {
                     );
                 }
                 #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "plugins"))]
                 QueryReply::TrackAuParameters {
                     track_name,
                     instance_id,
@@ -271,6 +281,7 @@ impl Engine {
                         ),
                     );
                 }
+                #[cfg(feature = "plugins")]
                 QueryReply::TrackVst3Parameters {
                     track_name,
                     instance_id,
@@ -292,6 +303,7 @@ impl Engine {
                     );
                 }
                 #[cfg(unix)]
+                #[cfg(all(unix, feature = "plugins"))]
                 QueryReply::TrackLv2PluginControls {
                     track_name,
                     instance_id,
@@ -325,6 +337,7 @@ impl Engine {
                         ),
                     );
                 }
+                #[cfg(feature = "plugins")]
                 QueryReply::TrackClapNoteNames {
                     track_name,
                     note_names,
@@ -340,6 +353,7 @@ impl Engine {
                     );
                 }
                 #[cfg(unix)]
+                #[cfg(all(unix, feature = "plugins"))]
                 QueryReply::TrackLv2Midnam {
                     track_name,
                     note_names,

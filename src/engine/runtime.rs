@@ -90,16 +90,19 @@ impl Engine {
             | Action::Session(_) => {
                 self.handle_request(a).await;
             }
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             Action::ListLv2Plugins => {
                 self.handle_request(a).await;
             }
+            #[cfg(feature = "plugins")]
             Action::ListVst3Plugins => {
                 self.handle_request(a).await;
             }
+            #[cfg(feature = "plugins")]
             Action::ListClapPlugins => {
                 self.handle_request(a).await;
             }
+            #[cfg(feature = "plugins")]
             Action::ListClapPluginsWithCapabilities => {
                 self.handle_request(a).await;
             }
@@ -114,6 +117,7 @@ impl Engine {
                 }
             }
         };
+        #[cfg(feature = "plugins")]
         self.publish_clap_state_dirty().await;
     }
 
@@ -185,6 +189,7 @@ impl Engine {
             ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => {
                 t.lock().name.clone()
             }
+            #[cfg(feature = "plugins")]
             ProcessTask::Plugin { track, .. } => track.lock().name.clone(),
         }
     }
@@ -216,6 +221,7 @@ impl Engine {
     pub(crate) fn prepare_task_track(&self, task: &ProcessTask) {
         let track = match task {
             ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => t,
+            #[cfg(feature = "plugins")]
             ProcessTask::Plugin { track, .. } => track,
         };
         // Mirror the dispatcher-thread transport positions into the shared
@@ -749,7 +755,6 @@ impl Engine {
             | Action::SetClipMuted { .. }
             | Action::SetClipReversed { .. }
             | Action::SetClipGainDb { .. }
-            | Action::SetClipPluginGraphJson { .. }
             | Action::SetClipPitchCorrection { .. }
             | Action::Connect { .. }
             | Action::Disconnect { .. } => {
@@ -758,6 +763,7 @@ impl Engine {
                 }
             }
             // Plugins (non-LV2).
+            #[cfg(feature = "plugins")]
             Action::TrackClearPlugins { .. }
             | Action::TrackGetClapNoteNames { .. }
             | Action::TrackGetPluginGraph { .. }
@@ -814,7 +820,7 @@ impl Engine {
                 }
             }
             // Plugins (AU, macOS only).
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             Action::ListAuPlugins
             | Action::TrackLoadAuPlugin { .. }
             | Action::TrackUnloadAuPlugin { .. }
@@ -834,7 +840,7 @@ impl Engine {
                 }
             }
             // Plugins (LV2, Unix only).
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             Action::TrackSetLv2PluginState { .. }
             | Action::ClipSetLv2PluginState { .. }
             | Action::TrackGetLv2Midnam { .. }
@@ -925,7 +931,9 @@ impl Engine {
             };
             self.poll_node_worker_results().await;
             self.poll_jack_hw_finished().await;
+            #[cfg(feature = "plugins")]
             self.poll_stopped_plugin_parameter_echoes().await;
+            #[cfg(feature = "plugins")]
             if !self.transport.playing && !self.transport.transport_running {
                 self.publish_clap_state_dirty().await;
             }

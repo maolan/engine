@@ -1,6 +1,6 @@
 [package]
 name = "maolan-engine"
-version = "0.3.24"
+version = "0.4.0"
 edition = "2024"
 description = "Audio engine for the Maolan DAW with audio/MIDI tracks, routing, export, and out-of-process CLAP/VST3/LV2 plugin support"
 license = "BSD-2-Clause"
@@ -14,19 +14,19 @@ categories = ["multimedia::audio"]
 [dependencies]
 num_cpus = "1.17.0"
 tokio = { version = "1.53.1", features = ["full"] }
-oxideav-core = "0.1.35"
-oxideav-basic = "0.0.10"
-oxideav-flac = "0.0.11"
-oxideav-mp3 = "0.1.3"
-oxideav-ogg = "0.1.8"
-symphonia = { version = "0.6.1", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+oxideav-core = { version = "0.1.35", optional = true }
+oxideav-basic = { version = "0.0.11", optional = true }
+oxideav-flac = { version = "0.0.11", optional = true }
+oxideav-mp3 = { version = "0.1.3", optional = true }
+oxideav-ogg = { version = "0.1.8", optional = true }
+symphonia = { version = "0.6.1", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"], optional = true }
 tracing-subscriber = "0.3.23"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 byteorder = "1.5.0"
-midly = "0.5.3"
+midly = { version = "0.5.3", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-maolan-plugin-protocol = "0.0.20"
+maolan-plugin-protocol = { version = "0.0.20", optional = true }
 uuid = { version = "1.24.0", features = ["v4"] }
 wide = "1.6.0"
 arc-swap = "1.9.2"
@@ -36,10 +36,20 @@ rubato = "5.0"
 audioadapter = "5.0"
 audioadapter-buffers = "5.1"
 timestretch = "0.15.0"
-mixosc = { version = "0.0.15", optional = true }
+mixosc = { version = "0.0.16", optional = true }
 
 [features]
 default = []
+audio = [
+    "dep:oxideav-core",
+    "dep:oxideav-basic",
+    "dep:oxideav-flac",
+    "dep:oxideav-mp3",
+    "dep:oxideav-ogg",
+    "dep:symphonia",
+]
+midi = ["dep:midly"]
+plugins = ["dep:maolan-plugin-protocol"]
 mixosc = ["dep:mixosc"]
 
 [target.'cfg(target_os = "macos")'.dependencies]

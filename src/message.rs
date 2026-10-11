@@ -1,11 +1,13 @@
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "plugins"))]
 use crate::au::AuPluginInfo;
+#[cfg(feature = "plugins")]
 use crate::clap::{ClapParameterInfo, ClapPluginInfo};
 pub use crate::connectable::{ConnectableConnection, ConnectableRef};
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 use crate::lv2::Lv2PluginInfo;
 use crate::midi::io::MidiEvent;
 use crate::state::TrackHandle;
+#[cfg(feature = "plugins")]
 use crate::vst3::Vst3PluginInfo;
 use crate::{kind::Kind, modulator::Modulator};
 use std::net::SocketAddr;
@@ -105,22 +107,24 @@ pub enum OfflineAutomationTarget {
         channel: u8,
         cc: u8,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     Lv2Parameter {
         instance_id: usize,
         index: u32,
         min: f32,
         max: f32,
     },
+    #[cfg(feature = "plugins")]
     Vst3Parameter {
         instance_id: usize,
         param_id: u32,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     AuParameter {
         instance_id: usize,
         param_index: u32,
     },
+    #[cfg(feature = "plugins")]
     ClapParameter {
         instance_id: usize,
         param_id: u32,
@@ -264,6 +268,7 @@ pub struct AudioClipData {
     pub pitch_correction_detector: PitchCorrectionDetector,
     #[serde(default)]
     pub pitch_correction_mode: PitchCorrectionMode,
+    #[cfg(feature = "plugins")]
     pub plugin_graph_json: Option<serde_json::Value>,
     pub grouped_clips: Vec<AudioClipData>,
 }
@@ -301,6 +306,7 @@ pub struct ClipMoveTo {
     pub input_channel: usize,
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PluginGraphNode {
     TrackInput,
@@ -313,6 +319,7 @@ pub enum PluginGraphNode {
     AuPluginInstance(usize),
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PluginGraphPlugin {
     pub node: PluginGraphNode,
@@ -331,14 +338,14 @@ pub struct PluginGraphPlugin {
     pub bypassed: bool,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Lv2StatePortValue {
     pub index: u32,
     pub value: f32,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Lv2StateProperty {
     pub key_uri: String,
@@ -347,14 +354,14 @@ pub struct Lv2StateProperty {
     pub value: Vec<u8>,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Lv2PluginState {
     pub port_values: Vec<Lv2StatePortValue>,
     pub properties: Vec<Lv2StateProperty>,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lv2ControlPortInfo {
     pub index: u32,
@@ -364,6 +371,7 @@ pub struct Lv2ControlPortInfo {
     pub value: f32,
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginGraphConnection {
     pub from_node: PluginGraphNode,
@@ -373,8 +381,10 @@ pub struct PluginGraphConnection {
     pub kind: Kind,
 }
 
+#[cfg(feature = "plugins")]
 pub type PluginGraphSnapshot = (Vec<PluginGraphPlugin>, Vec<PluginGraphConnection>);
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
 pub enum PluginKind {
     Clap,
@@ -390,6 +400,7 @@ pub enum ProcessTask {
     Track(TrackHandle),
     FolderInput(TrackHandle),
     FolderOutput(TrackHandle),
+    #[cfg(feature = "plugins")]
     Plugin {
         track: TrackHandle,
         kind: PluginKind,
@@ -404,6 +415,7 @@ impl PartialEq for ProcessTask {
             (Track(a), Track(b))
             | (FolderInput(a), FolderInput(b))
             | (FolderOutput(a), FolderOutput(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "plugins")]
             (
                 Plugin {
                     track: a,
@@ -430,6 +442,7 @@ impl std::hash::Hash for ProcessTask {
             Track(t) | FolderInput(t) | FolderOutput(t) => {
                 Arc::as_ptr(t).hash(state);
             }
+            #[cfg(feature = "plugins")]
             Plugin { track, kind, index } => {
                 Arc::as_ptr(track).hash(state);
                 kind.hash(state);
@@ -439,6 +452,7 @@ impl std::hash::Hash for ProcessTask {
     }
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Vst3GraphNode {
     TrackInput,
@@ -446,6 +460,7 @@ pub enum Vst3GraphNode {
     PluginInstance(usize),
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Debug)]
 pub struct Vst3GraphPlugin {
     pub instance_id: usize,
@@ -456,6 +471,7 @@ pub struct Vst3GraphPlugin {
     pub parameters: Vec<crate::vst3::port::ParameterInfo>,
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vst3GraphConnection {
     pub from_node: Vst3GraphNode,
@@ -607,10 +623,12 @@ pub enum Event {
         source: String,
         message: String,
     },
+    #[cfg(feature = "plugins")]
     TrackClapStateDirty {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipClapStateDirty {
         track_name: String,
         clip_idx: usize,
@@ -637,12 +655,14 @@ pub enum Event {
         rate: usize,
         input: bool,
     },
+    #[cfg(feature = "plugins")]
     TrackClapStateSnapshot {
         track_name: String,
         instance_id: usize,
         plugin_id: String,
         state: Box<crate::clap::ClapPluginState>,
     },
+    #[cfg(feature = "plugins")]
     ClipClapStateSnapshot {
         track_name: String,
         clip_idx: usize,
@@ -650,51 +670,56 @@ pub enum Event {
         plugin_id: String,
         state: Box<crate::clap::ClapPluginState>,
     },
+    #[cfg(feature = "plugins")]
     TrackVst3StateSnapshot {
         track_name: String,
         instance_id: usize,
         state: Box<crate::vst3::state::Vst3PluginState>,
     },
+    #[cfg(feature = "plugins")]
     ClipVst3StateSnapshot {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         state: Box<crate::vst3::state::Vst3PluginState>,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackAuStateSnapshot {
         track_name: String,
         instance_id: usize,
         state: Box<crate::au::AuPluginState>,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ClipAuStateSnapshot {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         state: Box<crate::au::AuPluginState>,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackLv2StateSnapshot {
         track_name: String,
         instance_id: usize,
         state: Vec<u8>,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     ClipLv2StateSnapshot {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         state: Vec<u8>,
     },
+    #[cfg(feature = "plugins")]
     TrackSnapshotAllClapStatesDone {
         track_name: String,
     },
+    #[cfg(feature = "plugins")]
     TrackClapResourceFiles {
         track_name: String,
         instance_id: usize,
         files: Vec<(u32, String)>,
     },
+    #[cfg(feature = "plugins")]
     ClipClapResourceFiles {
         track_name: String,
         clip_idx: usize,
@@ -776,80 +801,90 @@ pub enum QueryReply {
         hw_out_db: Arc<Vec<f32>>,
         track_meters: Arc<Vec<(String, Vec<f32>)>>,
     },
+    #[cfg(feature = "plugins")]
     ClapPlugins(Vec<ClapPluginInfo>),
+    #[cfg(feature = "plugins")]
     ClapPluginsUnavailable {
         error: String,
     },
+    #[cfg(feature = "plugins")]
     Vst3Plugins(Vec<Vst3PluginInfo>),
+    #[cfg(feature = "plugins")]
     Vst3PluginsUnavailable {
         error: String,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     AuPlugins(Vec<AuPluginInfo>),
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     AuPluginsUnavailable {
         error: String,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     Lv2Plugins(Vec<Lv2PluginInfo>),
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     Lv2PluginsUnavailable {
         error: String,
     },
+    #[cfg(feature = "plugins")]
     TrackPluginGraph {
         track_name: String,
         plugins: Vec<PluginGraphPlugin>,
         connections: Vec<PluginGraphConnection>,
         connectable_connections: Vec<ConnectableConnection>,
     },
+    #[cfg(feature = "plugins")]
     TrackVst3Graph {
         track_name: String,
         plugins: Vec<Vst3GraphPlugin>,
         connections: Vec<Vst3GraphConnection>,
     },
+    #[cfg(feature = "plugins")]
     TrackClapParameters {
         track_name: String,
         instance_id: usize,
         parameters: Vec<ClapParameterInfo>,
     },
+    #[cfg(feature = "plugins")]
     ClipClapParameters {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         parameters: Vec<ClapParameterInfo>,
     },
+    #[cfg(feature = "plugins")]
     TrackVst3Parameters {
         track_name: String,
         instance_id: usize,
         parameters: Vec<crate::vst3::port::ParameterInfo>,
     },
+    #[cfg(feature = "plugins")]
     ClipVst3Parameters {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         parameters: Vec<crate::vst3::port::ParameterInfo>,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackAuParameters {
         track_name: String,
         instance_id: usize,
         parameters: Vec<crate::au::AuParamInfo>,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ClipAuParameters {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         parameters: Vec<crate::au::AuParamInfo>,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackLv2PluginControls {
         track_name: String,
         instance_id: usize,
         controls: Vec<Lv2ControlPortInfo>,
         instance_access_handle: Option<usize>,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     ClipLv2PluginControls {
         track_name: String,
         clip_idx: usize,
@@ -857,11 +892,12 @@ pub enum QueryReply {
         controls: Vec<Lv2ControlPortInfo>,
         instance_access_handle: Option<usize>,
     },
+    #[cfg(feature = "plugins")]
     TrackClapNoteNames {
         track_name: String,
         note_names: std::collections::HashMap<u8, String>,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackLv2Midnam {
         track_name: String,
         note_names: std::collections::HashMap<u8, String>,
@@ -872,9 +908,11 @@ pub enum QueryReply {
         frozen_track_count: usize,
         audio_clip_count: usize,
         midi_clip_count: usize,
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         lv2_instance_count: usize,
+        #[cfg(feature = "plugins")]
         vst3_instance_count: usize,
+        #[cfg(feature = "plugins")]
         clap_instance_count: usize,
         pending_requests: usize,
         workers_total: usize,
@@ -1028,6 +1066,7 @@ pub enum Action {
         pitch_correction_formant_compensation: Option<bool>,
         pitch_correction_detector: PitchCorrectionDetector,
         pitch_correction_mode: PitchCorrectionMode,
+        #[cfg(feature = "plugins")]
         plugin_graph_json: Option<serde_json::Value>,
     },
     AddGroupedClip {
@@ -1095,6 +1134,7 @@ pub enum Action {
         kind: Kind,
         gain_db: f32,
     },
+    #[cfg(feature = "plugins")]
     SetClipPluginGraphJson {
         track_name: String,
         clip_index: usize,
@@ -1319,16 +1359,20 @@ pub enum Action {
     TrackClearDefaultPassthrough {
         track_name: String,
     },
+    #[cfg(feature = "plugins")]
+    #[cfg(feature = "plugins")]
     TrackClearPlugins {
         track_name: String,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackSetLv2PluginState {
         track_name: String,
         instance_id: usize,
         state: Vec<u8>,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     ClipSetLv2PluginState {
         track_name: String,
         clip_idx: usize,
@@ -1336,35 +1380,42 @@ pub enum Action {
         state: Vec<u8>,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackLv2SnapshotState {
         track_name: String,
         instance_id: usize,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     ClipLv2SnapshotState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackGetLv2PluginControls {
         track_name: String,
         instance_id: usize,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     ClipGetLv2PluginControls {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackGetLv2Midnam {
         track_name: String,
     },
+    #[cfg(feature = "plugins")]
     TrackGetClapNoteNames {
         track_name: String,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackSetLv2ControlValue {
         track_name: String,
         instance_id: usize,
@@ -1372,6 +1423,7 @@ pub enum Action {
         value: f32,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     ClipSetLv2ControlValue {
         track_name: String,
         clip_idx: usize,
@@ -1379,10 +1431,12 @@ pub enum Action {
         index: u32,
         value: f32,
     },
+    #[cfg(feature = "plugins")]
     TrackGetPluginGraph {
         track_name: String,
         include_state: bool,
     },
+    #[cfg(feature = "plugins")]
     TrackConnectPluginAudio {
         track_name: String,
         from_node: PluginGraphNode,
@@ -1390,6 +1444,7 @@ pub enum Action {
         to_node: PluginGraphNode,
         to_port: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackConnectPluginMidi {
         track_name: String,
         from_node: PluginGraphNode,
@@ -1397,6 +1452,7 @@ pub enum Action {
         to_node: PluginGraphNode,
         to_port: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackDisconnectPluginAudio {
         track_name: String,
         from_node: PluginGraphNode,
@@ -1404,6 +1460,7 @@ pub enum Action {
         to_node: PluginGraphNode,
         to_port: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackDisconnectPluginMidi {
         track_name: String,
         from_node: PluginGraphNode,
@@ -1439,19 +1496,25 @@ pub enum Action {
         to: ConnectableRef,
         to_port: usize,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     ListLv2Plugins,
+    #[cfg(feature = "plugins")]
     ListVst3Plugins,
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ListAuPlugins,
+    #[cfg(feature = "plugins")]
     ListClapPlugins,
+    #[cfg(feature = "plugins")]
     ListClapPluginsWithCapabilities,
+    #[cfg(feature = "plugins")]
     TrackSetClapParameter {
         track_name: String,
         instance_id: usize,
         param_id: u32,
         value: f64,
     },
+    #[cfg(feature = "plugins")]
     ClipSetClapParameter {
         track_name: String,
         clip_idx: usize,
@@ -1459,11 +1522,13 @@ pub enum Action {
         param_id: u32,
         value: f64,
     },
+    #[cfg(feature = "plugins")]
     ClipGetClapParameters {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackSetClapParameterAt {
         track_name: String,
         instance_id: usize,
@@ -1471,141 +1536,170 @@ pub enum Action {
         value: f64,
         frame: u32,
     },
+    #[cfg(feature = "plugins")]
     TrackBeginClapParameterEdit {
         track_name: String,
         instance_id: usize,
         param_id: u32,
         frame: u32,
     },
+    #[cfg(feature = "plugins")]
     TrackEndClapParameterEdit {
         track_name: String,
         instance_id: usize,
         param_id: u32,
         frame: u32,
     },
+    #[cfg(feature = "plugins")]
     TrackGetClapParameters {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackClapSnapshotState {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipClapSnapshotState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackClapRestoreState {
         track_name: String,
         instance_id: usize,
         state: crate::clap::ClapPluginState,
     },
+    #[cfg(feature = "plugins")]
     ClipClapRestoreState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         state: crate::clap::ClapPluginState,
     },
+    #[cfg(feature = "plugins")]
     TrackSnapshotAllClapStates {
         track_name: String,
     },
+    #[cfg(feature = "plugins")]
     TrackLoadClapPlugin {
         track_name: String,
         plugin_id: String,
         instance_id: Option<usize>,
     },
+    #[cfg(feature = "plugins")]
     TrackUnloadClapPlugin {
         track_name: String,
         plugin_id: String,
     },
+    #[cfg(feature = "plugins")]
     TrackUnloadClapPluginInstance {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackShowClapGui {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipShowClapGui {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackLoadVst3Plugin {
         track_name: String,
         plugin_id: String,
         instance_id: Option<usize>,
     },
+    #[cfg(feature = "plugins")]
     TrackUnloadVst3Plugin {
         track_name: String,
         plugin_id: String,
     },
+    #[cfg(feature = "plugins")]
     TrackUnloadVst3PluginInstance {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackShowVst3Gui {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipShowVst3Gui {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackLoadAuPlugin {
         track_name: String,
         plugin_id: String,
         instance_id: Option<usize>,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackUnloadAuPlugin {
         track_name: String,
         plugin_id: String,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackUnloadAuPluginInstance {
         track_name: String,
         instance_id: usize,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackShowAuGui {
         track_name: String,
         instance_id: usize,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ClipShowAuGui {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackLoadLv2Plugin {
         track_name: String,
         plugin_uri: String,
         instance_id: Option<usize>,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackUnloadLv2Plugin {
         track_name: String,
         plugin_uri: String,
     },
     #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     TrackUnloadLv2PluginInstance {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackShowLv2Gui {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipShowLv2Gui {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackSetPluginResourceDir {
         track_name: String,
         instance_id: usize,
@@ -1613,10 +1707,12 @@ pub enum Action {
         directory: String,
         shared: bool,
     },
+    #[cfg(feature = "plugins")]
     TrackClapCollectResources {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipSetPluginResourceDir {
         track_name: String,
         clip_idx: usize,
@@ -1625,20 +1721,24 @@ pub enum Action {
         directory: String,
         shared: bool,
     },
+    #[cfg(feature = "plugins")]
     ClipClapCollectResources {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackGetVst3Graph {
         track_name: String,
     },
+    #[cfg(feature = "plugins")]
     TrackSetVst3Parameter {
         track_name: String,
         instance_id: usize,
         param_id: u32,
         value: f32,
     },
+    #[cfg(feature = "plugins")]
     ClipSetVst3Parameter {
         track_name: String,
         clip_idx: usize,
@@ -1646,35 +1746,42 @@ pub enum Action {
         param_id: u32,
         value: f32,
     },
+    #[cfg(feature = "plugins")]
     TrackSetPluginBypassed {
         track_name: String,
         instance_id: usize,
         format: String,
         bypassed: bool,
     },
+    #[cfg(feature = "plugins")]
     TrackGetVst3Parameters {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipGetVst3Parameters {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackVst3SnapshotState {
         track_name: String,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     ClipVst3SnapshotState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackVst3RestoreState {
         track_name: String,
         instance_id: usize,
         state: crate::vst3::state::Vst3PluginState,
     },
+    #[cfg(feature = "plugins")]
     ClipVst3RestoreState {
         track_name: String,
         clip_idx: usize,
@@ -1682,6 +1789,7 @@ pub enum Action {
         state: crate::vst3::state::Vst3PluginState,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackSetAuParameter {
         track_name: String,
         instance_id: usize,
@@ -1689,6 +1797,7 @@ pub enum Action {
         value: f32,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ClipSetAuParameter {
         track_name: String,
         clip_idx: usize,
@@ -1697,40 +1806,47 @@ pub enum Action {
         value: f32,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackGetAuParameters {
         track_name: String,
         instance_id: usize,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ClipGetAuParameters {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackAuSnapshotState {
         track_name: String,
         instance_id: usize,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ClipAuSnapshotState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     TrackAuRestoreState {
         track_name: String,
         instance_id: usize,
         state: crate::au::AuPluginState,
     },
     #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     ClipAuRestoreState {
         track_name: String,
         clip_idx: usize,
         instance_id: usize,
         state: crate::au::AuPluginState,
     },
+    #[cfg(feature = "plugins")]
     TrackConnectVst3Audio {
         track_name: String,
         from_node: Vst3GraphNode,
@@ -1738,6 +1854,7 @@ pub enum Action {
         to_node: Vst3GraphNode,
         to_port: usize,
     },
+    #[cfg(feature = "plugins")]
     TrackDisconnectVst3Audio {
         track_name: String,
         from_node: Vst3GraphNode,
@@ -1908,6 +2025,7 @@ mod tests {
             pitch_correction_formant_compensation: Some(false),
             pitch_correction_detector: super::PitchCorrectionDetector::Neural,
             pitch_correction_mode: super::PitchCorrectionMode::Resynth,
+            #[cfg(feature = "plugins")]
             plugin_graph_json: Some(json!({"plugins":[],"connections":[{"kind":"Audio"}]})),
             grouped_clips: vec![AudioClipData {
                 name: "child.wav".to_string(),
@@ -1923,6 +2041,7 @@ mod tests {
         assert_eq!(restored.name, clip.name);
         assert_eq!(restored.preview_name, clip.preview_name);
         assert_eq!(restored.source_name, clip.source_name);
+        #[cfg(feature = "plugins")]
         assert_eq!(restored.plugin_graph_json, clip.plugin_graph_json);
         assert_eq!(restored.grouped_clips.len(), 1);
         assert_eq!(restored.grouped_clips[0].name, "child.wav");
@@ -2001,6 +2120,7 @@ mod tests {
         assert!(restored.source_offset.is_none());
         assert!(restored.source_length.is_none());
         assert!(restored.pitch_correction_points.is_empty());
+        #[cfg(feature = "plugins")]
         assert!(restored.plugin_graph_json.is_none());
     }
 }

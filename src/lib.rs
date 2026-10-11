@@ -1,4 +1,5 @@
 mod audio;
+#[cfg(feature = "audio")]
 pub mod audio_codec;
 #[cfg(target_os = "macos")]
 pub mod audio_devices {
@@ -38,6 +39,7 @@ mod parallel_render;
 #[cfg(unix)]
 mod pitch_shift;
 mod plan_builder;
+#[cfg(feature = "plugins")]
 pub mod plugins;
 pub mod render_plan;
 mod routing;
@@ -48,19 +50,23 @@ pub mod triple_buffer;
 pub mod workers;
 pub use workers::worker;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "plugins"))]
 pub use plugins::au_proc;
+#[cfg(feature = "plugins")]
 pub use plugins::clap_proc;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 pub use plugins::lv2_proc;
+#[cfg(feature = "plugins")]
 pub use plugins::vst3_proc;
 
+#[cfg(feature = "plugins")]
 pub mod clap {
     pub use crate::plugins::types::is_supported_clap_binary;
     pub use crate::plugins::types::{
         ClapMidiOutputEvent, ClapParameterInfo, ClapPluginInfo, ClapPluginState,
     };
 }
+#[cfg(feature = "plugins")]
 pub mod vst3 {
     pub use crate::plugins::types::{Vst3PluginInfo, Vst3PluginState};
     pub mod interfaces {
@@ -73,11 +79,11 @@ pub mod vst3 {
         pub use crate::plugins::types::Vst3PluginState;
     }
 }
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 pub mod lv2 {
     pub use crate::plugins::types::Lv2PluginInfo;
 }
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "plugins"))]
 pub mod au {
     pub use crate::plugins::types::{AuParamInfo, AuPluginInfo, AuPluginState};
 }

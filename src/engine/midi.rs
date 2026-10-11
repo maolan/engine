@@ -1,15 +1,15 @@
 use super::*;
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
+#[cfg(feature = "midi")]
+use crate::message::{MpeExpressionPoint, MpeNoteExpression};
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
-    message::{
-        Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, MpeExpressionPoint,
-        MpeNoteExpression,
-    },
+    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
     midi::io::MidiEvent,
 };
+#[cfg(feature = "midi")]
 use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
 use std::{collections::HashMap, path::Path, time::Duration};
 use tracing::error;
@@ -148,6 +148,17 @@ impl Engine {
         events
     }
 
+    #[cfg(not(feature = "midi"))]
+    pub(crate) fn parse_midi_clip_for_edit(
+        path: &Path,
+        sample_rate: f64,
+        clip_start: usize,
+    ) -> Result<MidiEditParseResult, String> {
+        let _ = (path, sample_rate, clip_start);
+        Err("midi file support is disabled (enable the `midi` cargo feature)".to_string())
+    }
+
+    #[cfg(feature = "midi")]
     pub(crate) fn parse_midi_clip_for_edit(
         path: &Path,
         sample_rate: f64,
@@ -2148,7 +2159,9 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::Engine;
+    #[cfg(feature = "midi")]
     use crate::message::{MpeExpressionCurve, MpeExpressionPoint, MpeNoteExpression};
+    #[cfg(feature = "midi")]
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -2209,6 +2222,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "midi")]
     #[test]
     fn mpe_expression_round_trips_through_midi_file() {
         let sample_rate = 48_000;

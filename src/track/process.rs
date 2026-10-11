@@ -1,4 +1,5 @@
 use crate::audio::track::AudioTrack;
+#[cfg(feature = "plugins")]
 use crate::message::{PluginGraphNode, PluginKind};
 use crate::midi::track::MIDITrack;
 
@@ -57,19 +58,25 @@ impl TrackData {
             primary_audio_outs: io.audio_outs,
             audio: AudioTrack::new(io.audio_ins, io.audio_outs, buffer_size),
             midi: MIDITrack::new(io.midi_ins, io.midi_outs),
+            #[cfg(feature = "plugins")]
             clap_plugins: Vec::new(),
+            #[cfg(feature = "plugins")]
             vst3_plugins: Vec::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             au_plugins: Vec::new(),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             lv2_plugins: Vec::new(),
+            #[cfg(feature = "plugins")]
             plugin_midi_connections: Vec::new(),
+            #[cfg(feature = "plugins")]
             next_clap_instance_id: AtomicUsize::new(0),
+            #[cfg(feature = "plugins")]
             next_vst3_instance_id: AtomicUsize::new(0),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             next_au_instance_id: AtomicUsize::new(0),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             next_lv2_instance_id: AtomicUsize::new(0),
+            #[cfg(feature = "plugins")]
             next_plugin_instance_id: AtomicUsize::new(0),
             mpe_state: MpeState::new(),
             sample_rate,
@@ -133,6 +140,7 @@ impl TrackData {
         .with_default_passthrough()
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn alloc_plugin_instance_id(&self) -> usize {
         // Returns the pre-increment value, matching the old read-then-write.
         self.next_plugin_instance_id
@@ -144,7 +152,11 @@ impl TrackData {
 
     pub fn setup(&mut self) -> bool {
         self.audio.setup();
+        #[cfg(feature = "plugins")]
         let mut reconfigured = false;
+        #[cfg(not(feature = "plugins"))]
+        let reconfigured = false;
+        #[cfg(feature = "plugins")]
         for runtime in self.rt.clip_plugin_tracks.values() {
             for instance in &runtime.clap_plugins {
                 instance.processor.run_host_callbacks_main_thread();
@@ -400,6 +412,7 @@ impl TrackData {
             audio_inputs,
             metronome_output,
         );
+        #[cfg(feature = "plugins")]
         let plugin_outputs =
             self.process_track_plugins_in_graph_order_with_audio_buffers(frames, audio_inputs);
         // Safety: the input buffers and `plugin_outputs` outlive the
@@ -424,15 +437,18 @@ impl TrackData {
                 sources.push((key, slice, 0));
             }
         }
-        let graph_latencies = self.current_plugin_graph_source_latencies();
-        sources.extend(plugin_outputs.iter().map(|(key, buffer)| {
-            let slice = buffer.as_slice();
-            (
-                *key,
-                unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) },
-                graph_latencies.get(key).copied().unwrap_or(0),
-            )
-        }));
+        #[cfg(feature = "plugins")]
+        {
+            let graph_latencies = self.current_plugin_graph_source_latencies();
+            sources.extend(plugin_outputs.iter().map(|(key, buffer)| {
+                let slice = buffer.as_slice();
+                (
+                    *key,
+                    unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) },
+                    graph_latencies.get(key).copied().unwrap_or(0),
+                )
+            }));
+        }
         self.process_folder_output_with_audio_buffers(audio_outputs, sources);
         frames
     }
@@ -621,8 +637,11 @@ impl TrackData {
         // afterwards, so no per-cycle clone is necessary.
         self.rt.folder_input_midi_events = track_input_midi_events;
 
-        self.rt.folder_plugin_midi_node_events.clear();
-        self.rt.folder_processed_midi_plugins.clear();
+        #[cfg(feature = "plugins")]
+        {
+            self.rt.folder_plugin_midi_node_events.clear();
+            self.rt.folder_processed_midi_plugins.clear();
+        }
     }
 
     pub(crate) fn compute_process_frames(&self) -> usize {
@@ -639,6 +658,7 @@ impl TrackData {
             .unwrap_or(self.process_block_size())
     }
 
+    #[cfg(feature = "plugins")]
     pub fn process_plugin_with_audio_buffers(
         &mut self,
         kind: PluginKind,
@@ -873,6 +893,7 @@ impl TrackData {
         // Both `route_*` callees currently ignore their `_input_events`
         // parameter, so no per-cycle snapshot of the events is needed.
         self.route_track_inputs_to_track_outputs(&[]);
+        #[cfg(feature = "plugins")]
         self.route_plugin_midi_to_track_outputs_graph(&[], &self.rt.folder_plugin_midi_node_events);
 
         // Sum child-track MIDI outputs into the folder's MIDI outputs.
@@ -1165,7 +1186,9 @@ impl TrackData {
             rt.pending_automation_midi_events.clear();
             rt.record_tap_midi_in.clear();
             rt.folder_input_midi_events.clear();
+            #[cfg(feature = "plugins")]
             rt.folder_plugin_midi_node_events.clear();
+            #[cfg(feature = "plugins")]
             rt.folder_processed_midi_plugins.clear();
         });
         self.clear_local_midi_inputs();

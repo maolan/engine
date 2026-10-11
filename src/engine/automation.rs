@@ -8,8 +8,15 @@ use mixosc::parameters::{OscValue, build_set};
 /// acks since the GUI also sends those as commands.
 #[derive(Clone, Debug)]
 pub(crate) enum AutomationEcho {
-    Level { track_name: String, level: f32 },
-    Balance { track_name: String, balance: f32 },
+    Level {
+        track_name: String,
+        level: f32,
+    },
+    Balance {
+        track_name: String,
+        balance: f32,
+    },
+    #[cfg(feature = "plugins")]
     Action(Box<Action>),
 }
 
@@ -31,6 +38,7 @@ impl Engine {
                     })
                     .await;
                 }
+                #[cfg(feature = "plugins")]
                 AutomationEcho::Action(action) => self.notify_clients(Ok(*action)).await,
             }
         }
@@ -63,17 +71,20 @@ impl Engine {
         self.automation.modulator_values = Some(values.clone());
         let mut echoes = Vec::new();
         let mut per_track: HashMap<String, (Option<f32>, Option<f32>)> = HashMap::new();
+        #[cfg(feature = "plugins")]
         let mut clap_params: HashMap<(String, usize, u32), f64> = HashMap::new();
+        #[cfg(feature = "plugins")]
         let mut vst3_params: HashMap<(String, usize, u32), f32> = HashMap::new();
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         let mut au_params: HashMap<(String, usize, u32), f32> = HashMap::new();
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         let mut lv2_params: HashMap<(String, usize, u32), f32> = HashMap::new();
         let mut midi_cc_events: HashMap<String, Vec<MidiEvent>> = HashMap::new();
 
         let map_f32 = |value: f32, min: f32, max: f32| -> f32 {
             crate::modulator::map_value(value, min, max)
         };
+        #[cfg(feature = "plugins")]
         let map_f64 = |value: f32, min: f64, max: f64| -> f64 {
             crate::modulator::map_value_f64(value, min, max)
         };
@@ -123,6 +134,7 @@ impl Engine {
                             });
                         }
                     }
+                    #[cfg(feature = "plugins")]
                     ModulatorTarget::ClapParameter {
                         track_name,
                         instance_id,
@@ -134,6 +146,7 @@ impl Engine {
                         clap_params
                             .insert((track_name.clone(), *instance_id, *param_id), param_value);
                     }
+                    #[cfg(feature = "plugins")]
                     ModulatorTarget::Vst3Parameter {
                         track_name,
                         instance_id,
@@ -145,7 +158,7 @@ impl Engine {
                         vst3_params
                             .insert((track_name.clone(), *instance_id, *param_id), param_value);
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(all(target_os = "macos", feature = "plugins"))]
                     ModulatorTarget::AuParameter {
                         track_name,
                         instance_id,
@@ -159,7 +172,7 @@ impl Engine {
                             param_value,
                         );
                     }
-                    #[cfg(unix)]
+                    #[cfg(all(unix, feature = "plugins"))]
                     ModulatorTarget::Lv2Parameter {
                         track_name,
                         instance_id,
@@ -222,6 +235,7 @@ impl Engine {
             }
         }
 
+        #[cfg(feature = "plugins")]
         for ((track_name, instance_id, param_id), value) in clap_params {
             if let Some(track) = state.tracks.get(&track_name).cloned()
                 && track
@@ -239,6 +253,7 @@ impl Engine {
                 )));
             }
         }
+        #[cfg(feature = "plugins")]
         for ((track_name, instance_id, param_id), value) in vst3_params {
             if let Some(track) = state.tracks.get(&track_name).cloned()
                 && track
@@ -256,7 +271,7 @@ impl Engine {
                 )));
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         for ((track_name, instance_id, param_index), value) in au_params {
             if let Some(track) = state.tracks.get(&track_name).cloned()
                 && track
@@ -274,7 +289,7 @@ impl Engine {
                 )));
             }
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for ((track_name, instance_id, index), value) in lv2_params {
             if let Some(track) = state.tracks.get(&track_name).cloned()
                 && track

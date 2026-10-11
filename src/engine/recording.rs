@@ -1,12 +1,14 @@
 use super::*;
 use crate::{audio::clip::AudioClip, kind::Kind, message::Action, midi::clip::MIDIClip};
+#[cfg(feature = "midi")]
 use midly::{
     Arena, Format, Header, MetaMessage, Smf, Timing, TrackEvent, TrackEventKind,
     live::LiveEvent,
     num::{u15, u24, u28},
 };
+#[cfg(feature = "midi")]
+use std::fs::File;
 use std::{
-    fs::File,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -504,8 +506,14 @@ impl Engine {
             return;
         }
         let file_path = audio_dir.join(&rec.file_name);
+        #[cfg(feature = "audio")]
         let write_result =
             crate::audio_codec::write_wav_f32(&file_path, samples, rec.channels, rate as u32);
+        #[cfg(not(feature = "audio"))]
+        let write_result: Result<(), String> = {
+            let _ = (&file_path, samples, rec.channels, rate);
+            Err("audio codec support is disabled (enable the `audio` cargo feature)".to_string())
+        };
         if let Err(e) = write_result {
             tracing::error!("flush_recording_entry: WAV write failed: {}", e);
             self.notify_clients(Err(format!(
@@ -542,6 +550,7 @@ impl Engine {
             start_sample,
             start_sample.saturating_add(length.max(1)),
         );
+        #[cfg(feature = "plugins")]
         let (audio_ins, audio_outs) =
             if let Some(track) = self.state_snapshot.load_full().tracks.get(&track_name) {
                 let track = track.lock();
@@ -556,6 +565,15 @@ impl Engine {
                 );
                 (0, 0)
             };
+        #[cfg(not(feature = "plugins"))]
+        if let Some(track) = self.state_snapshot.load_full().tracks.get(&track_name) {
+            track.lock().audio.push_clip(clip.clone());
+        } else {
+            tracing::warn!(
+                "flush_recording_entry: track '{}' not found in engine state",
+                track_name
+            );
+        }
         let clip_id = crate::message::generate_clip_id();
         clip.id.clone_from(&clip_id);
         self.notify_clients(Ok(Action::AddClip {
@@ -584,7 +602,24 @@ impl Engine {
             pitch_correction_formant_compensation: None,
             pitch_correction_detector: Default::default(),
             pitch_correction_mode: Default::default(),
-            plugin_graph_json: Some(Self::default_clip_plugin_graph_json(audio_ins, audio_outs)),
+            #[cfg(feature = "plugins")]
+            plugin_graph_json: {
+                let connections = (0..audio_ins.min(audio_outs))
+                    .map(|port| {
+                        serde_json::json!({
+                            "from_node": "TrackInput",
+                            "from_port": port,
+                            "to_node": "TrackOutput",
+                            "to_port": port,
+                            "kind": "Audio",
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Some(serde_json::json!({
+                    "plugins": [],
+                    "connections": connections,
+                }))
+            },
         }))
         .await;
         if let Some(track) = self
@@ -742,6 +777,7 @@ impl Engine {
             pitch_correction_formant_compensation: None,
             pitch_correction_detector: Default::default(),
             pitch_correction_mode: Default::default(),
+            #[cfg(feature = "plugins")]
             plugin_graph_json: None,
         }))
         .await;
@@ -762,6 +798,17 @@ impl Engine {
         }
     }
 
+    #[cfg(not(feature = "midi"))]
+    pub(crate) fn write_midi_file(
+        path: &Path,
+        sample_rate: u32,
+        events: &[(u64, Vec<u8>)],
+    ) -> Result<(), String> {
+        let _ = (path, sample_rate, events);
+        Err("midi file support is disabled (enable the `midi` cargo feature)".to_string())
+    }
+
+    #[cfg(feature = "midi")]
     pub(crate) fn write_midi_file(
         path: &Path,
         sample_rate: u32,

@@ -115,6 +115,7 @@ pub enum ModulatorTarget {
         min: f32,
         max: f32,
     },
+    #[cfg(feature = "plugins")]
     ClapParameter {
         track_name: String,
         instance_id: usize,
@@ -122,6 +123,7 @@ pub enum ModulatorTarget {
         min: f64,
         max: f64,
     },
+    #[cfg(feature = "plugins")]
     Vst3Parameter {
         track_name: String,
         instance_id: usize,
@@ -129,7 +131,7 @@ pub enum ModulatorTarget {
         min: f32,
         max: f32,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     AuParameter {
         track_name: String,
         instance_id: usize,
@@ -137,7 +139,7 @@ pub enum ModulatorTarget {
         min: f32,
         max: f32,
     },
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     Lv2Parameter {
         track_name: String,
         instance_id: usize,
@@ -157,12 +159,14 @@ impl ModulatorTarget {
         match self {
             Self::TrackVolume { track_name, .. }
             | Self::TrackBalance { track_name, .. }
-            | Self::ClapParameter { track_name, .. }
-            | Self::Vst3Parameter { track_name, .. }
             | Self::MidiCc { track_name, .. } => Some(track_name),
-            #[cfg(target_os = "macos")]
+            #[cfg(feature = "plugins")]
+            Self::ClapParameter { track_name, .. } | Self::Vst3Parameter { track_name, .. } => {
+                Some(track_name)
+            }
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             Self::AuParameter { track_name, .. } => Some(track_name),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             Self::Lv2Parameter { track_name, .. } => Some(track_name),
             Self::HwOutVolume { .. } | Self::HwOutBalance { .. } => None,
         }

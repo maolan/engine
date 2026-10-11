@@ -28,6 +28,7 @@ pub(crate) fn audio_clip_to_data(
         pitch_correction_formant_compensation: clip.pitch_correction_formant_compensation,
         pitch_correction_detector: Default::default(),
         pitch_correction_mode: Default::default(),
+        #[cfg(feature = "plugins")]
         plugin_graph_json: clip.plugin_graph_json.clone(),
         grouped_clips: clip.grouped_clips.iter().map(audio_clip_to_data).collect(),
     }

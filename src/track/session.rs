@@ -218,6 +218,7 @@ impl TrackData {
         if frames == 0 || inputs.is_empty() {
             return;
         }
+        #[cfg(feature = "plugins")]
         let mut active_clip_plugin_keys = HashSet::new();
         let channel_count = inputs.len();
         let clip_count = self.rt.playing_session_clips.len();
@@ -297,6 +298,7 @@ impl TrackData {
                         0,
                         play_position,
                         segment_len,
+                        #[cfg(feature = "plugins")]
                         &mut active_clip_plugin_keys,
                         &mut clip_scratch,
                     )
@@ -345,6 +347,7 @@ impl TrackData {
                 self.rt.playing_session_clips.remove(idx);
             }
         }
+        #[cfg(feature = "plugins")]
         self.rt
             .clip_plugin_tracks
             .retain(|key, _| active_clip_plugin_keys.contains(key));

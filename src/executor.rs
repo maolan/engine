@@ -21,7 +21,9 @@
 //! mirroring the legacy `!progressed` fallback: they run with stale input
 //! data, which is the standard feedback-loop behaviour.
 
-use crate::message::{PluginKind, ProcessTask};
+#[cfg(feature = "plugins")]
+use crate::message::PluginKind;
+use crate::message::ProcessTask;
 use crate::render_plan::{NodeId, Op, PlanSlot, SharedPlan};
 use crate::state::TrackHandle;
 #[cfg(test)]
@@ -286,6 +288,7 @@ impl CycleExecutor {
             ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => {
                 t.clone()
             }
+            #[cfg(feature = "plugins")]
             ProcessTask::Plugin { track, .. } => track.clone(),
         };
         silence_task_ports(&track, task);
@@ -299,6 +302,7 @@ fn silence_task_ports(track: &TrackHandle, task: &ProcessTask) {
     match task {
         ProcessTask::Track(_) | ProcessTask::FolderOutput(_) => t.audio.outs.clone(),
         ProcessTask::FolderInput(_) => Vec::new(),
+        #[cfg(feature = "plugins")]
         ProcessTask::Plugin { kind, index, .. } => match kind {
             PluginKind::Clap => t
                 .clap_plugins

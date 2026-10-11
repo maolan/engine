@@ -22,17 +22,32 @@
 //! to every channel ring, so `min(slots)` across rings is the readable frame
 //! count for all channels at once.
 
+#[cfg(feature = "audio")]
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "audio")]
+use std::path::Path;
+#[cfg(feature = "audio")]
+use std::path::PathBuf;
+#[cfg(feature = "audio")]
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "audio")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "audio")]
 use std::thread::JoinHandle;
+#[cfg(feature = "audio")]
 use std::time::Duration;
 
+#[cfg(feature = "audio")]
 use audioadapter_buffers::direct::InterleavedSlice;
-use rtrb::{Consumer, Producer, RingBuffer};
+#[cfg(feature = "audio")]
+use rtrb::Consumer;
+#[cfg(feature = "audio")]
+use rtrb::{Producer, RingBuffer};
+#[cfg(feature = "audio")]
 use rubato::{Async, FixedAsync, Indexing, PolynomialDegree, Resampler};
 
+#[cfg(feature = "audio")]
 use crate::audio_codec::{StreamingDecoder, probe_audio_file};
 
 /// Default ring capacity multiplier (× period frames per channel ring).
@@ -103,6 +118,7 @@ pub(crate) fn release_producer_slot() {
 }
 
 /// Shared producer control state.
+#[cfg(feature = "audio")]
 pub(crate) struct ProducerControl {
     pub(crate) stop: Arc<AtomicBool>,
     /// 0 = no seek pending, otherwise `requested_source_frame + 1`.
@@ -110,6 +126,7 @@ pub(crate) struct ProducerControl {
     pub(crate) eof: Arc<AtomicBool>,
 }
 
+#[cfg(feature = "audio")]
 pub struct StreamingClipBuffer {
     pub channels: usize,
     pub engine_sample_rate: usize,
@@ -117,9 +134,9 @@ pub struct StreamingClipBuffer {
     total_frames: Option<u64>,
     /// Source file path; used by `read_window` to open an independent
     /// decoder without disturbing the real-time rings.
+    #[cfg(feature = "audio")]
     path: PathBuf,
     rings: Vec<Mutex<Consumer<f32>>>,
-    eof: Arc<AtomicBool>,
     underruns: AtomicUsize,
     control: ProducerControl,
     /// Next source frame the consumer expects to read; `u64::MAX` until the
@@ -128,6 +145,7 @@ pub struct StreamingClipBuffer {
     producer: Mutex<Option<ProducerThread>>,
 }
 
+#[cfg(feature = "audio")]
 impl std::fmt::Debug for StreamingClipBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamingClipBuffer")
@@ -139,84 +157,96 @@ impl std::fmt::Debug for StreamingClipBuffer {
     }
 }
 
+#[cfg(feature = "audio")]
 struct ProducerThread {
     handle: JoinHandle<()>,
     done: std::sync::mpsc::Receiver<()>,
 }
 
+#[cfg(feature = "audio")]
 impl StreamingClipBuffer {
     /// Start a streaming producer for `path`, resampled to `engine_rate`.
     /// Each channel ring holds `multiplier * period_frames` floats.
+    #[cfg(feature = "audio")]
     pub fn start(
         path: &Path,
         engine_rate: usize,
         period_frames: usize,
         multiplier: usize,
     ) -> io::Result<Self> {
-        let info = probe_audio_file(path)?;
-        let channels = info.channels.max(1);
-        // Guard against unbounded producer threads in sessions with very
-        // many clips (see `preload_audio_clip_cache`); beyond the cap the
-        // caller falls back to a whole-file buffered decode.
-        if !try_acquire_producer_slot() {
-            return Err(io::Error::other(format!(
-                "Streaming producer cap reached; not starting stream for '{}'",
-                path.display()
-            )));
+        #[cfg(not(feature = "audio"))]
+        {
+            let _ = (path, engine_rate, period_frames, multiplier);
+            return Err(io::Error::other(
+                "audio codec support is disabled (enable the `audio` cargo feature)",
+            ));
         }
-        let capacity = multiplier.max(1).saturating_mul(period_frames.max(1));
-        let mut rings = Vec::with_capacity(channels);
-        let mut producers = Vec::with_capacity(channels);
-        for _ in 0..channels {
-            let (producer, consumer) = RingBuffer::new(capacity.max(1));
-            producers.push(producer);
-            rings.push(Mutex::new(consumer));
-        }
-        let control = ProducerControl {
-            stop: Arc::new(AtomicBool::new(false)),
-            seek_request: Arc::new(AtomicUsize::new(0)),
-            eof: Arc::new(AtomicBool::new(false)),
-        };
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let thread_control = ProducerControl {
-            stop: control.stop.clone(),
-            seek_request: control.seek_request.clone(),
-            eof: control.eof.clone(),
-        };
-        let path_buf = path.to_path_buf();
-        let source_rate = info.sample_rate as usize;
-        let handle = std::thread::Builder::new()
-            .name(format!("maolan-stream-{}", path.display()))
-            .spawn(move || {
-                producer_main(
-                    path_buf,
-                    engine_rate,
-                    source_rate,
-                    channels,
-                    producers,
-                    thread_control,
-                    done_tx,
-                );
+        #[cfg(feature = "audio")]
+        {
+            let info = probe_audio_file(path)?;
+            let channels = info.channels.max(1);
+            // Guard against unbounded producer threads in sessions with very
+            // many clips (see `preload_audio_clip_cache`); beyond the cap the
+            // caller falls back to a whole-file buffered decode.
+            if !try_acquire_producer_slot() {
+                return Err(io::Error::other(format!(
+                    "Streaming producer cap reached; not starting stream for '{}'",
+                    path.display()
+                )));
+            }
+            let capacity = multiplier.max(1).saturating_mul(period_frames.max(1));
+            let mut rings = Vec::with_capacity(channels);
+            let mut producers = Vec::with_capacity(channels);
+            for _ in 0..channels {
+                let (producer, consumer) = RingBuffer::new(capacity.max(1));
+                producers.push(producer);
+                rings.push(Mutex::new(consumer));
+            }
+            let control = ProducerControl {
+                stop: Arc::new(AtomicBool::new(false)),
+                seek_request: Arc::new(AtomicUsize::new(0)),
+                eof: Arc::new(AtomicBool::new(false)),
+            };
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let thread_control = ProducerControl {
+                stop: control.stop.clone(),
+                seek_request: control.seek_request.clone(),
+                eof: control.eof.clone(),
+            };
+            let path_buf = path.to_path_buf();
+            let source_rate = info.sample_rate as usize;
+            let handle = std::thread::Builder::new()
+                .name(format!("maolan-stream-{}", path.display()))
+                .spawn(move || {
+                    producer_main(
+                        path_buf,
+                        engine_rate,
+                        source_rate,
+                        channels,
+                        producers,
+                        thread_control,
+                        done_tx,
+                    );
+                })
+                .map_err(|e| {
+                    release_producer_slot();
+                    io::Error::other(format!("Failed to spawn streaming producer: {e}"))
+                })?;
+            Ok(Self {
+                channels,
+                engine_sample_rate: engine_rate,
+                total_frames: info.frames,
+                path: path.to_path_buf(),
+                rings,
+                underruns: AtomicUsize::new(0),
+                control,
+                expected_next: AtomicU64::new(u64::MAX),
+                producer: Mutex::new(Some(ProducerThread {
+                    handle,
+                    done: done_rx,
+                })),
             })
-            .map_err(|e| {
-                release_producer_slot();
-                io::Error::other(format!("Failed to spawn streaming producer: {e}"))
-            })?;
-        Ok(Self {
-            channels,
-            engine_sample_rate: engine_rate,
-            total_frames: info.frames,
-            path: path.to_path_buf(),
-            rings,
-            eof: control.eof.clone(),
-            underruns: AtomicUsize::new(0),
-            control,
-            expected_next: AtomicU64::new(u64::MAX),
-            producer: Mutex::new(Some(ProducerThread {
-                handle,
-                done: done_rx,
-            })),
-        })
+        }
     }
 
     pub fn channels(&self) -> usize {
@@ -224,7 +254,7 @@ impl StreamingClipBuffer {
     }
 
     pub fn is_eof(&self) -> bool {
-        self.eof.load(Ordering::Acquire)
+        self.control.eof.load(Ordering::Acquire)
     }
 
     pub fn underruns(&self) -> usize {
@@ -246,35 +276,45 @@ impl StreamingClipBuffer {
     /// and never touches the SPSC rings, so the real-time read position and
     /// the producer are undisturbed.
     pub fn read_window(&self, start: usize, len: usize) -> io::Result<Vec<Vec<f32>>> {
-        let channels = self.channels.max(1);
-        let mut window = vec![vec![0.0_f32; len]; channels];
-        if len == 0 {
-            return Ok(window);
+        #[cfg(not(feature = "audio"))]
+        {
+            let _ = (start, len);
+            return Err(io::Error::other(
+                "audio codec support is disabled (enable the `audio` cargo feature)",
+            ));
         }
-        let mut decoder = StreamingDecoder::new(&self.path)?;
-        let mut position = 0usize;
-        let mut filled = 0usize;
-        while filled < len {
-            let Some(chunk) = decoder.next_chunk(DECODE_CHUNK_FRAMES)? else {
-                break;
-            };
-            let frames = chunk.len() / channels;
-            if position + frames <= start {
-                // Whole chunk lands before the window; discard it.
-                position += frames;
-                continue;
+        #[cfg(feature = "audio")]
+        {
+            let channels = self.channels.max(1);
+            let mut window = vec![vec![0.0_f32; len]; channels];
+            if len == 0 {
+                return Ok(window);
             }
-            let chunk_from = start.saturating_sub(position);
-            let take = (frames - chunk_from).min(len - filled);
-            for (channel, plane) in window.iter_mut().enumerate() {
-                for i in 0..take {
-                    plane[filled + i] = chunk[(chunk_from + i) * channels + channel];
+            let mut decoder = StreamingDecoder::new(&self.path)?;
+            let mut position = 0usize;
+            let mut filled = 0usize;
+            while filled < len {
+                let Some(chunk) = decoder.next_chunk(DECODE_CHUNK_FRAMES)? else {
+                    break;
+                };
+                let frames = chunk.len() / channels;
+                if position + frames <= start {
+                    // Whole chunk lands before the window; discard it.
+                    position += frames;
+                    continue;
                 }
+                let chunk_from = start.saturating_sub(position);
+                let take = (frames - chunk_from).min(len - filled);
+                for (channel, plane) in window.iter_mut().enumerate() {
+                    for i in 0..take {
+                        plane[filled + i] = chunk[(chunk_from + i) * channels + channel];
+                    }
+                }
+                filled += take;
+                position += frames;
             }
-            filled += take;
-            position += frames;
+            Ok(window)
         }
-        Ok(window)
     }
 
     /// Read up to `len` frames starting at source frame `from_frame` into
@@ -339,6 +379,7 @@ impl StreamingClipBuffer {
     }
 }
 
+#[cfg(feature = "audio")]
 impl Drop for StreamingClipBuffer {
     fn drop(&mut self) {
         self.control.stop.store(true, Ordering::Release);
@@ -356,6 +397,7 @@ impl Drop for StreamingClipBuffer {
     }
 }
 
+#[cfg(feature = "audio")]
 fn make_resampler(
     engine_rate: usize,
     source_rate: usize,
@@ -373,6 +415,7 @@ fn make_resampler(
     .map_err(|e| io::Error::other(format!("Failed to create resampler: {e}")))
 }
 
+#[cfg(feature = "audio")]
 fn producer_main(
     path: PathBuf,
     engine_rate: usize,
@@ -401,6 +444,7 @@ fn producer_main(
     let _ = done.send(());
 }
 
+#[cfg(feature = "audio")]
 fn run_producer(
     path: &Path,
     engine_rate: usize,
@@ -548,6 +592,7 @@ fn run_producer(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "audio")]
 fn push_chunk(
     chunk: Vec<f32>,
     frames: usize,
@@ -595,7 +640,7 @@ fn push_chunk(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "audio"))]
 mod tests {
     use super::*;
     use crate::audio_codec::{AudioDither, AudioEncodeFormat, encode_audio_to_file, write_wav_f32};

@@ -32,7 +32,6 @@ use std::time::Duration;
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::streaming::{DECODE_CHUNK_FRAMES, try_acquire_producer_slot};
-use crate::audio_codec::probe_audio_file;
 
 /// On-disk layout of a PCM (integer or float) RIFF/WAVE stream.
 #[derive(Clone)]
@@ -42,6 +41,7 @@ struct WavPcmLayout {
     /// Byte length of the `data` chunk payload.
     data_len: u64,
     channels: usize,
+    sample_rate: u32,
     bits_per_sample: u16,
     /// WAVE format tag: 1 = integer PCM, 3 = IEEE float.
     format_tag: u16,
@@ -108,6 +108,7 @@ fn parse_wav_pcm_layout(path: &Path) -> io::Result<WavPcmLayout> {
     }
     let mut format_tag = None;
     let mut channels = None;
+    let mut sample_rate = None;
     let mut bits_per_sample = None;
     let mut data_offset = None;
     let mut data_len = None;
@@ -127,6 +128,7 @@ fn parse_wav_pcm_layout(path: &Path) -> io::Result<WavPcmLayout> {
             }
             format_tag = Some(u16::from_le_bytes([fmt[0], fmt[1]]));
             channels = Some(u16::from_le_bytes([fmt[2], fmt[3]]));
+            sample_rate = Some(u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]));
             bits_per_sample = Some(u16::from_le_bytes([fmt[14], fmt[15]]));
             // WAVE_FORMAT_EXTENSIBLE (0xFFFE) carries the real format tag in
             // the first two bytes of the SubFormat GUID (at offset 24).
@@ -156,6 +158,7 @@ fn parse_wav_pcm_layout(path: &Path) -> io::Result<WavPcmLayout> {
     }
     let format_tag = format_tag.ok_or_else(|| io::Error::other("WAV file has no fmt chunk"))?;
     let channels = channels.ok_or_else(|| io::Error::other("WAV file has no fmt chunk"))?;
+    let sample_rate = sample_rate.ok_or_else(|| io::Error::other("WAV file has no fmt chunk"))?;
     let bits_per_sample =
         bits_per_sample.ok_or_else(|| io::Error::other("WAV file has no fmt chunk"))?;
     if !matches!(format_tag, 1 | 3) {
@@ -169,6 +172,7 @@ fn parse_wav_pcm_layout(path: &Path) -> io::Result<WavPcmLayout> {
         data_offset,
         data_len,
         channels: channels.max(1) as usize,
+        sample_rate,
         bits_per_sample,
         format_tag,
     })
@@ -255,7 +259,11 @@ pub struct SeekableStreamingClipBuffer {
     pub channels: usize,
     pub engine_sample_rate: usize,
     total_frames: usize,
+    /// Only read by `read_window` (random-access offline reads: pitch
+    /// correction on Unix, reversed playback with `audio`).
+    #[cfg(any(unix, feature = "audio"))]
     path: PathBuf,
+    #[cfg(any(unix, feature = "audio"))]
     layout: WavPcmLayout,
     rings: Vec<Mutex<Consumer<QueuedSample>>>,
     eof: Arc<AtomicBool>,
@@ -294,13 +302,12 @@ impl SeekableStreamingClipBuffer {
         multiplier: usize,
     ) -> io::Result<Self> {
         let layout = parse_wav_pcm_layout(path)?;
-        let info = probe_audio_file(path)?;
         let channels = layout.channels.max(1);
-        if info.sample_rate as usize != engine_rate {
+        if layout.sample_rate as usize != engine_rate {
             return Err(io::Error::other(format!(
                 "'{}' is at {} Hz, not the engine rate {engine_rate} Hz",
                 path.display(),
-                info.sample_rate
+                layout.sample_rate
             )));
         }
         // Guard against unbounded producer threads in sessions with very
@@ -346,7 +353,9 @@ impl SeekableStreamingClipBuffer {
             channels,
             engine_sample_rate: engine_rate,
             total_frames,
+            #[cfg(any(unix, feature = "audio"))]
             path: path.to_path_buf(),
+            #[cfg(any(unix, feature = "audio"))]
             layout,
             rings,
             eof: control.eof.clone(),
@@ -373,6 +382,7 @@ impl SeekableStreamingClipBuffer {
     }
 
     /// Total decoded frames in the source file, if known.
+    #[cfg(feature = "audio")]
     pub fn total_frames(&self) -> Option<u64> {
         Some(self.total_frames as u64)
     }
@@ -460,6 +470,7 @@ impl SeekableStreamingClipBuffer {
     ///
     /// This opens a short-lived file handle on the calling thread and never
     /// touches the SPSC rings, so the real-time read position is undisturbed.
+    #[cfg(any(unix, feature = "audio"))]
     pub fn read_window(&self, start: usize, len: usize) -> io::Result<Vec<Vec<f32>>> {
         let channels = self.channels.max(1);
         let mut window = vec![vec![0.0_f32; len]; channels];
@@ -492,6 +503,7 @@ impl SeekableStreamingClipBuffer {
 
     /// Path kept only so [`Self::read_window`] can open its own handle; the
     /// producer thread holds the primary one.
+    #[cfg(any(unix, feature = "audio"))]
     fn layout_path_hint(&self) -> PathBuf {
         self.path.clone()
     }
@@ -610,7 +622,7 @@ fn run_producer(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "audio"))]
 mod tests {
     use super::*;
     use crate::audio_codec::write_wav_f32;

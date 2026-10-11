@@ -1,4 +1,5 @@
 use crate::connectable::{ConnectableConnection, ConnectableRef};
+#[cfg(feature = "plugins")]
 use crate::message::{PluginGraphConnection, PluginGraphNode};
 
 use super::*;
@@ -115,6 +116,7 @@ impl TrackData {
         Ok(())
     }
 
+    #[cfg(feature = "plugins")]
     pub fn plugin_graph_connections(&self) -> Vec<PluginGraphConnection> {
         let mut source_ports: Vec<(PluginGraphNode, usize, Arc<AudioIO>)> = self
             .audio
@@ -123,7 +125,7 @@ impl TrackData {
             .enumerate()
             .map(|(idx, io)| (PluginGraphNode::TrackInput, idx, io.clone()))
             .collect();
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for instance in &self.lv2_plugins {
             source_ports.extend(instance.processor.audio_outputs().iter().enumerate().map(
                 |(idx, io)| {
@@ -147,7 +149,7 @@ impl TrackData {
                 },
             ));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         for instance in &self.au_plugins {
             source_ports.extend(instance.processor.audio_outputs().iter().enumerate().map(
                 |(idx, io)| {
@@ -188,7 +190,7 @@ impl TrackData {
                 }
             }
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for instance in &self.lv2_plugins {
             for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
                 for conn in to_io.connections().iter() {
@@ -226,7 +228,7 @@ impl TrackData {
                 }
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         for instance in &self.au_plugins {
             for (to_port, to_io) in instance.processor.audio_inputs().iter().enumerate() {
                 for conn in to_io.connections().iter() {
@@ -305,23 +307,25 @@ impl TrackData {
                 audio_sources.push((io.clone(), ConnectableRef::ChildTrack(name.clone()), port));
             }
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.clap_plugins {
             for (port, io) in instance.audio_outputs().iter().enumerate() {
                 audio_sources.push((io.clone(), ConnectableRef::ClapPlugin(instance.id), port));
             }
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.vst3_plugins {
             for (port, io) in instance.audio_outputs().iter().enumerate() {
                 audio_sources.push((io.clone(), ConnectableRef::Vst3Plugin(instance.id), port));
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         for instance in &self.au_plugins {
             for (port, io) in instance.audio_outputs().iter().enumerate() {
                 audio_sources.push((io.clone(), ConnectableRef::AuPlugin(instance.id), port));
             }
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for instance in &self.lv2_plugins {
             for (port, io) in instance.audio_outputs().iter().enumerate() {
                 audio_sources.push((io.clone(), ConnectableRef::Lv2Plugin(instance.id), port));
@@ -358,26 +362,28 @@ impl TrackData {
             let name = child.name.clone();
             report_audio_targets(child.audio_inputs(), ConnectableRef::ChildTrack(name));
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.clap_plugins {
             report_audio_targets(
                 instance.audio_inputs(),
                 ConnectableRef::ClapPlugin(instance.id),
             );
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.vst3_plugins {
             report_audio_targets(
                 instance.audio_inputs(),
                 ConnectableRef::Vst3Plugin(instance.id),
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         for instance in &self.au_plugins {
             report_audio_targets(
                 instance.audio_inputs(),
                 ConnectableRef::AuPlugin(instance.id),
             );
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for instance in &self.lv2_plugins {
             report_audio_targets(
                 instance.audio_inputs(),
@@ -401,23 +407,25 @@ impl TrackData {
                 midi_sources.push((io.clone(), ConnectableRef::ChildTrack(name.clone()), port));
             }
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.clap_plugins {
             for (port, io) in instance.midi_outputs().iter().enumerate() {
                 midi_sources.push((io.clone(), ConnectableRef::ClapPlugin(instance.id), port));
             }
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.vst3_plugins {
             for (port, io) in instance.midi_outputs().iter().enumerate() {
                 midi_sources.push((io.clone(), ConnectableRef::Vst3Plugin(instance.id), port));
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         for instance in &self.au_plugins {
             for (port, io) in instance.midi_outputs().iter().enumerate() {
                 midi_sources.push((io.clone(), ConnectableRef::AuPlugin(instance.id), port));
             }
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for instance in &self.lv2_plugins {
             for (port, io) in instance.midi_outputs().iter().enumerate() {
                 midi_sources.push((io.clone(), ConnectableRef::Lv2Plugin(instance.id), port));
@@ -454,26 +462,28 @@ impl TrackData {
             let name = child.name.clone();
             report_midi_targets(child.midi_inputs(), ConnectableRef::ChildTrack(name));
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.clap_plugins {
             report_midi_targets(
                 instance.midi_inputs(),
                 ConnectableRef::ClapPlugin(instance.id),
             );
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.vst3_plugins {
             report_midi_targets(
                 instance.midi_inputs(),
                 ConnectableRef::Vst3Plugin(instance.id),
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         for instance in &self.au_plugins {
             report_midi_targets(
                 instance.midi_inputs(),
                 ConnectableRef::AuPlugin(instance.id),
             );
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for instance in &self.lv2_plugins {
             report_midi_targets(
                 instance.midi_inputs(),
@@ -505,26 +515,28 @@ impl TrackData {
                 .find(|child| child.lock().name == *name)
                 .and_then(|child| child.lock().audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("Child track '{name}' audio output port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::ClapPlugin(instance_id) => self
                 .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("CLAP plugin audio output port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::Vst3Plugin(instance_id) => self
                 .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("VST3 plugin audio output port {port} not found")),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             ConnectableRef::AuPlugin(instance_id) => self
                 .au_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.audio_outputs().get(port).cloned())
                 .ok_or_else(|| format!("AU plugin audio output port {port} not found")),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             ConnectableRef::Lv2Plugin(instance_id) => self
                 .lv2_plugins
                 .iter()
@@ -557,26 +569,28 @@ impl TrackData {
                 .find(|child| child.lock().name == *name)
                 .and_then(|child| child.lock().audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("Child track '{name}' audio input port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::ClapPlugin(instance_id) => self
                 .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("CLAP plugin audio input port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::Vst3Plugin(instance_id) => self
                 .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("VST3 plugin audio input port {port} not found")),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             ConnectableRef::AuPlugin(instance_id) => self
                 .au_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.audio_inputs().get(port).cloned())
                 .ok_or_else(|| format!("AU plugin audio input port {port} not found")),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             ConnectableRef::Lv2Plugin(instance_id) => self
                 .lv2_plugins
                 .iter()
@@ -641,26 +655,28 @@ impl TrackData {
                 .find(|child| child.lock().name == *name)
                 .and_then(|child| child.lock().midi_outputs().get(port).cloned())
                 .ok_or_else(|| format!("Child track '{name}' MIDI output port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::ClapPlugin(instance_id) => self
                 .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.midi_outputs().get(port).cloned())
                 .ok_or_else(|| format!("CLAP plugin MIDI output port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::Vst3Plugin(instance_id) => self
                 .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.midi_outputs().get(port).cloned())
                 .ok_or_else(|| format!("VST3 plugin MIDI output port {port} not found")),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             ConnectableRef::AuPlugin(instance_id) => self
                 .au_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.midi_outputs().get(port).cloned())
                 .ok_or_else(|| format!("AU plugin MIDI output port {port} not found")),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             ConnectableRef::Lv2Plugin(instance_id) => self
                 .lv2_plugins
                 .iter()
@@ -693,26 +709,28 @@ impl TrackData {
                 .find(|child| child.lock().name == *name)
                 .and_then(|child| child.lock().midi_inputs().get(port).cloned())
                 .ok_or_else(|| format!("Child track '{name}' MIDI input port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::ClapPlugin(instance_id) => self
                 .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.midi_inputs().get(port).cloned())
                 .ok_or_else(|| format!("CLAP plugin MIDI input port {port} not found")),
+            #[cfg(feature = "plugins")]
             ConnectableRef::Vst3Plugin(instance_id) => self
                 .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.midi_inputs().get(port).cloned())
                 .ok_or_else(|| format!("VST3 plugin MIDI input port {port} not found")),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             ConnectableRef::AuPlugin(instance_id) => self
                 .au_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
                 .and_then(|instance| instance.midi_inputs().get(port).cloned())
                 .ok_or_else(|| format!("AU plugin MIDI input port {port} not found")),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             ConnectableRef::Lv2Plugin(instance_id) => self
                 .lv2_plugins
                 .iter()
@@ -878,24 +896,30 @@ impl TrackData {
         }
         let count = self.midi.ins.len().min(self.midi.outs.len());
         for port in 0..count {
+            #[cfg(feature = "plugins")]
             let _ = self.connect_plugin_midi(
                 PluginGraphNode::TrackInput,
                 port,
                 PluginGraphNode::TrackOutput,
                 port,
             );
+            #[cfg(not(feature = "plugins"))]
+            MIDIIO::connect(&self.midi.ins[port], &self.midi.outs[port]);
         }
     }
 
     pub(crate) fn disconnect_midi_inputs_from_outputs(&mut self) {
         let count = self.midi.ins.len().min(self.midi.outs.len());
         for port in 0..count {
+            #[cfg(feature = "plugins")]
             let _ = self.disconnect_plugin_midi(
                 PluginGraphNode::TrackInput,
                 port,
                 PluginGraphNode::TrackOutput,
                 port,
             );
+            #[cfg(not(feature = "plugins"))]
+            let _ = MIDIIO::disconnect(&self.midi.ins[port], &self.midi.outs[port]);
         }
     }
 
@@ -953,13 +977,15 @@ impl TrackData {
         if let Some(src) = self.metronome_source.load_full() {
             sources.push(src);
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         for instance in &self.lv2_plugins {
             sources.extend(instance.processor.audio_outputs().iter().cloned());
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.vst3_plugins {
             sources.extend(instance.processor.audio_outputs().iter().cloned());
         }
+        #[cfg(feature = "plugins")]
         for instance in &self.clap_plugins {
             sources.extend(instance.processor.audio_outputs().iter().cloned());
         }

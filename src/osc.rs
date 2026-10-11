@@ -1,11 +1,13 @@
 use crate::connectable::ConnectableRef;
 use crate::kind::Kind;
+#[cfg(feature = "plugins")]
+use crate::message::PluginGraphNode;
 use crate::message::{
     Action, AudioClipData, ClipMoveFrom, ClipMoveTo, GlobalMidiLearnTarget, LaunchQuantization,
     Message, MidiClipData, MidiControllerData, MidiLearnBinding, MidiNoteData, MidiRawEventData,
     MpeExpressionCurve, MpeExpressionPoint, MpeNoteExpression, OfflineAutomationLane,
-    OfflineAutomationTarget, PitchCorrectionPointData, PluginGraphNode, SessionMidiLearnTarget,
-    TempoPoint, TimeSignaturePoint, TrackAutomationMode, TrackColor, TrackMidiLearnTarget,
+    OfflineAutomationTarget, PitchCorrectionPointData, SessionMidiLearnTarget, TempoPoint,
+    TimeSignaturePoint, TrackAutomationMode, TrackColor, TrackMidiLearnTarget,
 };
 use crate::modulator::Modulator;
 use std::{
@@ -353,24 +355,28 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
         "/disconnect" => parse_connect(args, false),
 
         // Plugins
+        #[cfg(feature = "plugins")]
         "/plugin/load" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
             let path = args.next_string()?;
             parse_plugin_load(track_name, &format, path)
         }
+        #[cfg(feature = "plugins")]
         "/plugin/unload" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
             let path = args.next_string()?;
             parse_plugin_unload(track_name, &format, path)
         }
+        #[cfg(feature = "plugins")]
         "/plugin/unload_instance" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
             let instance_id = args.next_int()? as usize;
             parse_plugin_unload_instance(track_name, &format, instance_id)
         }
+        #[cfg(feature = "plugins")]
         "/plugin/bypass" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -383,18 +389,21 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
                 bypassed,
             })
         }
+        #[cfg(feature = "plugins")]
         "/plugin/show_gui" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
             let instance_id = args.next_int()? as usize;
             parse_plugin_show_gui(track_name, &format, instance_id)
         }
+        #[cfg(feature = "plugins")]
         "/plugin/snapshot_state" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
             let instance_id = args.next_int()? as usize;
             parse_plugin_snapshot_state(track_name, &format, instance_id)
         }
+        #[cfg(feature = "plugins")]
         "/plugin/restore_state" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -402,6 +411,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let state_json = args.next_string()?;
             parse_plugin_restore_state(track_name, &format, instance_id, &state_json)
         }
+        #[cfg(feature = "plugins")]
         "/plugin/set_resource_dir" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -420,6 +430,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
                 shared,
             })
         }
+        #[cfg(feature = "plugins")]
         "/plugin/collect_resources" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -434,12 +445,16 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
                 )),
             }
         }
+        #[cfg(feature = "plugins")]
         "/plugin/snapshot_all_states" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackSnapshotAllClapStates { track_name })
         }
+        #[cfg(feature = "plugins")]
         "/plugin/set_param_at" => parse_plugin_set_param_at(args),
+        #[cfg(feature = "plugins")]
         "/plugin/begin_param_edit" => parse_clap_param_edit(args, true),
+        #[cfg(feature = "plugins")]
         "/plugin/end_param_edit" => parse_clap_param_edit(args, false),
 
         // Automation
@@ -489,6 +504,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
         // Queries
         "/query/tracks" => no_args(args, Action::RequestTrackList),
         "/query/transport" => no_args(args, Action::RequestTransportState),
+        #[cfg(feature = "plugins")]
         "/query/plugins" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackGetPluginGraph {
@@ -497,12 +513,14 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             })
         }
         "/query/meters" => no_args(args, Action::RequestMeterSnapshot),
+        #[cfg(feature = "plugins")]
         "/query/plugin_parameters" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
             let instance_id = args.next_int()? as usize;
             parse_plugin_parameters_query(track_name, &format, instance_id)
         }
+        #[cfg(feature = "plugins")]
         "/query/clip_plugin_parameters" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -510,22 +528,29 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let instance_id = args.next_int()? as usize;
             parse_clip_plugin_parameters_query(track_name, &format, clip_idx, instance_id)
         }
+        #[cfg(feature = "plugins")]
         "/query/clap_plugins" => no_args(args, Action::ListClapPlugins),
+        #[cfg(feature = "plugins")]
         "/query/clap_plugins_with_capabilities" => {
             no_args(args, Action::ListClapPluginsWithCapabilities)
         }
+        #[cfg(feature = "plugins")]
         "/query/vst3_plugins" => no_args(args, Action::ListVst3Plugins),
         #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "/query/lv2_plugins" => no_args(args, Action::ListLv2Plugins),
+        #[cfg(feature = "plugins")]
         "/query/clap_note_names" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackGetClapNoteNames { track_name })
         }
         #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "/query/lv2_midnam" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackGetLv2Midnam { track_name })
         }
+        #[cfg(feature = "plugins")]
         "/query/vst3_graph" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackGetVst3Graph { track_name })
@@ -673,6 +698,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
                 name,
             })
         }
+        #[cfg(feature = "plugins")]
         "/clip/plugin_graph_json" => {
             let track_name = args.next_string()?;
             let clip_index = args.next_int()? as usize;
@@ -734,18 +760,27 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
         }
 
         // Plugin graph connections
+        #[cfg(feature = "plugins")]
         "/plugin/connect_audio" => parse_plugin_graph_connection(args, true, Kind::Audio),
+        #[cfg(feature = "plugins")]
         "/plugin/disconnect_audio" => parse_plugin_graph_connection(args, false, Kind::Audio),
+        #[cfg(feature = "plugins")]
         "/plugin/connect_midi" => parse_plugin_graph_connection(args, true, Kind::MIDI),
+        #[cfg(feature = "plugins")]
         "/plugin/disconnect_midi" => parse_plugin_graph_connection(args, false, Kind::MIDI),
 
         // VST3 internal graph connections
+        #[cfg(feature = "plugins")]
         "/vst3/connect_audio" => parse_vst3_graph_connection(args, true),
+        #[cfg(feature = "plugins")]
         "/vst3/disconnect_audio" => parse_vst3_graph_connection(args, false),
 
         // Plugin parameters
+        #[cfg(feature = "plugins")]
         "/plugin/set_param" => parse_plugin_set_param(args),
+        #[cfg(feature = "plugins")]
         "/clip_plugin/set_param" => parse_clip_plugin_set_param(args),
+        #[cfg(feature = "plugins")]
         "/clip_plugin/snapshot_state" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -753,6 +788,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let instance_id = args.next_int()? as usize;
             parse_clip_plugin_snapshot_state(track_name, &format, clip_idx, instance_id)
         }
+        #[cfg(feature = "plugins")]
         "/clip_plugin/restore_state" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -761,6 +797,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let state_json = args.next_string()?;
             parse_clip_plugin_restore_state(track_name, &format, clip_idx, instance_id, &state_json)
         }
+        #[cfg(feature = "plugins")]
         "/clip_plugin/set_resource_dir" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -781,6 +818,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
                 shared,
             })
         }
+        #[cfg(feature = "plugins")]
         "/clip_plugin/collect_resources" => {
             let track_name = args.next_string()?;
             let format = args.next_string()?;
@@ -978,6 +1016,7 @@ fn dispatch_address(address: &str, mut args: OscArgs<'_>) -> Result<Action, Stri
             let track_name = args.next_string()?;
             Ok(Action::TrackClearDefaultPassthrough { track_name })
         }
+        #[cfg(feature = "plugins")]
         "/track/clear_plugins" => {
             let track_name = args.next_string()?;
             Ok(Action::TrackClearPlugins { track_name })
@@ -1045,6 +1084,7 @@ fn parse_kind(value: &str) -> Result<Kind, String> {
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_load(track_name: String, format: &str, path: String) -> Result<Action, String> {
     match format {
         "clap" => Ok(Action::TrackLoadClapPlugin {
@@ -1057,13 +1097,13 @@ fn parse_plugin_load(track_name: String, format: &str, path: String) -> Result<A
             plugin_id: path,
             instance_id: None,
         }),
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => Ok(Action::TrackLoadAuPlugin {
             track_name,
             plugin_id: path,
             instance_id: None,
         }),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::TrackLoadLv2Plugin {
             track_name,
             plugin_uri: path,
@@ -1073,6 +1113,7 @@ fn parse_plugin_load(track_name: String, format: &str, path: String) -> Result<A
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_unload(track_name: String, format: &str, path: String) -> Result<Action, String> {
     match format {
         "clap" => Ok(Action::TrackUnloadClapPlugin {
@@ -1083,12 +1124,12 @@ fn parse_plugin_unload(track_name: String, format: &str, path: String) -> Result
             track_name,
             plugin_id: path,
         }),
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => Ok(Action::TrackUnloadAuPlugin {
             track_name,
             plugin_id: path,
         }),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::TrackUnloadLv2Plugin {
             track_name,
             plugin_uri: path,
@@ -1097,6 +1138,7 @@ fn parse_plugin_unload(track_name: String, format: &str, path: String) -> Result
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_unload_instance(
     track_name: String,
     format: &str,
@@ -1111,12 +1153,12 @@ fn parse_plugin_unload_instance(
             track_name,
             instance_id,
         }),
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => Ok(Action::TrackUnloadAuPluginInstance {
             track_name,
             instance_id,
         }),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::TrackUnloadLv2PluginInstance {
             track_name,
             instance_id,
@@ -1125,6 +1167,7 @@ fn parse_plugin_unload_instance(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_parameters_query(
     track_name: String,
     format: &str,
@@ -1139,12 +1182,12 @@ fn parse_plugin_parameters_query(
             track_name,
             instance_id,
         }),
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => Ok(Action::TrackGetAuParameters {
             track_name,
             instance_id,
         }),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::TrackGetLv2PluginControls {
             track_name,
             instance_id,
@@ -1153,6 +1196,7 @@ fn parse_plugin_parameters_query(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_clip_plugin_parameters_query(
     track_name: String,
     format: &str,
@@ -1163,7 +1207,7 @@ fn parse_clip_plugin_parameters_query(
     let _ = (&track_name, clip_idx, instance_id);
 
     match format {
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::ClipGetLv2PluginControls {
             track_name,
             clip_idx,
@@ -1175,6 +1219,7 @@ fn parse_clip_plugin_parameters_query(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_show_gui(
     track_name: String,
     format: &str,
@@ -1189,12 +1234,12 @@ fn parse_plugin_show_gui(
             track_name,
             instance_id,
         }),
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => Ok(Action::TrackShowAuGui {
             track_name,
             instance_id,
         }),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::TrackShowLv2Gui {
             track_name,
             instance_id,
@@ -1203,6 +1248,7 @@ fn parse_plugin_show_gui(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_snapshot_state(
     track_name: String,
     format: &str,
@@ -1217,12 +1263,12 @@ fn parse_plugin_snapshot_state(
             track_name,
             instance_id,
         }),
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => Ok(Action::TrackAuSnapshotState {
             track_name,
             instance_id,
         }),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::TrackLv2SnapshotState {
             track_name,
             instance_id,
@@ -1231,6 +1277,7 @@ fn parse_plugin_snapshot_state(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_restore_state(
     track_name: String,
     format: &str,
@@ -1254,7 +1301,7 @@ fn parse_plugin_restore_state(
                 state,
             })
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => {
             let state = parse_au_state(state_json)?;
             Ok(Action::TrackAuRestoreState {
@@ -1263,7 +1310,7 @@ fn parse_plugin_restore_state(
                 state,
             })
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::TrackSetLv2PluginState {
             track_name,
             instance_id,
@@ -1273,6 +1320,7 @@ fn parse_plugin_restore_state(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_clip_plugin_snapshot_state(
     track_name: String,
     format: &str,
@@ -1290,13 +1338,13 @@ fn parse_clip_plugin_snapshot_state(
             clip_idx,
             instance_id,
         }),
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => Ok(Action::ClipAuSnapshotState {
             track_name,
             clip_idx,
             instance_id,
         }),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::ClipLv2SnapshotState {
             track_name,
             clip_idx,
@@ -1308,6 +1356,7 @@ fn parse_clip_plugin_snapshot_state(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_clip_plugin_restore_state(
     track_name: String,
     format: &str,
@@ -1334,7 +1383,7 @@ fn parse_clip_plugin_restore_state(
                 state,
             })
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => {
             let state = parse_au_state(state_json)?;
             Ok(Action::ClipAuRestoreState {
@@ -1344,7 +1393,7 @@ fn parse_clip_plugin_restore_state(
                 state,
             })
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => Ok(Action::ClipSetLv2PluginState {
             track_name,
             clip_idx,
@@ -1357,6 +1406,7 @@ fn parse_clip_plugin_restore_state(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_state_bytes(json: &str) -> Result<Vec<u8>, String> {
     let value: serde_json::Value = parse_json(json)?;
     Ok(value
@@ -1371,11 +1421,13 @@ fn parse_state_bytes(json: &str) -> Result<Vec<u8>, String> {
         .unwrap_or_default())
 }
 
+#[cfg(feature = "plugins")]
 fn parse_clap_state(json: &str) -> Result<crate::clap::ClapPluginState, String> {
     let bytes = parse_state_bytes(json)?;
     Ok(crate::clap::ClapPluginState { bytes })
 }
 
+#[cfg(feature = "plugins")]
 fn parse_vst3_state(json: &str) -> Result<crate::vst3::state::Vst3PluginState, String> {
     let value: serde_json::Value = parse_json(json)?;
     let plugin_id = value
@@ -1405,6 +1457,7 @@ fn parse_vst3_state(json: &str) -> Result<crate::vst3::state::Vst3PluginState, S
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "plugins"))]
 fn parse_au_state(json: &str) -> Result<crate::au::AuPluginState, String> {
     let value: serde_json::Value = parse_json(json)?;
     let bytes = value
@@ -1498,6 +1551,7 @@ fn parse_add_clip(mut args: OscArgs<'_>) -> Result<Action, String> {
         pitch_correction_formant_compensation: None,
         pitch_correction_detector: Default::default(),
         pitch_correction_mode: Default::default(),
+        #[cfg(feature = "plugins")]
         plugin_graph_json: None,
     })
 }
@@ -1902,6 +1956,7 @@ fn parse_sysex_events(mut args: OscArgs<'_>) -> Result<Action, String> {
     })
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_graph_node(value: &str) -> Result<PluginGraphNode, String> {
     match value {
         "track_input" => Ok(PluginGraphNode::TrackInput),
@@ -1938,6 +1993,7 @@ fn parse_plugin_graph_node(value: &str) -> Result<PluginGraphNode, String> {
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_graph_connection(
     mut args: OscArgs<'_>,
     connect: bool,
@@ -1993,19 +2049,21 @@ fn parse_connectable_ref(value: &str) -> Result<ConnectableRef, String> {
             if let Some(rest) = value.strip_prefix("child:") {
                 return Ok(ConnectableRef::ChildTrack(rest.to_string()));
             }
+            #[cfg(feature = "plugins")]
             if let Some(rest) = value.strip_prefix("clap_") {
                 let id = rest
                     .parse()
                     .map_err(|_| format!("Invalid clap instance id: {rest}"))?;
                 return Ok(ConnectableRef::ClapPlugin(id));
             }
+            #[cfg(feature = "plugins")]
             if let Some(rest) = value.strip_prefix("vst3_") {
                 let id = rest
                     .parse()
                     .map_err(|_| format!("Invalid vst3 instance id: {rest}"))?;
                 return Ok(ConnectableRef::Vst3Plugin(id));
             }
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             if let Some(rest) = value.strip_prefix("lv2_") {
                 let id = rest
                     .parse()
@@ -2064,6 +2122,7 @@ fn parse_track_connectable(
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> {
     let track_name = args.next_string()?;
     let format = args.next_string()?;
@@ -2088,7 +2147,7 @@ fn parse_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> {
                 value,
             })
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         "au" => {
             let value = args.next_float()?;
             Ok(Action::TrackSetAuParameter {
@@ -2098,7 +2157,7 @@ fn parse_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> {
                 value,
             })
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => {
             let index = param_id;
             let value = args.next_float()?;
@@ -2113,6 +2172,7 @@ fn parse_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> {
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_plugin_set_param_at(mut args: OscArgs<'_>) -> Result<Action, String> {
     let track_name = args.next_string()?;
     let format = args.next_string()?;
@@ -2134,6 +2194,7 @@ fn parse_plugin_set_param_at(mut args: OscArgs<'_>) -> Result<Action, String> {
     })
 }
 
+#[cfg(feature = "plugins")]
 fn parse_clap_param_edit(mut args: OscArgs<'_>, begin: bool) -> Result<Action, String> {
     let track_name = args.next_string()?;
     let format = args.next_string()?;
@@ -2162,6 +2223,7 @@ fn parse_clap_param_edit(mut args: OscArgs<'_>, begin: bool) -> Result<Action, S
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_vst3_graph_node(value: &str) -> Result<crate::message::Vst3GraphNode, String> {
     match value {
         "track_input" => Ok(crate::message::Vst3GraphNode::TrackInput),
@@ -2178,6 +2240,7 @@ fn parse_vst3_graph_node(value: &str) -> Result<crate::message::Vst3GraphNode, S
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_vst3_graph_connection(mut args: OscArgs<'_>, connect: bool) -> Result<Action, String> {
     let track_name = args.next_string()?;
     let from_node = parse_vst3_graph_node(&args.next_string()?)?;
@@ -2203,6 +2266,7 @@ fn parse_vst3_graph_connection(mut args: OscArgs<'_>, connect: bool) -> Result<A
     }
 }
 
+#[cfg(feature = "plugins")]
 fn parse_clip_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> {
     let track_name = args.next_string()?;
     let format = args.next_string()?;
@@ -2220,7 +2284,7 @@ fn parse_clip_plugin_set_param(mut args: OscArgs<'_>) -> Result<Action, String> 
                 value,
             })
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         "lv2" => {
             let index = param_id;
             let value = args.next_float()?;
@@ -2606,10 +2670,13 @@ pub enum OscArg {
 #[cfg(test)]
 mod tests {
     use super::{OscArg, build_error_packet, build_osc_packet, parse_osc_request};
+    #[cfg(feature = "plugins")]
     use crate::connectable::ConnectableRef;
     use crate::kind::Kind;
+    #[cfg(feature = "plugins")]
+    use crate::message::PluginGraphNode;
     use crate::message::{
-        Action, OfflineAutomationTarget, PluginGraphNode, TrackAutomationMode, TrackMidiLearnTarget,
+        Action, OfflineAutomationTarget, TrackAutomationMode, TrackMidiLearnTarget,
     };
 
     fn osc_packet(address: &str) -> Vec<u8> {
@@ -2879,6 +2946,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_plugin_commands() {
         let packet = osc_packet_with_args(
@@ -2949,6 +3017,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_query_addresses() {
         assert!(matches!(
@@ -3054,6 +3123,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_plugin_graph_and_parameter_commands() {
         let packet = osc_packet_with_args(
@@ -3094,6 +3164,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_track_connectable_commands() {
         let packet = osc_packet_with_args(
@@ -3291,6 +3362,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_plugin_state_and_resource_commands() {
         let packet = osc_packet_with_args(
@@ -3422,6 +3494,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_clip_plugin_state_and_resource_commands() {
         let packet = osc_packet_with_args(
@@ -3550,6 +3623,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_extra_query_addresses() {
         assert!(matches!(
@@ -3588,8 +3662,8 @@ mod tests {
         ));
     }
 
+    #[cfg(all(unix, feature = "plugins"))]
     #[test]
-    #[cfg(unix)]
     fn parses_lv2_midnam_query() {
         let packet = osc_packet_with_args(
             "/query/lv2_midnam",
@@ -3620,6 +3694,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_clap_parameter_edit_gestures() {
         let packet = osc_packet_with_args(
@@ -3689,6 +3764,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_clip_vst3_snapshot() {
         let packet = osc_packet_with_args(
@@ -3708,6 +3784,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn parses_vst3_graph_connections() {
         let packet = osc_packet_with_args(
