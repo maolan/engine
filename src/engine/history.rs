@@ -170,6 +170,7 @@ mod tests {
     use crate::history::{create_inverse_action, create_inverse_actions, should_record};
     use crate::kind::Kind;
     use crate::message::{ClipMoveFrom, ClipMoveTo, MidiLearnBinding, TrackMidiLearnTarget};
+    #[cfg(feature = "plugins")]
     use crate::plugins::types::Vst3PluginState;
     use crate::state::State;
     use crate::track::Track;
@@ -341,12 +342,15 @@ mod tests {
             length: 32,
             offset: 16,
         }));
-        assert!(should_record(&Action::TrackLoadVst3Plugin {
-            track_name: "t".to_string(),
-            plugin_id: "/tmp/test.vst3".to_string(),
-            instance_id: None,
-        }));
-        #[cfg(unix)]
+        #[cfg(feature = "plugins")]
+        {
+            assert!(should_record(&Action::TrackLoadVst3Plugin {
+                track_name: "t".to_string(),
+                plugin_id: "/tmp/test.vst3".to_string(),
+                instance_id: None,
+            }));
+        }
+        #[cfg(all(unix, feature = "plugins"))]
         {
             assert!(should_record(&Action::TrackLoadLv2Plugin {
                 track_name: "t".to_string(),
@@ -365,15 +369,18 @@ mod tests {
                 state: vec![],
             }));
         }
-        assert!(!should_record(&Action::TrackVst3RestoreState {
-            track_name: "t".to_string(),
-            instance_id: 0,
-            state: Vst3PluginState {
-                plugin_id: "id".to_string(),
-                component_state: vec![],
-                controller_state: vec![],
-            },
-        }));
+        #[cfg(feature = "plugins")]
+        {
+            assert!(!should_record(&Action::TrackVst3RestoreState {
+                track_name: "t".to_string(),
+                instance_id: 0,
+                state: Vst3PluginState {
+                    plugin_id: "id".to_string(),
+                    component_state: vec![],
+                    controller_state: vec![],
+                },
+            }));
+        }
     }
 
     #[test]
@@ -411,6 +418,7 @@ mod tests {
                 pitch_correction_formant_compensation: None,
                 pitch_correction_detector: Default::default(),
                 pitch_correction_mode: Default::default(),
+                #[cfg(feature = "plugins")]
                 plugin_graph_json: None,
             },
             &state,
@@ -827,6 +835,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn create_inverse_action_for_remove_grouped_audio_clip_preserves_child_metadata() {
         let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
@@ -877,6 +886,7 @@ mod tests {
                 assert_eq!(child.pitch_correction_frame_likeness, Some(0.25));
                 assert_eq!(child.pitch_correction_inertia_ms, Some(100));
                 assert_eq!(child.pitch_correction_formant_compensation, Some(true));
+                #[cfg(feature = "plugins")]
                 assert!(child.plugin_graph_json.is_some());
             }
             other => panic!("unexpected inverse action: {other:?}"),
@@ -1106,6 +1116,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn create_inverse_action_for_vst3_load_uses_next_runtime_instance_id() {
         let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
@@ -1123,6 +1134,7 @@ mod tests {
         .unwrap();
 
         match inverse {
+            #[cfg(feature = "plugins")]
             Action::TrackUnloadVst3PluginInstance {
                 track_name,
                 instance_id,
@@ -1134,8 +1146,8 @@ mod tests {
         }
     }
 
+    #[cfg(all(unix, feature = "plugins"))]
     #[test]
-    #[cfg(unix)]
     fn create_inverse_action_for_lv2_load_uses_next_runtime_instance_id() {
         let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         track.next_lv2_instance_id.store(5, Ordering::Relaxed);
@@ -1651,6 +1663,7 @@ mod undo_consistency {
                 pitch_correction_formant_compensation: None,
                 pitch_correction_detector: Default::default(),
                 pitch_correction_mode: Default::default(),
+                #[cfg(feature = "plugins")]
                 plugin_graph_json: None,
             },
             Action::AddGroupedClip {
@@ -1729,6 +1742,7 @@ mod undo_consistency {
                 clip_index: 0,
                 name: "s".to_string(),
             },
+            #[cfg(feature = "plugins")]
             Action::SetClipPluginGraphJson {
                 track_name: "t1".to_string(),
                 clip_index: 0,
@@ -1760,6 +1774,7 @@ mod undo_consistency {
                 to_port: 0,
                 kind: Kind::Audio,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackConnectVst3Audio {
                 track_name: "t1".to_string(),
                 from_node: crate::message::Vst3GraphNode::TrackInput,
@@ -1767,6 +1782,7 @@ mod undo_consistency {
                 to_node: crate::message::Vst3GraphNode::TrackOutput,
                 to_port: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackDisconnectVst3Audio {
                 track_name: "t1".to_string(),
                 from_node: crate::message::Vst3GraphNode::TrackInput,
@@ -1774,6 +1790,7 @@ mod undo_consistency {
                 to_node: crate::message::Vst3GraphNode::TrackOutput,
                 to_port: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackConnectPluginAudio {
                 track_name: "t1".to_string(),
                 from_node: crate::message::PluginGraphNode::TrackInput,
@@ -1781,6 +1798,7 @@ mod undo_consistency {
                 to_node: crate::message::PluginGraphNode::TrackOutput,
                 to_port: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackDisconnectPluginAudio {
                 track_name: "t1".to_string(),
                 from_node: crate::message::PluginGraphNode::TrackInput,
@@ -1788,6 +1806,7 @@ mod undo_consistency {
                 to_node: crate::message::PluginGraphNode::TrackOutput,
                 to_port: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackConnectPluginMidi {
                 track_name: "t1".to_string(),
                 from_node: crate::message::PluginGraphNode::TrackInput,
@@ -1795,6 +1814,7 @@ mod undo_consistency {
                 to_node: crate::message::PluginGraphNode::TrackOutput,
                 to_port: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackDisconnectPluginMidi {
                 track_name: "t1".to_string(),
                 from_node: crate::message::PluginGraphNode::TrackInput,
@@ -1830,34 +1850,41 @@ mod undo_consistency {
                 to: crate::message::ConnectableRef::TrackOutput,
                 to_port: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackLoadClapPlugin {
                 track_name: "t1".to_string(),
                 plugin_id: "p".to_string(),
                 instance_id: None,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackUnloadClapPlugin {
                 track_name: "t1".to_string(),
                 plugin_id: "p".to_string(),
             },
+            #[cfg(feature = "plugins")]
             Action::TrackUnloadClapPluginInstance {
                 track_name: "t1".to_string(),
                 instance_id: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackLoadVst3Plugin {
                 track_name: "t1".to_string(),
                 plugin_id: "p".to_string(),
                 instance_id: None,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackUnloadVst3PluginInstance {
                 track_name: "t1".to_string(),
                 instance_id: 0,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackSetClapParameter {
                 track_name: "t1".to_string(),
                 instance_id: 0,
                 param_id: 0,
                 value: 0.5,
             },
+            #[cfg(feature = "plugins")]
             Action::ClipSetClapParameter {
                 track_name: "t1".to_string(),
                 clip_idx: 0,
@@ -1865,12 +1892,14 @@ mod undo_consistency {
                 param_id: 0,
                 value: 0.5,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackSetVst3Parameter {
                 track_name: "t1".to_string(),
                 instance_id: 0,
                 param_id: 0,
                 value: 0.5,
             },
+            #[cfg(feature = "plugins")]
             Action::TrackSetPluginBypassed {
                 track_name: "t1".to_string(),
                 instance_id: 0,
@@ -1920,9 +1949,9 @@ mod undo_consistency {
                 old_sysex_events: vec![sysex()],
             },
         ];
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         let mut v = v;
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         v.extend([
             Action::TrackLoadLv2Plugin {
                 track_name: "t1".to_string(),
@@ -1976,26 +2005,31 @@ mod undo_consistency {
     /// declines to record when the target instance is absent, so only the
     /// record/ignore classification is asserted.
     fn fixture_limited(action: &Action) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(not(feature = "plugins"))]
+        let _ = action;
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         if matches!(
             action,
             Action::TrackUnloadAuPluginInstance { .. } | Action::TrackSetAuParameter { .. }
         ) {
             return true;
         }
-        if matches!(
-            action,
-            Action::TrackUnloadClapPlugin { .. }
-                | Action::TrackUnloadClapPluginInstance { .. }
-                | Action::TrackUnloadVst3PluginInstance { .. }
-                | Action::TrackSetClapParameter { .. }
-                | Action::ClipSetClapParameter { .. }
-                | Action::TrackSetVst3Parameter { .. }
-                | Action::TrackSetPluginBypassed { .. }
-        ) {
-            return true;
+        #[cfg(feature = "plugins")]
+        {
+            if matches!(
+                action,
+                Action::TrackUnloadClapPlugin { .. }
+                    | Action::TrackUnloadClapPluginInstance { .. }
+                    | Action::TrackUnloadVst3PluginInstance { .. }
+                    | Action::TrackSetClapParameter { .. }
+                    | Action::ClipSetClapParameter { .. }
+                    | Action::TrackSetVst3Parameter { .. }
+                    | Action::TrackSetPluginBypassed { .. }
+            ) {
+                return true;
+            }
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         if matches!(
             action,
             Action::TrackLoadLv2Plugin { .. }
@@ -2105,11 +2139,25 @@ mod undo_consistency {
             | Action::SetClipMuted { .. }
             | Action::SetClipReversed { .. }
             | Action::SetClipSourceName { .. }
-            | Action::SetClipPluginGraphJson { .. }
             | Action::SetClipPitchCorrection { .. }
             | Action::ClearAllMidiLearnBindings
             | Action::Connect { .. }
             | Action::Disconnect { .. }
+            | Action::ModifyMidiNotes { .. }
+            | Action::ModifyMidiControllers { .. }
+            | Action::DeleteMidiControllers { .. }
+            | Action::InsertMidiControllers { .. }
+            | Action::DeleteMidiNotes { .. }
+            | Action::InsertMidiNotes { .. }
+            | Action::SetMidiSysExEvents { .. }
+            | Action::TrackConnectAudio { .. }
+            | Action::TrackDisconnectAudio { .. }
+            | Action::TrackConnectMidi { .. }
+            | Action::TrackDisconnectMidi { .. }
+            | Action::SetClipPlaybackEnabled(_)
+            | Action::SetRecordEnabled(_) => true,
+            #[cfg(feature = "plugins")]
+            Action::SetClipPluginGraphJson { .. }
             | Action::TrackConnectVst3Audio { .. }
             | Action::TrackDisconnectVst3Audio { .. }
             | Action::TrackLoadClapPlugin { .. }
@@ -2123,28 +2171,15 @@ mod undo_consistency {
             | Action::TrackSetPluginBypassed { .. }
             | Action::TrackUnloadVst3Plugin { .. }
             | Action::ClipSetVst3Parameter { .. }
-            | Action::ModifyMidiNotes { .. }
-            | Action::ModifyMidiControllers { .. }
-            | Action::DeleteMidiControllers { .. }
-            | Action::InsertMidiControllers { .. }
-            | Action::DeleteMidiNotes { .. }
-            | Action::InsertMidiNotes { .. }
-            | Action::SetMidiSysExEvents { .. }
             | Action::TrackConnectPluginAudio { .. }
             | Action::TrackDisconnectPluginAudio { .. }
             | Action::TrackConnectPluginMidi { .. }
-            | Action::TrackDisconnectPluginMidi { .. }
-            | Action::TrackConnectAudio { .. }
-            | Action::TrackDisconnectAudio { .. }
-            | Action::TrackConnectMidi { .. }
-            | Action::TrackDisconnectMidi { .. }
-            | Action::SetClipPlaybackEnabled(_)
-            | Action::SetRecordEnabled(_) => true,
-            #[cfg(unix)]
+            | Action::TrackDisconnectPluginMidi { .. } => true,
+            #[cfg(all(unix, feature = "plugins"))]
             Action::TrackLoadLv2Plugin { .. }
             | Action::TrackUnloadLv2PluginInstance { .. }
             | Action::TrackSetLv2ControlValue { .. } => true,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             Action::TrackLoadAuPlugin { .. }
             | Action::TrackUnloadAuPlugin { .. }
             | Action::TrackUnloadAuPluginInstance { .. }
@@ -2200,7 +2235,29 @@ mod undo_consistency {
             | Action::TrackOfflineBounceProgress { .. }
             | Action::PianoKey { .. }
             | Action::TrackClearDefaultPassthrough { .. }
-            | Action::TrackClearPlugins { .. }
+            | Action::OpenAudioDevice { .. }
+            | Action::JackAddAudioInputPort
+            | Action::JackRemoveAudioInputPort(_)
+            | Action::JackAddAudioOutputPort
+            | Action::JackRemoveAudioOutputPort(_)
+            | Action::JackGetGraph
+            | Action::JackConnect { .. }
+            | Action::JackDisconnect { .. }
+            | Action::OpenMidiInputDevice(_)
+            | Action::OpenMidiOutputDevice(_)
+            | Action::RequestSessionDiagnostics
+            | Action::RequestMidiLearnMappingsReport
+            | Action::TransportPositionAt { .. }
+            | Action::StepRecordMidiNote { .. }
+            | Action::Log { .. }
+            | Action::IoDelayCalibrate { .. }
+            | Action::IoDelayConfigure { .. }
+            | Action::IoDelayAddMeasurement { .. } => false,
+
+            // Plugin query/GUI/state actions are never recorded (they are
+            // queries or echoes, not document mutations).
+            #[cfg(feature = "plugins")]
+            Action::TrackClearPlugins { .. }
             | Action::ListVst3Plugins
             | Action::ListClapPlugins
             | Action::ListClapPluginsWithCapabilities
@@ -2232,29 +2289,11 @@ mod undo_consistency {
             | Action::TrackVst3SnapshotState { .. }
             | Action::ClipVst3SnapshotState { .. }
             | Action::TrackVst3RestoreState { .. }
-            | Action::ClipVst3RestoreState { .. }
-            | Action::OpenAudioDevice { .. }
-            | Action::JackAddAudioInputPort
-            | Action::JackRemoveAudioInputPort(_)
-            | Action::JackAddAudioOutputPort
-            | Action::JackRemoveAudioOutputPort(_)
-            | Action::JackGetGraph
-            | Action::JackConnect { .. }
-            | Action::JackDisconnect { .. }
-            | Action::OpenMidiInputDevice(_)
-            | Action::OpenMidiOutputDevice(_)
-            | Action::RequestSessionDiagnostics
-            | Action::RequestMidiLearnMappingsReport
-            | Action::TransportPositionAt { .. }
-            | Action::StepRecordMidiNote { .. }
-            | Action::Log { .. }
-            | Action::IoDelayCalibrate { .. }
-            | Action::IoDelayConfigure { .. }
-            | Action::IoDelayAddMeasurement { .. } => false,
+            | Action::ClipVst3RestoreState { .. } => false,
 
             // LV2 actions exist only on Unix (LV2 support is not built on
             // Windows).
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             Action::ListLv2Plugins
             | Action::TrackGetLv2Midnam { .. }
             | Action::TrackUnloadLv2Plugin { .. }
@@ -2268,7 +2307,7 @@ mod undo_consistency {
 
             // AU actions exist only on macOS (AUv2 support is not built on
             // other platforms).
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             Action::ListAuPlugins
             | Action::TrackShowAuGui { .. }
             | Action::ClipShowAuGui { .. }

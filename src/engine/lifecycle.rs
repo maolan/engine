@@ -295,6 +295,7 @@ impl Engine {
         }
         self.hw_driver = None;
         self.hw_driver_info = None;
+        #[cfg(feature = "plugins")]
         crate::plugins::ipc::reset_plugin_wait_bound();
         self.hw_input_ports.clear();
         self.hw_output_ports.clear();

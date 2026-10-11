@@ -223,6 +223,7 @@ impl Engine {
                 }
                 self.hw_driver = None;
                 self.hw_driver_info = None;
+                #[cfg(feature = "plugins")]
                 crate::plugins::ipc::reset_plugin_wait_bound();
                 self.hw_input_ports.clear();
                 self.hw_output_ports.clear();
@@ -537,6 +538,7 @@ impl Engine {
         });
         // Bound the plugin-host wait by the device period (ARCHITECTURE.md
         // Phase 3): min(100 ms, 2 × period).
+        #[cfg(feature = "plugins")]
         crate::plugins::ipc::set_plugin_wait_bound(
             crate::plugins::ipc::plugin_wait_bound_for_period(
                 d.cycle_samples(),

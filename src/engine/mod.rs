@@ -21,6 +21,7 @@ mod inline;
 mod lifecycle;
 mod meters;
 mod midi;
+#[cfg(feature = "plugins")]
 mod plugins;
 mod queries;
 mod recording;
@@ -258,6 +259,7 @@ pub(crate) struct ClipAddRequest<'a> {
     pitch_correction_frame_likeness: Option<f32>,
     pitch_correction_inertia_ms: Option<u16>,
     pitch_correction_formant_compensation: Option<bool>,
+    #[cfg(feature = "plugins")]
     plugin_graph_json: Option<serde_json::Value>,
 }
 
@@ -343,6 +345,13 @@ impl Drop for Engine {
     }
 }
 
+impl Engine {
+    pub(crate) const METRONOME_TRACK: &'static str = "metronome";
+    pub(crate) const METRONOME_DEFAULT_LEVEL_DB: f32 = -10.0;
+    pub(crate) const MIDI_CC_ALL_SOUND_OFF: u8 = 120;
+    pub(crate) const MIDI_CC_SUSTAIN_PEDAL: u8 = 64;
+}
+
 type MidiEditParseResult = (
     Vec<MidiNoteData>,
     Vec<MidiControllerData>,
@@ -353,10 +362,12 @@ type MidiEditParseResult = (
 mod tests {
     use super::*;
     use crate::audio::clip::AudioClip;
+    #[cfg(feature = "plugins")]
     use crate::message::PluginKind;
     use crate::message::ProcessTask;
     use crate::midi::clip::MIDIClip;
     use crate::track::Track;
+    #[cfg(feature = "plugins")]
     use std::path::Path;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -655,6 +666,7 @@ mod tests {
         assert!(engine.recording_segments_for_cycle(128).is_empty());
     }
 
+    #[cfg(feature = "audio")]
     #[tokio::test]
     async fn recording_flush_preserves_compensated_start_and_all_samples() {
         let (mut engine, mut rx) = make_engine_with_client();
@@ -2585,6 +2597,7 @@ mod tests {
         all(miri, target_os = "freebsd"),
         ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
     )]
+    #[cfg(feature = "audio")]
     #[tokio::test]
     async fn play_stop_play_keeps_clip_output_audible() {
         use crate::audio::clip::AudioClip;
@@ -3009,6 +3022,7 @@ mod tests {
                         ProcessTask::Track(t)
                         | ProcessTask::FolderInput(t)
                         | ProcessTask::FolderOutput(t) => t,
+                        #[cfg(feature = "plugins")]
                         ProcessTask::Plugin { track, .. } => track,
                     };
                     if track.lock().name == name && want(task) {
@@ -3107,6 +3121,7 @@ mod tests {
         all(miri, target_os = "freebsd"),
         ignore = "uses filesystem metadata, which Miri isolation does not support on FreeBSD"
     )]
+    #[cfg(feature = "plugins")]
     #[test]
     fn child_to_plugin_to_folder_output_render_plan_has_no_cycle() {
         use crate::message::{ConnectableRef, ProcessTask};
@@ -3618,6 +3633,7 @@ mod tests {
     /// /dev/dsp5): open the real device, play a tone, stop (queued; the
     /// zero-fill broadcast silences the output), play again — audio must
     /// return (no trigger ioctls, no halt/resync stall).
+    #[cfg(feature = "audio")]
     #[tokio::test]
     async fn oss_play_stop_play_resumes_output() {
         use crate::audio::clip::AudioClip;

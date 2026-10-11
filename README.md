@@ -22,6 +22,24 @@ The engine uses a **two-tier process model**:
 
 Plugins are never loaded directly into the DAW. If a plugin crashes, only its host process dies; the DAW detects the failure, bypasses the plugin, and continues playback.
 
+## Cargo features
+
+All capabilities beyond core real-time track processing are opt-in cargo
+features; the crate builds with `default = []`:
+
+| Feature | Enables | Dependencies |
+|---------|---------|--------------|
+| `audio` | Audio file decode/encode (import, export, recording takes, freeze/bounce WAV) | `symphonia`, `oxideav-*` |
+| `midi` | Standard MIDI File import/export (`.mid` clips and MIDI takes) | `midly` |
+| `plugins` | Out-of-process CLAP/VST3/LV2/AU plugin hosting, plugin graphs, plugin messages | `maolan-plugin-protocol` |
+| `mixosc` | OSC control-surface automation | `mixosc` |
+
+Without `audio`, engine-rate PCM/WAV clips still play via the codec-free
+seekable streaming path, but compressed formats and file export are
+unavailable. Without `midi`, MIDI tracks still process internal events, but
+`.mid` file I/O is disabled. Without `plugins`, the plugin API is absent
+entirely.
+
 ## Platform support
 
 | Feature | Linux | FreeBSD | macOS | Windows |

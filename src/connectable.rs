@@ -27,11 +27,13 @@ pub enum ConnectableRef {
     TrackInput,
     TrackOutput,
     ChildTrack(String),
+    #[cfg(feature = "plugins")]
     ClapPlugin(usize),
+    #[cfg(feature = "plugins")]
     Vst3Plugin(usize),
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     Lv2Plugin(usize),
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     AuPlugin(usize),
 }
 
@@ -129,9 +131,11 @@ pub fn disconnect_midi(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "plugins")]
+    use super::ConnectableConnection;
     use super::{
-        AudioPorts, ConnectableConnection, ConnectableRef, MidiPorts, connect_audio, connect_midi,
-        disconnect_audio, disconnect_midi,
+        AudioPorts, ConnectableRef, MidiPorts, connect_audio, connect_midi, disconnect_audio,
+        disconnect_midi,
     };
     use crate::audio::io::AudioIO;
     use crate::midi::io::MIDIIO;
@@ -265,7 +269,9 @@ mod tests {
             ConnectableRef::TrackInput,
             ConnectableRef::TrackOutput,
             ConnectableRef::ChildTrack("Child".to_string()),
+            #[cfg(feature = "plugins")]
             ConnectableRef::ClapPlugin(3),
+            #[cfg(feature = "plugins")]
             ConnectableRef::Vst3Plugin(7),
         ];
         for r in refs {
@@ -275,6 +281,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn connectable_connection_serde_round_trip() {
         let conn = ConnectableConnection {

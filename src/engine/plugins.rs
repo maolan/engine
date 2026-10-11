@@ -72,46 +72,6 @@ impl Engine {
         }
     }
 
-    pub(crate) const METRONOME_TRACK: &'static str = "metronome";
-    pub(crate) const METRONOME_DEFAULT_LEVEL_DB: f32 = -10.0;
-    pub(crate) const MIDI_CC_ALL_SOUND_OFF: u8 = 120;
-    pub(crate) const MIDI_CC_SUSTAIN_PEDAL: u8 = 64;
-
-    pub(crate) fn default_clip_plugin_graph_json(
-        audio_ins: usize,
-        audio_outs: usize,
-    ) -> serde_json::Value {
-        let connections = (0..audio_ins.min(audio_outs))
-            .map(|port| {
-                serde_json::json!({
-                    "from_node": "TrackInput",
-                    "from_port": port,
-                    "to_node": "TrackOutput",
-                    "to_port": port,
-                    "kind": "Audio",
-                })
-            })
-            .collect::<Vec<_>>();
-        serde_json::json!({
-            "plugins": [],
-            "connections": connections,
-        })
-    }
-
-    pub(crate) fn set_clip_plugin_graph_json(
-        &mut self,
-        track_name: &str,
-        clip_index: usize,
-        plugin_graph_json: Option<serde_json::Value>,
-    ) {
-        if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
-            let track = track.lock();
-            track.audio.update_clip(clip_index, |clip| {
-                clip.plugin_graph_json = plugin_graph_json;
-            });
-        }
-    }
-
     pub(crate) async fn handle_track_load_clap_plugin(
         &mut self,
         track_name: &str,

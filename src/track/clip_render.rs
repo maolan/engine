@@ -1,15 +1,23 @@
+#[cfg(feature = "plugins")]
 use crate::message::{PluginGraphNode, PluginKind};
 #[cfg(unix)]
 use crate::pitch_shift::LivePitchShifter;
 
 use super::*;
-use crate::{audio::io::AudioIO, midi::io::MidiEvent};
+#[cfg(feature = "plugins")]
+use crate::audio::io::AudioIO;
+use crate::midi::io::MidiEvent;
+#[cfg(feature = "midi")]
 use midly::{MetaMessage, Smf, Timing, TrackEventKind, live::LiveEvent};
+#[cfg(feature = "plugins")]
 use serde_json::Value;
-use std::{collections::HashSet, path::Path, sync::Arc};
+#[cfg(feature = "plugins")]
+use std::collections::HashSet;
+use std::{path::Path, sync::Arc};
 
 /// Decoding strategy chosen for an audio clip file (see
 /// [`TrackData::choose_clip_strategy`]).
+#[cfg(feature = "audio")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipStrategy {
     /// Engine-rate PCM/WAV: O(1)-seekable streaming producer.
@@ -19,9 +27,12 @@ pub(crate) enum ClipStrategy {
 }
 
 /// Channel count of any `AudioClipBuffer` variant.
+#[cfg(any(unix, feature = "audio"))]
 fn buffer_channel_count(buffer: &AudioClipBuffer) -> usize {
     match buffer {
+        #[cfg(any(feature = "audio", test))]
         AudioClipBuffer::Buffered { channels, .. } => (*channels).max(1),
+        #[cfg(feature = "audio")]
         AudioClipBuffer::Streaming(stream) => stream.channels().max(1),
         AudioClipBuffer::SeekableStreaming(stream) => stream.channels().max(1),
     }
@@ -43,12 +54,14 @@ fn effective_channels_for(buffer_channels: usize, input_count: usize) -> usize {
 /// variants this is a `read_window` call on the streaming buffer that never
 /// disturbs the real-time rings; for `Buffered` it slices the in-memory
 /// samples.
+#[cfg(any(unix, feature = "audio"))]
 fn clip_sample_window(
     buffer: &AudioClipBuffer,
     start: usize,
     len: usize,
 ) -> Option<(usize, Vec<Vec<f32>>)> {
     match buffer {
+        #[cfg(any(feature = "audio", test))]
         AudioClipBuffer::Buffered { channels, samples } => {
             let channels = (*channels).max(1);
             let total_frames = samples.len() / channels;
@@ -63,6 +76,7 @@ fn clip_sample_window(
             }
             Some((channels, window))
         }
+        #[cfg(feature = "audio")]
         AudioClipBuffer::Streaming(stream) => stream
             .read_window(start, len)
             .ok()
@@ -76,6 +90,7 @@ fn clip_sample_window(
 
 impl TrackData {
     /// Decoding strategy for an audio clip file.
+    #[cfg(feature = "audio")]
     pub(crate) fn choose_clip_strategy(
         is_wav: bool,
         probed: Option<&crate::audio_codec::AudioFileInfo>,
@@ -91,6 +106,7 @@ impl TrackData {
         self.rt.midi_clip_cache.remove(clip_name);
     }
 
+    #[cfg(feature = "audio")]
     pub(crate) fn load_audio_clip_buffer(path: &Path) -> Option<AudioClipBuffer> {
         let open_started = std::time::Instant::now();
         let (samples, channels, _sample_rate) =
@@ -126,34 +142,61 @@ impl TrackData {
         }
         let path = self.resolve_clip_path(clip_name);
         let engine_rate = self.sample_rate.round().max(1.0) as u32;
-        let is_wav = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
-        let probed = crate::audio_codec::probe_audio_file(&path).ok();
 
         let load_started = std::time::Instant::now();
-        let loaded = match Self::choose_clip_strategy(is_wav, probed.as_ref(), engine_rate) {
-            ClipStrategy::SeekableWav => {
-                let period_frames = self.process_block_size().max(1);
-                let multiplier = streaming::ring_buffer_multiplier();
-                match seekable_streaming::SeekableStreamingClipBuffer::start(
-                    &path,
-                    engine_rate as usize,
-                    period_frames,
-                    multiplier,
-                ) {
-                    Ok(stream) => Some(AudioClipBuffer::SeekableStreaming(Arc::new(stream))),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Seekable streaming setup failed for '{}' ({e}); trying compressed streaming",
-                            path.display()
-                        );
-                        self.start_compressed_stream(&path, engine_rate as usize)
+        #[cfg(feature = "audio")]
+        let loaded = {
+            let is_wav = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
+            let probed = crate::audio_codec::probe_audio_file(&path).ok();
+            match Self::choose_clip_strategy(is_wav, probed.as_ref(), engine_rate) {
+                ClipStrategy::SeekableWav => {
+                    let period_frames = self.process_block_size().max(1);
+                    let multiplier = streaming::ring_buffer_multiplier();
+                    match seekable_streaming::SeekableStreamingClipBuffer::start(
+                        &path,
+                        engine_rate as usize,
+                        period_frames,
+                        multiplier,
+                    ) {
+                        Ok(stream) => Some(AudioClipBuffer::SeekableStreaming(Arc::new(stream))),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Seekable streaming setup failed for '{}' ({e}); trying compressed streaming",
+                                path.display()
+                            );
+                            self.start_compressed_stream(&path, engine_rate as usize)
+                        }
                     }
                 }
+                ClipStrategy::Streaming => {
+                    self.start_compressed_stream(&path, engine_rate as usize)
+                }
             }
-            ClipStrategy::Streaming => self.start_compressed_stream(&path, engine_rate as usize),
+        }?;
+        #[cfg(not(feature = "audio"))]
+        let loaded = {
+            // Without codec support only engine-rate PCM/WAV files can play,
+            // via the codec-free seekable streaming path.
+            let period_frames = self.process_block_size().max(1);
+            let multiplier = streaming::ring_buffer_multiplier();
+            match seekable_streaming::SeekableStreamingClipBuffer::start(
+                &path,
+                engine_rate as usize,
+                period_frames,
+                multiplier,
+            ) {
+                Ok(stream) => Some(AudioClipBuffer::SeekableStreaming(Arc::new(stream))),
+                Err(e) => {
+                    tracing::warn!(
+                        "Clip '{}' cannot play without codec support ({e}); enable the `audio` cargo feature",
+                        path.display()
+                    );
+                    None
+                }
+            }
         }?;
         let elapsed = load_started.elapsed().as_secs_f64() * 1000.0;
         if elapsed > 20.0 {
@@ -172,6 +215,7 @@ impl TrackData {
     }
 
     /// Whole-file decode fallback used when streaming setup fails.
+    #[cfg(feature = "audio")]
     pub(crate) fn start_compressed_stream(
         &self,
         path: &Path,
@@ -211,6 +255,7 @@ impl TrackData {
         )
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn clip_plugin_runtime_key(
         clip: &crate::audio::clip::AudioClip,
         input_count: usize,
@@ -235,6 +280,7 @@ impl TrackData {
         )
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn clip_plugin_runtime_node_from_json(
         value: &Value,
         runtime_nodes: &[PluginGraphNode],
@@ -271,6 +317,7 @@ impl TrackData {
         }
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn clip_graph_uses_plugin_runtime(graph: &Value) -> bool {
         graph
             .get("plugins")
@@ -278,6 +325,7 @@ impl TrackData {
             .is_some_and(|plugins| !plugins.is_empty())
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn clip_graph_track_io_node(value: &Value) -> Option<bool> {
         let kind = if let Some(kind) = value.get("type").and_then(Value::as_str) {
             kind
@@ -291,6 +339,7 @@ impl TrackData {
         }
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn process_direct_clip_graph(
         graph: &Value,
         input_blocks: &[Vec<f32>],
@@ -339,6 +388,7 @@ impl TrackData {
         outputs
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn build_clip_plugin_runtime(
         &self,
         clip: &crate::audio::clip::AudioClip,
@@ -532,6 +582,7 @@ impl TrackData {
         Ok(runtime)
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn process_clip_plugin_runtime_segment(
         &mut self,
         clip: &crate::audio::clip::AudioClip,
@@ -619,7 +670,7 @@ impl TrackData {
         parent_start: usize,
         absolute_from: usize,
         request_len: usize,
-        active_clip_plugin_keys: &mut HashSet<String>,
+        #[cfg(feature = "plugins")] active_clip_plugin_keys: &mut HashSet<String>,
         out: &mut Vec<Vec<f32>>,
     ) -> Option<()> {
         let clip_start = parent_start.saturating_add(clip.start);
@@ -658,6 +709,7 @@ impl TrackData {
                         clip_start,
                         child_from,
                         child_len,
+                        #[cfg(feature = "plugins")]
                         active_clip_plugin_keys,
                         out,
                     )
@@ -688,6 +740,7 @@ impl TrackData {
                 absolute_from,
                 &mut input_blocks,
             );
+            #[cfg(feature = "plugins")]
             if clip.plugin_graph_json.is_some() {
                 active_clip_plugin_keys.insert(Self::clip_plugin_runtime_key(
                     clip,
@@ -726,7 +779,9 @@ impl TrackData {
                 self.clip_buffer(playback_name)?
             }
         };
+        #[cfg(feature = "plugins")]
         let has_clip_plugins = clip.plugin_graph_json.is_some();
+        #[cfg(feature = "plugins")]
         if has_clip_plugins {
             active_clip_plugin_keys.insert(Self::clip_plugin_runtime_key(
                 clip,
@@ -815,6 +870,7 @@ impl TrackData {
                 block[..request_len].copy_from_slice(&corrected[source_channel][..request_len]);
             }
             Self::apply_audio_clip_fades(clip, clip_start, clip_len, absolute_from, input_blocks);
+            #[cfg(feature = "plugins")]
             if has_clip_plugins
                 && let Ok(processed) = self.process_clip_plugin_runtime_segment(
                     clip,
@@ -830,9 +886,11 @@ impl TrackData {
 
         // Reversed playback reads the source backwards, which the streaming
         // rings cannot do; read the needed window and walk it in reverse.
+        #[cfg(feature = "audio")]
         if clip.reversed && !matches!(buffer.as_ref(), AudioClipBuffer::Buffered { .. }) {
             let clip_channels = buffer_channel_count(&buffer);
             let total_frames = match buffer.as_ref() {
+                #[cfg(feature = "audio")]
                 AudioClipBuffer::Streaming(stream) => stream
                     .total_frames()
                     .map(|t| t as usize)
@@ -841,6 +899,7 @@ impl TrackData {
                     .total_frames()
                     .map(|t| t as usize)
                     .unwrap_or(usize::MAX),
+                #[cfg(any(feature = "audio", test))]
                 AudioClipBuffer::Buffered { .. } => unreachable!(),
             };
             let source_end = clip.offset.saturating_add(clip_len).min(total_frames);
@@ -893,6 +952,7 @@ impl TrackData {
                 }
             }
             Self::apply_audio_clip_fades(clip, clip_start, clip_len, absolute_from, input_blocks);
+            #[cfg(feature = "plugins")]
             if has_clip_plugins
                 && let Ok(processed) = self.process_clip_plugin_runtime_segment(
                     clip,
@@ -907,6 +967,7 @@ impl TrackData {
         }
 
         match buffer.as_ref() {
+            #[cfg(feature = "audio")]
             AudioClipBuffer::Streaming(stream) => {
                 let clip_channels = stream.channels().max(1);
                 let input_count = self.audio.ins.len().max(1);
@@ -951,6 +1012,7 @@ impl TrackData {
                     block.copy_from_slice(&stream_blocks[source_channel]);
                 }
             }
+            #[cfg(any(feature = "audio", test))]
             AudioClipBuffer::Buffered { channels, samples } => {
                 let channels = (*channels).max(1);
                 let total_frames = samples.len() / channels;
@@ -1029,6 +1091,7 @@ impl TrackData {
             }
         }
         Self::apply_audio_clip_fades(clip, clip_start, clip_len, absolute_from, out);
+        #[cfg(feature = "plugins")]
         if has_clip_plugins
             && let Ok(processed) =
                 self.process_clip_plugin_runtime_segment(clip, out, absolute_from, request_len)
@@ -1200,6 +1263,7 @@ impl TrackData {
             .collect()
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) fn ensure_clip_plugin_runtime(
         &mut self,
         clip_idx: usize,
@@ -1309,6 +1373,17 @@ impl TrackData {
         }
     }
 
+    #[cfg(not(feature = "midi"))]
+    pub(crate) fn load_midi_clip_events(
+        path: &Path,
+        sample_rate: f64,
+    ) -> Option<Vec<(usize, Vec<u8>)>> {
+        let _ = (path, sample_rate);
+        tracing::warn!("MIDI clip loading requires the `midi` cargo feature");
+        None
+    }
+
+    #[cfg(feature = "midi")]
     pub(crate) fn load_midi_clip_events(
         path: &Path,
         sample_rate: f64,
@@ -1538,6 +1613,7 @@ impl TrackData {
             return;
         }
 
+        #[cfg(feature = "plugins")]
         let mut active_clip_plugin_keys = HashSet::new();
         let segments = self.cycle_segments(frames);
         // Reusable render target for all clips this cycle; restored to
@@ -1584,6 +1660,7 @@ impl TrackData {
                         0,
                         from,
                         copy_len,
+                        #[cfg(feature = "plugins")]
                         &mut active_clip_plugin_keys,
                         &mut clip_scratch,
                     )
@@ -1658,6 +1735,7 @@ impl TrackData {
             }
         }
         self.rt.clip_render_scratch = clip_scratch;
+        #[cfg(feature = "plugins")]
         self.rt
             .clip_plugin_tracks
             .retain(|key, _| active_clip_plugin_keys.contains(key));
@@ -1682,7 +1760,7 @@ impl TrackData {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "audio"))]
 mod tests {
     use super::*;
     use crate::audio_codec::{AudioDither, AudioEncodeFormat, encode_audio_to_file, write_wav_f32};

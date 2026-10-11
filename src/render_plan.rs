@@ -22,7 +22,9 @@
 
 use crate::audio::io::AudioIO;
 use crate::connectable::{ConnectableConnection, ConnectableRef};
-use crate::message::{PluginKind, ProcessTask};
+#[cfg(feature = "plugins")]
+use crate::message::PluginKind;
+use crate::message::ProcessTask;
 use crate::state::{StateSnapshot, TrackHandle};
 #[cfg(test)]
 use crate::track::Track;
@@ -511,6 +513,7 @@ impl Builder {
 
     /// Register a plugin's MIDI ports at the task that processes it (its own
     /// node for folder plugins, the track task for inline plugins).
+    #[cfg(feature = "plugins")]
     fn register_plugin_midi_ports(
         &mut self,
         t: &TrackData,
@@ -658,7 +661,9 @@ impl Builder {
             source_keys.insert(ConnectableRef::TrackInput, folder_input);
             target_keys.insert(ConnectableRef::TrackInput, folder_input);
 
+            #[cfg(feature = "plugins")]
             let mut plugin_nodes: Vec<NodeId> = Vec::new();
+            #[cfg(feature = "plugins")]
             for idx in 0..t.clap_plugins.len() {
                 let node = self.push_plugin(&track, &t, PluginKind::Clap, idx, folder_input);
                 let id = t.clap_plugins[idx].id;
@@ -666,6 +671,7 @@ impl Builder {
                 target_keys.insert(ConnectableRef::ClapPlugin(id), node);
                 plugin_nodes.push(node);
             }
+            #[cfg(feature = "plugins")]
             for idx in 0..t.vst3_plugins.len() {
                 let node = self.push_plugin(&track, &t, PluginKind::Vst3, idx, folder_input);
                 let id = t.vst3_plugins[idx].id;
@@ -673,7 +679,7 @@ impl Builder {
                 target_keys.insert(ConnectableRef::Vst3Plugin(id), node);
                 plugin_nodes.push(node);
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             for idx in 0..t.au_plugins.len() {
                 let node = self.push_plugin(&track, &t, PluginKind::Au, idx, folder_input);
                 let id = t.au_plugins[idx].id;
@@ -681,7 +687,7 @@ impl Builder {
                 target_keys.insert(ConnectableRef::AuPlugin(id), node);
                 plugin_nodes.push(node);
             }
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             for idx in 0..t.lv2_plugins.len() {
                 let node = self.push_plugin(&track, &t, PluginKind::Lv2, idx, folder_input);
                 let id = t.lv2_plugins[idx].id;
@@ -706,6 +712,7 @@ impl Builder {
                 outs: outs.clone(),
             });
             self.edges.insert((folder_input, folder_output));
+            #[cfg(feature = "plugins")]
             for &p in &plugin_nodes {
                 self.edges.insert((p, folder_output));
             }
@@ -753,17 +760,19 @@ impl Builder {
             }
             self.register_midi_track_ports(&t, task, task);
             // Inline plugins are processed inside the track task body.
+            #[cfg(feature = "plugins")]
             for idx in 0..t.clap_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Clap, idx, task);
             }
+            #[cfg(feature = "plugins")]
             for idx in 0..t.vst3_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Vst3, idx, task);
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "plugins"))]
             for idx in 0..t.au_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Au, idx, task);
             }
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             for idx in 0..t.lv2_plugins.len() {
                 self.register_plugin_midi_ports(&t, PluginKind::Lv2, idx, task);
             }
@@ -771,6 +780,7 @@ impl Builder {
         }
     }
 
+    #[cfg(feature = "plugins")]
     fn push_plugin(
         &mut self,
         track: &TrackHandle,
@@ -1030,6 +1040,7 @@ mod tests {
                         ProcessTask::Track(t)
                         | ProcessTask::FolderInput(t)
                         | ProcessTask::FolderOutput(t) => t,
+                        #[cfg(feature = "plugins")]
                         ProcessTask::Plugin { track, .. } => track,
                     };
                     if track.lock().name == name {
@@ -1053,6 +1064,7 @@ mod tests {
                         ProcessTask::Track(t)
                         | ProcessTask::FolderInput(t)
                         | ProcessTask::FolderOutput(t) => t,
+                        #[cfg(feature = "plugins")]
                         ProcessTask::Plugin { track, .. } => track,
                     };
                     if track.lock().name == name && want(task) {

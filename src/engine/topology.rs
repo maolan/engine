@@ -709,7 +709,10 @@ impl Engine {
                     clip.pitch_correction_inertia_ms = request.pitch_correction_inertia_ms;
                     clip.pitch_correction_formant_compensation =
                         request.pitch_correction_formant_compensation;
-                    clip.plugin_graph_json = request.plugin_graph_json;
+                    #[cfg(feature = "plugins")]
+                    {
+                        clip.plugin_graph_json = request.plugin_graph_json;
+                    }
                     Self::push_audio_clip_with_cross_section_fades(&mut track, clip);
                     #[cfg(unix)]
                     track.rt.clip_pitch_shifters.clear();
@@ -765,7 +768,10 @@ impl Engine {
         clip.pitch_correction_frame_likeness = data.pitch_correction_frame_likeness;
         clip.pitch_correction_inertia_ms = data.pitch_correction_inertia_ms;
         clip.pitch_correction_formant_compensation = data.pitch_correction_formant_compensation;
-        clip.plugin_graph_json = data.plugin_graph_json.clone();
+        #[cfg(feature = "plugins")]
+        {
+            clip.plugin_graph_json = data.plugin_graph_json.clone();
+        }
         clip.grouped_clips = data
             .grouped_clips
             .iter()
@@ -2721,9 +2727,9 @@ impl Engine {
             pitch_correction_frame_likeness,
             pitch_correction_inertia_ms,
             pitch_correction_formant_compensation,
-            pitch_correction_detector: _,
-            pitch_correction_mode: _,
+            #[cfg(feature = "plugins")]
             ref plugin_graph_json,
+            ..
         } = action
         else {
             return false;
@@ -2753,6 +2759,7 @@ impl Engine {
             pitch_correction_frame_likeness,
             pitch_correction_inertia_ms,
             pitch_correction_formant_compensation,
+            #[cfg(feature = "plugins")]
             plugin_graph_json: plugin_graph_json.clone(),
         });
         if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
@@ -2808,6 +2815,7 @@ impl Engine {
         false
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) async fn handle_track_connect_audio(&mut self, a: Action) -> bool {
         let Action::TrackConnectAudio {
             ref track_name,
@@ -2845,6 +2853,7 @@ impl Engine {
         false
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) async fn handle_track_disconnect_audio(&mut self, a: Action) -> bool {
         let Action::TrackDisconnectAudio {
             ref track_name,
@@ -2882,6 +2891,7 @@ impl Engine {
         false
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) async fn handle_track_connect_midi(&mut self, a: Action) -> bool {
         let Action::TrackConnectMidi {
             ref track_name,
@@ -2919,6 +2929,7 @@ impl Engine {
         false
     }
 
+    #[cfg(feature = "plugins")]
     pub(crate) async fn handle_track_disconnect_midi(&mut self, a: Action) -> bool {
         let Action::TrackDisconnectMidi {
             ref track_name,
@@ -3587,12 +3598,18 @@ impl Engine {
             } => {
                 self.set_clip_gain_db(track_name, clip_index, kind, gain_db);
             }
+            #[cfg(feature = "plugins")]
             Action::SetClipPluginGraphJson {
                 ref track_name,
                 clip_index,
                 ref plugin_graph_json,
             } => {
-                self.set_clip_plugin_graph_json(track_name, clip_index, plugin_graph_json.clone());
+                if let Some(track) = self.state_snapshot.load_full().tracks.get(track_name) {
+                    let track = track.lock();
+                    track.audio.update_clip(clip_index, |clip| {
+                        clip.plugin_graph_json = plugin_graph_json.clone();
+                    });
+                }
             }
             Action::SetClipPitchCorrection { .. } => {
                 if Self::box_bool(self.handle_set_clip_pitch_correction(a.clone())).await {
@@ -3725,31 +3742,42 @@ pub(crate) fn undo_should_record(action: &Action) -> bool {
             | Action::SetClipMuted { .. }
             | Action::SetClipReversed { .. }
             | Action::SetClipSourceName { .. }
-            | Action::SetClipPluginGraphJson { .. }
             | Action::SetClipPitchCorrection { .. }
             | Action::Connect { .. }
             | Action::Disconnect { .. }
-            | Action::TrackConnectVst3Audio { .. }
-            | Action::TrackDisconnectVst3Audio { .. }
-            | Action::TrackLoadClapPlugin { .. }
-            | Action::TrackUnloadClapPlugin { .. }
-            | Action::TrackUnloadClapPluginInstance { .. }
-            | Action::TrackLoadVst3Plugin { .. }
-            | Action::TrackUnloadVst3PluginInstance { .. }
-            | Action::TrackSetClapParameter { .. }
-            | Action::ClipSetClapParameter { .. }
-            | Action::TrackSetVst3Parameter { .. }
-            | Action::TrackSetPluginBypassed { .. }
-            | Action::TrackConnectPluginAudio { .. }
-            | Action::TrackDisconnectPluginAudio { .. }
-            | Action::TrackConnectPluginMidi { .. }
-            | Action::TrackDisconnectPluginMidi { .. }
             | Action::TrackConnectAudio { .. }
             | Action::TrackDisconnectAudio { .. }
             | Action::TrackConnectMidi { .. }
             | Action::TrackDisconnectMidi { .. }
     ) || {
-        #[cfg(unix)]
+        #[cfg(feature = "plugins")]
+        {
+            matches!(
+                action,
+                Action::SetClipPluginGraphJson { .. }
+                    | Action::TrackConnectVst3Audio { .. }
+                    | Action::TrackDisconnectVst3Audio { .. }
+                    | Action::TrackLoadClapPlugin { .. }
+                    | Action::TrackUnloadClapPlugin { .. }
+                    | Action::TrackUnloadClapPluginInstance { .. }
+                    | Action::TrackLoadVst3Plugin { .. }
+                    | Action::TrackUnloadVst3PluginInstance { .. }
+                    | Action::TrackSetClapParameter { .. }
+                    | Action::ClipSetClapParameter { .. }
+                    | Action::TrackSetVst3Parameter { .. }
+                    | Action::TrackSetPluginBypassed { .. }
+                    | Action::TrackConnectPluginAudio { .. }
+                    | Action::TrackDisconnectPluginAudio { .. }
+                    | Action::TrackConnectPluginMidi { .. }
+                    | Action::TrackDisconnectPluginMidi { .. }
+            )
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            false
+        }
+    } || {
+        #[cfg(all(unix, feature = "plugins"))]
         {
             matches!(
                 action,
@@ -3758,12 +3786,12 @@ pub(crate) fn undo_should_record(action: &Action) -> bool {
                     | Action::TrackLoadLv2Plugin { .. }
             )
         }
-        #[cfg(not(unix))]
+        #[cfg(not(all(unix, feature = "plugins")))]
         {
             false
         }
     } || {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         {
             matches!(
                 action,
@@ -3774,7 +3802,7 @@ pub(crate) fn undo_should_record(action: &Action) -> bool {
                     | Action::ClipSetAuParameter { .. }
             )
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "plugins")))]
         {
             false
         }
@@ -3997,6 +4025,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
                                 .pitch_correction_formant_compensation,
                             pitch_correction_detector: Default::default(),
                             pitch_correction_mode: Default::default(),
+                            #[cfg(feature = "plugins")]
                             plugin_graph_json: clip.plugin_graph_json.clone(),
                         })
                     } else {
@@ -4038,6 +4067,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
                             pitch_correction_formant_compensation: None,
                             pitch_correction_detector: Default::default(),
                             pitch_correction_mode: Default::default(),
+                            #[cfg(feature = "plugins")]
                             plugin_graph_json: None,
                         })
                     } else {
@@ -4341,6 +4371,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(feature = "plugins")]
         Action::SetClipPluginGraphJson {
             track_name,
             clip_index,
@@ -4389,6 +4420,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             kind: *kind,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackConnectVst3Audio {
             track_name,
             from_node,
@@ -4403,6 +4435,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackDisconnectVst3Audio {
             track_name,
             from_node,
@@ -4417,6 +4450,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackConnectPluginAudio {
             track_name,
             from_node,
@@ -4431,6 +4465,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackDisconnectPluginAudio {
             track_name,
             from_node,
@@ -4445,6 +4480,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackConnectPluginMidi {
             track_name,
             from_node,
@@ -4459,6 +4495,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackDisconnectPluginMidi {
             track_name,
             from_node,
@@ -4529,6 +4566,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             to_port: *to_port,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackLoadClapPlugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -4538,6 +4576,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(feature = "plugins")]
         Action::TrackUnloadClapPlugin {
             track_name,
             plugin_id,
@@ -4547,6 +4586,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             instance_id: None,
         }),
 
+        #[cfg(feature = "plugins")]
         Action::TrackLoadVst3Plugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -4556,7 +4596,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "plugins"))]
         Action::TrackLoadAuPlugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -4566,7 +4606,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         Action::TrackLoadLv2Plugin { track_name, .. } => {
             let track = state.tracks.get(track_name)?;
             let track = track.lock();
@@ -4576,6 +4616,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(feature = "plugins")]
         Action::TrackSetClapParameter {
             track_name,
             instance_id,
@@ -4591,6 +4632,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(feature = "plugins")]
         Action::ClipSetClapParameter {
             track_name,
             clip_idx,
@@ -4610,6 +4652,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(feature = "plugins")]
         Action::TrackSetVst3Parameter {
             track_name,
             instance_id,
@@ -4625,6 +4668,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
+        #[cfg(feature = "plugins")]
         Action::TrackSetPluginBypassed {
             track_name,
             instance_id,
@@ -4644,13 +4688,13 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
                     .iter()
                     .find(|i| i.id == *instance_id)
                     .map(|i| i.processor.is_bypassed()),
-                #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "plugins"))]
                 "AU" => track
                     .au_plugins
                     .iter()
                     .find(|i| i.id == *instance_id)
                     .map(|i| i.processor.is_bypassed()),
-                #[cfg(unix)]
+                #[cfg(all(unix, feature = "plugins"))]
                 "LV2" => track
                     .lv2_plugins
                     .iter()
@@ -4666,7 +4710,7 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
             })
         }
 
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "plugins"))]
         Action::TrackSetLv2ControlValue { .. } => None,
         _ => None,
     }
@@ -4722,6 +4766,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
         return Some(actions);
     }
 
+    #[cfg(feature = "plugins")]
     if let Action::TrackUnloadClapPlugin {
         track_name,
         plugin_id,
@@ -4749,6 +4794,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
         ]);
     }
 
+    #[cfg(feature = "plugins")]
     if let Action::TrackUnloadClapPluginInstance {
         track_name,
         instance_id,
@@ -4773,6 +4819,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
         ]);
     }
 
+    #[cfg(feature = "plugins")]
     if let Action::TrackUnloadVst3PluginInstance {
         track_name,
         instance_id,
@@ -4797,7 +4844,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
         ]);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     {
         if let Action::TrackUnloadLv2PluginInstance {
             track_name,
@@ -4984,6 +5031,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
                         .pitch_correction_formant_compensation,
                     pitch_correction_detector: Default::default(),
                     pitch_correction_mode: Default::default(),
+                    #[cfg(feature = "plugins")]
                     plugin_graph_json: clip.plugin_graph_json.clone(),
                 });
             }
@@ -5015,10 +5063,12 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
                     pitch_correction_formant_compensation: None,
                     pitch_correction_detector: Default::default(),
                     pitch_correction_mode: Default::default(),
+                    #[cfg(feature = "plugins")]
                     plugin_graph_json: None,
                 });
             }
 
+            #[cfg(feature = "plugins")]
             for instance in &track.vst3_plugins {
                 let id = instance.id;
                 let plugin_id = instance.processor.plugin_id().to_string();
@@ -5036,6 +5086,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
                 }
             }
 
+            #[cfg(feature = "plugins")]
             for (id, plugin_id, state) in track.clap_snapshot_all_states() {
                 actions.push(Action::TrackLoadClapPlugin {
                     track_name: track.name.clone(),
@@ -5049,7 +5100,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
                 });
             }
 
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "plugins"))]
             for instance in &track.lv2_plugins {
                 let id = instance.id;
                 let uri = instance.processor.uri().to_string();
@@ -5067,6 +5118,7 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
                 }
             }
 
+            #[cfg(feature = "plugins")]
             for conn in &track.plugin_midi_connections {
                 actions.push(Action::TrackConnectPluginMidi {
                     track_name: track.name.clone(),

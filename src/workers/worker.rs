@@ -46,6 +46,30 @@ pub struct Worker {
     realtime_priority: i32,
 }
 
+/// Write a freeze/offline-bounce WAV file, or fail when codec support is
+/// compiled out.
+#[cfg(feature = "audio")]
+fn write_freeze_wav(
+    path: &std::path::Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+) -> Result<(), String> {
+    crate::audio_codec::write_wav_f32(path, samples, channels, sample_rate)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "audio"))]
+fn write_freeze_wav(
+    path: &std::path::Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let _ = (path, samples, channels, sample_rate);
+    Err("audio codec support is disabled (enable the `audio` cargo feature)".to_string())
+}
+
 impl Worker {
     fn apply_freeze_automation_at_sample(
         track: &mut crate::track::TrackData,
@@ -71,7 +95,7 @@ impl Worker {
                         vec![0xB0 | channel.min(15), cc.min(127), cc_value],
                     ));
                 }
-                #[cfg(unix)]
+                #[cfg(all(unix, feature = "plugins"))]
                 OfflineAutomationTarget::Lv2Parameter {
                     instance_id,
                     index,
@@ -87,19 +111,21 @@ impl Worker {
                         param_value as f64,
                     );
                 }
+                #[cfg(feature = "plugins")]
                 OfflineAutomationTarget::Vst3Parameter {
                     instance_id,
                     param_id,
                 } => {
                     let _ = track.set_vst3_parameter(instance_id, param_id, value.clamp(0.0, 1.0));
                 }
-                #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "plugins"))]
                 OfflineAutomationTarget::AuParameter {
                     instance_id,
                     param_index,
                 } => {
                     let _ = track.set_au_parameter(instance_id, param_index, value.clamp(0.0, 1.0));
                 }
+                #[cfg(feature = "plugins")]
                 OfflineAutomationTarget::ClapParameter {
                     instance_id,
                     param_id,
@@ -274,7 +300,7 @@ impl Worker {
             }
         }
 
-        if let Err(e) = crate::audio_codec::write_wav_f32(
+        if let Err(e) = write_freeze_wav(
             std::path::Path::new(&job.output_path),
             &output_samples,
             channels,
@@ -430,6 +456,7 @@ impl Worker {
         })
     }
 
+    #[cfg(feature = "plugins")]
     fn collect_arena_input_slices(
         plan: &crate::render_plan::RenderPlan,
         ins: &[crate::render_plan::BufferId],
@@ -544,6 +571,7 @@ impl Worker {
                             ProcessTask::Track(t)
                             | ProcessTask::FolderInput(t)
                             | ProcessTask::FolderOutput(t) => t,
+                            #[cfg(feature = "plugins")]
                             ProcessTask::Plugin { track, .. } => track,
                         };
                         let mut t = track.lock();
@@ -618,6 +646,7 @@ impl Worker {
                                     &mut scratch.source_buffers,
                                     metronome_output,
                                 );
+                                #[cfg(feature = "plugins")]
                                 for &out in outs.iter().take(audio_out_count) {
                                     plan.set_buffer_latency(out, t.plugin_graph_latency_samples());
                                 }
@@ -680,10 +709,12 @@ impl Worker {
                                     &mut scratch.outputs_mut,
                                     &scratch.source_buffers,
                                 );
+                                #[cfg(feature = "plugins")]
                                 for &out in outs {
                                     plan.set_buffer_latency(out, t.plugin_graph_latency_samples());
                                 }
                             }
+                            #[cfg(feature = "plugins")]
                             ProcessTask::Plugin { kind, index, .. } => {
                                 let input_latency = ins
                                     .iter()
@@ -722,7 +753,10 @@ impl Worker {
                             }
                         }
                         t.audio.set_processing(false);
+                        #[cfg(feature = "plugins")]
                         let latency_changed = t.take_plugin_latency_changed();
+                        #[cfg(not(feature = "plugins"))]
+                        let latency_changed = false;
                         let updates = std::mem::take(&mut t.rt.echoed_parameter_updates);
                         let meter = t.output_meter_linear();
                         (meter, updates, latency_changed)
@@ -1148,6 +1182,7 @@ mod tests {
         assert_eq!(track.balance(), 0.25);
     }
 
+    #[cfg(feature = "audio")]
     #[cfg_attr(
         all(miri, target_os = "freebsd"),
         ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"

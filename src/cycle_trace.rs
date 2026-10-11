@@ -255,11 +255,13 @@ fn push_histogram_samples(storage: &TraceStorage, seq: u64) {
 /// RAII guard accumulating the enclosing scope's duration into the current
 /// cycle's plugin-wait total. Free (no storage access) when tracing is
 /// disabled.
+#[cfg(feature = "plugins")]
 pub(crate) struct PluginWaitGuard {
     start: Option<Instant>,
     seq: u64,
 }
 
+#[cfg(feature = "plugins")]
 pub(crate) fn plugin_wait() -> PluginWaitGuard {
     if !enabled() {
         return PluginWaitGuard {
@@ -279,6 +281,7 @@ pub(crate) fn plugin_wait() -> PluginWaitGuard {
     }
 }
 
+#[cfg(feature = "plugins")]
 impl Drop for PluginWaitGuard {
     fn drop(&mut self) {
         let Some(start) = self.start else {
@@ -451,6 +454,7 @@ mod tests {
         mark(TracePoint::RenderEnd);
         mark(TracePoint::GoSent);
         mark(TracePoint::GoReceived);
+        #[cfg(feature = "plugins")]
         {
             let _guard = plugin_wait();
             std::thread::sleep(std::time::Duration::from_micros(200));
@@ -476,16 +480,20 @@ mod tests {
         let end = slot2.point(TracePoint::HwCycleEnd);
         assert!(start != 0, "HwCycleStart stamped");
         assert!(end >= start, "HwCycleEnd monotonic after HwCycleStart");
-        let slot1 = &storage.slots[slot_index(seq1)];
-        assert!(
-            slot1.plugin_wait_ns.load(Ordering::Relaxed) > 0,
-            "plugin wait accumulated into the cycle slot"
-        );
+        #[cfg(feature = "plugins")]
+        {
+            let slot1 = &storage.slots[slot_index(seq1)];
+            assert!(
+                slot1.plugin_wait_ns.load(Ordering::Relaxed) > 0,
+                "plugin wait accumulated into the cycle slot"
+            );
+        }
 
         force(false);
         assert!(!enabled());
         assert_eq!(begin_cycle(), 0);
         assert_eq!(take_summary_due(), None);
+        #[cfg(feature = "plugins")]
         drop(plugin_wait());
         mark(TracePoint::HwCycleEnd);
         dump_histogram();

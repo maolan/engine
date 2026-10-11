@@ -1,4 +1,5 @@
 use super::{audio::track::AudioTrack, midi::mpe::MpeState, midi::track::MIDITrack};
+#[cfg(feature = "plugins")]
 use crate::message::{PluginGraphConnection, PluginGraphNode};
 #[cfg(unix)]
 use crate::pitch_shift::LivePitchShifter;
@@ -26,17 +27,21 @@ use std::{
 };
 
 mod clip_render;
+#[cfg(feature = "plugins")]
 mod instances;
+mod midi_io;
+#[cfg(feature = "plugins")]
 mod plugins;
 mod process;
 mod seekable_streaming;
 mod session;
 mod streaming;
 mod track_routing;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "plugins"))]
 pub use instances::AuInstance;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "plugins"))]
 pub use instances::Lv2Instance;
+#[cfg(feature = "plugins")]
 pub use instances::{ClapInstance, Vst3Instance};
 pub use process::TrackMonitorKind;
 pub(crate) use streaming::{DEFAULT_RING_BUFFER_MULTIPLIER, set_ring_buffer_multiplier};
@@ -77,8 +82,10 @@ pub(crate) struct TrackIoCounts {
 pub(crate) enum AudioClipBuffer {
     /// Whole file decoded into memory (fallback when streaming setup fails,
     /// and used directly by tests/fixtures).
+    #[cfg(any(feature = "audio", test))]
     Buffered { channels: usize, samples: Vec<f32> },
     /// Incrementally decoded by a producer thread into per-channel rings.
+    #[cfg(feature = "audio")]
     Streaming(Arc<streaming::StreamingClipBuffer>),
     /// Engine-rate PCM/WAV file served by a producer thread that can seek
     /// to any frame in O(1); reads/writes go through per-channel rings.
@@ -91,6 +98,7 @@ pub(crate) struct ClipPitchShifter {
     shifter: LivePitchShifter,
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Debug)]
 pub(crate) struct ClipPluginRuntime {
     input_sources: Vec<Arc<AudioIO>>,
@@ -104,9 +112,11 @@ pub(crate) struct ClipPluginRuntime {
     plugin_midi_connections: Vec<PluginGraphConnection>,
 }
 
+#[cfg(feature = "plugins")]
 #[derive(Clone, Copy)]
 struct ClipRuntimeProcessContext {}
 
+#[cfg(feature = "plugins")]
 impl ClipPluginRuntime {
     fn setup_ports(&self) {
         for source in &self.input_sources {
@@ -748,6 +758,7 @@ pub struct TrackRt {
     pub record_tap_midi_in: Vec<MidiEvent>,
     record_tap_enabled: bool,
     audio_clip_cache: HashMap<String, Arc<AudioClipBuffer>>,
+    #[cfg(feature = "plugins")]
     clip_plugin_tracks: HashMap<String, ClipPluginRuntime>,
     #[cfg(unix)]
     pub(crate) clip_pitch_shifters: HashMap<String, ClipPitchShifter>,
@@ -768,7 +779,9 @@ pub struct TrackRt {
     pub session_clip_pool_audio: Vec<Arc<AudioClip>>,
     pub session_clip_pool_midi: Vec<Arc<MIDIClip>>,
     folder_input_midi_events: Vec<Vec<MidiEvent>>,
+    #[cfg(feature = "plugins")]
     folder_plugin_midi_node_events: HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
+    #[cfg(feature = "plugins")]
     folder_processed_midi_plugins: HashSet<PluginGraphNode>,
     folder_clip_playback_active: bool,
     folder_record_tap_input_snapshots: Vec<Vec<f32>>,
@@ -810,6 +823,7 @@ impl TrackRt {
             record_tap_midi_in: vec![],
             record_tap_enabled: false,
             audio_clip_cache: HashMap::new(),
+            #[cfg(feature = "plugins")]
             clip_plugin_tracks: HashMap::new(),
             #[cfg(unix)]
             clip_pitch_shifters: HashMap::new(),
@@ -827,7 +841,9 @@ impl TrackRt {
             session_clip_pool_audio: Vec::new(),
             session_clip_pool_midi: Vec::new(),
             folder_input_midi_events: Vec::new(),
+            #[cfg(feature = "plugins")]
             folder_plugin_midi_node_events: HashMap::new(),
+            #[cfg(feature = "plugins")]
             folder_processed_midi_plugins: HashSet::new(),
             folder_clip_playback_active: false,
             folder_record_tap_input_snapshots: Vec::new(),
@@ -941,20 +957,26 @@ pub struct TrackData {
     primary_audio_outs: usize,
     pub audio: AudioTrack,
     pub midi: MIDITrack,
+    #[cfg(feature = "plugins")]
     pub clap_plugins: Vec<ClapInstance>,
+    #[cfg(feature = "plugins")]
     pub vst3_plugins: Vec<Vst3Instance>,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     pub au_plugins: Vec<AuInstance>,
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     pub lv2_plugins: Vec<Lv2Instance>,
+    #[cfg(feature = "plugins")]
     pub plugin_midi_connections: Vec<PluginGraphConnection>,
 
+    #[cfg(feature = "plugins")]
     pub next_clap_instance_id: AtomicUsize,
+    #[cfg(feature = "plugins")]
     pub next_vst3_instance_id: AtomicUsize,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "plugins"))]
     pub next_au_instance_id: AtomicUsize,
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "plugins"))]
     pub next_lv2_instance_id: AtomicUsize,
+    #[cfg(feature = "plugins")]
     pub next_plugin_instance_id: AtomicUsize,
     pub mpe_state: MpeState,
     pub sample_rate: f64,
@@ -1094,6 +1116,7 @@ impl Track {
         )
     }
 
+    #[cfg(feature = "plugins")]
     pub fn process_direct_clip_graph(
         graph: &serde_json::Value,
         track_inputs: &[Vec<f32>],
@@ -1102,10 +1125,12 @@ impl Track {
         TrackData::process_direct_clip_graph(graph, track_inputs, block_size)
     }
 
+    #[cfg(feature = "plugins")]
     pub fn clip_graph_uses_plugin_runtime(graph: &serde_json::Value) -> bool {
         TrackData::clip_graph_uses_plugin_runtime(graph)
     }
 
+    #[cfg(feature = "plugins")]
     pub fn clip_plugin_runtime_key(
         clip: &crate::audio::clip::AudioClip,
         input_count: usize,
@@ -1143,8 +1168,10 @@ mod tests {
     use super::{AudioClipBuffer, HwMidiOutEvent, Track};
     use crate::audio::clip::AudioClip;
     use crate::audio::io::AudioIO;
+    use crate::kind::Kind;
+    #[cfg(feature = "plugins")]
+    use crate::message::PluginGraphNode;
     use crate::midi::io::MIDIIO;
-    use crate::{kind::Kind, message::PluginGraphNode};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
@@ -1188,6 +1215,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn plugin_graph_includes_default_track_midi_passthrough() {
         let track = Track::new("t".to_string(), 0, 0, 1, 2, 64, 48_000.0);
@@ -1209,6 +1237,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn disconnect_plugin_audio_removes_default_track_passthrough() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
@@ -1237,6 +1266,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn connect_plugin_audio_recreates_default_track_passthrough() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
@@ -1266,6 +1296,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn plugin_cycle_detection_assumes_track_passthrough() {
         let mut track = Track::new("t".to_string(), 1, 1, 1, 1, 8, 48_000.0);
@@ -1283,6 +1314,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn disconnect_plugin_midi_removes_default_track_passthrough() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
@@ -1311,6 +1343,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn connect_plugin_midi_recreates_default_track_passthrough() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
@@ -1379,6 +1412,7 @@ mod tests {
         assert_eq!(out[0], 0.8);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn clip_direct_graph_accepts_capitalized_audio_kind() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
@@ -1469,6 +1503,7 @@ mod tests {
         assert_eq!(out[0], 0.8);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn disconnecting_one_stereo_internal_channel_mutes_only_that_channel() {
         let mut track = Track::new("t".to_string(), 2, 2, 0, 0, 8, 48_000.0);
@@ -1498,6 +1533,7 @@ mod tests {
         assert_eq!(out_r[0], 0.0);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn direct_clip_graph_passthrough_is_audible_with_input_monitor_off() {
         let graph = serde_json::json!({
@@ -1516,6 +1552,7 @@ mod tests {
         assert_eq!(outputs, vec![vec![0.5, -0.25]]);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn direct_clip_graph_accepts_legacy_string_track_nodes() {
         let graph = serde_json::json!({
@@ -1534,6 +1571,7 @@ mod tests {
         assert_eq!(outputs, vec![vec![0.5, -0.25]]);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn direct_clip_graph_empty_connections_produces_silence() {
         let graph = serde_json::json!({
@@ -1544,6 +1582,7 @@ mod tests {
         assert_eq!(outputs, vec![vec![0.0, 0.0]]);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn direct_clip_graph_respects_connection_port_fields_for_stereo() {
         let graph = serde_json::json!({
@@ -1570,6 +1609,7 @@ mod tests {
         assert_eq!(outputs, vec![vec![0.25, 0.0], vec![0.75, 0.0]]);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn direct_clip_graph_ignores_non_audio_and_non_track_io_connections() {
         let graph = serde_json::json!({
@@ -1595,6 +1635,7 @@ mod tests {
         assert_eq!(outputs, vec![vec![0.0, 0.0]]);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn clip_graph_uses_plugin_runtime_only_when_plugins_are_present() {
         let no_plugins = serde_json::json!({
@@ -1612,6 +1653,7 @@ mod tests {
         assert!(Track::clip_graph_uses_plugin_runtime(&with_plugin));
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn clip_plugin_runtime_key_changes_when_graph_changes() {
         let mut clip = crate::audio::clip::AudioClip::new("clip.wav".to_string(), 0, 128);
@@ -1638,6 +1680,7 @@ mod tests {
         assert_ne!(key_before, key_after);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn clip_plugin_runtime_key_changes_when_channel_shape_changes() {
         let mut clip = crate::audio::clip::AudioClip::new("clip.wav".to_string(), 0, 128);
@@ -2028,6 +2071,7 @@ mod tests {
         assert_eq!(out[0], 1.5);
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn direct_clip_graph_ignores_malformed_track_nodes() {
         let graph = serde_json::json!({
@@ -2178,6 +2222,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "plugins")]
     #[test]
     fn connect_audio_connectable_rejects_track_input_as_source() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
