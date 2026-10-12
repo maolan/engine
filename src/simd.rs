@@ -1,1255 +1,446 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-mod x86 {
-    pub use std::arch::x86_64::*;
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-use x86::*;
+use fearless_simd::prelude::*;
+use fearless_simd::{Level, dispatch};
+use fearless_simd_macros::simd;
 
 pub fn add_inplace(dst: &mut [f32], src: &[f32]) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            add_inplace_avx(dst, src);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            add_inplace_sse(dst, src);
-            return;
-        }
-    }
-    add_inplace_scalar(dst, src);
+    dispatch!(Level::new(), simd => add_inplace_kernel(simd, dst, src));
 }
 
 pub fn mul_inplace(dst: &mut [f32], gain: f32) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            mul_inplace_avx(dst, gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            mul_inplace_sse(dst, gain);
-            return;
-        }
-    }
-    mul_inplace_scalar(dst, gain);
+    dispatch!(Level::new(), simd => mul_inplace_kernel(simd, dst, gain));
 }
 
 pub fn add_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
-            add_scaled_inplace_avx_fma(dst, src, gain);
-            return;
-        }
-        if is_x86_feature_detected!("avx") {
-            add_scaled_inplace_avx(dst, src, gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            add_scaled_inplace_sse(dst, src, gain);
-            return;
-        }
-    }
-    add_scaled_inplace_scalar(dst, src, gain);
+    dispatch!(Level::new(), simd => add_scaled_inplace_kernel(simd, dst, src, gain));
 }
 
 pub fn copy_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            copy_scaled_inplace_avx(dst, src, gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            copy_scaled_inplace_sse(dst, src, gain);
-            return;
-        }
-    }
-    copy_scaled_inplace_scalar(dst, src, gain);
+    dispatch!(Level::new(), simd => copy_scaled_inplace_kernel(simd, dst, src, gain));
 }
 
 pub fn add_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            add_sanitized_inplace_avx(dst, src);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            add_sanitized_inplace_sse(dst, src);
-            return;
-        }
-    }
-    add_sanitized_inplace_scalar(dst, src);
+    dispatch!(Level::new(), simd => add_sanitized_inplace_kernel(simd, dst, src));
 }
 
 pub fn copy_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            copy_sanitized_inplace_avx(dst, src);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            copy_sanitized_inplace_sse(dst, src);
-            return;
-        }
-    }
-    copy_sanitized_inplace_scalar(dst, src);
+    dispatch!(Level::new(), simd => copy_sanitized_inplace_kernel(simd, dst, src));
 }
 
 pub fn sanitize_finite_inplace(buf: &mut [f32]) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            sanitize_finite_inplace_avx(buf);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            sanitize_finite_inplace_sse(buf);
-            return;
-        }
-    }
-    sanitize_finite_inplace_scalar(buf);
+    dispatch!(Level::new(), simd => sanitize_finite_inplace_kernel(simd, buf));
 }
 
 pub fn peak_abs(buf: &[f32]) -> f32 {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            return peak_abs_avx(buf);
-        }
-        if is_x86_feature_detected!("sse") {
-            return peak_abs_sse(buf);
-        }
-    }
-    peak_abs_scalar(buf)
+    dispatch!(Level::new(), simd => peak_abs_kernel(simd, buf))
 }
 
 pub fn clamp_inplace(buf: &mut [f32], min: f32, max: f32) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            clamp_inplace_avx(buf, min, max);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            clamp_inplace_sse(buf, min, max);
-            return;
-        }
-    }
-    clamp_inplace_scalar(buf, min, max);
-}
-
-fn add_inplace_scalar(dst: &mut [f32], src: &[f32]) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d += *s;
-    }
-}
-
-fn mul_inplace_scalar(dst: &mut [f32], gain: f32) {
-    for d in dst.iter_mut() {
-        *d *= gain;
-    }
-}
-
-fn add_scaled_inplace_scalar(dst: &mut [f32], src: &[f32], gain: f32) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d += *s * gain;
-    }
-}
-
-fn copy_scaled_inplace_scalar(dst: &mut [f32], src: &[f32], gain: f32) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d = *s * gain;
-    }
-}
-
-fn add_sanitized_inplace_scalar(dst: &mut [f32], src: &[f32]) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d += if s.is_finite() { *s } else { 0.0 };
-    }
-}
-
-fn copy_sanitized_inplace_scalar(dst: &mut [f32], src: &[f32]) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d = if s.is_finite() { *s } else { 0.0 };
-    }
-}
-
-fn sanitize_finite_inplace_scalar(buf: &mut [f32]) {
-    for s in buf.iter_mut() {
-        if !s.is_finite() {
-            *s = 0.0;
-        }
-    }
-}
-
-fn peak_abs_scalar(buf: &[f32]) -> f32 {
-    buf.iter().fold(0.0f32, |acc, s| acc.max(s.abs()))
-}
-
-fn clamp_inplace_scalar(buf: &mut [f32], min: f32, max: f32) {
-    for s in buf.iter_mut() {
-        *s = s.clamp(min, max);
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn add_inplace_sse(dst: &mut [f32], src: &[f32]) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let mut i = 0usize;
-    while i + 4 <= dst_head.len() {
-        let d = _mm_loadu_ps(dst_head.as_ptr().add(i));
-        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
-        let r = _mm_add_ps(d, s);
-        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d += *s;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn mul_inplace_sse(dst: &mut [f32], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0usize;
-    while i + 4 <= dst.len() {
-        let d = _mm_loadu_ps(dst.as_ptr().add(i));
-        let r = _mm_mul_ps(d, g);
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for d in &mut dst[i..] {
-        *d *= gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn add_scaled_inplace_sse(dst: &mut [f32], src: &[f32], gain: f32) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let g = _mm_set1_ps(gain);
-    let mut i = 0usize;
-    while i + 4 <= dst_head.len() {
-        let d = _mm_loadu_ps(dst_head.as_ptr().add(i));
-        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
-        let r = _mm_add_ps(d, _mm_mul_ps(s, g));
-        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d += *s * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn copy_scaled_inplace_sse(dst: &mut [f32], src: &[f32], gain: f32) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let g = _mm_set1_ps(gain);
-    let mut i = 0usize;
-    while i + 4 <= dst_head.len() {
-        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
-        let r = _mm_mul_ps(s, g);
-        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d = *s * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn add_sanitized_inplace_sse(dst: &mut [f32], src: &[f32]) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let sign_mask = _mm_set1_ps(-0.0);
-    let finite_max = _mm_set1_ps(f32::MAX);
-    let mut i = 0usize;
-    while i + 4 <= dst_head.len() {
-        let d = _mm_loadu_ps(dst_head.as_ptr().add(i));
-        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
-        let abs_s = _mm_andnot_ps(sign_mask, s);
-        let finite_mask = _mm_cmple_ps(abs_s, finite_max);
-        let sanitized = _mm_and_ps(s, finite_mask);
-        let r = _mm_add_ps(d, sanitized);
-        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d += if s.is_finite() { *s } else { 0.0 };
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn copy_sanitized_inplace_sse(dst: &mut [f32], src: &[f32]) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let sign_mask = _mm_set1_ps(-0.0);
-    let finite_max = _mm_set1_ps(f32::MAX);
-    let mut i = 0usize;
-    while i + 4 <= dst_head.len() {
-        let s = _mm_loadu_ps(src_head.as_ptr().add(i));
-        let abs_s = _mm_andnot_ps(sign_mask, s);
-        let finite_mask = _mm_cmple_ps(abs_s, finite_max);
-        let r = _mm_and_ps(s, finite_mask);
-        _mm_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d = if s.is_finite() { *s } else { 0.0 };
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn sanitize_finite_inplace_sse(buf: &mut [f32]) {
-    let sign_mask = _mm_set1_ps(-0.0);
-    let finite_max = _mm_set1_ps(f32::MAX);
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        let v = _mm_loadu_ps(buf.as_ptr().add(i));
-        let abs_v = _mm_andnot_ps(sign_mask, v);
-        let finite_mask = _mm_cmple_ps(abs_v, finite_max);
-        let r = _mm_and_ps(v, finite_mask);
-        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for s in &mut buf[i..] {
-        if !s.is_finite() {
-            *s = 0.0;
-        }
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn peak_abs_sse(buf: &[f32]) -> f32 {
-    let sign_mask = _mm_set1_ps(-0.0);
-    let mut peak = _mm_setzero_ps();
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        let v = _mm_loadu_ps(buf.as_ptr().add(i));
-        let abs_v = _mm_andnot_ps(sign_mask, v);
-        peak = _mm_max_ps(peak, abs_v);
-        i += 4;
-    }
-    let mut arr = [0.0f32; 4];
-    _mm_storeu_ps(arr.as_mut_ptr(), peak);
-    let mut max_scalar = arr.into_iter().fold(0.0f32, |a, b| a.max(b));
-    for s in &buf[i..] {
-        max_scalar = max_scalar.max(s.abs());
-    }
-    max_scalar
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn clamp_inplace_sse(buf: &mut [f32], min: f32, max: f32) {
-    let vmin = _mm_set1_ps(min);
-    let vmax = _mm_set1_ps(max);
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        let v = _mm_loadu_ps(buf.as_ptr().add(i));
-        let r = _mm_min_ps(_mm_max_ps(v, vmin), vmax);
-        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for s in &mut buf[i..] {
-        *s = s.clamp(min, max);
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn add_inplace_avx(dst: &mut [f32], src: &[f32]) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let mut i = 0;
-    while i + 8 <= dst_head.len() {
-        let d = _mm256_loadu_ps(dst_head.as_ptr().add(i));
-        let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
-        let r = _mm256_add_ps(d, s);
-        _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d += *s;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn mul_inplace_avx(dst: &mut [f32], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= dst.len() {
-        let d = _mm256_loadu_ps(dst.as_ptr().add(i));
-        let r = _mm256_mul_ps(d, g);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for d in &mut dst[i..] {
-        *d *= gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn add_scaled_inplace_avx(dst: &mut [f32], src: &[f32], gain: f32) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= dst_head.len() {
-        let d = _mm256_loadu_ps(dst_head.as_ptr().add(i));
-        let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
-        let r = _mm256_add_ps(d, _mm256_mul_ps(s, g));
-        _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d += *s * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx,fma")]
-unsafe fn add_scaled_inplace_avx_fma(dst: &mut [f32], src: &[f32], gain: f32) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= dst_head.len() {
-        let d = _mm256_loadu_ps(dst_head.as_ptr().add(i));
-        let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
-        let r = _mm256_fmadd_ps(s, g, d);
-        _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d += *s * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn copy_scaled_inplace_avx(dst: &mut [f32], src: &[f32], gain: f32) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= dst_head.len() {
-        let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
-        let r = _mm256_mul_ps(s, g);
-        _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d = *s * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn add_sanitized_inplace_avx(dst: &mut [f32], src: &[f32]) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let zero = _mm256_setzero_ps();
-    let max_val = _mm256_set1_ps(f32::MAX);
-    let mut i = 0;
-    while i + 8 <= dst_head.len() {
-        let d = _mm256_loadu_ps(dst_head.as_ptr().add(i));
-        let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
-        let abs_s = _mm256_andnot_ps(_mm256_set1_ps(-0.0), s);
-        let mask = _mm256_cmp_ps(abs_s, max_val, _CMP_LE_OQ);
-        let sanitized = _mm256_blendv_ps(zero, s, mask);
-        let r = _mm256_add_ps(d, sanitized);
-        _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d += if s.is_finite() { *s } else { 0.0 };
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn copy_sanitized_inplace_avx(dst: &mut [f32], src: &[f32]) {
-    let len = dst.len().min(src.len());
-    let dst_head = &mut dst[..len];
-    let src_head = &src[..len];
-    let zero = _mm256_setzero_ps();
-    let max_val = _mm256_set1_ps(f32::MAX);
-    let mut i = 0;
-    while i + 8 <= dst_head.len() {
-        let s = _mm256_loadu_ps(src_head.as_ptr().add(i));
-        let abs_s = _mm256_andnot_ps(_mm256_set1_ps(-0.0), s);
-        let mask = _mm256_cmp_ps(abs_s, max_val, _CMP_LE_OQ);
-        let r = _mm256_blendv_ps(zero, s, mask);
-        _mm256_storeu_ps(dst_head.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for (d, s) in dst_head[i..].iter_mut().zip(src_head[i..].iter()) {
-        *d = if s.is_finite() { *s } else { 0.0 };
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn sanitize_finite_inplace_avx(buf: &mut [f32]) {
-    let zero = _mm256_setzero_ps();
-    let max_val = _mm256_set1_ps(f32::MAX);
-    let mut i = 0;
-    while i + 8 <= buf.len() {
-        let v = _mm256_loadu_ps(buf.as_ptr().add(i));
-        let abs_v = _mm256_andnot_ps(_mm256_set1_ps(-0.0), v);
-        let mask = _mm256_cmp_ps(abs_v, max_val, _CMP_LE_OQ);
-        let r = _mm256_blendv_ps(zero, v, mask);
-        _mm256_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for s in &mut buf[i..] {
-        if !s.is_finite() {
-            *s = 0.0;
-        }
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn peak_abs_avx(buf: &[f32]) -> f32 {
-    let mut peak = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= buf.len() {
-        let v = _mm256_loadu_ps(buf.as_ptr().add(i));
-        let abs_v = _mm256_andnot_ps(_mm256_set1_ps(-0.0), v);
-        peak = _mm256_max_ps(peak, abs_v);
-        i += 8;
-    }
-    let mut arr = [0.0f32; 8];
-    _mm256_storeu_ps(arr.as_mut_ptr(), peak);
-    let mut max_scalar = arr.iter().fold(0.0f32, |a, &b| a.max(b));
-    for s in &buf[i..] {
-        max_scalar = max_scalar.max(s.abs());
-    }
-    max_scalar
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn clamp_inplace_avx(buf: &mut [f32], min: f32, max: f32) {
-    let vmin = _mm256_set1_ps(min);
-    let vmax = _mm256_set1_ps(max);
-    let mut i = 0;
-    while i + 8 <= buf.len() {
-        let v = _mm256_loadu_ps(buf.as_ptr().add(i));
-        let r = _mm256_max_ps(vmin, _mm256_min_ps(vmax, v));
-        _mm256_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for s in &mut buf[i..] {
-        *s = s.clamp(min, max);
-    }
+    dispatch!(Level::new(), simd => clamp_inplace_kernel(simd, buf, min, max));
 }
 
 pub fn convert_i32_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            convert_i32_to_f32_avx(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            convert_i32_to_f32_sse(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_i32_to_f32_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_i32_to_f32_scalar(src: &[i32], dst: &mut [f32], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = *s as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_i32_to_f32_sse(src: &[i32], dst: &mut [f32], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0;
-    while i + 4 <= src.len() {
-        let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let f = _mm_cvtepi32_ps(s);
-        let r = _mm_mul_ps(f, g);
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = *s as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn convert_i32_to_f32_avx(src: &[i32], dst: &mut [f32], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= src.len() {
-        let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-        let f = _mm256_cvtepi32_ps(s);
-        let r = _mm256_mul_ps(f, g);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = *s as f32 * gain;
-    }
+    dispatch!(Level::new(), simd => convert_i32_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_i16_to_f32(src: &[i16], dst: &mut [f32], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx2") {
-            convert_i16_to_f32_avx2(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse4.1") {
-            convert_i16_to_f32_sse41(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_i16_to_f32_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_i16_to_f32_scalar(src: &[i16], dst: &mut [f32], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = *s as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_i16_to_f32_sse41(src: &[i16], dst: &mut [f32], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= src.len() {
-        let bytes = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let low = _mm_cvtepi16_epi32(bytes);
-        let high = _mm_cvtepi16_epi32(_mm_srli_si128(bytes, 8));
-        let low_f = _mm_mul_ps(_mm_cvtepi32_ps(low), g);
-        let high_f = _mm_mul_ps(_mm_cvtepi32_ps(high), g);
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), low_f);
-        _mm_storeu_ps(dst.as_mut_ptr().add(i + 4), high_f);
-        i += 8;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = *s as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-unsafe fn convert_i16_to_f32_avx2(src: &[i16], dst: &mut [f32], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 16 <= src.len() {
-        let bytes = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let low = _mm256_cvtepi16_epi32(bytes);
-        let high = _mm256_cvtepi16_epi32(_mm_srli_si128(bytes, 8));
-        let low_f = _mm256_mul_ps(_mm256_cvtepi32_ps(low), g);
-        let high_f = _mm256_mul_ps(_mm256_cvtepi32_ps(high), g);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), low_f);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), high_f);
-        i += 16;
-    }
-    if i + 8 <= src.len() {
-        let bytes = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let low = _mm_cvtepi16_epi32(bytes);
-        let high = _mm_cvtepi16_epi32(_mm_srli_si128(bytes, 8));
-        let low_f = _mm_mul_ps(_mm_cvtepi32_ps(low), _mm_set1_ps(gain));
-        let high_f = _mm_mul_ps(_mm_cvtepi32_ps(high), _mm_set1_ps(gain));
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), low_f);
-        _mm_storeu_ps(dst.as_mut_ptr().add(i + 4), high_f);
-        i += 8;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = *s as f32 * gain;
-    }
+    dispatch!(Level::new(), simd => convert_i16_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_i8_to_f32(src: &[i8], dst: &mut [f32], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx2") {
-            convert_i8_to_f32_avx2(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse4.1") {
-            convert_i8_to_f32_sse41(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_i8_to_f32_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_i8_to_f32_scalar(src: &[i8], dst: &mut [f32], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = *s as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_i8_to_f32_sse41(src: &[i8], dst: &mut [f32], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0;
-    while i + 4 <= src.len() {
-        let bytes = _mm_cvtsi32_si128(*(src.as_ptr().add(i) as *const i32));
-        let i32s = _mm_cvtepi8_epi32(bytes);
-        let f32s = _mm_mul_ps(_mm_cvtepi32_ps(i32s), g);
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), f32s);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = *s as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-unsafe fn convert_i8_to_f32_avx2(src: &[i8], dst: &mut [f32], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= src.len() {
-        let bytes = _mm_cvtsi64_si128(*(src.as_ptr().add(i) as *const i64));
-        let i32s = _mm256_cvtepi8_epi32(bytes);
-        let f32s = _mm256_mul_ps(_mm256_cvtepi32_ps(i32s), g);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), f32s);
-        i += 8;
-    }
-    if i + 4 <= src.len() {
-        let bytes = _mm_cvtsi32_si128(*(src.as_ptr().add(i) as *const i32));
-        let i32s = _mm_cvtepi8_epi32(bytes);
-        let f32s = _mm_mul_ps(_mm_cvtepi32_ps(i32s), _mm_set1_ps(gain));
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), f32s);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = *s as f32 * gain;
-    }
+    dispatch!(Level::new(), simd => convert_i8_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_i24_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx2") {
-            convert_i24_to_f32_avx2(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse4.1") {
-            convert_i24_to_f32_sse41(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_i24_to_f32_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_i24_to_f32_scalar(src: &[i32], dst: &mut [f32], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        let mut v = *s & 0x00FF_FFFF;
-        if (v & 0x0080_0000) != 0 {
-            v |= 0xFF00_0000u32 as i32;
-        }
-        *d = v as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_i24_to_f32_sse41(src: &[i32], dst: &mut [f32], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0;
-    while i + 4 <= src.len() {
-        let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let extended = _mm_srai_epi32(_mm_slli_epi32(s, 8), 8);
-        let f = _mm_cvtepi32_ps(extended);
-        let r = _mm_mul_ps(f, g);
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        let mut v = *s & 0x00FF_FFFF;
-        if (v & 0x0080_0000) != 0 {
-            v |= 0xFF00_0000u32 as i32;
-        }
-        *d = v as f32 * gain;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-unsafe fn convert_i24_to_f32_avx2(src: &[i32], dst: &mut [f32], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= src.len() {
-        let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-        let extended = _mm256_srai_epi32(_mm256_slli_epi32(s, 8), 8);
-        let f = _mm256_cvtepi32_ps(extended);
-        let r = _mm256_mul_ps(f, g);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    if i + 4 <= src.len() {
-        let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let extended = _mm_srai_epi32(_mm_slli_epi32(s, 8), 8);
-        let f = _mm_cvtepi32_ps(extended);
-        let r = _mm_mul_ps(f, _mm_set1_ps(gain));
-        _mm_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        let mut v = *s & 0x00FF_FFFF;
-        if (v & 0x0080_0000) != 0 {
-            v |= 0xFF00_0000u32 as i32;
-        }
-        *d = v as f32 * gain;
-    }
+    dispatch!(Level::new(), simd => convert_i24_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i24(src: &[f32], dst: &mut [i32], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            convert_f32_to_i24_avx(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse2") {
-            convert_f32_to_i24_sse2(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_f32_to_i24_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_f32_to_i24_scalar(src: &[f32], dst: &mut [i32], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = (*s * gain) as i32 & 0x00FF_FFFF;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_f32_to_i24_sse2(src: &[f32], dst: &mut [i32], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mask = _mm_set1_epi32(0x00FF_FFFF);
-    let mut i = 0;
-    while i + 4 <= src.len() {
-        let s = _mm_loadu_ps(src.as_ptr().add(i));
-        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g));
-        let m = _mm_and_si128(v, mask);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, m);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i32 & 0x00FF_FFFF;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn convert_f32_to_i24_avx(src: &[f32], dst: &mut [i32], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x00FF_FFFF));
-    let mut i = 0;
-    while i + 8 <= src.len() {
-        let s = _mm256_loadu_ps(src.as_ptr().add(i));
-        let v = _mm256_cvttps_epi32(_mm256_mul_ps(s, g));
-        let m = _mm256_castps_si256(_mm256_and_ps(_mm256_castsi256_ps(v), mask));
-        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, m);
-        i += 8;
-    }
-    if i + 4 <= src.len() {
-        let g_sse = _mm_set1_ps(gain);
-        let mask_sse = _mm_set1_epi32(0x00FF_FFFF);
-        let s = _mm_loadu_ps(src.as_ptr().add(i));
-        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g_sse));
-        let m = _mm_and_si128(v, mask_sse);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, m);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i32 & 0x00FF_FFFF;
-    }
+    dispatch!(Level::new(), simd => convert_f32_to_i24_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i32(src: &[f32], dst: &mut [i32], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            convert_f32_to_i32_avx(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse2") {
-            convert_f32_to_i32_sse2(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_f32_to_i32_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_f32_to_i32_scalar(src: &[f32], dst: &mut [i32], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = (*s * gain) as i32;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_f32_to_i32_sse2(src: &[f32], dst: &mut [i32], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0;
-    while i + 4 <= src.len() {
-        let s = _mm_loadu_ps(src.as_ptr().add(i));
-        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g));
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, v);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i32;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn convert_f32_to_i32_avx(src: &[f32], dst: &mut [i32], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= src.len() {
-        let s = _mm256_loadu_ps(src.as_ptr().add(i));
-        let v = _mm256_cvttps_epi32(_mm256_mul_ps(s, g));
-        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, v);
-        i += 8;
-    }
-    if i + 4 <= src.len() {
-        let s = _mm_loadu_ps(src.as_ptr().add(i));
-        let v = _mm_cvttps_epi32(_mm_mul_ps(s, _mm_set1_ps(gain)));
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, v);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i32;
-    }
+    dispatch!(Level::new(), simd => convert_f32_to_i32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i16(src: &[f32], dst: &mut [i16], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            convert_f32_to_i16_avx(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse2") {
-            convert_f32_to_i16_sse2(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_f32_to_i16_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_f32_to_i16_scalar(src: &[f32], dst: &mut [i16], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = (*s * gain) as i16;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_f32_to_i16_sse2(src: &[f32], dst: &mut [i16], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0;
-    while i + 8 <= src.len() {
-        let s0 = _mm_loadu_ps(src.as_ptr().add(i));
-        let s1 = _mm_loadu_ps(src.as_ptr().add(i + 4));
-        let v0 = _mm_cvttps_epi32(_mm_mul_ps(s0, g));
-        let v1 = _mm_cvttps_epi32(_mm_mul_ps(s1, g));
-        let packed = _mm_packs_epi32(v0, v1);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
-        i += 8;
-    }
-    if i + 4 <= src.len() {
-        let s = _mm_loadu_ps(src.as_ptr().add(i));
-        let v = _mm_cvttps_epi32(_mm_mul_ps(s, g));
-        let packed = _mm_packs_epi32(v, _mm_setzero_si128());
-        _mm_storel_epi64(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i16;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn convert_f32_to_i16_avx(src: &[f32], dst: &mut [i16], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0usize;
-    while i + 8 <= src.len() {
-        let s = _mm256_loadu_ps(src.as_ptr().add(i));
-        let v = _mm256_cvttps_epi32(_mm256_mul_ps(s, g));
-        let vlo = _mm256_castsi256_si128(v);
-        let vhi = _mm256_extracti128_si256(v, 1);
-        let packed = _mm_packs_epi32(vlo, vhi);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
-        i += 8;
-    }
-    if i + 4 <= src.len() {
-        let s = _mm_loadu_ps(src.as_ptr().add(i));
-        let v = _mm_cvttps_epi32(_mm_mul_ps(s, _mm_set1_ps(gain)));
-        let packed = _mm_packs_epi32(v, _mm_setzero_si128());
-        _mm_storel_epi64(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
-        i += 4;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i16;
-    }
+    dispatch!(Level::new(), simd => convert_f32_to_i16_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i8(src: &[f32], dst: &mut [i8], gain: f32) {
-    let n = src.len().min(dst.len());
-    if n == 0 {
-        return;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            convert_f32_to_i8_avx(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-        if is_x86_feature_detected!("sse2") {
-            convert_f32_to_i8_sse2(&src[..n], &mut dst[..n], gain);
-            return;
-        }
-    }
-    convert_f32_to_i8_scalar(&src[..n], &mut dst[..n], gain);
-}
-
-fn convert_f32_to_i8_scalar(src: &[f32], dst: &mut [i8], gain: f32) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = (*s * gain) as i8;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-unsafe fn convert_f32_to_i8_sse2(src: &[f32], dst: &mut [i8], gain: f32) {
-    let g = _mm_set1_ps(gain);
-    let mut i = 0;
-    while i + 16 <= src.len() {
-        let s0 = _mm_loadu_ps(src.as_ptr().add(i));
-        let s1 = _mm_loadu_ps(src.as_ptr().add(i + 4));
-        let s2 = _mm_loadu_ps(src.as_ptr().add(i + 8));
-        let s3 = _mm_loadu_ps(src.as_ptr().add(i + 12));
-        let v0 = _mm_cvttps_epi32(_mm_mul_ps(s0, g));
-        let v1 = _mm_cvttps_epi32(_mm_mul_ps(s1, g));
-        let v2 = _mm_cvttps_epi32(_mm_mul_ps(s2, g));
-        let v3 = _mm_cvttps_epi32(_mm_mul_ps(s3, g));
-        let p0 = _mm_packs_epi32(v0, v1);
-        let p1 = _mm_packs_epi32(v2, v3);
-        let packed = _mm_packs_epi16(p0, p1);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
-        i += 16;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i8;
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn convert_f32_to_i8_avx(src: &[f32], dst: &mut [i8], gain: f32) {
-    let g = _mm256_set1_ps(gain);
-    let mut i = 0usize;
-    while i + 16 <= src.len() {
-        let s0 = _mm256_loadu_ps(src.as_ptr().add(i));
-        let s1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
-        let v0 = _mm256_cvttps_epi32(_mm256_mul_ps(s0, g));
-        let v1 = _mm256_cvttps_epi32(_mm256_mul_ps(s1, g));
-        let p0 = _mm_packs_epi32(_mm256_castsi256_si128(v0), _mm256_extracti128_si256(v0, 1));
-        let p1 = _mm_packs_epi32(_mm256_castsi256_si128(v1), _mm256_extracti128_si256(v1, 1));
-        let packed = _mm_packs_epi16(p0, p1);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, packed);
-        i += 16;
-    }
-    for (s, d) in src[i..].iter().zip(dst[i..].iter_mut()) {
-        *d = (*s * gain) as i8;
-    }
+    dispatch!(Level::new(), simd => convert_f32_to_i8_kernel(simd, src, dst, gain));
 }
 
 pub fn apply_fade_in_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            apply_fade_in_inplace_avx(buf, start_t, dt);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            apply_fade_in_inplace_sse(buf, start_t, dt);
-            return;
-        }
-    }
-    for (i, v) in buf.iter_mut().enumerate() {
-        let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
-        *v *= (t * std::f32::consts::FRAC_PI_2).sin();
-    }
+    dispatch!(Level::new(), simd => apply_fade_in_kernel(simd, buf, start_t, dt));
 }
 
 pub fn apply_fade_out_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            apply_fade_out_inplace_avx(buf, start_t, dt);
-            return;
-        }
-        if is_x86_feature_detected!("sse") {
-            apply_fade_out_inplace_sse(buf, start_t, dt);
-            return;
-        }
+    dispatch!(Level::new(), simd => apply_fade_out_kernel(simd, buf, start_t, dt));
+}
+
+pub fn interleave_stereo(l: &[f32], r: &[f32], dst: &mut [f32]) {
+    dispatch!(Level::new(), simd => interleave_stereo_kernel(simd, l, r, dst));
+}
+
+#[simd]
+fn add_inplace_kernel<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let mut dchunks = dst.chunks_exact_mut(S::f32s::LEN);
+    let mut schunks = src.chunks_exact(S::f32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let dv = S::f32s::from_slice(simd, d);
+        let sv = S::f32s::from_slice(simd, s);
+        (dv + sv).store_slice(d);
     }
-    for (i, v) in buf.iter_mut().enumerate() {
-        let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
-        *v *= (t * std::f32::consts::FRAC_PI_2).cos();
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d += *s;
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn apply_fade_in_inplace_avx(buf: &mut [f32], start_t: f32, dt: f32) {
-    let mut i = 0usize;
-    while i + 8 <= buf.len() {
-        let mut gain = [0.0f32; 8];
+#[simd]
+fn mul_inplace_kernel<S: Simd>(simd: S, dst: &mut [f32], gain: f32) {
+    let mut chunks = dst.chunks_exact_mut(S::f32s::LEN);
+    for d in chunks.by_ref() {
+        (S::f32s::from_slice(simd, d) * gain).store_slice(d);
+    }
+    for d in chunks.into_remainder() {
+        *d *= gain;
+    }
+}
+
+#[simd]
+fn add_scaled_inplace_kernel<S: Simd>(simd: S, dst: &mut [f32], src: &[f32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let mut dchunks = dst.chunks_exact_mut(S::f32s::LEN);
+    let mut schunks = src.chunks_exact(S::f32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let dv = S::f32s::from_slice(simd, d);
+        let sv = S::f32s::from_slice(simd, s);
+        (dv + sv * gain).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d += *s * gain;
+    }
+}
+
+#[simd]
+fn copy_scaled_inplace_kernel<S: Simd>(simd: S, dst: &mut [f32], src: &[f32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let mut dchunks = dst.chunks_exact_mut(S::f32s::LEN);
+    let mut schunks = src.chunks_exact(S::f32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let sv = S::f32s::from_slice(simd, s);
+        (sv * gain).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = *s * gain;
+    }
+}
+
+#[simd]
+fn add_sanitized_inplace_kernel<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let zero = S::f32s::splat(simd, 0.0);
+    let mut dchunks = dst.chunks_exact_mut(S::f32s::LEN);
+    let mut schunks = src.chunks_exact(S::f32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let dv = S::f32s::from_slice(simd, d);
+        let sv = S::f32s::from_slice(simd, s);
+        (dv + sv.is_finite().select(sv, zero)).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d += if s.is_finite() { *s } else { 0.0 };
+    }
+}
+
+#[simd]
+fn copy_sanitized_inplace_kernel<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let zero = S::f32s::splat(simd, 0.0);
+    let mut dchunks = dst.chunks_exact_mut(S::f32s::LEN);
+    let mut schunks = src.chunks_exact(S::f32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let sv = S::f32s::from_slice(simd, s);
+        sv.is_finite().select(sv, zero).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = if s.is_finite() { *s } else { 0.0 };
+    }
+}
+
+#[simd]
+fn sanitize_finite_inplace_kernel<S: Simd>(simd: S, buf: &mut [f32]) {
+    let zero = S::f32s::splat(simd, 0.0);
+    let mut chunks = buf.chunks_exact_mut(S::f32s::LEN);
+    for b in chunks.by_ref() {
+        let v = S::f32s::from_slice(simd, b);
+        v.is_finite().select(v, zero).store_slice(b);
+    }
+    for s in chunks.into_remainder() {
+        if !s.is_finite() {
+            *s = 0.0;
+        }
+    }
+}
+
+#[simd]
+fn peak_abs_kernel<S: Simd>(simd: S, buf: &[f32]) -> f32 {
+    let mut acc = S::f32s::splat(simd, 0.0);
+    let mut chunks = buf.chunks_exact(S::f32s::LEN);
+    for c in chunks.by_ref() {
+        acc = acc.max(S::f32s::from_slice(simd, c).abs());
+    }
+    let mut m = acc.reduce_max();
+    for v in chunks.remainder() {
+        m = m.max(v.abs());
+    }
+    m
+}
+
+#[simd]
+fn clamp_inplace_kernel<S: Simd>(simd: S, buf: &mut [f32], min: f32, max: f32) {
+    let vmin = S::f32s::splat(simd, min);
+    let vmax = S::f32s::splat(simd, max);
+    let mut chunks = buf.chunks_exact_mut(S::f32s::LEN);
+    for b in chunks.by_ref() {
+        let v = S::f32s::from_slice(simd, b);
+        v.min(vmax).max(vmin).store_slice(b);
+    }
+    for s in chunks.into_remainder() {
+        *s = s.clamp(min, max);
+    }
+}
+
+#[simd]
+fn convert_i32_to_f32_kernel<S: Simd>(simd: S, src: &[i32], dst: &mut [f32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let mut dchunks = dst.chunks_exact_mut(S::f32s::LEN);
+    let mut schunks = src.chunks_exact(S::i32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let v = S::i32s::from_slice(simd, s);
+        (v.to_float::<S::f32s>() * gain).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = *s as f32 * gain;
+    }
+}
+
+#[simd]
+fn convert_i16_to_f32_kernel<S: Simd>(simd: S, src: &[i16], dst: &mut [f32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let half = S::i32s::LEN;
+    let mut dchunks = dst.chunks_exact_mut(2 * half);
+    let mut schunks = src.chunks_exact(S::i16s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let (lo, hi) = S::i16s::from_slice(simd, s).widen();
+        (lo.to_float::<S::f32s>() * gain).store_slice(&mut d[..half]);
+        (hi.to_float::<S::f32s>() * gain).store_slice(&mut d[half..]);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = *s as f32 * gain;
+    }
+}
+
+#[simd]
+fn convert_i8_to_f32_kernel<S: Simd>(simd: S, src: &[i8], dst: &mut [f32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let quarter = S::i32s::LEN;
+    let mut dchunks = dst.chunks_exact_mut(4 * quarter);
+    let mut schunks = src.chunks_exact(S::i8s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let (lo, hi) = S::i8s::from_slice(simd, s).widen();
+        let (l0, l1) = lo.widen();
+        let (h0, h1) = hi.widen();
+        (l0.to_float::<S::f32s>() * gain).store_slice(&mut d[..quarter]);
+        (l1.to_float::<S::f32s>() * gain).store_slice(&mut d[quarter..2 * quarter]);
+        (h0.to_float::<S::f32s>() * gain).store_slice(&mut d[2 * quarter..3 * quarter]);
+        (h1.to_float::<S::f32s>() * gain).store_slice(&mut d[3 * quarter..]);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = *s as f32 * gain;
+    }
+}
+
+#[simd]
+fn convert_i24_to_f32_kernel<S: Simd>(simd: S, src: &[i32], dst: &mut [f32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let mut dchunks = dst.chunks_exact_mut(S::f32s::LEN);
+    let mut schunks = src.chunks_exact(S::i32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let v = S::i32s::from_slice(simd, s);
+        // Sign-extend the low 24 bits: shift the sign bit into place, then back arithmetically.
+        let ext = (v << 8u32) >> 8u32;
+        (ext.to_float::<S::f32s>() * gain).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        let mut v = *s & 0x00FF_FFFF;
+        if (v & 0x0080_0000) != 0 {
+            v |= 0xFF00_0000u32 as i32;
+        }
+        *d = v as f32 * gain;
+    }
+}
+
+#[simd]
+fn convert_f32_to_i32_kernel<S: Simd>(simd: S, src: &[f32], dst: &mut [i32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let mut dchunks = dst.chunks_exact_mut(S::i32s::LEN);
+    let mut schunks = src.chunks_exact(S::f32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let v = S::f32s::from_slice(simd, s) * gain;
+        let ints: S::i32s = v.to_int_precise();
+        ints.store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = (*s * gain) as i32;
+    }
+}
+
+#[simd]
+fn convert_f32_to_i16_kernel<S: Simd>(simd: S, src: &[f32], dst: &mut [i16], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let l = S::f32s::LEN;
+    let mut dchunks = dst.chunks_exact_mut(2 * l);
+    let mut schunks = src.chunks_exact(2 * l);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let v0 = S::f32s::from_slice(simd, &s[..l]) * gain;
+        let v1 = S::f32s::from_slice(simd, &s[l..]) * gain;
+        let i0: S::i32s = v0.to_int_precise();
+        let i1: S::i32s = v1.to_int_precise();
+        // Saturating narrowing matches the old `packs` behavior and Rust's `as` casts.
+        i0.saturating_narrow(i1).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = (*s * gain) as i16;
+    }
+}
+
+#[simd]
+fn convert_f32_to_i8_kernel<S: Simd>(simd: S, src: &[f32], dst: &mut [i8], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let l = S::f32s::LEN;
+    let mut dchunks = dst.chunks_exact_mut(4 * l);
+    let mut schunks = src.chunks_exact(4 * l);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let i0: S::i32s = (S::f32s::from_slice(simd, &s[..l]) * gain).to_int_precise();
+        let i1: S::i32s = (S::f32s::from_slice(simd, &s[l..2 * l]) * gain).to_int_precise();
+        let i2: S::i32s = (S::f32s::from_slice(simd, &s[2 * l..3 * l]) * gain).to_int_precise();
+        let i3: S::i32s = (S::f32s::from_slice(simd, &s[3 * l..]) * gain).to_int_precise();
+        let n0 = i0.saturating_narrow(i1);
+        let n1 = i2.saturating_narrow(i3);
+        n0.saturating_narrow(n1).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = (*s * gain) as i8;
+    }
+}
+
+#[simd]
+fn convert_f32_to_i24_kernel<S: Simd>(simd: S, src: &[f32], dst: &mut [i32], gain: f32) {
+    let n = dst.len().min(src.len());
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    let mask = S::i32s::splat(simd, 0x00FF_FFFF);
+    let mut dchunks = dst.chunks_exact_mut(S::i32s::LEN);
+    let mut schunks = src.chunks_exact(S::f32s::LEN);
+    for (d, s) in dchunks.by_ref().zip(schunks.by_ref()) {
+        let v = S::f32s::from_slice(simd, s) * gain;
+        let ints: S::i32s = v.to_int_precise();
+        (ints & mask).store_slice(d);
+    }
+    for (d, s) in dchunks.into_remainder().iter_mut().zip(schunks.remainder()) {
+        *d = (*s * gain) as i32 & 0x00FF_FFFF;
+    }
+}
+
+#[simd]
+fn interleave_stereo_kernel<S: Simd>(simd: S, l: &[f32], r: &[f32], dst: &mut [f32]) {
+    let n = l.len().min(r.len()).min(dst.len() / 2);
+    let l = &l[..n];
+    let r = &r[..n];
+    let dst = &mut dst[..2 * n];
+    let len = S::f32s::LEN;
+    let mut lchunks = l.chunks_exact(len);
+    let mut rchunks = r.chunks_exact(len);
+    let mut dchunks = dst.chunks_exact_mut(2 * len);
+    for ((lc, rc), d) in lchunks.by_ref().zip(rchunks.by_ref()).zip(dchunks.by_ref()) {
+        let lv = S::f32s::from_slice(simd, lc);
+        let rv = S::f32s::from_slice(simd, rc);
+        let (i0, i1) = lv.interleave(rv);
+        i0.store_slice(&mut d[..len]);
+        i1.store_slice(&mut d[len..]);
+    }
+    let lrem = lchunks.remainder();
+    let rrem = rchunks.remainder();
+    let drem = dchunks.into_remainder();
+    for i in 0..lrem.len() {
+        drem[2 * i] = lrem[i];
+        drem[2 * i + 1] = rrem[i];
+    }
+}
+
+#[simd]
+fn apply_fade_in_kernel<S: Simd>(simd: S, buf: &mut [f32], start_t: f32, dt: f32) {
+    let len = S::f32s::LEN;
+    let mut chunks = buf.chunks_exact_mut(len);
+    let mut base = 0usize;
+    for chunk in chunks.by_ref() {
+        let mut gain = [0.0f32; 16];
         for (lane, g) in gain.iter_mut().enumerate() {
-            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
+            let t = (start_t + (base + lane) as f32 * dt).clamp(0.0, 1.0);
             *g = (t * std::f32::consts::FRAC_PI_2).sin();
         }
-        let s = _mm256_loadu_ps(buf.as_ptr().add(i));
-        let g = _mm256_loadu_ps(gain.as_ptr());
-        let r = _mm256_mul_ps(s, g);
-        _mm256_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 8;
+        let gv = S::f32s::from_slice(simd, &gain[..len]);
+        (S::f32s::from_slice(simd, chunk) * gv).store_slice(chunk);
+        base += len;
     }
-    for (j, v) in buf[i..].iter_mut().enumerate() {
-        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
+    for (j, v) in chunks.into_remainder().iter_mut().enumerate() {
+        let t = (start_t + (base + j) as f32 * dt).clamp(0.0, 1.0);
         *v *= (t * std::f32::consts::FRAC_PI_2).sin();
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn apply_fade_in_inplace_sse(buf: &mut [f32], start_t: f32, dt: f32) {
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        let mut gain = [0.0f32; 4];
+#[simd]
+fn apply_fade_out_kernel<S: Simd>(simd: S, buf: &mut [f32], start_t: f32, dt: f32) {
+    let len = S::f32s::LEN;
+    let mut chunks = buf.chunks_exact_mut(len);
+    let mut base = 0usize;
+    for chunk in chunks.by_ref() {
+        let mut gain = [0.0f32; 16];
         for (lane, g) in gain.iter_mut().enumerate() {
-            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
-            *g = (t * std::f32::consts::FRAC_PI_2).sin();
-        }
-        let s = _mm_loadu_ps(buf.as_ptr().add(i));
-        let g = _mm_loadu_ps(gain.as_ptr());
-        let r = _mm_mul_ps(s, g);
-        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (j, v) in buf[i..].iter_mut().enumerate() {
-        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
-        *v *= (t * std::f32::consts::FRAC_PI_2).sin();
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx")]
-unsafe fn apply_fade_out_inplace_avx(buf: &mut [f32], start_t: f32, dt: f32) {
-    let mut i = 0usize;
-    while i + 8 <= buf.len() {
-        let mut gain = [0.0f32; 8];
-        for (lane, g) in gain.iter_mut().enumerate() {
-            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
+            let t = (start_t + (base + lane) as f32 * dt).clamp(0.0, 1.0);
             *g = (t * std::f32::consts::FRAC_PI_2).cos();
         }
-        let s = _mm256_loadu_ps(buf.as_ptr().add(i));
-        let g = _mm256_loadu_ps(gain.as_ptr());
-        let r = _mm256_mul_ps(s, g);
-        _mm256_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 8;
+        let gv = S::f32s::from_slice(simd, &gain[..len]);
+        (S::f32s::from_slice(simd, chunk) * gv).store_slice(chunk);
+        base += len;
     }
-    for (j, v) in buf[i..].iter_mut().enumerate() {
-        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
-        *v *= (t * std::f32::consts::FRAC_PI_2).cos();
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse")]
-unsafe fn apply_fade_out_inplace_sse(buf: &mut [f32], start_t: f32, dt: f32) {
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        let mut gain = [0.0f32; 4];
-        for (lane, g) in gain.iter_mut().enumerate() {
-            let t = (start_t + (i + lane) as f32 * dt).clamp(0.0, 1.0);
-            *g = (t * std::f32::consts::FRAC_PI_2).cos();
-        }
-        let s = _mm_loadu_ps(buf.as_ptr().add(i));
-        let g = _mm_loadu_ps(gain.as_ptr());
-        let r = _mm_mul_ps(s, g);
-        _mm_storeu_ps(buf.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    for (j, v) in buf[i..].iter_mut().enumerate() {
-        let t = (start_t + (i + j) as f32 * dt).clamp(0.0, 1.0);
+    for (j, v) in chunks.into_remainder().iter_mut().enumerate() {
+        let t = (start_t + (base + j) as f32 * dt).clamp(0.0, 1.0);
         *v *= (t * std::f32::consts::FRAC_PI_2).cos();
     }
 }
@@ -1333,5 +524,185 @@ mod tests {
         let mut a = [-2.0f32, -0.5, 0.0, 0.5, 2.0];
         clamp_inplace(&mut a, -1.0, 1.0);
         assert_eq!(a, [-1.0, -0.5, 0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn convert_i32_to_f32_matches_scalar() {
+        let src: Vec<i32> = (0..17).map(|i| i * 123_456_789 - 1_000_000_000).collect();
+        let mut dst = vec![0.0f32; src.len()];
+        convert_i32_to_f32(&src, &mut dst, 0.5);
+        for (s, d) in src.iter().zip(dst.iter()) {
+            assert_eq!(*d, *s as f32 * 0.5);
+        }
+    }
+
+    #[test]
+    fn convert_i16_to_f32_matches_scalar() {
+        let src: Vec<i16> = (0..19).map(|i| (i * 7000 - 60_000) as i16).collect();
+        let mut dst = vec![0.0f32; src.len()];
+        convert_i16_to_f32(&src, &mut dst, 1.0);
+        for (s, d) in src.iter().zip(dst.iter()) {
+            assert_eq!(*d, *s as f32);
+        }
+    }
+
+    #[test]
+    fn convert_i8_to_f32_matches_scalar() {
+        let src: Vec<i8> = (0..21).map(|i| (i * 17 - 180) as i8).collect();
+        let mut dst = vec![0.0f32; src.len()];
+        convert_i8_to_f32(&src, &mut dst, 2.0);
+        for (s, d) in src.iter().zip(dst.iter()) {
+            assert_eq!(*d, *s as f32 * 2.0);
+        }
+    }
+
+    #[test]
+    fn convert_i24_to_f32_sign_extends() {
+        // i24 samples packed in the low 24 bits of each i32 lane.
+        let src = [
+            0i32,
+            1,
+            -1,          // 0xFFFFFFFF -> -1
+            0x007F_FFFF, // max positive i24
+            0x0080_0000, // min negative i24 (sign bit set)
+            0x00FF_FFFF, // all low bits set -> -1
+            0x1234_5678, // high byte ignored
+            42,
+            -42,
+            0x00AB_CDEF, // negative when sign-extended
+        ];
+        let mut dst = vec![0.0f32; src.len()];
+        convert_i24_to_f32(&src, &mut dst, 1.0);
+        let expected = [
+            0.0f32,
+            1.0,
+            -1.0,
+            8_388_607.0,
+            -8_388_608.0,
+            -1.0,
+            0x34_5678 as f32,
+            42.0,
+            -42.0,
+            -5_517_841.0,
+        ];
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn convert_f32_to_i32_truncates() {
+        let src = [
+            0.0f32,
+            0.9,
+            -0.9,
+            1.5,
+            -1.5,
+            2.5,
+            -2.5,
+            123_456.79,
+            -123_456.79,
+            7.0,
+            -3.0,
+        ];
+        let mut dst = vec![0i32; src.len()];
+        convert_f32_to_i32(&src, &mut dst, 1.0);
+        let expected: Vec<i32> = src.iter().map(|s| *s as i32).collect();
+        assert_eq!(dst, expected);
+        assert_eq!(dst[3], 1);
+        assert_eq!(dst[4], -1);
+    }
+
+    #[test]
+    fn convert_f32_to_i16_saturates() {
+        // `cvttps` + `packs` saturates like Rust's `as` for values in i32 range.
+        let src = [
+            0.0f32, 0.9, -0.9, 1.5, -1.5, 32767.0, -32768.0, 100_000.0, -100_000.0, 5.0, -7.0,
+            123.456,
+        ];
+        let mut dst = vec![0i16; src.len()];
+        convert_f32_to_i16(&src, &mut dst, 1.0);
+        let expected: Vec<i16> = src.iter().map(|s| *s as i16).collect();
+        assert_eq!(dst, expected);
+        assert_eq!(dst[7], i16::MAX);
+        assert_eq!(dst[8], i16::MIN);
+    }
+
+    #[test]
+    fn convert_f32_to_i8_saturates() {
+        let src = [
+            0.0f32, 0.9, -0.9, 1.5, -1.5, 127.0, -128.0, 200.0, -200.0, 5.0, -7.0, 63.0, -64.0,
+            12.0,
+        ];
+        let mut dst = vec![0i8; src.len()];
+        convert_f32_to_i8(&src, &mut dst, 1.0);
+        let expected: Vec<i8> = src.iter().map(|s| *s as i8).collect();
+        assert_eq!(dst, expected);
+        assert_eq!(dst[7], i8::MAX);
+        assert_eq!(dst[8], i8::MIN);
+    }
+
+    #[test]
+    fn convert_f32_to_i24_masks_low_bits() {
+        let src = [
+            0.0f32,
+            0.9,
+            -0.9,
+            5.9,
+            -5.9,
+            300.0,
+            -300.0,
+            8_388_607.0,
+            -8_388_608.0,
+            1.0,
+            -1.0,
+            16_777_215.0,
+            1e7,
+        ];
+        let mut dst = vec![0i32; src.len()];
+        convert_f32_to_i24(&src, &mut dst, 1.0);
+        let expected: Vec<i32> = src.iter().map(|s| (*s as i32) & 0x00FF_FFFF).collect();
+        assert_eq!(dst, expected);
+        assert_eq!(dst[7], 0x007F_FFFF);
+        // -8388608 truncates to i32 -8388608, mask keeps all 24 bits.
+        assert_eq!(dst[8], 0x0080_0000);
+        // -1 truncates to -1, mask keeps the low 24 bits (0x00FF_FFFF).
+        assert_eq!(dst[10], 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn apply_fade_in_matches_scalar() {
+        let mut buf: Vec<f32> = (0..37).map(|i| (i % 7) as f32 * 0.25 - 0.5).collect();
+        let mut expected = buf.clone();
+        let (start_t, dt) = (0.1f32, 0.023);
+        apply_fade_in_inplace(&mut buf, start_t, dt);
+        for (i, v) in expected.iter_mut().enumerate() {
+            let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
+            *v *= (t * std::f32::consts::FRAC_PI_2).sin();
+        }
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn apply_fade_out_matches_scalar() {
+        let mut buf: Vec<f32> = (0..29).map(|i| (i % 5) as f32 * 0.5 - 1.0).collect();
+        let mut expected = buf.clone();
+        let (start_t, dt) = (0.0f32, 0.041);
+        apply_fade_out_inplace(&mut buf, start_t, dt);
+        for (i, v) in expected.iter_mut().enumerate() {
+            let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
+            *v *= (t * std::f32::consts::FRAC_PI_2).cos();
+        }
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn interleave_stereo_matches_scalar() {
+        let l: Vec<f32> = (0..23).map(|i| i as f32 * 0.5 - 5.0).collect();
+        let r: Vec<f32> = (0..23).map(|i| 5.0 - i as f32 * 0.25).collect();
+        let mut dst = vec![0.0f32; 2 * l.len()];
+        interleave_stereo(&l, &r, &mut dst);
+        for i in 0..l.len() {
+            assert_eq!(dst[2 * i], l[i]);
+            assert_eq!(dst[2 * i + 1], r[i]);
+        }
     }
 }
