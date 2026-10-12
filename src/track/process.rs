@@ -1580,43 +1580,12 @@ impl TrackData {
                 let out_l = &output_buffers[0];
                 let out_r = &output_buffers[1];
                 let copy_len = step.min(out_l.len()).min(out_r.len());
-                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-                unsafe {
-                    if std::arch::is_x86_feature_detected!("sse") {
-                        let n = copy_len / 4;
-                        for i in 0..n {
-                            let l = std::arch::x86_64::_mm_loadu_ps(out_l.as_ptr().add(i * 4));
-                            let r = std::arch::x86_64::_mm_loadu_ps(out_r.as_ptr().add(i * 4));
-                            let lr0 = std::arch::x86_64::_mm_unpacklo_ps(l, r);
-                            let lr1 = std::arch::x86_64::_mm_unpackhi_ps(l, r);
-                            let dst = (cursor + i * 4) * 2;
-                            std::arch::x86_64::_mm_storeu_ps(rendered.as_mut_ptr().add(dst), lr0);
-                            std::arch::x86_64::_mm_storeu_ps(
-                                rendered.as_mut_ptr().add(dst + 4),
-                                lr1,
-                            );
-                        }
-                        for i in n * 4..copy_len {
-                            let dst = (cursor + i) * 2;
-                            rendered[dst] = out_l[i];
-                            rendered[dst + 1] = out_r[i];
-                        }
-                    } else {
-                        for i in 0..copy_len {
-                            let dst = (cursor + i) * 2;
-                            rendered[dst] = out_l[i];
-                            rendered[dst + 1] = out_r[i];
-                        }
-                    }
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-                {
-                    for i in 0..copy_len {
-                        let dst = (cursor + i) * 2;
-                        rendered[dst] = out_l[i];
-                        rendered[dst + 1] = out_r[i];
-                    }
-                }
+                let dst = cursor * 2;
+                crate::simd::interleave_stereo(
+                    &out_l[..copy_len],
+                    &out_r[..copy_len],
+                    &mut rendered[dst..dst + copy_len * 2],
+                );
             } else {
                 for (ch, out) in output_buffers.iter().enumerate().take(channels) {
                     let copy_len = step.min(out.len());
