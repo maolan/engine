@@ -353,7 +353,7 @@ impl TrackData {
             .retain(|key, _| active_clip_plugin_keys.contains(key));
         let peak = inputs
             .iter()
-            .map(|input| input.iter().map(|&s| s.abs()).fold(0.0_f32, f32::max))
+            .map(|input| crate::simd::peak_abs(input))
             .fold(0.0_f32, f32::max);
         tracing::debug!(
             "mix_session_audio_into_inputs track={} playing_clips={} input_peak={}",

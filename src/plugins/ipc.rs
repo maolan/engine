@@ -178,9 +178,8 @@ pub fn wait_for_ready(header: &ShmHeader, child: &mut Child, timeout: Duration) 
 pub fn bypass_copy_input_slices_to_outputs(inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
     for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
         output.fill(0.0);
-        for (d, s) in output.iter_mut().zip(input.iter()) {
-            *d = *s;
-        }
+        let n = output.len().min(input.len());
+        output[..n].copy_from_slice(&input[..n]);
     }
     for output in outputs.iter_mut().skip(inputs.len()) {
         output.fill(0.0);

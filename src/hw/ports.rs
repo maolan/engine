@@ -44,21 +44,60 @@ pub fn fill_arena_from_interleaved(
     channels: usize,
 ) {
     let total = frames.saturating_mul(channels).min(buffer.len());
+    if channels == 2 {
+        let idx0 = plan.hw_in_map.iter().position(|&(ch, _)| ch == 0);
+        let idx1 = plan.hw_in_map.iter().position(|&(ch, _)| ch == 1);
+        if let (Some(i0), Some(i1)) = (idx0, idx1) {
+            // Safety: same driver-is-sole-producer invariant as the scalar
+            // path below; hw_in_map entries reference distinct arena buffers.
+            let l = unsafe { &mut *plan.buffer_ptr(plan.hw_in_map[i0].1) };
+            let r = unsafe { &mut *plan.buffer_ptr(plan.hw_in_map[i1].1) };
+            if l.len() == r.len() {
+                let end = frames.min(l.len());
+                let n = end.min(buffer.len() / 2);
+                crate::simd::deinterleave_stereo(&mut l[..n], &mut r[..n], &buffer[..2 * n]);
+                // A buffer cut mid-frame still hands its dangling sample to
+                // channel 0 before the scalar gather stops, so mirror that.
+                if n < end && buffer.len() % 2 == 1 {
+                    l[n] = buffer[2 * n];
+                }
+                for (k, &(ch_idx, buf)) in plan.hw_in_map.iter().enumerate() {
+                    if k == i0 || k == i1 {
+                        continue;
+                    }
+                    // Safety: same between-cycles invariant as above.
+                    let arena = unsafe { &mut *plan.buffer_ptr(buf) };
+                    fill_plane_scalar(arena, frames, ch_idx, channels, buffer, total);
+                }
+                return;
+            }
+        }
+    }
     for &(ch_idx, buf) in &plan.hw_in_map {
         // Safety: the driver is the sole producer of HwInput arena buffers.
         // The engine only dispatches a cycle after the driver reports new
         // input, and this write happens before that report, so no node is
         // reading these buffers concurrently.
         let arena = unsafe { &mut *plan.buffer_ptr(buf) };
-        let end = frames.min(arena.len());
-        let dst = &mut arena[..end];
-        let mut i = ch_idx;
-        for d in dst.iter_mut() {
-            *d = buffer.get(i).copied().unwrap_or(0.0);
-            i = i.saturating_add(channels);
-            if i >= total {
-                break;
-            }
+        fill_plane_scalar(arena, frames, ch_idx, channels, buffer, total);
+    }
+}
+
+fn fill_plane_scalar(
+    arena: &mut [f32],
+    frames: usize,
+    ch_idx: usize,
+    channels: usize,
+    buffer: &[f32],
+    total: usize,
+) {
+    let end = frames.min(arena.len());
+    let mut i = ch_idx;
+    for d in arena[..end].iter_mut() {
+        *d = buffer.get(i).copied().unwrap_or(0.0);
+        i = i.saturating_add(channels);
+        if i >= total {
+            break;
         }
     }
 }

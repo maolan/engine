@@ -82,6 +82,10 @@ pub fn interleave_stereo(l: &[f32], r: &[f32], dst: &mut [f32]) {
     dispatch!(Level::new(), simd => interleave_stereo_kernel(simd, l, r, dst));
 }
 
+pub fn deinterleave_stereo(l: &mut [f32], r: &mut [f32], src: &[f32]) {
+    dispatch!(Level::new(), simd => deinterleave_stereo_kernel(simd, l, r, src));
+}
+
 #[simd]
 fn add_inplace_kernel<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
     let n = dst.len().min(src.len());
@@ -404,6 +408,32 @@ fn interleave_stereo_kernel<S: Simd>(simd: S, l: &[f32], r: &[f32], dst: &mut [f
 }
 
 #[simd]
+fn deinterleave_stereo_kernel<S: Simd>(simd: S, l: &mut [f32], r: &mut [f32], src: &[f32]) {
+    let len = S::f32s::LEN;
+    let n = l.len().min(r.len()).min(src.len() / 2);
+    let l = &mut l[..n];
+    let r = &mut r[..n];
+    let src = &src[..2 * n];
+    let mut schunks = src.chunks_exact(2 * len);
+    let mut lchunks = l.chunks_exact_mut(len);
+    let mut rchunks = r.chunks_exact_mut(len);
+    for (s, (lc, rc)) in schunks.by_ref().zip(lchunks.by_ref().zip(rchunks.by_ref())) {
+        let v0 = S::f32s::from_slice(simd, &s[..len]);
+        let v1 = S::f32s::from_slice(simd, &s[len..]);
+        let (lv, rv) = v0.deinterleave(v1);
+        lv.store_slice(lc);
+        rv.store_slice(rc);
+    }
+    let srem = schunks.remainder();
+    let lrem = lchunks.into_remainder();
+    let rrem = rchunks.into_remainder();
+    for i in 0..lrem.len() {
+        lrem[i] = srem[2 * i];
+        rrem[i] = srem[2 * i + 1];
+    }
+}
+
+#[simd]
 fn apply_fade_in_kernel<S: Simd>(simd: S, buf: &mut [f32], start_t: f32, dt: f32) {
     let len = S::f32s::LEN;
     let mut chunks = buf.chunks_exact_mut(len);
@@ -703,6 +733,20 @@ mod tests {
         for i in 0..l.len() {
             assert_eq!(dst[2 * i], l[i]);
             assert_eq!(dst[2 * i + 1], r[i]);
+        }
+    }
+
+    #[test]
+    fn deinterleave_stereo_matches_scalar() {
+        // Odd source length: the dangling sample must be ignored.
+        let src: Vec<f32> = (0..47).map(|i| i as f32 * 0.125 - 3.0).collect();
+        let n = src.len() / 2;
+        let mut l = vec![f32::NAN; n];
+        let mut r = vec![f32::NAN; n];
+        deinterleave_stereo(&mut l, &mut r, &src);
+        for i in 0..n {
+            assert_eq!(l[i], src[2 * i]);
+            assert_eq!(r[i], src[2 * i + 1]);
         }
     }
 }

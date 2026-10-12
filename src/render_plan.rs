@@ -226,20 +226,33 @@ impl DelayLine {
         }
 
         let frames = output.len().min(input.len());
-        for frame in 0..frames {
-            let delayed = self.buffer[self.pos];
-            self.buffer[self.pos] = input[frame];
-            self.pos += 1;
-            if self.pos == self.buffer.len() {
-                self.pos = 0;
-            }
-            let delayed = if delayed.is_finite() { delayed } else { 0.0 };
+        // The ring wrap means the block covers at most two contiguous spans
+        // of the ring. Read each span out (sanitizing, as the scalar loop
+        // did) before overwriting it with the raw input.
+        let len = self.buffer.len();
+        let mut pos = self.pos;
+        let mut done = 0;
+        while done < frames {
+            let span = (len - pos).min(frames - done);
             if add {
-                output[frame] += delayed;
+                crate::simd::add_sanitized_inplace(
+                    &mut output[done..done + span],
+                    &self.buffer[pos..pos + span],
+                );
             } else {
-                output[frame] = delayed;
+                crate::simd::copy_sanitized_inplace(
+                    &mut output[done..done + span],
+                    &self.buffer[pos..pos + span],
+                );
             }
+            self.buffer[pos..pos + span].copy_from_slice(&input[done..done + span]);
+            pos += span;
+            if pos == len {
+                pos = 0;
+            }
+            done += span;
         }
+        self.pos = pos;
         if !add && frames < output.len() {
             output[frames..].fill(0.0);
         }

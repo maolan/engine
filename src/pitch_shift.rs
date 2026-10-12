@@ -108,9 +108,17 @@ impl LivePitchShifter {
     fn pitch_shift_interleaved_block(&mut self, pitch_scale: f64) {
         let channels = self.channels;
         self.interleaved.resize(self.block_size * channels, 0.0);
-        for frame in 0..self.block_size {
-            for channel in 0..channels {
-                self.interleaved[frame * channels + channel] = self.input[channel][frame];
+        if channels == 2 {
+            crate::simd::interleave_stereo(
+                &self.input[0][..self.block_size],
+                &self.input[1][..self.block_size],
+                &mut self.interleaved,
+            );
+        } else {
+            for frame in 0..self.block_size {
+                for channel in 0..channels {
+                    self.interleaved[frame * channels + channel] = self.input[channel][frame];
+                }
             }
         }
 
@@ -125,11 +133,26 @@ impl LivePitchShifter {
         for channel in &mut self.output {
             channel.fill(0.0);
         }
-        for frame in 0..self.block_size {
-            for channel in 0..channels {
-                let sample_index = frame * channels + channel;
-                if sample_index < corrected.len().min(expected_len) {
-                    self.output[channel][frame] = corrected[sample_index];
+        if channels == 2 {
+            if let [l, r, ..] = &mut self.output[..] {
+                // Mirror the scalar loop: copy while the interleaved index
+                // stays inside both `corrected` and the expected length.
+                let limit = corrected.len().min(expected_len);
+                let n = self.block_size.min(limit / 2);
+                crate::simd::deinterleave_stereo(&mut l[..n], &mut r[..n], &corrected[..2 * n]);
+                // A corrected buffer cut mid-frame still lands its dangling
+                // sample in channel 0, matching the scalar loop.
+                if n < self.block_size && limit % 2 == 1 {
+                    l[n] = corrected[2 * n];
+                }
+            }
+        } else {
+            for frame in 0..self.block_size {
+                for channel in 0..channels {
+                    let sample_index = frame * channels + channel;
+                    if sample_index < corrected.len().min(expected_len) {
+                        self.output[channel][frame] = corrected[sample_index];
+                    }
                 }
             }
         }
