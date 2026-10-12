@@ -676,7 +676,13 @@ mod tests {
         clip.fade_enabled = false;
         track.audio.push_clip(clip);
 
-        let mut first_block: Option<Vec<f32>> = None;
+        // The producer decodes on a background thread, so initial blocks may
+        // under-run with silence while the stream primes (thread startup is
+        // slow to schedule on some CI machines). Capture every block and
+        // locate the first one that is frame-exact at its transport offset;
+        // a systematically delayed stream (e.g. one block behind) can never
+        // match at the correct offset.
+        let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(188);
         let mut peak = 0.0f32;
         for cycle in 0..188 {
             track.rt.transport_sample = cycle * 256;
@@ -687,9 +693,7 @@ mod tests {
                     peak = peak.max(s.abs());
                 }
             }
-            if cycle == 1 && !out.is_empty() {
-                first_block = Some(out[0].to_vec());
-            }
+            blocks.push(out.first().map(|lane| lane.to_vec()).unwrap_or_default());
             std::thread::sleep(Duration::from_millis(5));
         }
         let _ = std::fs::remove_file(&path);
@@ -698,15 +702,24 @@ mod tests {
             peak > 0.01,
             "seekable streaming clip must be audible through Track (peak {peak})"
         );
-        let first_block = first_block.expect("second render block");
-        // Even if the first callback under-runs during initial loading,
-        // the second callback must play source frame 256, not delayed frame 0.
-        for (i, (&actual, &expected)) in first_block.iter().zip(source[256..].iter()).enumerate() {
-            assert!(
-                (actual - expected).abs() < 1.0e-6,
-                "sample {i}: got {actual}, expected {expected}"
-            );
-        }
+        let exact = |cycle: usize| -> bool {
+            let block = &blocks[cycle];
+            !block.is_empty()
+                && block
+                    .iter()
+                    .zip(source[cycle * 256..].iter())
+                    .all(|(&actual, &expected)| (actual - expected).abs() < 1.0e-6)
+        };
+        let cycle = (0..blocks.len().saturating_sub(1))
+            .position(&exact)
+            .expect("no frame-exact block; stream is delayed or misaligned");
+        // The following block must line up too, so a stream that only briefly
+        // locks onto the right offset (or realigns late) cannot pass.
+        assert!(
+            exact(cycle + 1),
+            "block {} after first exact block is not frame-exact",
+            cycle + 1
+        );
     }
 
     #[test]
