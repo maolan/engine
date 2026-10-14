@@ -1,3 +1,4 @@
+use crate::timeutil::field_to_i64;
 use nix::libc;
 use std::{
     collections::HashMap,
@@ -146,10 +147,10 @@ impl FrameClock {
     }
 
     pub(super) fn sleep_until_frame(&self, frame: i64) -> bool {
-        let ns = self.frames_to_time(frame);
+        let ns = field_to_i64(self.zero.tv_nsec) + self.frames_to_time(frame);
         let wake = libc::timespec {
-            tv_sec: self.zero.tv_sec + (self.zero.tv_nsec + ns) / 1_000_000_000,
-            tv_nsec: (self.zero.tv_nsec + ns) % 1_000_000_000,
+            tv_sec: (field_to_i64(self.zero.tv_sec) + ns / 1_000_000_000) as _,
+            tv_nsec: (ns % 1_000_000_000) as _,
         };
         unsafe {
             libc::clock_nanosleep(
