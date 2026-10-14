@@ -14,6 +14,7 @@
 use crate::hw::oss::consts::{AFMT_S32_NE, PCM_CAP_MMAP, PCM_CAP_TRIGGER};
 use crate::hw::oss::{ioctl, position::stream_frame};
 use crate::mtdm::{self, Mtdm, make_report};
+use crate::timeutil::field_to_i64;
 
 pub use crate::mtdm::{IoDelayReport, IoDelayStatus};
 use nix::libc;
@@ -491,13 +492,13 @@ fn gettime_ns() -> i64 {
     unsafe {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
-    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+    field_to_i64(ts.tv_sec) * 1_000_000_000 + field_to_i64(ts.tv_nsec)
 }
 
 fn sleep_until_ns(target: i64) {
     let ts = libc::timespec {
-        tv_sec: target / 1_000_000_000,
-        tv_nsec: target % 1_000_000_000,
+        tv_sec: (target / 1_000_000_000) as _,
+        tv_nsec: (target % 1_000_000_000) as _,
     };
     let req = ts;
     loop {

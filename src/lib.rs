@@ -45,6 +45,8 @@ pub mod render_plan;
 mod routing;
 pub mod simd;
 pub mod state;
+#[cfg(target_os = "freebsd")]
+mod timeutil;
 mod track;
 pub mod triple_buffer;
 pub mod workers;
