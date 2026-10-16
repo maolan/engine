@@ -14,7 +14,8 @@ pub mod audio_devices {
 }
 #[cfg(target_os = "windows")]
 pub mod audio_devices {
-    pub use crate::hw::wasapi::effective_period_frames;
+    pub use crate::hw::asio::{AsioDeviceDescriptor, discover_asio_audio_devices};
+    pub use crate::hw::windows::effective_period_frames;
 }
 pub mod client;
 pub mod connectable;

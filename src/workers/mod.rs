@@ -8,5 +8,5 @@ pub mod oss_worker;
 #[cfg(target_os = "openbsd")]
 pub mod sndio_worker;
 #[cfg(target_os = "windows")]
-pub mod wasapi_worker;
+pub mod windows_worker;
 pub mod worker;
