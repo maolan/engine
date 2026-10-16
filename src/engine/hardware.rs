@@ -17,7 +17,9 @@ use crate::hw::oss::{HwDriver, HwOptions};
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 use crate::hw::traits::HwWorkerDriver;
 #[cfg(target_os = "windows")]
-use crate::hw::wasapi::{self, HwDriver};
+use crate::hw::wasapi;
+#[cfg(target_os = "windows")]
+use crate::hw::windows::HwDriver;
 use crate::track::set_ring_buffer_multiplier;
 #[cfg(target_os = "linux")]
 use crate::workers::alsa_worker::HwWorker;
@@ -28,7 +30,7 @@ use crate::workers::oss_worker::HwWorker;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 #[cfg(target_os = "windows")]
-use crate::workers::wasapi_worker::HwWorker;
+use crate::workers::windows_worker::HwWorker;
 use crate::{
     audio::io::AudioIO,
     engine::HwDriverInfo,
@@ -115,7 +117,11 @@ impl Engine {
 
     pub(crate) fn hw_profile_backend_label(_device: &str) -> &'static str {
         #[cfg(target_os = "windows")]
-        let label = "WASAPI";
+        let label = if crate::hw::asio::is_asio_device_id(_device) {
+            "ASIO"
+        } else {
+            "WASAPI"
+        };
         #[cfg(target_os = "macos")]
         let label = "CoreAudio";
         #[cfg(target_os = "linux")]

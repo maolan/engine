@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 pub mod alsa;
+#[cfg(target_os = "windows")]
+pub mod asio;
 pub mod common;
 pub mod config;
 pub mod convert_policy;
@@ -24,5 +26,7 @@ pub mod sndio;
 pub mod traits;
 #[cfg(target_os = "windows")]
 pub mod wasapi;
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod windows_midi;

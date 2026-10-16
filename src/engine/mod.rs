@@ -60,7 +60,9 @@ use crate::hw::oss::{HwDriver, MidiHub};
 #[cfg(target_os = "openbsd")]
 use crate::hw::sndio::{HwDriver, HwOptions, MidiHub};
 #[cfg(target_os = "windows")]
-use crate::hw::wasapi::{HwDriver, MidiHub};
+use crate::hw::wasapi::MidiHub;
+#[cfg(target_os = "windows")]
+use crate::hw::windows::HwDriver;
 #[cfg(target_os = "openbsd")]
 use crate::workers::sndio_worker::HwWorker;
 use crate::{
