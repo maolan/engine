@@ -23,6 +23,7 @@
 //!    string (`asio:<driver name>`), creates the SPSC rings, installs the
 //!    buffer-switch callback (which only ever touches the rings), starts
 //!    the stream, and ships the ring halves back in the report.
+//!    Device opening waits for the first callback before reporting readiness.
 //! 3. `run_cycle` (on whatever worker thread the engine assigns) drains the
 //!    input ring and fills the output ring — no COM, no driver pointers,
 //!    so the struct is naturally `Send`.
@@ -37,6 +38,42 @@
 //! allows only one stream per process. The engine opens exactly one audio
 //! device, which keeps the backend within that limit; opening a second
 //! ASIO device fails with `StreamError::Busy` while the first is alive.
+//!
+//! # Real-time rules (the buffer-switch callback must never block)
+//!
+//! The callback runs on the driver's own real-time thread; blocking it for
+//! roughly a buffer period or more stalls drivers like ASIO4ALL, which then
+//! manifests as the producer-side "Timed out waiting for ASIO buffer
+//! switch" watchdog. Guarantees:
+//!
+//! - Output: pops under the gate mutex (held only across ring pops and the
+//!   copy into the driver's buffers) and, when starved while playing, waits
+//!   on the condvar for at most [`STARVED_GRACE`] — never a full period.
+//! - Input: pushes lock-free; when the ring cannot hold a whole switch,
+//!   the oldest complete frames are dropped in ONE bounded mutex
+//!   acquisition (newest data wins, frame alignment preserved). There is
+//!   no per-sample locking and no retry loop.
+//! - No allocation in steady state (the scratch Vecs are pre-reserved).
+//! - `run_cycle` never holds the input consumer mutex across an allocation
+//!   (it drains into a reusable scratch) and never blocks while holding
+//!   either mutex; `queue_output_period`'s condvar wait releases the gate,
+//!   so the callback's and the producer's waits stay mutually exclusive
+//!   (empty ring vs. full ring) with no lost wakeup.
+//!
+//! # Requested vs. negotiated sizing
+//!
+//! The rings and scratch buffers are created before `Driver::stream` and
+//! are therefore sized from the *requested* period, while the callback
+//! paces by the *negotiated* `ctx.frames()`. Every `frames`-dependent
+//! consumer (`run_cycle`, `output_period`, the port surface) uses
+//! `period_frames` from the open report, i.e. the negotiated size, so a
+//! negotiation that comes out smaller than requested (e.g. ASIO4ALL
+//! clamping 4096 to its 2048 maximum) is fully consistent — the rings are
+//! merely over-capacious. A negotiation that comes out *larger* than
+//! requested (only possible with a stepped buffer-size granularity) can
+//! need more than one switch per engine cycle when `nperiods == 1`; it
+//! still cannot deadlock (the callback drains the ring every switch), but
+//! `nperiods >= 2` (the engine default) should be preferred.
 //!
 //! # Limitations
 //!
@@ -66,21 +103,21 @@ pub(crate) const ASIO_PREFIX: &str = "asio:";
 /// Poll interval for `Stream::take_events()` on the ASIO owner thread.
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Driver startup can take substantially longer than a running buffer switch:
+/// ASIO4ALL on USB hardware takes over a second at large periods. Do not start
+/// the steady-state watchdog or calibration until callbacks actually arrive.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long the buffer-switch callback may block waiting for engine data
 /// while the transport is playing, before falling back to silence.
 ///
-/// Deliberately a small fixed value rather than a full buffer period
-/// (CoreAudio's equivalent): the callback runs on the driver's own
-/// real-time buffer-switch thread, and blocking it for an entire buffer
-/// period (21.3 ms at 1024 frames / 48 kHz) made ASIO4ALL stall its
-/// engine at period >= 1024 — 512 frames (10.7 ms) still worked, which
-/// pinned the failure threshold to the period-scaled block. The engine
-/// cycle is paced by `queue_output_period` blocking on the full ring, so
-/// a short grace loses nothing but the stalled driver thread.
+/// Keep this independent of period size so a starved engine does not hold
+/// the driver's callback thread for an entire audio period.
 const STARVED_GRACE: Duration = Duration::from_millis(4);
 
 struct OutputGate {
     stopped: bool,
+    started: bool,
 }
 
 struct OutputShared {
@@ -205,6 +242,24 @@ fn queue_wait_timeout(period_frames: usize, sample_rate: usize) -> Duration {
     Duration::from_millis((period_ms.max(1) * 2).max(500))
 }
 
+/// Wait on a predicate protected by the callback's gate so a first switch
+/// arriving before this wait cannot be missed. This runs only on the owner
+/// thread; the callback never waits for startup acknowledgement.
+fn wait_for_stream_start(shared: &OutputShared, timeout: Duration) -> Result<(), String> {
+    let gate = shared
+        .gate
+        .lock()
+        .map_err(|_| "ASIO output gate poisoned".to_string())?;
+    let (gate, _) = shared
+        .condvar
+        .wait_timeout_while(gate, timeout, |gate| !gate.started)
+        .map_err(|_| "ASIO output gate poisoned".to_string())?;
+    if !gate.started {
+        return Err("Timed out waiting for ASIO stream startup (no buffer switch)".to_string());
+    }
+    Ok(())
+}
+
 /// Body of the dedicated ASIO owner thread: owns the COM guard, the driver,
 /// and the stream; bridges them to the engine through SPSC rings.
 fn asio_thread_main(
@@ -274,7 +329,10 @@ fn asio_thread_run(
         None
     };
     let output_shared = Arc::new(OutputShared {
-        gate: Mutex::new(OutputGate { stopped: false }),
+        gate: Mutex::new(OutputGate {
+            stopped: false,
+            started: false,
+        }),
         condvar: Condvar::new(),
         playing: AtomicBool::new(false),
         xruns: AtomicUsize::new(0),
@@ -314,6 +372,7 @@ fn asio_thread_run(
                 let Ok(mut gate) = out_shared.gate.lock() else {
                     return;
                 };
+                gate.started = true;
                 loop {
                     while out_scratch.len() < needed
                         && let Ok(sample) = output_consumer.pop()
@@ -363,7 +422,13 @@ fn asio_thread_run(
             out_shared.condvar.notify_all();
 
             // Inputs: interleave the per-channel driver buffers into the
-            // ring, dropping the oldest complete frames when full.
+            // ring. The callback must never block: if the ring cannot hold
+            // the whole switch, drop the oldest complete frames in ONE
+            // bounded mutex acquisition (keeping the newest data and frame
+            // alignment), then push without any retry loop. A single
+            // producer (this callback) and the room just made guarantee the
+            // pushes succeed; the residual failures only defend against a
+            // poisoned mutex and drop the newest sample rather than wait.
             if let Some((producer, in_shared)) = callback_input.as_mut()
                 && in_shared.channels > 0
             {
@@ -373,30 +438,27 @@ fn asio_thread_run(
                         in_scratch.push(ctx.input(ch).get(frame).copied().unwrap_or(0.0));
                     }
                 }
-                let mut offset = 0_usize;
-                while offset < in_scratch.len() {
-                    match producer.push(in_scratch[offset]) {
-                        Ok(()) => offset += 1,
-                        Err(sample) => {
-                            // Ring full: drop the oldest complete frame and
-                            // retry.
-                            in_scratch[offset] = match sample {
-                                rtrb::PushError::Full(v) => v,
-                            };
-                            let Ok(mut consumer) = in_shared.consumer.lock() else {
-                                return;
-                            };
-                            let frame_samples = in_shared.channels.max(1);
-                            for _ in 0..frame_samples {
-                                if consumer.pop().is_err() {
-                                    break;
-                                }
+                let deficit = in_scratch.len().saturating_sub(producer.slots());
+                if deficit > 0 {
+                    let dropped_frames = deficit.div_ceil(in_shared.channels);
+                    let dropped_samples = dropped_frames.saturating_mul(in_shared.channels);
+                    if let Ok(mut consumer) = in_shared.consumer.lock() {
+                        for _ in 0..dropped_samples {
+                            if consumer.pop().is_err() {
+                                break;
                             }
-                            // Advances once per dropped complete frame; the
-                            // retry below always frees exactly one frame
-                            // before pushing again.
-                            in_shared.overflow_drops.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+                    in_shared
+                        .overflow_drops
+                        .fetch_add(dropped_frames, Ordering::Relaxed);
+                    in_shared.xruns.fetch_add(dropped_frames, Ordering::Relaxed);
+                }
+                for sample in &in_scratch {
+                    if producer.push(*sample).is_err() {
+                        // Unreachable while the mutex above succeeded; drop
+                        // the newest sample rather than block the switch.
+                        in_shared.overflow_drops.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -407,6 +469,8 @@ fn asio_thread_run(
     stream
         .start()
         .map_err(|e| format!("Failed to start ASIO stream on '{}': {e}", info.name))?;
+
+    wait_for_stream_start(&output_shared, STARTUP_TIMEOUT)?;
 
     let report = OpenReport {
         output_producer,
@@ -474,6 +538,9 @@ pub struct HwDriver {
     audio_ins: Vec<Arc<AudioIO>>,
     audio_outs: Vec<Arc<AudioIO>>,
     input_queue: Vec<f32>,
+    /// Reusable ring-drain scratch: draining never allocates the retained
+    /// queue while the consumer mutex is held.
+    input_drain: Vec<f32>,
     /// Reusable interleaved output period; fed to the ring without any
     /// intermediate VecDeque copy.
     output_period: Vec<f32>,
@@ -567,6 +634,12 @@ impl HwDriver {
             audio_ins,
             audio_outs,
             input_queue: Vec::new(),
+            input_drain: Vec::with_capacity(
+                report
+                    .period_frames
+                    .saturating_mul(report.input_channels.max(1))
+                    .saturating_mul(4),
+            ),
             output_period: vec![
                 0.0_f32;
                 report.period_frames.saturating_mul(report.output_channels)
@@ -643,11 +716,27 @@ impl HwDriver {
     pub fn run_cycle(&mut self) -> Result<(), String> {
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
-        if let Some(shared) = &self.input_shared
-            && let Ok(mut consumer) = shared.consumer.lock()
-        {
-            while let Ok(sample) = consumer.pop() {
-                self.input_queue.push(sample);
+        let needed_samples = input_frames.saturating_mul(input_channels);
+        if let Some(shared) = &self.input_shared {
+            // Drain into a reusable scratch so no allocation of the
+            // retained queue (or anything else) happens while the consumer
+            // mutex is held — the callback takes the same lock on overflow
+            // and must never wait on a heap lock.
+            self.input_drain.clear();
+            if let Ok(mut consumer) = shared.consumer.lock() {
+                while let Ok(sample) = consumer.pop() {
+                    self.input_drain.push(sample);
+                }
+            }
+            self.input_queue.extend_from_slice(&self.input_drain);
+            // Keep at most the freshest period: a device that outpaces the
+            // engine must not grow the queue without bound, and the arena
+            // must always see recent input, not an ever-growing delay.
+            if self.input_queue.len() > needed_samples {
+                let dropped_frames = (self.input_queue.len() - needed_samples) / input_channels;
+                self.input_queue
+                    .drain(..self.input_queue.len() - needed_samples);
+                shared.xruns.fetch_add(dropped_frames, Ordering::Relaxed);
             }
         }
 
@@ -851,6 +940,48 @@ crate::impl_hw_device_for_driver!(HwDriver);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_shared(started: bool) -> Arc<OutputShared> {
+        Arc::new(OutputShared {
+            gate: Mutex::new(OutputGate {
+                stopped: false,
+                started,
+            }),
+            condvar: Condvar::new(),
+            playing: AtomicBool::new(false),
+            xruns: AtomicUsize::new(0),
+            idle_timeout: Duration::ZERO,
+        })
+    }
+
+    #[test]
+    fn startup_accepts_callback_before_wait() {
+        let shared = startup_shared(true);
+        assert!(wait_for_stream_start(&shared, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn startup_reports_missing_callback() {
+        let shared = startup_shared(false);
+        assert_eq!(
+            wait_for_stream_start(&shared, Duration::ZERO).unwrap_err(),
+            "Timed out waiting for ASIO stream startup (no buffer switch)"
+        );
+    }
+
+    #[test]
+    fn startup_allows_callback_after_running_watchdog_interval() {
+        let shared = startup_shared(false);
+        let callback_shared = shared.clone();
+        let callback = std::thread::spawn(move || {
+            std::thread::sleep(queue_wait_timeout(1024, 48_000) + Duration::from_millis(100));
+            callback_shared.gate.lock().unwrap().started = true;
+            callback_shared.condvar.notify_all();
+        });
+        let result = wait_for_stream_start(&shared, STARTUP_TIMEOUT);
+        callback.join().unwrap();
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn strip_prefix_only_when_present() {
