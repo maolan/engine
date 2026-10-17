@@ -1,6 +1,6 @@
 [package]
 name = "maolan-engine"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 description = "Audio engine for the Maolan DAW with audio/MIDI tracks, routing, export, and out-of-process CLAP/VST3/LV2 plugin support"
 license = "BSD-2-Clause"
@@ -13,21 +13,21 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 num_cpus = "1.17.0"
-tokio = { version = "1.53.1", features = ["full"] }
-oxideav-core = { version = "0.1.35", optional = true }
+tokio = { version = "1.53.3", features = ["full"] }
+oxideav-core = { version = "0.1.40", optional = true }
 oxideav-basic = { version = "0.0.11", optional = true }
 oxideav-flac = { version = "0.0.11", optional = true }
 oxideav-mp3 = { version = "0.1.3", optional = true }
-oxideav-ogg = { version = "0.1.8", optional = true }
+oxideav-ogg = { version = "0.1.9", optional = true }
 symphonia = { version = "0.6.1", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"], optional = true }
 tracing-subscriber = "0.3.23"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 byteorder = "1.5.0"
 midly = { version = "0.5.3", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 maolan-plugin-protocol = { version = "0.0.20", optional = true }
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 fearless_simd = "1.1"
 fearless_simd_macros = "0.1"
 arc-swap = "1.9.2"
@@ -35,7 +35,7 @@ basedrop = "0.1.3"
 rtrb = "0.4.0"
 rubato = "5.0"
 audioadapter = "5.0"
-audioadapter-buffers = "5.1"
+audioadapter-buffers = "5.2"
 timestretch = "0.15.0"
 mixosc = { version = "0.0.16", optional = true }
 
@@ -57,7 +57,7 @@ mixosc = ["dep:mixosc"]
 block = "0.1.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.12.0"
+alsa = "0.12.1"
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
 nvtree = "0.0.6"
