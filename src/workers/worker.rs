@@ -105,25 +105,33 @@ impl Worker {
                     let lo = min.min(max);
                     let hi = max.max(min);
                     let param_value = (lo + value * (hi - lo)).clamp(lo, hi);
-                    let _ = track.set_lv2_control_value(
-                        instance_id,
-                        index as usize,
-                        param_value as f64,
-                    );
+                    if let Err(e) =
+                        track.set_lv2_control_value(instance_id, index as usize, param_value as f64)
+                    {
+                        tracing::warn!("Offline LV2 automation failed: {e}");
+                    }
                 }
                 #[cfg(feature = "plugins")]
                 OfflineAutomationTarget::Vst3Parameter {
                     instance_id,
                     param_id,
                 } => {
-                    let _ = track.set_vst3_parameter(instance_id, param_id, value.clamp(0.0, 1.0));
+                    if let Err(e) =
+                        track.set_vst3_parameter(instance_id, param_id, value.clamp(0.0, 1.0))
+                    {
+                        tracing::warn!("Offline VST3 automation failed: {e}");
+                    }
                 }
                 #[cfg(all(target_os = "macos", feature = "plugins"))]
                 OfflineAutomationTarget::AuParameter {
                     instance_id,
                     param_index,
                 } => {
-                    let _ = track.set_au_parameter(instance_id, param_index, value.clamp(0.0, 1.0));
+                    if let Err(e) =
+                        track.set_au_parameter(instance_id, param_index, value.clamp(0.0, 1.0))
+                    {
+                        tracing::warn!("Offline Audio Unit automation failed: {e}");
+                    }
                 }
                 #[cfg(feature = "plugins")]
                 OfflineAutomationTarget::ClapParameter {
@@ -135,7 +143,11 @@ impl Worker {
                     let lo = min.min(max);
                     let hi = max.max(min);
                     let param_value = (lo + value as f64 * (hi - lo)).clamp(lo, hi);
-                    let _ = track.set_clap_parameter_at(instance_id, param_id, param_value, 0);
+                    if let Err(e) =
+                        track.set_clap_parameter_at(instance_id, param_id, param_value, 0)
+                    {
+                        tracing::warn!("Offline CLAP automation failed: {e}");
+                    }
                 }
                 OfflineAutomationTarget::MixOsc { .. } => {
                     // MixOSC values are sent to external hardware in real time,
@@ -165,13 +177,18 @@ impl Worker {
     async fn process_offline_bounce(&self, job: OfflineBounceWork) {
         let track_handle = job.state.tracks.get(&job.track_name).cloned();
         let Some(target_track) = track_handle else {
-            let _ = self
-                .tx
-                .send(Message::OfflineBounceFinished {
-                    result: Err(format!("Track not found: {}", job.track_name)),
-                })
-                .await;
-            let _ = self.tx.send(Message::Ready(self.id)).await;
+            crate::report_error(
+                self.tx
+                    .send(Message::OfflineBounceFinished {
+                        result: Err(format!("Track not found: {}", job.track_name)),
+                    })
+                    .await,
+                "Failed to report missing offline bounce track",
+            );
+            crate::report_error(
+                self.tx.send(Message::Ready(self.id)).await,
+                "Failed to return offline bounce worker",
+            );
             return;
         };
         let (channels, block_size, sample_rate) = {
@@ -211,7 +228,10 @@ impl Worker {
         let mut total_write_time = Duration::ZERO;
         while cursor < job.length_samples {
             if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = std::fs::remove_file(&job.output_path);
+                crate::report_error(
+                    std::fs::remove_file(&job.output_path),
+                    "Failed to remove canceled offline bounce",
+                );
                 if let Some((original_level, original_balance)) = freeze_state {
                     let mut t = target_track.lock();
                     Self::restore_track_after_freeze_render(
@@ -220,15 +240,20 @@ impl Worker {
                         original_balance,
                     );
                 }
-                let _ = self
-                    .tx
-                    .send(Message::OfflineBounceFinished {
-                        result: Ok(Action::TrackOfflineBounceCanceled {
-                            track_name: job.track_name.clone(),
-                        }),
-                    })
-                    .await;
-                let _ = self.tx.send(Message::Ready(self.id)).await;
+                crate::report_error(
+                    self.tx
+                        .send(Message::OfflineBounceFinished {
+                            result: Ok(Action::TrackOfflineBounceCanceled {
+                                track_name: job.track_name.clone(),
+                            }),
+                        })
+                        .await,
+                    "Failed to report canceled offline bounce",
+                );
+                crate::report_error(
+                    self.tx.send(Message::Ready(self.id)).await,
+                    "Failed to return offline bounce worker",
+                );
                 return;
             }
 
@@ -254,7 +279,7 @@ impl Worker {
 
             let p_start = Instant::now();
             for node in 0..render_plan.nodes.len() as crate::render_plan::NodeId {
-                let _ = Self::process_node_job_result(
+                Self::process_node_job_result(
                     self.id,
                     NodeJob {
                         epoch: 0,
@@ -287,16 +312,18 @@ impl Worker {
 
             if progress - last_reported_progress >= 0.01 || cursor >= job.length_samples {
                 last_reported_progress = progress;
-                let _ = self
-                    .tx
-                    .send(Message::OfflineBounceFinished {
-                        result: Ok(Action::TrackOfflineBounceProgress {
-                            track_name: job.track_name.clone(),
-                            progress,
-                            operation: Some("Rendering freeze".to_string()),
-                        }),
-                    })
-                    .await;
+                crate::report_error(
+                    self.tx
+                        .send(Message::OfflineBounceFinished {
+                            result: Ok(Action::TrackOfflineBounceProgress {
+                                track_name: job.track_name.clone(),
+                                progress,
+                                operation: Some("Rendering freeze".to_string()),
+                            }),
+                        })
+                        .await,
+                    "Failed to report offline bounce progress",
+                );
             }
         }
 
@@ -306,21 +333,29 @@ impl Worker {
             channels,
             sample_rate as u32,
         ) {
-            let _ = std::fs::remove_file(&job.output_path);
+            crate::report_error(
+                std::fs::remove_file(&job.output_path),
+                "Failed to remove failed offline bounce",
+            );
             if let Some((original_level, original_balance)) = freeze_state {
                 let mut t = target_track.lock();
                 Self::restore_track_after_freeze_render(&mut t, original_level, original_balance);
             }
-            let _ = self
-                .tx
-                .send(Message::OfflineBounceFinished {
-                    result: Err(format!(
-                        "Failed to write offline bounce '{}': {e}",
-                        job.output_path
-                    )),
-                })
-                .await;
-            let _ = self.tx.send(Message::Ready(self.id)).await;
+            crate::report_error(
+                self.tx
+                    .send(Message::OfflineBounceFinished {
+                        result: Err(format!(
+                            "Failed to write offline bounce '{}': {e}",
+                            job.output_path
+                        )),
+                    })
+                    .await,
+                "Failed to report offline bounce write error",
+            );
+            crate::report_error(
+                self.tx.send(Message::Ready(self.id)).await,
+                "Failed to return offline bounce worker",
+            );
             return;
         }
 
@@ -329,20 +364,25 @@ impl Worker {
             Self::restore_track_after_freeze_render(&mut t, original_level, original_balance);
         }
 
-        let _ = self
-            .tx
-            .send(Message::OfflineBounceFinished {
-                result: Ok(Action::TrackOfflineBounce {
-                    track_name: job.track_name,
-                    output_path: job.output_path,
-                    start_sample: job.start_sample,
-                    length_samples: job.length_samples,
-                    automation_lanes: vec![],
-                    apply_fader: job.apply_fader,
-                }),
-            })
-            .await;
-        let _ = self.tx.send(Message::Ready(self.id)).await;
+        crate::report_error(
+            self.tx
+                .send(Message::OfflineBounceFinished {
+                    result: Ok(Action::TrackOfflineBounce {
+                        track_name: job.track_name,
+                        output_path: job.output_path,
+                        start_sample: job.start_sample,
+                        length_samples: job.length_samples,
+                        automation_lanes: vec![],
+                        apply_fader: job.apply_fader,
+                    }),
+                })
+                .await,
+            "Failed to report completed offline bounce",
+        );
+        crate::report_error(
+            self.tx.send(Message::Ready(self.id)).await,
+            "Failed to return offline bounce worker",
+        );
     }
 
     #[cfg(unix)]
@@ -775,7 +815,12 @@ impl Worker {
 
     async fn process_node_job(&self, job: NodeJob) {
         let result = Self::process_node_job_result(self.id, job);
-        let _ = self.tx.send(result.into()).await;
+        if let Err(e) = self.tx.send(result.into()).await {
+            tracing::warn!(
+                "Worker {} failed to report completed node job: {e}",
+                self.id
+            );
+        }
     }
 
     pub async fn work(&mut self) {

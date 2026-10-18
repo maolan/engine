@@ -135,8 +135,10 @@ impl Engine {
 
     #[cfg(target_os = "freebsd")]
     pub(crate) fn maybe_start_freebsd_sync_group(&self) {
-        if let Some(oss) = &self.hw_driver {
-            let _ = oss.start_duplex_sync();
+        if let Some(oss) = &self.hw_driver
+            && !oss.start_duplex_sync()
+        {
+            tracing::warn!("Failed to start OSS duplex synchronization");
         }
     }
 
@@ -162,17 +164,21 @@ impl Engine {
                 // clients; notifying an optimistic Ok here would produce a
                 // spurious success followed by a contradictory Err when the
                 // open fails in the worker.
-                if want_input {
-                    let _ = worker
+                if want_input
+                    && let Err(e) = worker
                         .tx
                         .send(Message::HWOpenMidiInputDevice(device.clone()))
-                        .await;
+                        .await
+                {
+                    tracing::warn!("Error requesting MIDI input open for {device}: {e}");
                 }
-                if want_output {
-                    let _ = worker
+                if want_output
+                    && let Err(e) = worker
                         .tx
                         .send(Message::HWOpenMidiOutputDevice(device.clone()))
-                        .await;
+                        .await
+                {
+                    tracing::warn!("Error requesting MIDI output open for {device}: {e}");
                 }
             } else {
                 let opened_in = want_input
@@ -222,9 +228,13 @@ impl Engine {
                     if let Some(hw) = self.hw_driver.as_mut() {
                         hw.request_stop();
                     }
-                    let _ = worker.tx.send(Message::Request(Action::Quit)).await;
-                    if let Some(handle) = worker.handle.take() {
-                        let _ = handle.await;
+                    if let Err(e) = worker.tx.send(Message::Request(Action::Quit)).await {
+                        tracing::error!("Error stopping hardware worker for JACK: {e}");
+                    }
+                    if let Some(handle) = worker.handle.take()
+                        && let Err(e) = handle.await
+                    {
+                        tracing::error!("Error joining hardware worker for JACK: {e}");
                     }
                 }
                 self.hw_driver = None;

@@ -143,16 +143,25 @@ impl MidiInput {
             // correctly; the handle is open.
             let rc = unsafe { midiInPrepareHeader(handle, buffer, size_of::<MIDIHDR>() as u32) };
             if rc != MMSYSERR_NOERROR {
-                let _ = unsafe { midiInReset(handle) };
+                crate::report_winmm_status(
+                    unsafe { midiInReset(handle) },
+                    "Failed to reset Windows MIDI input",
+                );
                 for prepared in &mut buffers {
                     if prepared.dwFlags & MHDR_PREPARED != 0 {
                         // SAFETY: prepared header, still owned by us.
-                        let _ = unsafe {
-                            midiInUnprepareHeader(handle, prepared, size_of::<MIDIHDR>() as u32)
-                        };
+                        crate::report_winmm_status(
+                            unsafe {
+                                midiInUnprepareHeader(handle, prepared, size_of::<MIDIHDR>() as u32)
+                            },
+                            "Failed to unprepare Windows MIDI input header",
+                        );
                     }
                 }
-                let _ = unsafe { midiInClose(handle) };
+                crate::report_winmm_status(
+                    unsafe { midiInClose(handle) },
+                    "Failed to close Windows MIDI input",
+                );
                 for buffer in &buffers {
                     // SAFETY: each lpData came from the same layout box above
                     // and is still owned by us.
@@ -170,16 +179,25 @@ impl MidiInput {
             // SAFETY: `buffer` was just prepared and is not yet queued.
             let rc = unsafe { midiInAddBuffer(handle, buffer, size_of::<MIDIHDR>() as u32) };
             if rc != MMSYSERR_NOERROR {
-                let _ = unsafe { midiInReset(handle) };
+                crate::report_winmm_status(
+                    unsafe { midiInReset(handle) },
+                    "Failed to reset Windows MIDI input",
+                );
                 for buffer in &mut buffers {
                     if buffer.dwFlags & MHDR_PREPARED != 0 {
                         // SAFETY: prepared header, still owned by us.
-                        let _ = unsafe {
-                            midiInUnprepareHeader(handle, buffer, size_of::<MIDIHDR>() as u32)
-                        };
+                        crate::report_winmm_status(
+                            unsafe {
+                                midiInUnprepareHeader(handle, buffer, size_of::<MIDIHDR>() as u32)
+                            },
+                            "Failed to unprepare Windows MIDI input header",
+                        );
                     }
                 }
-                let _ = unsafe { midiInClose(handle) };
+                crate::report_winmm_status(
+                    unsafe { midiInClose(handle) },
+                    "Failed to close Windows MIDI input",
+                );
                 for buffer in &buffers {
                     // SAFETY: same layout box as above, still owned by us.
                     unsafe {
@@ -198,16 +216,25 @@ impl MidiInput {
         // SAFETY: handle is open, buffers are queued.
         let rc = unsafe { midiInStart(handle) };
         if rc != MMSYSERR_NOERROR {
-            let _ = unsafe { midiInReset(handle) };
+            crate::report_winmm_status(
+                unsafe { midiInReset(handle) },
+                "Failed to reset Windows MIDI input",
+            );
             for buffer in &mut buffers {
                 if buffer.dwFlags & MHDR_PREPARED != 0 {
                     // SAFETY: prepared header, still owned by us.
-                    let _ = unsafe {
-                        midiInUnprepareHeader(handle, buffer, size_of::<MIDIHDR>() as u32)
-                    };
+                    crate::report_winmm_status(
+                        unsafe {
+                            midiInUnprepareHeader(handle, buffer, size_of::<MIDIHDR>() as u32)
+                        },
+                        "Failed to unprepare Windows MIDI input header",
+                    );
                 }
             }
-            let _ = unsafe { midiInClose(handle) };
+            crate::report_winmm_status(
+                unsafe { midiInClose(handle) },
+                "Failed to close Windows MIDI input",
+            );
             for buffer in &buffers {
                 // SAFETY: same layout box as above, still owned by us.
                 unsafe {
@@ -410,7 +437,10 @@ impl MidiOutputConnection {
         let rc = unsafe { midiOutLongMsg(self.handle, &header, header_size) };
         if rc != MMSYSERR_NOERROR {
             // SAFETY: the driver never took ownership of a failed long msg.
-            let _ = unsafe { midiOutUnprepareHeader(self.handle, &mut header, header_size) };
+            crate::report_winmm_status(
+                unsafe { midiOutUnprepareHeader(self.handle, &mut header, header_size) },
+                "Failed to unprepare Windows MIDI output header",
+            );
             return Err(format!("midiOutLongMsg failed with code {rc}"));
         }
         // Wait for the driver to post MOM_DONE so `data_buf` stays valid until
@@ -432,7 +462,10 @@ impl MidiOutputConnection {
             // buffer. Unprepare may fail with MMSYSERR_STILLPLAYING — the
             // header and buffer are leaked in that case, which is preferable
             // to touching memory the driver still owns.
-            let _ = unsafe { midiOutUnprepareHeader(self.handle, &mut header, header_size) };
+            crate::report_winmm_status(
+                unsafe { midiOutUnprepareHeader(self.handle, &mut header, header_size) },
+                "Failed to unprepare Windows MIDI output header",
+            );
             return Err(format!(
                 "Timed out after {LONG_MSG_TIMEOUT:?} waiting for midiOutLongMsg completion"
             ));
@@ -503,7 +536,10 @@ extern "system" fn input_callback(
             }
             // Re-queue the buffer for the next sysex message.
             // SAFETY: the driver just returned `header` to us.
-            let _ = unsafe { midiInAddBuffer(hmidi, header, size_of::<MIDIHDR>() as u32) };
+            crate::report_winmm_status(
+                unsafe { midiInAddBuffer(hmidi, header, size_of::<MIDIHDR>() as u32) },
+                "Failed to requeue Windows MIDI input buffer",
+            );
         }
         MIM_ERROR => {
             // Invalid short message: nothing to re-queue.
@@ -512,7 +548,10 @@ extern "system" fn input_callback(
             // Invalid sysex; return the buffer to the driver queue.
             // SAFETY: param1 is a queued MIDIHDR lent by the connection.
             let header = unsafe { &mut *(param1 as *mut MIDIHDR) };
-            let _ = unsafe { midiInAddBuffer(hmidi, header, size_of::<MIDIHDR>() as u32) };
+            crate::report_winmm_status(
+                unsafe { midiInAddBuffer(hmidi, header, size_of::<MIDIHDR>() as u32) },
+                "Failed to requeue Windows MIDI input buffer",
+            );
         }
         _ => {}
     }

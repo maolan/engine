@@ -75,7 +75,10 @@ impl OscServer {
                             Err(reason) => {
                                 tracing::debug!(%src_addr, %reason, "OSC request parse error");
                                 let reply = build_error_packet(&reason);
-                                let _ = socket.send_to(&reply, src_addr);
+                                crate::report_error(
+                                    socket.send_to(&reply, src_addr),
+                                    "Failed to send OSC reply",
+                                );
                             }
                         }
                     }
@@ -107,7 +110,10 @@ impl OscServer {
         // stop flag and exits promptly, instead of blocking in recv_from until
         // the read timeout expires.
         if let Ok(wake) = UdpSocket::bind("127.0.0.1:0") {
-            let _ = wake.send_to(WAKEUP_PACKET, self.listen_addr);
+            crate::report_error(
+                wake.send_to(WAKEUP_PACKET, self.listen_addr),
+                "Failed to wake OSC server",
+            );
         }
         if let Some(handle) = self.handle.take() {
             drop(handle.join());

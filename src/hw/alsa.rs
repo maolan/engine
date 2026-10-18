@@ -306,9 +306,15 @@ impl HwDriver {
     }
 
     fn restart_duplex(&mut self) -> Result<(), String> {
-        let _ = self.playback.drop();
+        crate::report_error(
+            self.playback.drop(),
+            "Failed to drop ALSA playback device before restart",
+        );
         if !self.duplex_linked {
-            let _ = self.capture.drop();
+            crate::report_error(
+                self.capture.drop(),
+                "Failed to drop ALSA capture device before restart",
+            );
         }
         self.playback.prepare().map_err(|e| e.to_string())?;
         if self.capture.state() != State::Prepared {
@@ -928,8 +934,14 @@ impl crate::hw::traits::HwWorkerDriver for HwDriver {
 
     fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
-        let _ = self.capture.drop();
-        let _ = self.playback.drop();
+        crate::report_error(
+            self.capture.drop(),
+            "Failed to drop ALSA capture device during shutdown",
+        );
+        crate::report_error(
+            self.playback.drop(),
+            "Failed to drop ALSA playback device during shutdown",
+        );
     }
 
     fn stop_signaller(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {

@@ -95,10 +95,15 @@ struct OutputStream {
 impl OutputStream {
     fn stop(&mut self) {
         unsafe {
-            let _ = SetEvent(self.shutdown_event);
+            crate::report_error(
+                SetEvent(self.shutdown_event),
+                "Failed to signal WASAPI output shutdown",
+            );
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Err(error) = thread.join()
+        {
+            tracing::error!("WASAPI output thread panicked: {error:?}");
         }
     }
 }
@@ -107,7 +112,10 @@ impl Drop for OutputStream {
     fn drop(&mut self) {
         self.stop();
         unsafe {
-            let _ = CloseHandle(self.shutdown_event);
+            crate::report_error(
+                CloseHandle(self.shutdown_event),
+                "Failed to close WASAPI output shutdown event",
+            );
         }
     }
 }
@@ -120,10 +128,15 @@ struct InputStream {
 impl InputStream {
     fn stop(&mut self) {
         unsafe {
-            let _ = SetEvent(self.shutdown_event);
+            crate::report_error(
+                SetEvent(self.shutdown_event),
+                "Failed to signal WASAPI input shutdown",
+            );
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Err(error) = thread.join()
+        {
+            tracing::error!("WASAPI input thread panicked: {error:?}");
         }
     }
 }
@@ -132,7 +145,10 @@ impl Drop for InputStream {
     fn drop(&mut self) {
         self.stop();
         unsafe {
-            let _ = CloseHandle(self.shutdown_event);
+            crate::report_error(
+                CloseHandle(self.shutdown_event),
+                "Failed to close WASAPI input shutdown event",
+            );
         }
     }
 }
@@ -375,7 +391,10 @@ impl HwDriver {
             for sample in &interleaved {
                 bytes.extend_from_slice(&sample.to_le_bytes());
             }
-            let _ = file.write_all(&bytes);
+            crate::report_error(
+                file.write_all(&bytes),
+                "Failed to write WASAPI device diagnostic file",
+            );
         }
 
         self.queue_output_period(interleaved)
@@ -466,7 +485,10 @@ fn start_output_stream(
             );
             if let Err(err) = &result {
                 error!("WASAPI output thread failed: {err}");
-                let _ = ready_tx.try_send(Err(err.clone()));
+                crate::report_error(
+                    ready_tx.try_send(Err(err.clone())),
+                    "Failed to report WASAPI output thread startup error",
+                );
             }
         })
         .map_err(|e| format!("Failed to spawn WASAPI output thread: {e}"))?;
@@ -484,11 +506,19 @@ fn start_output_stream(
         )),
         Err(err) => {
             unsafe {
-                let _ = SetEvent(shutdown_event);
+                crate::report_error(
+                    SetEvent(shutdown_event),
+                    "Failed to signal WASAPI output shutdown",
+                );
             }
-            let _ = thread.join();
+            if let Err(error) = thread.join() {
+                tracing::error!("WASAPI output thread panicked during startup cleanup: {error:?}");
+            }
             unsafe {
-                let _ = CloseHandle(shutdown_event);
+                crate::report_error(
+                    CloseHandle(shutdown_event),
+                    "Failed to close WASAPI output shutdown event",
+                );
             }
             Err(err)
         }
@@ -520,7 +550,10 @@ fn start_input_stream(
             );
             if let Err(err) = &result {
                 error!("WASAPI input thread failed: {err}");
-                let _ = ready_tx.try_send(Err(err.clone()));
+                crate::report_error(
+                    ready_tx.try_send(Err(err.clone())),
+                    "Failed to report WASAPI input thread startup error",
+                );
             }
         })
         .map_err(|e| format!("Failed to spawn WASAPI input thread: {e}"))?;
@@ -539,11 +572,19 @@ fn start_input_stream(
         )),
         Err(err) => {
             unsafe {
-                let _ = SetEvent(shutdown_event);
+                crate::report_error(
+                    SetEvent(shutdown_event),
+                    "Failed to signal WASAPI input shutdown",
+                );
             }
-            let _ = thread.join();
+            if let Err(error) = thread.join() {
+                tracing::error!("WASAPI input thread panicked during startup cleanup: {error:?}");
+            }
             unsafe {
-                let _ = CloseHandle(shutdown_event);
+                crate::report_error(
+                    CloseHandle(shutdown_event),
+                    "Failed to close WASAPI input shutdown event",
+                );
             }
             Err(err)
         }
@@ -593,7 +634,10 @@ fn run_output_thread(
             .Start()
             .map_err(|e| format!("Failed to start WASAPI output: {e}"))?;
     }
-    let _ = ready_tx.try_send(Ok(info));
+    crate::report_error(
+        ready_tx.try_send(Ok(info)),
+        "Failed to report WASAPI output readiness",
+    );
 
     let mut pending = VecDeque::<f32>::new();
     loop {
@@ -616,7 +660,7 @@ fn run_output_thread(
     }
 
     unsafe {
-        let _ = client.client.Stop();
+        crate::report_error(client.client.Stop(), "Failed to stop WASAPI output client");
     }
     Ok(())
 }
@@ -651,7 +695,10 @@ fn run_input_thread(
     }
 
     let info = client.info();
-    let _ = ready_tx.try_send(Ok(info));
+    crate::report_error(
+        ready_tx.try_send(Ok(info)),
+        "Failed to report WASAPI input readiness",
+    );
     let chunk_samples = period_frames.saturating_mul(client.channels);
     let mut reservoir = VecDeque::<f32>::with_capacity(chunk_samples.saturating_mul(2));
     loop {
@@ -672,12 +719,14 @@ fn run_input_thread(
                     chunk.push(sample);
                 }
             }
-            let _ = input_tx.try_send(chunk);
+            if let Err(error) = input_tx.try_send(chunk) {
+                tracing::warn!("WASAPI input queue rejected an audio chunk: {error}");
+            }
         }
     }
 
     unsafe {
-        let _ = client.client.Stop();
+        crate::report_error(client.client.Stop(), "Failed to stop WASAPI input client");
     }
     Ok(())
 }
@@ -707,7 +756,10 @@ impl WasapiClient {
 impl Drop for WasapiClient {
     fn drop(&mut self) {
         unsafe {
-            let _ = CloseHandle(self.event);
+            crate::report_error(
+                CloseHandle(self.event),
+                "Failed to close WASAPI event handle",
+            );
         }
     }
 }
@@ -951,7 +1003,9 @@ fn fill_output_available(
         match output_rx.try_recv() {
             Ok(period) => {
                 pending.extend(period);
-                let _ = cycle_tick_tx.try_send(());
+                if let Err(TrySendError::Disconnected(())) = cycle_tick_tx.try_send(()) {
+                    tracing::debug!("WASAPI cycle tick receiver has been dropped");
+                }
             }
             Err(_) => break,
         }
@@ -1214,13 +1268,19 @@ fn device_friendly_name(device: &IMMDevice) -> Option<String> {
     let variant = unsafe { &value.Anonymous.Anonymous };
     if variant.vt != VT_LPWSTR {
         unsafe {
-            let _ = PropVariantClear(&mut value);
+            crate::report_error(
+                PropVariantClear(&mut value),
+                "Failed to clear WASAPI device property",
+            );
         }
         return None;
     }
     let text = unsafe { pwstr_to_string(variant.Anonymous.pwszVal) };
     unsafe {
-        let _ = PropVariantClear(&mut value);
+        crate::report_error(
+            PropVariantClear(&mut value),
+            "Failed to clear WASAPI device property",
+        );
     }
     Some(text)
 }
@@ -1372,10 +1432,16 @@ impl MidiHub {
 
     pub fn close_all(&mut self) {
         while let Some(input) = self.inputs.pop() {
-            let _ = input.connection.close();
+            crate::report_error(
+                input.connection.close(),
+                "Failed to close WASAPI MIDI input",
+            );
         }
         while let Some(output) = self.outputs.pop() {
-            let _ = output.connection.close();
+            crate::report_error(
+                output.connection.close(),
+                "Failed to close WASAPI MIDI output",
+            );
         }
     }
 
@@ -1396,10 +1462,16 @@ impl Drop for HwDriver {
 impl Drop for MidiHub {
     fn drop(&mut self) {
         while let Some(input) = self.inputs.pop() {
-            let _ = input.connection.close();
+            crate::report_error(
+                input.connection.close(),
+                "Failed to close WASAPI MIDI input",
+            );
         }
         while let Some(output) = self.outputs.pop() {
-            let _ = output.connection.close();
+            crate::report_error(
+                output.connection.close(),
+                "Failed to close WASAPI MIDI output",
+            );
         }
     }
 }

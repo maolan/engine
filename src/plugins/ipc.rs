@@ -247,7 +247,10 @@ pub fn drop_host(
     {
         let header = unsafe { header_mut(mapping.as_ptr()) };
         header.shutdown_request.store(1, Ordering::Release);
-        let _ = events.signal_host();
+        crate::report_error(
+            events.signal_host(),
+            "Failed to signal plugin host shutdown",
+        );
     }
 
     std::thread::spawn(move || {
@@ -262,13 +265,16 @@ pub fn drop_host(
             }
             if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
                 tracing::warn!(%shm_name, "drop_host: plugin host did not exit in time, killing");
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::report_error(child.kill(), "Failed to kill unresponsive plugin host");
+                crate::report_error(child.wait(), "Failed to reap plugin host process");
             }
         }
         drop(mapping);
         drop(events);
-        let _ = ShmMapping::unlink(&shm_name);
+        crate::report_error(
+            ShmMapping::unlink(&shm_name),
+            "Failed to unlink plugin shared memory",
+        );
         tracing::info!(%shm_name, "drop_host: cleanup complete");
     });
 }
@@ -464,7 +470,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 std::thread::sleep(Duration::from_millis(20));
-                let _ = events.signal_daw();
+                crate::report_error(events.signal_daw(), "Failed to signal DAW event");
             });
             wait_block_response(&counter, &events, Duration::from_secs(5))
                 .expect("event byte should satisfy the wait");

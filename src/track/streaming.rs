@@ -388,8 +388,10 @@ impl Drop for StreamingClipBuffer {
         if let Ok(mut guard) = self.producer.lock()
             && let Some(producer) = guard.take()
             && !producer.handle.is_finished()
+            && let Err(e) = producer.done.recv_timeout(Duration::from_millis(200))
+            && e != std::sync::mpsc::RecvTimeoutError::Timeout
         {
-            let _ = producer.done.recv_timeout(Duration::from_millis(200));
+            tracing::debug!("Streaming producer completion channel closed: {e}");
         }
         // If the producer is still alive here, `handle` is dropped and
         // the thread is detached; it observes the stop flag as soon as
@@ -441,7 +443,9 @@ fn producer_main(
     }
     control.eof.store(true, Ordering::Release);
     release_producer_slot();
-    let _ = done.send(());
+    if done.send(()).is_err() {
+        tracing::debug!("Streaming producer completion receiver was dropped");
+    }
 }
 
 #[cfg(feature = "audio")]
@@ -571,7 +575,11 @@ fn run_producer(
             for (channel, ring) in rings.iter_mut().enumerate() {
                 for frame in 0..push_frames {
                     // Lockstep: the same frame count is pushed to every ring.
-                    let _ = ring.push(data[frame * channels + channel]);
+                    if let Err(error) = ring.push(data[frame * channels + channel]) {
+                        tracing::error!(
+                            "Streaming audio ring unexpectedly filled during push: {error:?}"
+                        );
+                    }
                 }
             }
         }
@@ -658,7 +666,7 @@ mod tests {
             crate::audio_codec::decode_audio_to_f32_interleaved_sync(&wav_path)
                 .expect("decode tone wav");
         assert_eq!(channels, 1);
-        let _ = std::fs::remove_file(&wav_path);
+        std::fs::remove_file(&wav_path).expect("remove temporary test file");
         let flac_path = std::env::temp_dir().join(format!("{name}_{}.flac", std::process::id()));
         encode_audio_to_file(
             &flac_path,
@@ -746,7 +754,7 @@ mod tests {
         // report was complete silence for exactly this class of file.
         let path = stereo_tone_flac("maolan_stream_track_render", 44_100, 1.0, 440.0);
         let peak = render_track_peak(&path, 188); // ~1s of engine-rate frames
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
         assert!(
             peak > 0.01,
             "streaming clip rendered through Track must be audible (peak {peak})"
@@ -781,7 +789,9 @@ mod tests {
 
     #[test]
     fn streaming_flac_resamples_and_preserves_tone() {
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        if let Err(error) = tracing_subscriber::fmt().with_test_writer().try_init() {
+            tracing::debug!("Test tracing subscriber was already initialized: {error}");
+        }
         let source_rate = 44_100u32;
         let engine_rate = 48_000usize;
         let path = tone_flac("maolan_stream_tone", source_rate, 1.0, 440.0);
@@ -806,7 +816,7 @@ mod tests {
             collected.extend_from_slice(&out[0][..n]);
             from += n;
         }
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         let expected = engine_rate;
         assert!(
@@ -859,7 +869,7 @@ mod tests {
             .min()
             .unwrap_or(0);
         let read = buffer.read_frames(0, 512, &mut out);
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         assert!(read <= avail);
         assert_eq!(
@@ -906,7 +916,7 @@ mod tests {
                 .all(|&s| s == 0.0),
             "expected silence past EOF"
         );
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
     }
 
     #[test]
@@ -928,6 +938,6 @@ mod tests {
             wait_for_frames(&buffer, 1, Duration::from_secs(10)) > 0,
             "producer did not resume after seek"
         );
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
     }
 }

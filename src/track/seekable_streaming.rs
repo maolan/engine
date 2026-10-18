@@ -220,11 +220,13 @@ fn deinterleave(
 ) {
     for (channel, ring) in rings.iter_mut().enumerate() {
         for frame in 0..frames {
-            let _ = ring.push(QueuedSample {
+            if let Err(error) = ring.push(QueuedSample {
                 frame: start + frame,
                 generation,
                 value: data[frame * channels + channel],
-            });
+            }) {
+                tracing::error!("Seekable audio ring unexpectedly filled during push: {error:?}");
+            }
         }
     }
 }
@@ -246,7 +248,9 @@ fn read_queued_frames(
         if sample.generation == generation && sample.frame >= end {
             break;
         }
-        let _ = consumer.pop();
+        if consumer.pop().is_err() {
+            break;
+        }
         if sample.generation == generation && sample.frame >= from {
             dst[sample.frame - from] = sample.value;
             read += 1;
@@ -515,8 +519,10 @@ impl Drop for SeekableStreamingClipBuffer {
         if let Ok(mut guard) = self.producer.lock()
             && let Some(producer) = guard.take()
             && !producer.handle.is_finished()
+            && let Err(e) = producer.done.recv_timeout(Duration::from_millis(200))
+            && e != std::sync::mpsc::RecvTimeoutError::Timeout
         {
-            let _ = producer.done.recv_timeout(Duration::from_millis(200));
+            tracing::debug!("Seekable streaming producer completion channel closed: {e}");
         }
     }
 }
@@ -537,7 +543,9 @@ fn producer_main(
     }
     control.eof.store(true, Ordering::Release);
     super::streaming::release_producer_slot();
-    let _ = done.send(());
+    if done.send(()).is_err() {
+        tracing::debug!("Seekable streaming producer completion receiver was dropped");
+    }
 }
 
 fn run_producer(
@@ -696,7 +704,7 @@ mod tests {
             blocks.push(out.first().map(|lane| lane.to_vec()).unwrap_or_default());
             std::thread::sleep(Duration::from_millis(5));
         }
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         assert!(
             peak > 0.01,
@@ -744,7 +752,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(recovered, "seek producer did not recover");
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path).expect("remove temporary test file");
     }
 
     #[test]
@@ -777,7 +785,7 @@ mod tests {
             }
             assert!(recovered);
         }
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path).expect("remove temporary test file");
     }
 
     #[test]
@@ -833,7 +841,7 @@ mod tests {
             .min()
             .unwrap_or(0);
         let read = buffer.read_frames(0, 512, &mut out);
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         assert!(read <= avail);
         assert_eq!(
@@ -892,7 +900,7 @@ mod tests {
             eof_window[0][128..].iter().all(|&s| s == 0.0),
             "expected silence past EOF"
         );
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
     }
 
     #[test]
@@ -902,6 +910,6 @@ mod tests {
             SeekableStreamingClipBuffer::start(&path, 48_000, 64, 4).is_err(),
             "foreign-rate wav must be rejected by the seekable buffer"
         );
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
     }
 }

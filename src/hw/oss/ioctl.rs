@@ -281,7 +281,10 @@ pub fn add_to_sync_group(fd: i32, group: i32, input: bool) -> i32 {
         sync_group.mode = PCM_ENABLE_OUTPUT;
     }
     unsafe {
-        let _ = oss_add_sync_group(fd, &mut sync_group);
+        crate::report_error(
+            oss_add_sync_group(fd, &mut sync_group),
+            "Failed to add OSS device to sync group",
+        );
     }
     sync_group.id
 }

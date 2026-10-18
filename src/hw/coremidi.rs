@@ -326,9 +326,18 @@ impl MidiInputDevice {
         // disposing them guarantees no further block invocations, so the
         // shared context is reclaimed when this struct drops.
         unsafe {
-            let _ = MIDIPortDisconnectSource(self.port, self.source);
-            let _ = MIDIPortDispose(self.port);
-            let _ = MIDIClientDispose(self.client);
+            crate::report_status(
+                MIDIPortDisconnectSource(self.port, self.source),
+                "Failed to disconnect CoreMIDI source",
+            );
+            crate::report_status(
+                MIDIPortDispose(self.port),
+                "Failed to dispose CoreMIDI port",
+            );
+            crate::report_status(
+                MIDIClientDispose(self.client),
+                "Failed to dispose CoreMIDI client",
+            );
         }
     }
 }
@@ -371,7 +380,10 @@ impl BlockingWriter {
                             if let Ok(mut outputs) = outputs.lock() {
                                 send_output_events(&mut outputs, &events);
                             }
-                            let _ = ack.send(());
+                            crate::report_error(
+                                ack.send(()),
+                                "Failed to acknowledge CoreMIDI write",
+                            );
                         }
                         BlockingWriterMsg::Shutdown => break,
                     }
@@ -385,7 +397,10 @@ impl BlockingWriter {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.tx.send(BlockingWriterMsg::Shutdown);
+        crate::report_error(
+            self.tx.send(BlockingWriterMsg::Shutdown),
+            "Failed to stop CoreMIDI writer thread",
+        );
         if let Some(handle) = self.handle.take()
             && let Err(e) = handle.join()
         {
@@ -398,8 +413,14 @@ impl MidiOutputDevice {
     fn close(&mut self) {
         // SAFETY: the port/client are valid open refs owned by this device.
         unsafe {
-            let _ = MIDIPortDispose(self.port);
-            let _ = MIDIClientDispose(self.client);
+            crate::report_status(
+                MIDIPortDispose(self.port),
+                "Failed to dispose CoreMIDI output port",
+            );
+            crate::report_status(
+                MIDIClientDispose(self.client),
+                "Failed to dispose CoreMIDI client",
+            );
         }
     }
 }
@@ -464,7 +485,10 @@ impl MidiHub {
             CFRelease(port_name);
         }
         if status != 0 || port == 0 {
-            let _ = unsafe { MIDIClientDispose(client) };
+            crate::report_status(
+                unsafe { MIDIClientDispose(client) },
+                "Failed to dispose CoreMIDI client",
+            );
             return Err(os_error("MIDIInputPortCreateWithBlock", status));
         }
 
@@ -473,8 +497,11 @@ impl MidiHub {
         let status = unsafe { MIDIPortConnectSource(port, source, ptr::null_mut()) };
         if status != 0 {
             unsafe {
-                let _ = MIDIPortDispose(port);
-                let _ = MIDIClientDispose(client);
+                crate::report_status(MIDIPortDispose(port), "Failed to dispose CoreMIDI port");
+                crate::report_status(
+                    MIDIClientDispose(client),
+                    "Failed to dispose CoreMIDI client",
+                );
             }
             return Err(os_error("MIDIPortConnectSource", status));
         }
@@ -518,7 +545,10 @@ impl MidiHub {
             CFRelease(port_name);
         }
         if status != 0 || port == 0 {
-            let _ = unsafe { MIDIClientDispose(client) };
+            crate::report_status(
+                unsafe { MIDIClientDispose(client) },
+                "Failed to dispose CoreMIDI client",
+            );
             return Err(os_error("MIDIOutputPortCreate", status));
         }
 
@@ -574,7 +604,15 @@ impl MidiHub {
             }
             return;
         }
-        let _ = ack_rx.recv_timeout(timeout);
+        match ack_rx.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!("Timed out waiting for CoreMIDI output completion");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("CoreMIDI writer stopped before acknowledging output");
+            }
+        }
     }
 
     pub fn close_all(&mut self) {

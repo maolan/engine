@@ -68,7 +68,9 @@ impl WorkerEndpoint {
         // One outstanding job per worker means the completion slot is empty.
         // If the receiver has gone away, dropping the result is also safe:
         // all node writes have finished before we publish/retire it.
-        let _ = self.results.push(result);
+        if let Err(rtrb::PushError::Full(_)) = self.results.push(result) {
+            tracing::error!("Inline render result mailbox unexpectedly full");
+        }
         job.waiter.unpark();
         true
     }

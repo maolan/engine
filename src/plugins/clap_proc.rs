@@ -117,7 +117,7 @@ impl ClapProcessor {
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
         if !ipc::wait_for_ready(header, &mut child, Duration::from_secs(10)) {
-            let _ = child.kill();
+            crate::report_error(child.kill(), "Failed to terminate CLAP plugin process");
             return Err("host did not signal ready".to_string());
         }
 
@@ -199,7 +199,10 @@ impl ClapProcessor {
     fn disconnect_all(port: &Arc<AudioIO>) {
         let connections = port.connections();
         for other in connections.iter() {
-            let _ = AudioIO::disconnect(other, port);
+            crate::report_error(
+                AudioIO::disconnect(other, port),
+                "Failed to disconnect CLAP plugin audio port",
+            );
         }
     }
 
@@ -963,7 +966,7 @@ impl ClapProcessor {
         {
             let header = unsafe { header_mut(mapping.as_ptr()) };
             header.request_type.store(3, Ordering::Release);
-            let _ = events.signal_host();
+            crate::report_error(events.signal_host(), "Failed to signal CLAP plugin host");
             return Ok(());
         }
         Err("No active host to show GUI".to_string())
@@ -975,7 +978,7 @@ impl ClapProcessor {
         {
             let header = unsafe { header_mut(mapping.as_ptr()) };
             header.request_type.store(4, Ordering::Release);
-            let _ = events.signal_host();
+            crate::report_error(events.signal_host(), "Failed to signal CLAP plugin host");
         }
     }
 

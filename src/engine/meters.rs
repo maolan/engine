@@ -21,10 +21,13 @@ impl Engine {
     pub(crate) async fn send_hw_out_gain_balance(&mut self) {
         let (gain, balance) = self.hw_out_gain_balance();
         if let Some(worker) = &self.hw_worker {
-            let _ = worker
+            if let Err(e) = worker
                 .tx
                 .send(Message::HWSetOutputGainBalance { gain, balance })
-                .await;
+                .await
+            {
+                tracing::error!("Error sending hardware output gain and balance: {e}");
+            }
         } else {
             #[cfg(unix)]
             {

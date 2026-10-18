@@ -524,7 +524,7 @@ fn asio_thread_run(
             }
         }
     }
-    let _ = stream.stop();
+    crate::report_error(stream.stop(), "Failed to stop ASIO stream");
     Ok(())
 }
 
@@ -594,11 +594,15 @@ impl HwDriver {
         let report = match report_rx.recv() {
             Ok(Ok(report)) => report,
             Ok(Err(e)) => {
-                let _ = owner_thread.join();
+                if let Err(error) = owner_thread.join() {
+                    tracing::error!("ASIO owner thread panicked after open failure: {error:?}");
+                }
                 return Err(e);
             }
             Err(_) => {
-                let _ = owner_thread.join();
+                if let Err(error) = owner_thread.join() {
+                    tracing::error!("ASIO owner thread panicked during failed open: {error:?}");
+                }
                 return Err("ASIO thread terminated during device open".to_string());
             }
         };
@@ -858,10 +862,15 @@ impl HwDriver {
         }
         self.output_shared.condvar.notify_all();
         if let Some(tx) = self.control_tx.take() {
-            let _ = tx.send(ControlMsg::Shutdown);
+            crate::report_error(
+                tx.send(ControlMsg::Shutdown),
+                "Failed to send ASIO shutdown command",
+            );
         }
-        if let Some(handle) = self.owner_thread.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.owner_thread.take()
+            && let Err(error) = handle.join()
+        {
+            tracing::error!("ASIO owner thread panicked during shutdown: {error:?}");
         }
     }
 

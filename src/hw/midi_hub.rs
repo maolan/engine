@@ -304,7 +304,10 @@ impl MidiInputWaiter {
             return;
         }
         let one = [1_u8; 1];
-        let _ = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
+        let written = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
+        if written != one.len() as isize {
+            tracing::warn!("Failed to write MIDI wake byte (write returned {written})");
+        }
     }
 
     fn close(&mut self) {
@@ -438,7 +441,10 @@ impl MidiInputWaiter {
             return;
         }
         let one = [1_u8; 1];
-        let _ = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
+        let written = unsafe { libc::write(self.wake_write_fd, one.as_ptr().cast(), one.len()) };
+        if written != one.len() as isize {
+            tracing::warn!("Failed to write MIDI wake byte (write returned {written})");
+        }
     }
 
     fn close(&mut self) {

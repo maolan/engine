@@ -377,8 +377,10 @@ impl Engine {
         if self.osc_reply_socket.is_none() {
             self.osc_reply_socket = UdpSocket::bind("0.0.0.0:0").ok();
         }
-        if let Some(socket) = self.osc_reply_socket.as_ref() {
-            let _ = socket.send_to(packet, reply_to);
+        if let Some(socket) = self.osc_reply_socket.as_ref()
+            && let Err(error) = socket.send_to(packet, reply_to)
+        {
+            tracing::warn!("Failed to send OSC reply to {reply_to}: {error}");
         }
     }
 }

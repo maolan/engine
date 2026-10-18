@@ -94,6 +94,25 @@ pub mod au {
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;
 
+pub(crate) fn report_error<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) {
+    if let Err(error) = result {
+        tracing::warn!("{context}: {error:?}");
+    }
+}
+
+pub fn report_status(status: i32, context: &str) {
+    if status != 0 {
+        tracing::warn!("{context}: status {status}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn report_winmm_status(status: u32, context: &str) {
+    if status != 0 {
+        tracing::warn!("{context}: MMRESULT {status}");
+    }
+}
+
 pub fn enable_flush_denormals_to_zero() {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {

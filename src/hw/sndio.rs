@@ -116,7 +116,9 @@ impl Drop for HwDriver {
             return;
         }
         unsafe {
-            let _ = sio_stop(self.hdl);
+            if sio_stop(self.hdl) == 0 {
+                tracing::warn!("Failed to stop sndio device during drop");
+            }
             sio_close(self.hdl);
         }
         self.hdl = std::ptr::null_mut();

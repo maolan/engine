@@ -235,7 +235,9 @@ impl Engine {
         if let Some(worker) = &self.hw_worker {
             // Await instead of try_send: a dropped HWSetPlaying(false) would
             // leave the device playing after transport stop.
-            let _ = worker.tx.send(Message::HWSetPlaying(playing)).await;
+            if let Err(e) = worker.tx.send(Message::HWSetPlaying(playing)).await {
+                error!("Error setting hardware playing state: {e}");
+            }
         } else if let Some(driver) = self.hw_driver.as_mut() {
             driver.set_playing(playing);
         }
@@ -268,8 +270,10 @@ impl Engine {
             // Send MIDI panic (All Sound Off) for any active
             // notes before stopping the worker.
             let panic_events = self.panic_events_for_all_hw_midi_outputs();
-            if !panic_events.is_empty() {
-                let _ = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await;
+            if !panic_events.is_empty()
+                && let Err(e) = worker.tx.send(Message::HWMidiOutEvents(panic_events)).await
+            {
+                error!("Error sending MIDI panic events during shutdown: {e}");
             }
             // Send Quit to the worker so it stops its audio
             // cycle loop and releases the driver.

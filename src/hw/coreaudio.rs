@@ -740,13 +740,22 @@ impl Drop for UnitGuard {
             // SAFETY: the unit is still owned by this guard and was
             // successfully initialized; Stop is a no-op if never started.
             unsafe {
-                let _ = AudioOutputUnitStop(self.unit);
-                let _ = AudioUnitUninitialize(self.unit);
+                crate::report_status(
+                    AudioOutputUnitStop(self.unit),
+                    "Failed to stop CoreAudio output unit",
+                );
+                crate::report_status(
+                    AudioUnitUninitialize(self.unit),
+                    "Failed to uninitialize CoreAudio unit",
+                );
             }
         }
         // SAFETY: the unit handle is unique to this guard.
         unsafe {
-            let _ = AudioComponentInstanceDispose(self.unit);
+            crate::report_status(
+                AudioComponentInstanceDispose(self.unit),
+                "Failed to dispose CoreAudio unit",
+            );
         }
     }
 }
@@ -1758,17 +1767,32 @@ impl BufferedDriver {
         // its IO thread, so no callback is running once Stop returns.
         unsafe {
             if !self.output_unit.is_null() {
-                let _ = AudioOutputUnitStop(self.output_unit);
-                let _ = AudioUnitUninitialize(self.output_unit);
-                let _ = AudioComponentInstanceDispose(self.output_unit);
+                crate::report_status(
+                    AudioOutputUnitStop(self.output_unit),
+                    "Failed to stop CoreAudio output unit",
+                );
+                crate::report_status(
+                    AudioUnitUninitialize(self.output_unit),
+                    "Failed to uninitialize CoreAudio output unit",
+                );
+                crate::report_status(
+                    AudioComponentInstanceDispose(self.output_unit),
+                    "Failed to dispose CoreAudio output unit",
+                );
                 self.output_unit = ptr::null_mut();
             }
             if let Some(unit) = &mut self.input_unit
                 && !unit.is_null()
             {
-                let _ = AudioOutputUnitStop(*unit);
-                let _ = AudioUnitUninitialize(*unit);
-                let _ = AudioComponentInstanceDispose(*unit);
+                crate::report_status(AudioOutputUnitStop(*unit), "Failed to stop CoreAudio unit");
+                crate::report_status(
+                    AudioUnitUninitialize(*unit),
+                    "Failed to uninitialize CoreAudio unit",
+                );
+                crate::report_status(
+                    AudioComponentInstanceDispose(*unit),
+                    "Failed to dispose CoreAudio unit",
+                );
                 *unit = ptr::null_mut();
             }
         }

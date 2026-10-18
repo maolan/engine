@@ -531,8 +531,13 @@ impl Engine {
         let peaks_file_name = format!("{}.json", rec.file_name);
         let peaks_rel = format!("peaks/{}", peaks_file_name);
         let peaks_path = self.session_peaks_dir().map(|d| d.join(&peaks_file_name));
-        if let Some(peaks_dir) = self.session_peaks_dir() {
-            let _ = std::fs::create_dir_all(&peaks_dir);
+        if let Some(peaks_dir) = self.session_peaks_dir()
+            && let Err(e) = std::fs::create_dir_all(&peaks_dir)
+        {
+            tracing::warn!(
+                "Failed to create peaks directory {}: {e}",
+                peaks_dir.display()
+            );
         }
         if let Some(ref path) = peaks_path
             && let Err(e) = std::fs::write(
