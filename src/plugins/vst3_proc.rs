@@ -128,7 +128,7 @@ impl Vst3Processor {
 
         let header = unsafe { header_ref(mapping.as_ptr()) };
         if !ipc::wait_for_ready(header, &mut child, Duration::from_secs(10)) {
-            let _ = child.kill();
+            crate::report_error(child.kill(), "Failed to terminate VST3 plugin process");
             return Err("VST3 host did not signal ready".to_string());
         }
 
@@ -448,13 +448,15 @@ impl Vst3Processor {
                         }
                         d
                     };
-                    let _ = ring.push(maolan_plugin_protocol::MidiEvent {
+                    if !ring.push(maolan_plugin_protocol::MidiEvent {
                         sample_offset: ev.frame,
                         data,
                         channel: ev.data.first().copied().unwrap_or(0) & 0x0F,
                         flags: 0,
                         _pad: 0,
-                    });
+                    }) {
+                        tracing::warn!("VST3 plugin MIDI input ring is full; event dropped");
+                    }
                 }
                 port.mark_finished();
             }
@@ -618,7 +620,7 @@ impl Vst3Processor {
         {
             let header = unsafe { header_mut(mapping.as_ptr()) };
             header.request_type.store(4, Ordering::Release);
-            let _ = events.signal_host();
+            crate::report_error(events.signal_host(), "Failed to signal VST3 plugin host");
         }
     }
 

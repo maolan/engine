@@ -224,8 +224,14 @@ impl HwDriver {
         }
         let started = group > 0 && start_sync_group(in_fd, group).is_ok();
         if !started {
-            let _ = self.capture.start_trigger();
-            let _ = self.playback.start_trigger();
+            crate::report_error(
+                self.capture.start_trigger(),
+                "Failed to start OSS capture trigger",
+            );
+            crate::report_error(
+                self.playback.start_trigger(),
+                "Failed to start OSS playback trigger",
+            );
         }
         started
     }
@@ -358,9 +364,12 @@ impl HwWorkerDriver for HwDriver {
 
     fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
-        let _ = self.playback.stop_trigger();
-        let _ = self.playback.halt();
-        let _ = self.capture.halt();
+        crate::report_error(
+            self.playback.stop_trigger(),
+            "Failed to stop OSS playback trigger",
+        );
+        crate::report_error(self.playback.halt(), "Failed to halt OSS playback");
+        crate::report_error(self.capture.halt(), "Failed to halt OSS capture");
     }
 
     #[cfg(unix)]

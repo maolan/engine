@@ -1160,7 +1160,7 @@ mod tests {
 
         let (samples, channels, sample_rate) =
             decode_audio_to_f32_interleaved_sync(&path).expect("decode test wav");
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         assert_eq!(channels, 2);
         assert_eq!(sample_rate, 48_000);
@@ -1209,7 +1209,7 @@ mod tests {
             // Bypass Symphonia to exercise the OxideAV fallback directly.
             let (decoded, out_channels, out_rate) =
                 decode_with_oxideav(&path).expect("oxideav decode");
-            let _ = std::fs::remove_file(&path);
+            std::fs::remove_file(&path).expect("remove temporary test file");
 
             assert_eq!(out_channels, channels);
             assert_eq!(out_rate, sample_rate);
@@ -1238,7 +1238,7 @@ mod tests {
         write_wav_f32(&path, &source, channels, sample_rate).expect("write test wav");
 
         let info = probe_audio_file(&path).expect("probe wav");
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         assert_eq!(info.sample_rate, sample_rate);
         assert_eq!(info.channels, channels);
@@ -1272,7 +1272,7 @@ mod tests {
         .expect("encode test flac");
 
         let info = probe_audio_file(&path).expect("probe flac");
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         assert_eq!(info.sample_rate, sample_rate);
         assert_eq!(info.channels, channels);
@@ -1327,7 +1327,7 @@ mod tests {
                 Err(e) => panic!("streaming decode failed: {e}"),
             }
         }
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
 
         assert!(chunks > 1, "expected multiple chunks, got {chunks}");
         assert!(

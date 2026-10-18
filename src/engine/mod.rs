@@ -2613,7 +2613,7 @@ mod tests {
         engine.init().await;
 
         let tmp_dir = std::env::temp_dir().join("maolan_play_stop_play_test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create engine test directory");
         let wav_path = tmp_dir.join("tone.wav");
         let sample_rate = 48_000u32;
         let clip_samples = sample_rate as usize;
@@ -2661,7 +2661,10 @@ mod tests {
             count: usize,
         ) {
             for _ in 0..count {
-                let _ = tokio::time::timeout(TokioDuration::from_secs(2), client_rx.recv()).await;
+                tokio::time::timeout(TokioDuration::from_secs(2), client_rx.recv())
+                    .await
+                    .expect("timed out waiting for engine test message")
+                    .expect("engine test message channel closed");
             }
         }
 
@@ -2701,10 +2704,14 @@ mod tests {
                 };
                 if needs_retrigger {
                     last_retrigger = Some(Instant::now());
-                    let _ = tx.send(Message::Request(Action::Play)).await;
+                    tx.send(Message::Request(Action::Play))
+                        .await
+                        .expect("send play request");
                 }
-                let _ =
-                    tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await;
+                match tokio::time::timeout(TokioDuration::from_millis(10), client_rx.recv()).await {
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => panic!("engine test message channel closed"),
+                }
                 tokio::time::sleep(TokioDuration::from_millis(10)).await;
             }
             None
@@ -2740,10 +2747,12 @@ mod tests {
             "expected audible output on second play after stop, got {second_peak}"
         );
 
-        let _ = tx.send(Message::Request(Action::Quit)).await;
+        tx.send(Message::Request(Action::Quit))
+            .await
+            .expect("send quit request");
         tokio::time::sleep(TokioDuration::from_millis(200)).await;
         work_handle.abort();
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::remove_dir_all(&tmp_dir).expect("remove temporary test directory");
     }
 
     #[test]
@@ -3650,7 +3659,7 @@ mod tests {
         engine.init().await;
 
         let tmp_dir = std::env::temp_dir().join("maolan_oss_resume_test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create engine test directory");
         let wav_path = tmp_dir.join("tone.wav");
         let sample_rate = 48_000u32;
         let clip_samples = sample_rate as usize;
@@ -3728,16 +3737,21 @@ mod tests {
             state: &State,
             what: &str,
         ) -> f32 {
-            let _ = tx.send(Message::Request(Action::Play)).await;
+            tx.send(Message::Request(Action::Play))
+                .await
+                .expect("send play request");
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 let peak = peak_of(state).await;
                 if peak > 0.001 {
                     return peak;
                 }
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_millis(50), client_rx.recv())
-                        .await;
+                match tokio::time::timeout(std::time::Duration::from_millis(50), client_rx.recv())
+                    .await
+                {
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => panic!("engine test message channel closed"),
+                }
             }
             panic!("no audible output {what}");
         }
@@ -3755,8 +3769,11 @@ mod tests {
         tx.send(Message::Request(Action::Stop)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         for _ in 0..8 {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_millis(20), client_rx.recv()).await;
+            match tokio::time::timeout(std::time::Duration::from_millis(20), client_rx.recv()).await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
         }
 
         tx.send(Message::Request(Action::SetClipPlaybackEnabled(true)))
@@ -3764,9 +3781,11 @@ mod tests {
             .unwrap();
         wait_peak(&tx, &mut client_rx, &state, "after stop+play").await;
 
-        let _ = tx.send(Message::Request(Action::Quit)).await;
+        tx.send(Message::Request(Action::Quit))
+            .await
+            .expect("send quit request");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         work_handle.abort();
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::remove_dir_all(&tmp_dir).expect("remove temporary test directory");
     }
 }

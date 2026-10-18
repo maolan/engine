@@ -79,8 +79,10 @@ impl Drop for PlanBuilder {
     fn drop(&mut self) {
         self.quit.store(true, Ordering::Release);
         self.thread.unpark();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        if let Some(join) = self.join.take()
+            && let Err(error) = join.join()
+        {
+            tracing::error!("Plan builder thread panicked during shutdown: {error:?}");
         }
     }
 }
@@ -100,7 +102,9 @@ fn builder_loop(
         if quit.load(Ordering::Acquire) {
             drop(slot);
             collector.collect();
-            let _ = collector.try_cleanup();
+            if collector.try_cleanup().is_err() {
+                tracing::warn!("Render plan collector still has live handles during shutdown");
+            }
             break;
         }
         if !dirty.swap(false, Ordering::AcqRel) {

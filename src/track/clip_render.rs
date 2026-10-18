@@ -1783,7 +1783,7 @@ mod tests {
             TrackData::choose_clip_strategy(true, probed.as_ref(), 44_100),
             ClipStrategy::Streaming
         );
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
     }
 
     #[test]
@@ -1805,7 +1805,7 @@ mod tests {
             TrackData::choose_clip_strategy(false, probed.as_ref(), 48_000),
             ClipStrategy::Streaming
         );
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temporary test file");
     }
 
     #[test]

@@ -589,7 +589,10 @@ mod imp {
 
         pub fn deregister(&mut self, _poller: &Poller) {
             unsafe {
-                let _ = CloseHandle(self.handle.0);
+                crate::report_error(
+                    CloseHandle(self.handle.0),
+                    "Failed to close watchdog handle",
+                );
             }
         }
     }
@@ -603,7 +606,10 @@ mod imp {
     impl Wake {
         pub fn wake(&self) {
             unsafe {
-                let _ = windows::Win32::System::Threading::SetEvent(self.event.0);
+                crate::report_error(
+                    windows::Win32::System::Threading::SetEvent(self.event.0),
+                    "Failed to signal watchdog event",
+                );
             }
         }
     }
@@ -718,12 +724,12 @@ mod tests {
         let mut child = spawn_sleep(30);
         let flag = Arc::new(AtomicBool::new(false));
         wd.watch(child.id(), flag.clone());
-        let _ = child.kill();
+        child.kill().expect("kill watchdog child");
         assert!(
             wait_for_flag(&flag, Duration::from_secs(5)),
             "watchdog should set the bypass flag after the child is killed"
         );
-        let _ = child.wait();
+        child.wait().expect("wait for killed watchdog child");
     }
 
     #[cfg_attr(
@@ -737,7 +743,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         wd.watch(child.id(), flag.clone());
         wd.unwatch(child.id());
-        let _ = child.wait();
+        child.wait().expect("wait for watchdog child");
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             !flag.load(Ordering::Relaxed),

@@ -96,12 +96,14 @@ impl<B: Backend> HwWorker<B> {
             let c_name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
             #[cfg(target_os = "linux")]
             unsafe {
-                let _ = libc::pthread_setname_np(thread, c_name.as_ptr());
+                let rc = libc::pthread_setname_np(thread, c_name.as_ptr());
+                crate::report_status(rc, "Failed to name hardware worker thread");
             }
             #[cfg(target_os = "macos")]
             unsafe {
                 // macOS names the current thread and takes no thread handle.
-                let _ = libc::pthread_setname_np(c_name.as_ptr());
+                let rc = libc::pthread_setname_np(c_name.as_ptr());
+                crate::report_status(rc, "Failed to name hardware worker thread");
             }
             #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
             unsafe {
@@ -242,11 +244,13 @@ impl<B: Backend> HwWorker<B> {
         {
             self.last_xrun_report = Some(std::time::Instant::now());
             self.last_xrun_count = count;
-            if let Some(count) = count {
-                let _ = self
+            if let Some(count) = count
+                && let Err(e) = self
                     .tx
                     .send(Message::Event(crate::message::Event::AudioXruns { count }))
-                    .await;
+                    .await
+            {
+                error!("{} failed to publish audio xrun event: {e}", B::LABEL);
             }
         }
     }
@@ -365,7 +369,12 @@ impl<B: Backend> HwWorker<B> {
                         .expect("driver is only absent while a cycle is running");
                     let inline = self.inline_render.clone();
                     tokio::task::spawn_blocking(move || {
-                        let _ = tx.blocking_send(Self::run_cycle_blocking(driver, inline));
+                        if let Err(e) = tx.blocking_send(Self::run_cycle_blocking(driver, inline)) {
+                            error!(
+                                "{} failed to return completed hardware cycle: {e}",
+                                B::LABEL
+                            );
+                        }
                     });
                 }
             }
@@ -396,18 +405,24 @@ impl<B: Backend> HwWorker<B> {
             Message::HWOpenMidiInputDevice(device) => {
                 let result = self.lock_midi_hub().open_input(&device);
                 let action = crate::message::Action::OpenMidiInputDevice(device);
-                let _ = self
+                if let Err(e) = self
                     .tx
                     .send(Message::Response(result.map(|_| action)))
-                    .await;
+                    .await
+                {
+                    error!("{} failed to report MIDI input open result: {e}", B::LABEL);
+                }
             }
             Message::HWOpenMidiOutputDevice(device) => {
                 let result = self.lock_midi_hub().open_output(&device);
                 let action = crate::message::Action::OpenMidiOutputDevice(device);
-                let _ = self
+                if let Err(e) = self
                     .tx
                     .send(Message::Response(result.map(|_| action)))
-                    .await;
+                    .await
+                {
+                    error!("{} failed to report MIDI output open result: {e}", B::LABEL);
+                }
             }
             Message::HWCloseMidiDevices => {
                 self.lock_midi_hub().close_all();
@@ -476,9 +491,11 @@ impl<B: Backend> HwWorker<B> {
                         self.driver = Some(driver);
                         if let Err(e) = result {
                             error!("{} cycle error: {}", B::LABEL, e);
-                            let _ = self.tx.send(Message::Response(Err(format!(
+                            if let Err(send_error) = self.tx.send(Message::Response(Err(format!(
                                 "{} cycle error: {}", B::LABEL, e
-                            )))).await;
+                            )))).await {
+                                error!("{} failed to report cycle error: {send_error}", B::LABEL);
+                            }
                         }
                     }
                     if quit_pending {
@@ -610,14 +627,20 @@ impl<B: Backend> HwWorker<B> {
                         self.publish_xruns().await;
                         if let Err(e) = result {
                             error!("{} assist cycle error: {}", B::LABEL, e);
-                            let _ = self
+                            if let Err(send_error) = self
                                 .tx
                                 .send(Message::Response(Err(format!(
                                     "{} assist cycle error: {}",
                                     B::LABEL,
                                     e
                                 ))))
-                                .await;
+                                .await
+                            {
+                                error!(
+                                    "{} failed to report assist cycle error: {send_error}",
+                                    B::LABEL
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -675,18 +698,24 @@ impl<B: Backend> HwWorker<B> {
             Message::HWOpenMidiInputDevice(device) => {
                 let result = self.lock_midi_hub().open_input(&device);
                 let action = crate::message::Action::OpenMidiInputDevice(device);
-                let _ = self
+                if let Err(e) = self
                     .tx
                     .send(Message::Response(result.map(|_| action)))
-                    .await;
+                    .await
+                {
+                    error!("{} failed to report MIDI input open result: {e}", B::LABEL);
+                }
             }
             Message::HWOpenMidiOutputDevice(device) => {
                 let result = self.lock_midi_hub().open_output(&device);
                 let action = crate::message::Action::OpenMidiOutputDevice(device);
-                let _ = self
+                if let Err(e) = self
                     .tx
                     .send(Message::Response(result.map(|_| action)))
-                    .await;
+                    .await
+                {
+                    error!("{} failed to report MIDI output open result: {e}", B::LABEL);
+                }
             }
             Message::HWCloseMidiDevices => {
                 self.lock_midi_hub().close_all();
@@ -721,7 +750,9 @@ impl<B: Backend> HwWorker<B> {
             return;
         }
         spread_hw_event_frames(&mut midi_in_events, self.cycle_frames);
-        let _ = self.tx.send(Message::HWMidiEvents(midi_in_events)).await;
+        if let Err(e) = self.tx.send(Message::HWMidiEvents(midi_in_events)).await {
+            error!("{} failed to forward hardware MIDI input: {e}", B::LABEL);
+        }
     }
 
     fn shutdown_midi(&mut self) {

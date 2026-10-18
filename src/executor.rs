@@ -382,7 +382,9 @@ mod tests {
                 return;
             };
             collector.collect();
-            let _ = collector.try_cleanup();
+            if collector.try_cleanup().is_err() {
+                tracing::warn!("Render plan test collector still has live handles");
+            }
         }
     }
 

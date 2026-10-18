@@ -587,8 +587,10 @@ impl Engine {
         // queued stop drains after the in-flight cycle, so this lands
         // between cycles — at most one period of skew.
         self.clear_processing_buffers_before_playback();
-        if let Some(worker) = &self.hw_worker {
-            let _ = worker.tx.send(Message::HWZeroFillBuffers).await;
+        if let Some(worker) = &self.hw_worker
+            && let Err(e) = worker.tx.send(Message::HWZeroFillBuffers).await
+        {
+            error!("Error requesting hardware buffer zero fill: {e}");
         }
         #[cfg(unix)]
         if let Some(jack) = &self.jack_runtime

@@ -37,10 +37,11 @@ impl Engine {
 
     pub(crate) fn ensure_session_subdirs(&self) {
         if let Some(root) = &self.session.session_dir {
-            let _ = std::fs::create_dir_all(root.join("plugins"));
-            let _ = std::fs::create_dir_all(root.join("audio"));
-            let _ = std::fs::create_dir_all(root.join("midi"));
-            let _ = std::fs::create_dir_all(root.join("peaks"));
+            for name in ["plugins", "audio", "midi", "peaks"] {
+                if let Err(e) = std::fs::create_dir_all(root.join(name)) {
+                    tracing::error!("Failed to create session {name} directory: {e}");
+                }
+            }
         }
     }
 

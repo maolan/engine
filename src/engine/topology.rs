@@ -2327,7 +2327,10 @@ impl Engine {
                 for (port_idx, inp) in child.audio.ins.iter().enumerate() {
                     let sources = inp.connections();
                     for src in sources.iter() {
-                        let _ = AudioIO::disconnect(src, inp);
+                        crate::report_error(
+                            AudioIO::disconnect(src, inp),
+                            "Failed to disconnect removed hardware input",
+                        );
                         if let Some((src_name, src_port)) =
                             self.find_audio_io_owner(self.state.as_ref(), src)
                         {
@@ -2355,7 +2358,10 @@ impl Engine {
                 for (port_idx, out) in child.audio.outs.iter().enumerate() {
                     let targets = out.connections();
                     for tgt in targets.iter() {
-                        let _ = AudioIO::disconnect(out, tgt);
+                        crate::report_error(
+                            AudioIO::disconnect(out, tgt),
+                            "Failed to disconnect removed hardware output",
+                        );
                         if let Some((tgt_name, tgt_port)) =
                             self.find_audio_io_owner(self.state.as_ref(), tgt)
                         {
@@ -2425,7 +2431,10 @@ impl Engine {
                         if let Some((tgt_name, tgt_port, _)) =
                             self.find_midi_io_owner(self.state.as_ref(), &tgt)
                         {
-                            let _ = MIDIIO::disconnect(out, &tgt);
+                            crate::report_error(
+                                MIDIIO::disconnect(out, &tgt),
+                                "Failed to disconnect removed MIDI input",
+                            );
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: track_name.to_string(),
                                 from_port: port_idx,
@@ -2458,7 +2467,10 @@ impl Engine {
                             .iter()
                             .position(|inp| std::sync::Arc::ptr_eq(inp, &tgt))
                         {
-                            let _ = MIDIIO::disconnect(out, &tgt);
+                            crate::report_error(
+                                MIDIIO::disconnect(out, &tgt),
+                                "Failed to disconnect removed MIDI output",
+                            );
                             disconnect_actions.push(Action::Disconnect {
                                 from_track: other_name.clone(),
                                 from_port: out_port,

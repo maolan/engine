@@ -479,7 +479,10 @@ fn probe_oss_buffer_bytes(devpath: &str) -> Option<usize> {
         .ok()?;
     let fd = file.as_raw_fd();
     let mut request = ((0xffff_u32 << 16) | 16) as i32;
-    let _ = unsafe { oss_set_fragment(fd, &mut request) };
+    crate::report_error(
+        unsafe { oss_set_fragment(fd, &mut request) },
+        "Failed to set OSS probe fragment size",
+    );
     let mut output = BufferInfoProbe::new();
     let mut input = BufferInfoProbe::new();
     let output_bytes =

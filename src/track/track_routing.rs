@@ -10,11 +10,20 @@ use std::sync::Arc;
 impl TrackData {
     pub fn clear_default_passthrough(&mut self) {
         for (audio_in, audio_out) in self.audio.ins.iter().zip(self.audio.outs.iter()) {
-            let _ = AudioIO::disconnect(audio_in, audio_out);
-            let _ = AudioIO::disconnect(audio_out, audio_in);
+            crate::report_error(
+                AudioIO::disconnect(audio_in, audio_out),
+                "Failed to disconnect audio passthrough",
+            );
+            crate::report_error(
+                AudioIO::disconnect(audio_out, audio_in),
+                "Failed to disconnect audio passthrough",
+            );
         }
         for (midi_in, midi_out) in self.midi.ins.iter().zip(self.midi.outs.iter()) {
-            let _ = MIDIIO::disconnect(midi_out, midi_in);
+            crate::report_error(
+                MIDIIO::disconnect(midi_out, midi_in),
+                "Failed to disconnect MIDI passthrough",
+            );
         }
         self.invalidate_audio_route_cache();
         self.invalidate_midi_route_cache();
@@ -103,7 +112,10 @@ impl TrackData {
             return Err(format!("Track '{}' output removal failed", self.name));
         };
         for target in hw_outputs.iter().chain(track_inputs.iter()) {
-            let _ = AudioIO::disconnect(&output, target);
+            crate::report_error(
+                AudioIO::disconnect(&output, target),
+                "Failed to disconnect removed audio output",
+            );
         }
         self.rt.record_tap_outs.truncate(self.audio.outs.len());
         self.rt
@@ -897,11 +909,14 @@ impl TrackData {
         let count = self.midi.ins.len().min(self.midi.outs.len());
         for port in 0..count {
             #[cfg(feature = "plugins")]
-            let _ = self.connect_plugin_midi(
-                PluginGraphNode::TrackInput,
-                port,
-                PluginGraphNode::TrackOutput,
-                port,
+            crate::report_error(
+                self.connect_plugin_midi(
+                    PluginGraphNode::TrackInput,
+                    port,
+                    PluginGraphNode::TrackOutput,
+                    port,
+                ),
+                "Failed to connect plugin MIDI passthrough",
             );
             #[cfg(not(feature = "plugins"))]
             MIDIIO::connect(&self.midi.ins[port], &self.midi.outs[port]);
@@ -912,14 +927,20 @@ impl TrackData {
         let count = self.midi.ins.len().min(self.midi.outs.len());
         for port in 0..count {
             #[cfg(feature = "plugins")]
-            let _ = self.disconnect_plugin_midi(
-                PluginGraphNode::TrackInput,
-                port,
-                PluginGraphNode::TrackOutput,
-                port,
+            crate::report_error(
+                self.disconnect_plugin_midi(
+                    PluginGraphNode::TrackInput,
+                    port,
+                    PluginGraphNode::TrackOutput,
+                    port,
+                ),
+                "Failed to disconnect plugin MIDI passthrough",
             );
             #[cfg(not(feature = "plugins"))]
-            let _ = MIDIIO::disconnect(&self.midi.ins[port], &self.midi.outs[port]);
+            crate::report_error(
+                MIDIIO::disconnect(&self.midi.ins[port], &self.midi.outs[port]),
+                "Failed to disconnect MIDI passthrough",
+            );
         }
     }
 
@@ -942,25 +963,37 @@ impl TrackData {
         // Folder input -> child input
         for (in_idx, child_in) in self.audio.ins.iter().enumerate() {
             if let Some(parent_in) = parent.audio.ins.get(in_idx) {
-                let _ = AudioIO::disconnect(parent_in, child_in);
+                crate::report_error(
+                    AudioIO::disconnect(parent_in, child_in),
+                    "Failed to disconnect folder audio input",
+                );
             }
         }
         // Child output -> folder output
         for (out_idx, child_out) in self.audio.outs.iter().enumerate() {
             if let Some(parent_out) = parent.audio.outs.get(out_idx) {
-                let _ = AudioIO::disconnect(child_out, parent_out);
+                crate::report_error(
+                    AudioIO::disconnect(child_out, parent_out),
+                    "Failed to disconnect folder audio output",
+                );
             }
         }
         // Folder MIDI input -> child MIDI input
         for (in_idx, child_in) in self.midi.ins.iter().enumerate() {
             if let Some(parent_in) = parent.midi.ins.get(in_idx) {
-                let _ = MIDIIO::disconnect(parent_in, child_in);
+                crate::report_error(
+                    MIDIIO::disconnect(parent_in, child_in),
+                    "Failed to disconnect folder MIDI input",
+                );
             }
         }
         // Child MIDI output -> folder MIDI output
         for (out_idx, child_out) in self.midi.outs.iter().enumerate() {
             if let Some(parent_out) = parent.midi.outs.get(out_idx) {
-                let _ = MIDIIO::disconnect(child_out, parent_out);
+                crate::report_error(
+                    MIDIIO::disconnect(child_out, parent_out),
+                    "Failed to disconnect folder MIDI output",
+                );
             }
         }
         self.invalidate_audio_route_cache();
@@ -1006,7 +1039,10 @@ impl TrackData {
     pub(crate) fn disconnect_all(port: &Arc<AudioIO>) {
         let connections = port.connections();
         for other in connections.iter() {
-            let _ = AudioIO::disconnect(other, port);
+            crate::report_error(
+                AudioIO::disconnect(other, port),
+                "Failed to disconnect audio port",
+            );
         }
     }
 }

@@ -98,17 +98,29 @@ impl Process {
                 JackPortCommand::RemoveAudioInput(idx) => {
                     if idx < self.audio_in_ports.len() {
                         let port = self.audio_in_ports.remove(idx);
-                        let _ = self
+                        if self
                             .port_response_producer
-                            .push(JackPortResponse::RemovedAudioInput(idx, port));
+                            .push(JackPortResponse::RemovedAudioInput(idx, port))
+                            .is_err()
+                        {
+                            tracing::error!(
+                                "JACK port response ring is full; removed input port could not be returned"
+                            );
+                        }
                     }
                 }
                 JackPortCommand::RemoveAudioOutput(idx) => {
                     if idx < self.audio_out_ports.len() {
                         let port = self.audio_out_ports.remove(idx);
-                        let _ = self
+                        if self
                             .port_response_producer
-                            .push(JackPortResponse::RemovedAudioOutput(idx, port));
+                            .push(JackPortResponse::RemovedAudioOutput(idx, port))
+                            .is_err()
+                        {
+                            tracing::error!(
+                                "JACK port response ring is full; removed output port could not be returned"
+                            );
+                        }
                     }
                 }
             }
@@ -203,7 +215,10 @@ impl Process {
                     time: event.frame,
                     bytes: &event.data,
                 };
-                let _ = writer.write(&raw);
+                crate::report_error(
+                    writer.write(&raw),
+                    "Failed to write MIDI event to JACK port",
+                );
             }
         }
     }
@@ -535,7 +550,10 @@ impl JackRuntime {
                 unreachable!("command was just constructed above")
             };
             if let Some(client) = self.client.as_ref() {
-                let _ = client.as_client().unregister_port(port);
+                crate::report_error(
+                    client.as_client().unregister_port(port),
+                    "Failed to unregister JACK audio input",
+                );
             }
             return Err("JACK port command ring is full".to_string());
         }
@@ -573,7 +591,10 @@ impl JackRuntime {
                 unreachable!("command was just constructed above")
             };
             if let Some(client) = self.client.as_ref() {
-                let _ = client.as_client().unregister_port(port);
+                crate::report_error(
+                    client.as_client().unregister_port(port),
+                    "Failed to unregister JACK audio output",
+                );
             }
             return Err("JACK port command ring is full".to_string());
         }
@@ -753,7 +774,7 @@ impl JackRuntime {
 impl Drop for JackRuntime {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
-            let _ = client.deactivate();
+            crate::report_error(client.deactivate(), "Failed to deactivate JACK client");
         }
     }
 }

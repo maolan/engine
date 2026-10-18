@@ -455,7 +455,9 @@ impl<'a> DuplexChannelApi<'a> {
             }
         } else if !self.capture.playing.load(Ordering::Relaxed) {
             let frames = self.capture.chsamples as i64;
-            let _ = self.capture.frame_clock.sleep_until_frame(now + frames);
+            if !self.capture.frame_clock.sleep_until_frame(now + frames) {
+                tracing::warn!("OSS capture frame clock sleep failed");
+            }
         }
         Ok(())
     }

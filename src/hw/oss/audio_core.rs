@@ -450,7 +450,12 @@ impl DoubleBufferedChannel {
                         .buffer
                         .remaining()
                         .min(((position - write.write_position) as usize) * audio.frame_size());
-                    let _ = audio.write_map(Some(rec.buffer.position()), pointer, len);
+                    let written = audio.write_map(Some(rec.buffer.position()), pointer, len);
+                    if written < len {
+                        tracing::warn!(
+                            "OSS mapped audio write was short: wrote {written} of {len} bytes"
+                        );
+                    }
                 }
 
                 let offset = position - write.st.last_progress;

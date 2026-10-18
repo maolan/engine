@@ -549,7 +549,9 @@ mod tests {
                 return;
             };
             collector.collect();
-            let _ = collector.try_cleanup();
+            if collector.try_cleanup().is_err() {
+                tracing::warn!("Inline render test collector still has live handles");
+            }
         }
     }
 

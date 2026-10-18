@@ -3110,10 +3110,13 @@ impl Engine {
                 if let Ok(line) = line
                     && !line.is_empty()
                 {
-                    let _ = tx.blocking_send(Message::Request(Action::Log {
-                        source: source.clone(),
-                        message: line,
-                    }));
+                    crate::report_error(
+                        tx.blocking_send(Message::Request(Action::Log {
+                            source: source.clone(),
+                            message: line,
+                        })),
+                        "Failed to forward plugin log message",
+                    );
                 }
             }
         });

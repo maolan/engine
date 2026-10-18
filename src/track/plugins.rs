@@ -1494,24 +1494,36 @@ impl TrackData {
     pub fn clear_plugins(&mut self) {
         let clap_ids: Vec<usize> = self.clap_plugins.iter().map(|i| i.id).collect();
         for id in clap_ids {
-            let _ = self.unload_clap_plugin_instance(id);
+            crate::report_error(
+                self.unload_clap_plugin_instance(id),
+                "Failed to unload CLAP plugin",
+            );
         }
         let vst3_ids: Vec<usize> = self.vst3_plugins.iter().map(|i| i.id).collect();
         for id in vst3_ids {
-            let _ = self.unload_vst3_plugin_instance(id);
+            crate::report_error(
+                self.unload_vst3_plugin_instance(id),
+                "Failed to unload VST3 plugin",
+            );
         }
         #[cfg(target_os = "macos")]
         {
             let au_ids: Vec<usize> = self.au_plugins.iter().map(|i| i.id).collect();
             for id in au_ids {
-                let _ = self.unload_au_plugin_instance(id);
+                crate::report_error(
+                    self.unload_au_plugin_instance(id),
+                    "Failed to unload Audio Unit plugin",
+                );
             }
         }
         #[cfg(unix)]
         {
             let lv2_ids: Vec<usize> = self.lv2_plugins.iter().map(|i| i.id).collect();
             for id in lv2_ids {
-                let _ = self.unload_lv2_plugin_instance(id);
+                crate::report_error(
+                    self.unload_lv2_plugin_instance(id),
+                    "Failed to unload LV2 plugin",
+                );
             }
         }
         self.plugin_midi_connections.clear();

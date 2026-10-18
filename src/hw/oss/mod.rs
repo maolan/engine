@@ -271,7 +271,7 @@ impl Audio {
     /// Halt the device and explicitly close the fd so the kernel
     /// cannot drain pending buffers during process exit.
     pub fn close_fd(&mut self) {
-        let _ = self.halt();
+        crate::report_error(self.halt(), "Failed to halt OSS device before closing");
         if let Ok(devnull) = File::open("/dev/null") {
             drop(std::mem::replace(&mut self.dsp, devnull));
         }
@@ -307,7 +307,10 @@ impl Audio {
 
         let cooked = 0_i32;
         unsafe {
-            let _ = oss_set_cooked(dsp.as_raw_fd(), &cooked);
+            crate::report_error(
+                oss_set_cooked(dsp.as_raw_fd(), &cooked),
+                "Failed to configure OSS cooked mode",
+            );
         }
 
         let mut audio_info = AudioInfo::new();
@@ -440,7 +443,9 @@ impl Audio {
             if let Some(zero) = sync.clock_zero {
                 frame_clock.zero = zero;
             } else {
-                let _ = frame_clock.init_clock(effective_rate as u32);
+                if !frame_clock.init_clock(effective_rate as u32) {
+                    tracing::warn!("Failed to initialize OSS frame clock");
+                }
                 sync.clock_zero = Some(frame_clock.zero);
             }
         }
@@ -995,10 +1000,15 @@ impl Drop for Audio {
         // the kernel's dsp_close() calls chn_flush() on playback channels
         // which drains remaining audio data — sleeping up to CHN_TIMEOUT
         // (5 seconds by default) before actually closing the fd.
-        let _ = self.halt();
+        crate::report_error(self.halt(), "Failed to halt OSS device during drop");
         if self.mapped && !self.map.is_null() && self.buffer_info.bytes > 0 {
             unsafe {
-                let _ = libc::munmap(self.map, self.buffer_info.bytes as usize);
+                if libc::munmap(self.map, self.buffer_info.bytes as usize) != 0 {
+                    tracing::warn!(
+                        "Failed to unmap OSS audio buffer: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
             }
             self.map = std::ptr::null_mut();
         }
