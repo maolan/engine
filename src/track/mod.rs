@@ -1710,6 +1710,37 @@ mod tests {
     }
 
     #[test]
+    fn metronome_synthesis_reaches_track_output_port() {
+        let mut track = Track::new("metronome".to_string(), 0, 1, 0, 0, 512, 48_000.0);
+        track.set_metronome_enabled(true);
+        track.set_transport_timing(120.0, 4, 4);
+        track.set_clip_playback_enabled(true);
+        track.rt.transport_sample = 0;
+        let (source, _) = track.ensure_metronome_source(512);
+        assert!(source.is_some());
+
+        // Mirror the worker's Track-task seeding: `sources` holds only the
+        // audio-input placeholders (none here) — the metronome side-output is
+        // passed separately.
+        let mut side = vec![0.0_f32; 512];
+        let mut out = vec![0.0_f32; 512];
+        let mut inputs: Vec<&mut [f32]> = Vec::new();
+        let mut outputs: Vec<&mut [f32]> = vec![&mut out];
+        let mut sources: Vec<(usize, &[f32], usize)> = Vec::new();
+        track.process_render_block_with_audio_buffers_and_metronome(
+            &mut inputs,
+            &mut outputs,
+            &mut sources,
+            Some(&mut side),
+        );
+
+        let side_peak = side.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        let out_peak = out.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(side_peak > 0.0, "metronome side buffer is silent");
+        assert!(out_peak > 0.0, "metronome output port is silent");
+    }
+
+    #[test]
     fn cycle_segments_wrap_across_loop_boundary() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         track.rt.transport_sample = 14;
