@@ -1124,6 +1124,34 @@ mod tests {
         ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
     )]
     #[tokio::test]
+    async fn apply_grouped_actions_undoes_as_one_history_entry() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+
+        engine
+            .handle_request(Action::ApplyGroupedActions(vec![
+                Action::SetTempo(130.0),
+                Action::SetTempo(140.0),
+            ]))
+            .await;
+        assert_eq!(engine.transport.tempo_bpm, 140.0);
+
+        // A single undo must revert the whole group, not just the last
+        // inner action.
+        engine.handle_request(Action::Undo).await;
+        assert_eq!(
+            engine.transport.tempo_bpm, 120.0,
+            "one undo restores every action of the group"
+        );
+
+        engine.handle_request(Action::Redo).await;
+        assert_eq!(engine.transport.tempo_bpm, 140.0);
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
+    #[tokio::test]
     async fn osc_server_forwards_transport_packets_to_engine_channel() {
         let (tx, mut rx) = channel(4);
         let mut server =
