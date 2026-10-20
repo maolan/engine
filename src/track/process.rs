@@ -390,12 +390,12 @@ impl TrackData {
     /// combined list is passed on. The appended entries borrow buffers that
     /// only live for this call, so the caller must clear `sources`
     /// afterwards rather than retaining it.
-    pub(crate) fn process_render_block_with_audio_buffers_and_metronome(
+    pub(crate) fn process_render_block_with_audio_buffers_and_metronome<'a>(
         &mut self,
         audio_inputs: &mut [&mut [f32]],
         audio_outputs: &mut [&mut [f32]],
-        sources: &mut Vec<(usize, &[f32], usize)>,
-        metronome_output: Option<&mut [f32]>,
+        sources: &mut Vec<(usize, &'a [f32], usize)>,
+        mut metronome_output: Option<&'a mut [f32]>,
     ) -> usize {
         self.apply_transport_sample_snapshot();
         if !self.output_enabled() {
@@ -408,9 +408,17 @@ impl TrackData {
             }
             return frames;
         }
+        // The output stage resolves the metronome source port through the
+        // audio-route cache; the synthesized side buffer must be published
+        // in `sources` under that port's key or the click never reaches the
+        // track outputs.
+        let metronome_key = metronome_output.as_ref().and_then(|_| {
+            self.metronome_source()
+                .map(|src| Arc::as_ptr(&src) as usize)
+        });
         let frames = self.process_render_block_inputs_and_plugins_with_audio_buffers_and_metronome(
             audio_inputs,
-            metronome_output,
+            metronome_output.as_deref_mut(),
         );
         #[cfg(feature = "plugins")]
         let plugin_outputs =
@@ -448,6 +456,19 @@ impl TrackData {
                     graph_latencies.get(key).copied().unwrap_or(0),
                 )
             }));
+        }
+        // Publish the synthesized metronome side buffer so the output stage
+        // can sum it into the track outputs through the route cache.
+        let metronome_buf = metronome_output.map(|buf| &*buf);
+        if let (Some(key), Some(buf)) = (metronome_key, metronome_buf) {
+            if let Some((_, source, _)) = sources
+                .iter_mut()
+                .find(|(candidate, _, _)| *candidate == key)
+            {
+                *source = buf;
+            } else {
+                sources.push((key, buf, 0));
+            }
         }
         self.process_folder_output_with_audio_buffers(audio_outputs, sources);
         frames

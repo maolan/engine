@@ -928,6 +928,114 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn folder_inner_connections_restore_like_session_load() {
+        use crate::connectable::ConnectableRef;
+
+        let (mut engine, _client_rx) = make_engine_with_client();
+        engine.hw_driver_info = Some(HwDriverInfo {
+            cycle_samples: 128,
+            sample_rate: 48_000,
+            input_channels: 1,
+            output_channels: 2,
+            sample_bits: 32,
+            frame_size_bytes: 4,
+            capture_buffer_frames: 512,
+            fresh_capture: true,
+        });
+
+        // The session's track list, in saved order, with saved port counts.
+        let tracks = [
+            ("metronome", 0, 1, false),
+            ("rec", 1, 1, false),
+            ("guitar 1", 0, 2, true),
+            ("left 1", 1, 1, false),
+            ("right 1", 1, 1, false),
+            ("left 2", 1, 1, false),
+            ("right 2", 1, 1, false),
+        ];
+        for (name, audio_ins, audio_outs, folder) in tracks {
+            engine
+                .handle_add_track(Action::AddTrack {
+                    name: name.to_string(),
+                    audio_ins,
+                    audio_outs,
+                    midi_ins: 0,
+                    midi_outs: 0,
+                    folder,
+                    mixosc_addr: None,
+                })
+                .await;
+        }
+        engine
+            .handle_track_set_folder(Action::TrackSetFolder {
+                track_name: "guitar 1".to_string(),
+                is_folder: true,
+            })
+            .await;
+        for child in ["left 1", "right 1", "left 2", "right 2"] {
+            engine
+                .handle_track_set_parent(child, Some("guitar 1"))
+                .await;
+        }
+
+        // The folder's saved user (connectable) connections: both left
+        // children feed folder output 0, both right children output 1.
+        {
+            let state = engine.state.lock();
+            let folder = state.tracks.get("guitar 1").unwrap().clone();
+            let mut folder = folder.lock();
+            for (child, to_port) in [("left 1", 0), ("left 2", 0), ("right 1", 1), ("right 2", 1)] {
+                folder
+                    .connect_audio_connectable(
+                        ConnectableRef::ChildTrack(child.to_string()),
+                        0,
+                        ConnectableRef::TrackOutput,
+                        to_port,
+                    )
+                    .unwrap_or_else(|e| panic!("connect {child} -> folder out {to_port}: {e}"));
+            }
+            // The saved disabled defaults: right children must not feed the
+            // folder's output 0. The default may not exist at all (the
+            // folder/child output counts differ), in which case the
+            // disconnect is a no-op.
+            for child in ["right 1", "right 2"] {
+                let _ = folder.disconnect_audio_connectable(
+                    ConnectableRef::ChildTrack(child.to_string()),
+                    0,
+                    ConnectableRef::TrackOutput,
+                    0,
+                );
+            }
+        }
+
+        let state = engine.state.lock();
+        let folder = state.tracks.get("guitar 1").unwrap().lock();
+        let reported = folder.connectable_connections();
+        for (child, to_port) in [("left 1", 0), ("left 2", 0), ("right 1", 1), ("right 2", 1)] {
+            assert!(
+                reported.iter().any(|conn| {
+                    conn.kind == Kind::Audio
+                        && conn.from == ConnectableRef::ChildTrack(child.to_string())
+                        && conn.from_port == 0
+                        && conn.to == ConnectableRef::TrackOutput
+                        && conn.to_port == to_port
+                }),
+                "folder reports {child} -> folder output {to_port}, got {reported:?}"
+            );
+        }
+        for child in ["right 1", "right 2"] {
+            assert!(
+                !reported.iter().any(|conn| {
+                    conn.from == ConnectableRef::ChildTrack(child.to_string())
+                        && conn.to == ConnectableRef::TrackOutput
+                        && conn.to_port == 0
+                }),
+                "folder does not report the disabled {child} -> output 0, got {reported:?}"
+            );
+        }
+    }
+
     fn osc_packet(address: &str) -> Vec<u8> {
         fn push_padded_osc_string(packet: &mut Vec<u8>, value: &str) {
             packet.extend_from_slice(value.as_bytes());
