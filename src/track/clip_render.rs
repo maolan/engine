@@ -674,7 +674,9 @@ impl TrackData {
         out: &mut Vec<Vec<f32>>,
     ) -> Option<()> {
         let clip_start = parent_start.saturating_add(clip.start);
-        let clip_len = clip.end;
+        // `end` is an absolute timeline position (every writer stores
+        // `start + length`); the render length is `end - start`.
+        let clip_len = clip.end.saturating_sub(clip.start);
         if clip_len == 0 || request_len == 0 {
             return None;
         }
@@ -693,7 +695,7 @@ impl TrackData {
             input_blocks.resize_with(channel_count, || vec![0.0; request_len]);
             for child in clip.grouped_clips.clone() {
                 let child_start = clip_start.saturating_add(child.start);
-                let child_end = child_start.saturating_add(child.end);
+                let child_end = child_start.saturating_add(child.end.saturating_sub(child.start));
                 if absolute_to <= child_start || absolute_from >= child_end {
                     continue;
                 }
@@ -1106,7 +1108,9 @@ impl TrackData {
         segments: &[(usize, usize, usize)],
     ) {
         let clip_start = parent_start.saturating_add(clip.start);
-        let clip_len = clip.end;
+        // `end` is absolute (see the audio render path); length is `end -
+        // start`.
+        let clip_len = clip.end.saturating_sub(clip.start);
         if clip_len == 0 || clip.muted {
             return;
         }
@@ -1622,7 +1626,9 @@ impl TrackData {
             }
             for (segment_start, segment_end, out_offset) in &segments {
                 let clip_start = clip.start;
-                let clip_end = clip_start.saturating_add(clip.end);
+                // `end` is an absolute timeline position (writers store
+                // `start + length`), not a length.
+                let clip_end = clip.end;
                 tracing::debug!(
                     "mix_clip_audio_into_inputs clip '{}' range={}-{} segment={}-{} transport={}",
                     clip.name,

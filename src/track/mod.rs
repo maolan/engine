@@ -1171,6 +1171,7 @@ mod tests {
     use crate::kind::Kind;
     #[cfg(feature = "plugins")]
     use crate::message::PluginGraphNode;
+    use crate::midi::clip::MIDIClip;
     use crate::midi::io::MIDIIO;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -2517,6 +2518,88 @@ mod tests {
                 48_000.0
             ),
             2_880_000
+        );
+    }
+
+    #[test]
+    fn arrangement_audio_clip_stops_at_absolute_end() {
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        track.set_input_monitor(vec![false]);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+
+        // Engine clips store `end` as an absolute position (start + length).
+        // The source is deliberately longer than the clip: playback must
+        // stop at the clip end, not run to the end of the file.
+        let mut clip = AudioClip::new("clip.wav".to_string(), 1000, 1500);
+        clip.fade_enabled = false;
+        track.audio.push_clip(clip);
+        track.rt.audio_clip_cache.insert(
+            "clip.wav".to_string(),
+            Arc::new(AudioClipBuffer::Buffered {
+                channels: 1,
+                samples: vec![0.5; 4096],
+            }),
+        );
+
+        track.rt.transport_sample = 1200;
+        track.process();
+        assert!(
+            track.last_audio_outputs()[0].iter().any(|&s| s > 0.1),
+            "clip audio should sound inside the clip"
+        );
+
+        track.rt.transport_sample = 2000;
+        track.process();
+        assert!(
+            track.last_audio_outputs()[0]
+                .iter()
+                .all(|&s| s.abs() < 1e-6),
+            "clip audio must stop at the clip end, not play the whole file"
+        );
+    }
+
+    #[test]
+    fn arrangement_midi_clip_stops_at_absolute_end() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        track.set_midi_input_monitor(vec![false]);
+        track.set_midi_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+
+        // Clip [1000, 3000) (end is absolute). One note-on inside the clip
+        // and one past the real end but inside the doubly-offset range a
+        // length-typed reading of `end` would produce ([1000, 4000)).
+        let mut clip = MIDIClip::new("clip.mid".to_string(), 1000, 3000);
+        clip.id = "clip-1".to_string();
+        track.midi.push_clip(clip);
+        track.rt.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![
+                (200, vec![0x90, 60, 100]),
+                (2500, vec![0x90, 62, 100]),
+            ]),
+        );
+
+        track.rt.transport_sample = 1200;
+        track.process();
+        let note_ons_at_1200 = track
+            .rt
+            .pending_hw_midi_out_events
+            .iter()
+            .filter(|e| e.event.data.starts_with(&[0x90]))
+            .count();
+        assert_eq!(note_ons_at_1200, 1, "note-on inside the clip fires");
+
+        track.rt.pending_hw_midi_out_events.clear();
+        track.rt.transport_sample = 3500;
+        track.process();
+        assert!(
+            track
+                .rt
+                .pending_hw_midi_out_events
+                .iter()
+                .all(|e| !e.event.data.starts_with(&[0x90])),
+            "no note-on past the clip end"
         );
     }
 
