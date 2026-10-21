@@ -787,6 +787,9 @@ impl ClapProcessor {
             }
         }
 
+        // Snapshot before waking the host so an immediate completion is visible.
+        let counter = unsafe { response_counter(ptr) };
+        let expected = counter.load(Ordering::Acquire);
         if events.signal_host().is_err() {
             ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
@@ -794,7 +797,7 @@ impl ClapProcessor {
 
         let timeout = ipc::plugin_wait_timeout();
         let _plugin_wait = crate::cycle_trace::plugin_wait();
-        if ipc::wait_block_response(unsafe { response_counter(ptr) }, events, timeout).is_err() {
+        if ipc::wait_block_response(counter, expected, events, timeout).is_err() {
             ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
         }
