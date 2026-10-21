@@ -575,6 +575,9 @@ impl AuProcessor {
             }
         }
 
+        // Snapshot before waking the host so an immediate completion is visible.
+        let counter = unsafe { response_counter(ptr) };
+        let expected = counter.load(Ordering::Acquire);
         if events.signal_host().is_err() {
             ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);
             return Vec::new();
@@ -582,7 +585,7 @@ impl AuProcessor {
 
         let timeout = ipc::plugin_wait_timeout();
         let _plugin_wait = crate::cycle_trace::plugin_wait();
-        match ipc::wait_block_response(unsafe { response_counter(ptr) }, events, timeout) {
+        match ipc::wait_block_response(counter, expected, events, timeout) {
             Ok(()) => {}
             Err(_) => {
                 ipc::bypass_copy_input_slices_to_outputs(audio_inputs, audio_outputs);

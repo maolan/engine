@@ -9,18 +9,6 @@ use std::time::{Duration, Instant};
 /// Poll interval used while waiting for the plugin host to signal readiness.
 const HOST_READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-/// How long the RT thread spin-polls the shared-memory block-response
-/// counter before falling back to the blocking event wait. The host answers
-/// a block on another core within microseconds in the healthy case; 2 ms
-/// covers scheduler jitter while staying far below the 100 ms hung-host
-/// budget (roughly one small audio-block period).
-const BLOCK_RESPONSE_SPIN_BUDGET: Duration = Duration::from_millis(2);
-
-/// Maximum single event wait once the spin budget is exhausted. Slicing the
-/// remaining timeout lets us notice a counter bump that lands mid-wait (the
-/// host may run "eventless" and never write the completion byte).
-const BLOCK_RESPONSE_WAIT_SLICE: Duration = Duration::from_millis(5);
-
 /// Fallback plugin-wait ceiling before any audio device period is known (and
 /// after the device closes). Matches the historical fixed timeout.
 const DEFAULT_PLUGIN_WAIT_BOUND: Duration = Duration::from_millis(100);
@@ -95,12 +83,9 @@ pub fn spawn_host(
         .map_err(|e| format!("failed to create shared memory: {e}"))?;
     unsafe {
         init_shm_layout(mapping.as_ptr(), mapping.size());
-        // We observe block completion via the shm response counter, so the
-        // host can skip writing the per-block completion event byte (which
-        // would accumulate unread in the pipe). Hosts predating the counter
-        // treat this as a no-op write into padding and keep sending events,
-        // which `wait_block_response` still consumes via the fallback.
-        header_mut(mapping.as_ptr()).set_block_response_eventless(true);
+        // Every block completion must wake the waiting audio worker. Consuming
+        // one event per request also handles hosts that finish before we wait.
+        header_mut(mapping.as_ptr()).set_block_response_eventless(false);
     }
 
     let mut events = EventPair::new().map_err(|e| format!("failed to create event pipes: {e}"))?;
@@ -188,49 +173,35 @@ pub fn bypass_copy_input_slices_to_outputs(inputs: &[&[f32]], outputs: &mut [&mu
 
 /// Wait for the plugin host to finish the current audio block.
 ///
-/// Fast path: spin-poll the shm block-response counter (the host bumps it
-/// right before reporting each block) — no syscalls at all. If the counter
-/// does not move within [`BLOCK_RESPONSE_SPIN_BUDGET`] — e.g. a pre-0.0.19
-/// host binary that never bumps it, or a genuinely stuck host — fall back to
-/// the classic blocking event wait with the remaining timeout, sliced so a
-/// late counter bump is still noticed. The total worst-case latency is the
-/// same `timeout` the pure event wait had.
+/// Capture `expected` before signalling the host. Hosts send a completion event
+/// after publishing each block; blocking on it lets the worker sleep during DSP.
+/// Control requests share the event channel, so a wakeup only completes this
+/// wait when the block counter has advanced. Even an early completion retains
+/// its event, avoiding both missed responses and busy-polling.
 pub fn wait_block_response(
     counter: &AtomicU32,
+    expected: u32,
     events: &EventPair,
     timeout: Duration,
 ) -> std::io::Result<()> {
     let start = Instant::now();
-    let expected = counter.load(Ordering::Acquire);
     loop {
-        if counter.load(Ordering::Acquire) != expected {
-            return Ok(());
-        }
-        if start.elapsed() >= BLOCK_RESPONSE_SPIN_BUDGET {
-            break;
-        }
-        std::hint::spin_loop();
-    }
-    loop {
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "block response timeout",
             ));
         }
-        let slice = timeout
-            .saturating_sub(elapsed)
-            .min(BLOCK_RESPONSE_WAIT_SLICE);
-        match events.wait_host(slice) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // Re-check the counter: the host may have finished while we
-                // were parked (eventless hosts never write the byte).
+        match events.wait_host(remaining) {
+            Ok(()) => {
+                // Pair with the host's release increment before it signalled
+                // completion, publishing its shared-memory audio output.
                 if counter.load(Ordering::Acquire) != expected {
                     return Ok(());
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
@@ -442,38 +413,35 @@ mod tests {
     }
 
     #[test]
-    fn wait_block_response_fast_path_notices_counter() {
+    fn wait_block_response_consumes_completion_sent_before_wait() {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(7);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(10));
-                counter.fetch_add(1, Ordering::Release);
-            });
-            let start = Instant::now();
-            wait_block_response(&counter, &events, Duration::from_secs(5))
-                .expect("counter bump should satisfy the wait");
-            // Fast path must not need the event byte nor anywhere near the
-            // 5 s timeout.
-            assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "counter fast path took too long"
-            );
-        });
+        counter.fetch_add(1, Ordering::Release);
+        events.signal_daw().expect("signal completion before wait");
+        wait_block_response(&counter, 7, &events, Duration::from_millis(100))
+            .expect("already completed block must not be missed");
+
+        // The previous event must not satisfy the next block's wait.
+        let err = wait_block_response(&counter, 8, &events, Duration::from_millis(10))
+            .expect_err("completion must be consumed exactly once");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
-    fn wait_block_response_falls_back_to_event() {
+    fn wait_block_response_ignores_stale_control_event() {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(0);
-        // Simulate a pre-counter host: only the event byte ever arrives.
+        // A queued control response must not complete an audio block.
+        events.signal_daw().expect("signal stale control response");
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 std::thread::sleep(Duration::from_millis(20));
-                crate::report_error(events.signal_daw(), "Failed to signal DAW event");
+                counter.fetch_add(1, Ordering::Release);
+                events.signal_daw().expect("signal audio completion");
             });
-            wait_block_response(&counter, &events, Duration::from_secs(5))
-                .expect("event byte should satisfy the wait");
+            wait_block_response(&counter, 0, &events, Duration::from_secs(5))
+                .expect("audio completion should satisfy the wait");
+            assert_eq!(counter.load(Ordering::Acquire), 1);
         });
     }
 
@@ -482,7 +450,8 @@ mod tests {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(0);
         let start = Instant::now();
-        let err = wait_block_response(&counter, &events, Duration::from_millis(100)).unwrap_err();
+        let err =
+            wait_block_response(&counter, 0, &events, Duration::from_millis(100)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         let elapsed = start.elapsed();
         assert!(
@@ -496,19 +465,19 @@ mod tests {
     }
 
     #[test]
-    fn wait_block_response_notices_counter_during_fallback() {
+    fn wait_block_response_wakes_when_host_finishes() {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(0);
-        // Eventless host: counter moves only after the spin budget is spent
-        // and no byte is ever written.
+        // Completion after the worker has begun waiting must wake it.
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 std::thread::sleep(Duration::from_millis(30));
                 counter.fetch_add(1, Ordering::Release);
+                events.signal_daw().expect("signal block completion");
             });
             let start = Instant::now();
-            wait_block_response(&counter, &events, Duration::from_secs(5))
-                .expect("mid-wait counter bump should satisfy the wait");
+            wait_block_response(&counter, 0, &events, Duration::from_secs(5))
+                .expect("host completion should wake the wait");
             assert!(start.elapsed() < Duration::from_secs(1));
         });
     }
