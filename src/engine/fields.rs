@@ -125,11 +125,7 @@ pub struct MeterFields {
     pub hw_out_balance: f32,
     pub hw_out_muted: bool,
     pub last_hw_out_meter_publish: Option<Instant>,
-    #[cfg(unix)]
-    pub last_hw_out_meter_linear: Vec<f32>,
     pub hw_out_peak_hold_linear: Vec<f32>,
-    #[cfg(unix)]
-    pub hw_out_meter_publish_phase: bool,
     pub last_track_meter_publish: Option<Instant>,
     pub last_meter_snapshot_publish: Option<Instant>,
     pub track_meter_linear_by_track: HashMap<String, Vec<f32>>,
@@ -143,8 +139,6 @@ pub struct MeterFields {
 impl MeterFields {
     pub(crate) const METER_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
     pub(crate) const METER_DECAY_AFTER_STOP: Duration = Duration::from_secs(1);
-    #[cfg(unix)]
-    pub(crate) const HW_OUT_METER_LINEAR_EPSILON: f32 = 0.0025;
 
     pub(crate) fn new(
         meter_snapshot_producer: crate::triple_buffer::TripleBufferProducer<
@@ -156,11 +150,7 @@ impl MeterFields {
             hw_out_balance: 0.0,
             hw_out_muted: false,
             last_hw_out_meter_publish: None,
-            #[cfg(unix)]
-            last_hw_out_meter_linear: vec![],
             hw_out_peak_hold_linear: vec![],
-            #[cfg(unix)]
-            hw_out_meter_publish_phase: false,
             last_track_meter_publish: None,
             last_meter_snapshot_publish: None,
             track_meter_linear_by_track: HashMap::new(),

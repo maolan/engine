@@ -2,10 +2,6 @@ use super::*;
 use crate::engine::fields::{MeterDecay, MeterFields};
 
 impl Engine {
-    pub(crate) async fn maybe_notify_hw_out_meter(&mut self, _meter_db: Vec<f32>) {
-        {}
-    }
-
     /// Current hardware-output gain/balance as configured by the user.
     pub(crate) fn hw_out_gain_balance(&self) -> (f32, f32) {
         let gain = if self.meters.hw_out_muted {
@@ -39,19 +35,20 @@ impl Engine {
         }
     }
 
-    /// Peak-hold meter over a plan's hardware-output arena. On the pool path
-    /// this is the render that just finished; on the inline path the arena
-    /// still holds the cycle's render output when the `HWFinished` handler
-    /// runs (the next render only happens after the next Go).
+    /// Peak-hold meter over a plan's hardware-output arena. The hold is
+    /// updated on every call (once per hw cycle, matching the per-render-block
+    /// cadence of track meters) so the master meter decays at the same rate;
+    /// only the publish into `latest_hw_out_meter_db` and the
+    /// `Event::TrackMeters { track_name: "hw:out" }` notification (consumed by
+    /// the GUI master strip) are rate-limited to `METER_PUBLISH_INTERVAL`. On
+    /// the pool path this is the render that just finished; on the inline path
+    /// the arena still holds the cycle's render output when the `HWFinished`
+    /// handler runs (the next render only happens after the next Go).
     pub(crate) async fn apply_hw_out_meter_from_plan(
         &mut self,
         plan: &crate::render_plan::RenderPlan,
     ) {
         if self.meters.meter_decay_after_stop.is_some() {
-            return;
-        }
-        let should_notify_interval = self.meters.should_publish_hw_out_meters();
-        if !should_notify_interval {
             return;
         }
         let (gain, balance) = self.hw_out_gain_balance();
@@ -61,22 +58,26 @@ impl Engine {
                 .hw_out_peak_hold_linear
                 .resize(peaks_linear.len(), 0.0);
         }
-        let mut held_peaks = Vec::with_capacity(peaks_linear.len());
         for (idx, peak_now) in peaks_linear.iter().copied().enumerate() {
             let held = self.meters.hw_out_peak_hold_linear[idx] * 0.92;
-            let next = peak_now.max(held);
-            self.meters.hw_out_peak_hold_linear[idx] = next;
-            held_peaks.push(next);
+            self.meters.hw_out_peak_hold_linear[idx] = peak_now.max(held);
         }
-        let should_notify = self.meters.should_publish_hw_out_linear(&held_peaks);
-        let meter_db: Vec<f32> = held_peaks
-            .into_iter()
+        if !self.meters.should_publish_hw_out_meters() {
+            return;
+        }
+        let meter_db: Vec<f32> = self
+            .meters
+            .hw_out_peak_hold_linear
+            .iter()
+            .copied()
             .map(MeterFields::meter_linear_to_db)
             .collect();
         self.meters.latest_hw_out_meter_db = Arc::new(meter_db.clone());
-        if should_notify {
-            self.maybe_notify_hw_out_meter(meter_db).await;
-        }
+        self.notify_event(crate::message::Event::TrackMeters {
+            track_name: "hw:out".to_string(),
+            output_db: meter_db,
+        })
+        .await;
     }
 
     pub(crate) async fn apply_hw_out_gain_and_meter(&mut self) {
@@ -137,10 +138,6 @@ impl Engine {
         self.meters.last_hw_out_meter_publish = None;
         self.meters.last_track_meter_publish = None;
         self.meters.last_meter_snapshot_publish = None;
-        #[cfg(unix)]
-        {
-            self.meters.last_hw_out_meter_linear.clear();
-        }
 
         let tracks: Vec<(String, crate::state::TrackHandle)> = self
             .state_snapshot
@@ -320,38 +317,6 @@ impl MeterFields {
                 self.last_track_meter_publish = Some(now);
                 true
             }
-        }
-    }
-
-    pub(crate) fn should_publish_hw_out_linear(&mut self, peaks_linear: &[f32]) -> bool {
-        #[cfg(unix)]
-        {
-            self.hw_out_meter_publish_phase = !self.hw_out_meter_publish_phase;
-            if !self.hw_out_meter_publish_phase {
-                return false;
-            }
-            let changed = if self.last_hw_out_meter_linear.len() != peaks_linear.len() {
-                true
-            } else {
-                self.last_hw_out_meter_linear
-                    .iter()
-                    .zip(peaks_linear.iter())
-                    .any(|(prev, next)| {
-                        (prev - next).abs() >= MeterFields::HW_OUT_METER_LINEAR_EPSILON
-                    })
-            };
-            if !changed {
-                return false;
-            }
-            self.last_hw_out_meter_linear.clear();
-            self.last_hw_out_meter_linear
-                .extend_from_slice(peaks_linear);
-            true
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = peaks_linear;
-            false
         }
     }
 
