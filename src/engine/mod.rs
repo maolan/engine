@@ -568,6 +568,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_loop_wrap_reanchors_capture_without_silencing_audio() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        engine.hw_driver_info = Some(HwDriverInfo {
+            cycle_samples: 512,
+            sample_rate: 48_000,
+            input_channels: 1,
+            output_channels: 1,
+            sample_bits: 32,
+            frame_size_bytes: 4,
+            capture_buffer_frames: 2048,
+            fresh_capture: true,
+        });
+        engine.rt_inline_enabled = true;
+        engine.transport.transport_running = true;
+        engine.transport.loop_enabled = true;
+        let period = engine.current_cycle_samples();
+        engine.transport.loop_range_samples = Some((period, 4 * period));
+        engine.transport.transport_sample = 3 * period;
+        engine.inline_render.publish_go((3 * period) as i64, true);
+        engine.inline_render.render_cycle(period as u32, Some(0));
+        engine.transport.awaiting_hwfinished = true;
+        engine.handle_hw_finished().await;
+        assert_eq!(engine.transport.transport_sample, period);
+
+        engine.inline_render.publish_go(period as i64, false);
+        engine
+            .inline_render
+            .render_cycle(period as u32, Some(period as i64));
+        let outcome = engine.inline_render.take_outcome().unwrap();
+        assert!(!outcome.stale, "loop wrap is not a missed audio deadline");
+        assert_eq!(outcome.skipped_frames, 0);
+        assert!(!engine.inline_render.take_stale_silence());
+
+        // A genuine missed period must still be detected after the wrap.
+        engine.inline_render.publish_go((2 * period) as i64, false);
+        engine
+            .inline_render
+            .render_cycle(period as u32, Some((3 * period) as i64));
+        assert!(engine.inline_render.take_outcome().unwrap().stale);
+    }
+
+    #[tokio::test]
     async fn recording_peaks_query_reports_real_take_bounds_and_channel_extrema() {
         let (mut engine, mut rx) = make_engine_with_client();
         engine.transport.playing = true;
