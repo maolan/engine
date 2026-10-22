@@ -264,29 +264,18 @@ impl HwDriver {
     }
 
     pub fn latency_ranges(&self) -> ((usize, usize), (usize, usize)) {
-        if self.fresh_capture() {
-            let input = self.cycle_samples() + self.input_latency_frames;
-            let output = self.playback.mmap_write_ahead() as usize + self.output_latency_frames;
-            // Actual write-ahead is learned from the feeder quantum at
-            // startup. Report its bounds; these exclude the device FIFO
-            // and converters, for which user calibration is still needed.
-            let max_output = (self.playback.buffer_frames() as usize - self.cycle_samples())
-                + self.output_latency_frames;
-            return ((input, input), (output, max_output));
-        }
+        // Inline rendering completes the current graph between capture and
+        // playback, like JACK synchronous mode, even with parallel node workers.
         latency::latency_ranges(
             self.cycle_samples(),
             self.nperiods,
-            self.sync_mode,
+            self.sync_mode || self.capture.inline_render.is_some(),
             self.input_latency_frames,
             self.output_latency_frames,
         )
     }
 
     pub fn set_playing(&mut self, playing: bool) {
-        if self.playing.load(Ordering::Relaxed) != playing {
-            self.capture.mmap_cycle = super::mmap_cycle::CycleCursor::default();
-        }
         // State flag only: playback DMA never halts. While stopped, the
         // per-cycle render is silence (fill_output_buffer zeroes it when
         // !playing) and the ring is kept/-fed silent via
@@ -297,10 +286,9 @@ impl HwDriver {
         }
     }
 
-    /// Direct mmap cycles start with fresh capture; kernel uptime is not
-    /// invalid startup audio and must not seed the recording discard.
+    /// Queued capture includes priming buffers; recording must discard them.
     pub fn fresh_capture(&self) -> bool {
-        super::mmap_cycle::direct_enabled(&self.capture, &self.playback)
+        false
     }
 
     /// One full write of the persistent zero buffer into the mapped

@@ -23,7 +23,6 @@ mod convert;
 mod driver;
 mod io_util;
 pub(crate) mod ioctl;
-mod mmap_cycle;
 pub(crate) mod position;
 mod sync;
 
@@ -78,11 +77,7 @@ pub struct Audio {
     frame_stamp: i64,
     duplex_sync: Arc<std::sync::Mutex<DuplexSync>>,
     channel: DoubleBufferedChannel,
-    mmap_cycle: mmap_cycle::CycleCursor,
-    direct_mmap_allowed: bool,
-    mmap_scratch: Vec<u8>,
-    last_underrun_count: i32,
-    last_overrun_count: i32,
+    consumed_capture_end: Option<i64>,
     xrun_count: u64,
     playing: Arc<AtomicBool>,
     was_playing_last_cycle: bool,
@@ -341,9 +336,9 @@ impl Audio {
             .ok_or_else(|| std::io::Error::other(format!("Unsupported format: {format:#x}")))?;
         let frame_size = (channels as usize) * bytes_per_sample;
 
-        // Two periods of address space let the inline path write one period
-        // with deadline headroom learned from the feeder. Capacity is not a
-        // queue: the direct path consumes fresh capture without prefetching.
+        // Leave room for the queued period and the block being rendered.
+        // Timestamped channel buffers determine latency; ring capacity only
+        // limits how much of those buffers can be transferred at once.
         let ring_frames = options
             .period_frames
             .checked_mul(if crate::hw::config::env_opt_out("MAOLAN_RT_INLINE") {
@@ -453,7 +448,7 @@ impl Audio {
         let buffer_frames_cached = (buffer_info.bytes as usize / frame_size) as i64;
         let fragment_bytes = buffer_info.fragsize.max(1) as usize;
 
-        let mut initial_audio = Audio {
+        let initial_audio = Audio {
             dsp,
             channels: io_channels,
             input,
@@ -478,13 +473,7 @@ impl Audio {
             frame_stamp: 0,
             duplex_sync,
             channel,
-            mmap_cycle: mmap_cycle::CycleCursor::default(),
-            // Separate devices may drift even at the same nominal rate;
-            // retain the legacy clock-correction path for that configuration.
-            direct_mmap_allowed: path == sync_key,
-            mmap_scratch: vec![0; buffer_bytes],
-            last_underrun_count: 0,
-            last_overrun_count: 0,
+            consumed_capture_end: None,
             xrun_count: 0,
             playing,
             was_playing_last_cycle: false,
@@ -494,9 +483,6 @@ impl Audio {
             inline_render: None,
             stale_silence_once: false,
         };
-
-        initial_audio.last_underrun_count = initial_audio.get_play_underruns();
-        initial_audio.last_overrun_count = initial_audio.get_rec_overruns();
 
         Ok(initial_audio)
     }
@@ -534,12 +520,6 @@ impl Audio {
 
     fn stepping(&self) -> i64 {
         self.frame_clock.stepping()
-    }
-
-    fn mmap_write_ahead(&self) -> i64 {
-        // The software pointer already feeds the hardware FIFO. Reserve a
-        // short copy/scheduling margin, not another whole engine period.
-        (2 * self.stepping()).min(self.chsamples as i64)
     }
 
     fn shared_cycle_end_add(&self, delta: i64) -> i64 {
@@ -634,35 +614,6 @@ impl Audio {
         if rc.is_ok() { err.rec_overruns } else { 0 }
     }
 
-    pub(super) fn detect_xrun_enhanced(&mut self) -> i64 {
-        let current_underruns = if self.input {
-            0
-        } else {
-            self.get_play_underruns()
-        };
-        let current_overruns = if self.input {
-            self.get_rec_overruns()
-        } else {
-            0
-        };
-
-        if (self.last_underrun_count >= 0 || self.last_overrun_count >= 0)
-            && (current_underruns > self.last_underrun_count
-                || current_overruns > self.last_overrun_count)
-        {
-            self.xrun_count += 1;
-            self.last_underrun_count = current_underruns;
-            self.last_overrun_count = current_overruns;
-
-            return self.chsamples as i64;
-        }
-
-        self.last_underrun_count = current_underruns;
-        self.last_overrun_count = current_overruns;
-
-        0
-    }
-
     /// Current capture frame position reported by the OSS driver via
     /// `SNDCTL_DSP_CURRENT_IPTR`, expressed in frames since the input stream
     /// started. Returns `None` on ioctl failure or for playback devices.
@@ -673,18 +624,10 @@ impl Audio {
         self.stream_frame().ok()
     }
 
-    /// The direct mmap path reports its consumed absolute sample window.
-    /// Otherwise the cursor is in the channel's scheduling timeline (which can
-    /// be rebased during resynchronization). Unlike the raw device head from
-    /// [`Audio::current_capture_frame`], this accounts for the ring backlog.
-    /// Used as the Phase 4 staleness anchor, not as a hardware timestamp.
+    /// End of the consumed primary period in the channel scheduling timeline.
+    /// Prefetching the secondary buffer must not move the transport anchor.
     pub fn current_read_frame(&self) -> Option<i64> {
-        if !self.input {
-            return None;
-        }
-        self.mmap_cycle
-            .capture_end
-            .or_else(|| self.channel.read_data_end_frame())
+        self.consumed_capture_end
     }
 
     pub fn frame_size_bytes(&self) -> usize {
@@ -973,8 +916,7 @@ impl Audio {
             }
             self.zero_block = block;
         }
-        self.channel
-            .reset_buffers(self.frame_stamp, self.frame_size().max(1));
+        self.channel.silence_buffers();
     }
 
     pub fn force_silence_now(&mut self) {
@@ -989,8 +931,7 @@ impl Audio {
         self.stop_fade_remaining_frames = 0;
         self.stop_fade_total_frames = 0;
         self.was_playing_last_cycle = false;
-        self.channel
-            .reset_buffers(self.frame_stamp, self.frame_size().max(1));
+        self.channel.silence_buffers();
     }
 }
 

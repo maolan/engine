@@ -276,20 +276,6 @@ impl InlineRender {
         self.anchor_valid.store(false, Ordering::Release);
     }
 
-    /// Backend deadline check after render/copy. The output missed its safe
-    /// playback window, so report the gap through the same Phase 4 mailbox
-    /// as a pre-render stale cycle. Called before HWFinished is published.
-    #[cfg(any(target_os = "freebsd", test))]
-    pub(crate) fn discard_completed_cycle(&self, skipped_frames: u64) {
-        if let Some(outcome) = self.lock_mailbox().ready.as_mut() {
-            outcome.stale = true;
-            outcome.skipped_frames = outcome.skipped_frames.max(skipped_frames);
-            outcome.plan = None;
-            outcome.results.clear();
-        }
-        self.invalidate_anchor();
-    }
-
     fn lock_mailbox(&self) -> std::sync::MutexGuard<'_, OutcomeMailbox> {
         self.mailbox.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -314,6 +300,15 @@ impl InlineRender {
     /// uncontended by construction (see the module docs) and poison-safe via
     /// `into_inner`.
     pub fn render_cycle(&self, frames: u32, actual_capture: Option<i64>) {
+        self.render_cycle_with_service(frames, actual_capture, || std::time::Duration::MAX);
+    }
+
+    pub(crate) fn render_cycle_with_service(
+        &self,
+        frames: u32,
+        actual_capture: Option<i64>,
+        mut service: impl FnMut() -> std::time::Duration,
+    ) {
         let render = self.render_requested.swap(false, Ordering::Acquire);
         let tag = self.go_tag.load(Ordering::Acquire);
 
@@ -392,7 +387,7 @@ impl InlineRender {
                         .parallel
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .render(plan.clone(), period);
+                        .render_with_service(plan.clone(), period, &mut service);
                     if let Some(results) = results {
                         outcome.results = results;
                     } else {
@@ -409,6 +404,7 @@ impl InlineRender {
                         if matches!(&plan.nodes[node as usize], Op::HwInput { .. }) {
                             continue;
                         }
+                        service();
                         outcome.results.push(Worker::process_node_job_result(
                             INLINE_WORKER_ID,
                             crate::executor::NodeJob {
@@ -817,25 +813,6 @@ mod tests {
             None,
             "zero frames: no check"
         );
-    }
-
-    #[test]
-    fn completed_render_can_be_discarded_when_backend_deadline_is_missed() {
-        let guard = TestSlotGuard::new(sum_plan());
-        let ctx = InlineRender::new(guard.slot());
-        ctx.publish_go(0, true);
-        ctx.request_render(true);
-        ctx.render_cycle(8, Some(1000));
-        ctx.discard_completed_cycle(16);
-        let outcome = ctx.take_outcome().expect("completed cycle");
-        assert!(outcome.stale);
-        assert_eq!(outcome.skipped_frames, 16);
-        assert!(outcome.plan.is_none());
-        assert!(outcome.results.is_empty());
-        ctx.publish_go(24, false);
-        ctx.request_render(true);
-        ctx.render_cycle(8, Some(1024));
-        assert!(!ctx.take_outcome().unwrap().stale);
     }
 
     #[test]

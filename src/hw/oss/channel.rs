@@ -1,3 +1,8 @@
+//! Period scheduling follows JACK's OSS double-buffer model: consume the
+//! primary capture buffer, render, and requeue output at the next period.
+//! While node workers render, the coordinator services raw device buffers,
+//! performing the I/O work JACK delegates to its channel assist thread.
+
 use super::{
     Audio, DoubleBufferedChannel, convert_in_to_i32_connected, convert_out_from_i32_interleaved,
 };
@@ -14,9 +19,6 @@ pub struct OSSChannel<'a> {
 
 impl<'a> OSSChannel<'a> {
     pub fn run_cycle(&mut self) -> std::io::Result<()> {
-        if self.direct_mmap_enabled() {
-            return self.run_direct_mmap_cycle();
-        }
         if self.capture.is_mapped() || self.playback.is_mapped() {
             DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?.run_cycle()
         } else {
@@ -25,20 +27,11 @@ impl<'a> OSSChannel<'a> {
     }
 
     pub fn run_cycle_with_assist(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
-        if self.direct_mmap_enabled() {
-            let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
-            return self.run_direct_mmap_cycle();
-        }
-        DuplexChannelApi::new(self.capture, self.playback, self.stop_requested)?
-            .run_cycle_with_assist(assist_lock)
+        let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
+        self.run_cycle()
     }
 
     pub fn run_assist_step(&mut self) -> std::io::Result<bool> {
-        // Direct inline cycles are Go-paced; an autonomous assist must not
-        // consume their capture window or replay the previous render arena.
-        if self.direct_mmap_enabled() {
-            return Ok(false);
-        }
         if !self.capture.is_mapped() && !self.playback.is_mapped() {
             return self.run_cycle().map(|_| true);
         }
@@ -56,9 +49,6 @@ impl<'a> OSSChannel<'a> {
     }
 
     pub fn run_assist_step_with_lock(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<bool> {
-        if self.direct_mmap_enabled() {
-            return Ok(false);
-        }
         if !self.capture.is_mapped() && !self.playback.is_mapped() {
             return self.run_cycle().map(|_| true);
         }
@@ -149,10 +139,8 @@ impl<'a> DuplexChannelApi<'a> {
         if xrun > 0 {
             let skip = xrun + frames;
             cycle_end = self.capture.shared_cycle_end_add(skip);
-            self.capture
-                .channel
-                .jump_read_progress(skip, self.capture.buffer_frames());
-            self.playback.channel.jump_write_progress(skip);
+            // Hardware progress was already sampled above. Move queued buffer
+            // timestamps, not the device counters: advancing both counts a gap twice.
             self.capture.channel.reset_buffers(
                 self.capture.channel.end_frames() + skip,
                 self.capture.frame_size(),
@@ -169,6 +157,13 @@ impl<'a> DuplexChannelApi<'a> {
             self.check_time_and_run()?;
         }
 
+        // The secondary buffer may already be prefetched. Anchor transport to
+        // the primary period consumed here, never to that prefetch cursor.
+        crate::cycle_trace::set_frame_metric(
+            crate::cycle_trace::FrameMetric::CaptureOvershootFrames,
+            self.capture.channel.capture_overshoot(),
+        );
+        self.capture.consumed_capture_end = Some(self.capture.channel.end_frames());
         let mut inbuf = self.capture.channel.take_buffer();
         if self
             .capture
@@ -190,11 +185,29 @@ impl<'a> DuplexChannelApi<'a> {
             return Err(std::io::Error::other("failed to requeue capture buffer"));
         }
         self.capture.process_ports();
-        if let Some(ctx) = self.capture.inline_render.as_ref() {
-            ctx.render_cycle(
+        if let Some(ctx) = self.capture.inline_render.clone() {
+            let mut service_error = None;
+            ctx.render_cycle_with_service(
                 self.capture.chsamples as u32,
                 self.capture.current_read_frame(),
+                || {
+                    // Only raw driver buffers are touched here. Worker threads own
+                    // the render arena until render/finish_pending completes.
+                    if service_error.is_none()
+                        && let Err(error) =
+                            self.check_stop().and_then(|()| self.check_time_and_run())
+                    {
+                        service_error = Some(error);
+                    }
+                    let frames = (self.next_wakeup() - self.now)
+                        .max(self.capture.stepping())
+                        .min(self.capture.chsamples as i64);
+                    std::time::Duration::from_secs_f64(frames as f64 / self.capture.rate as f64)
+                },
             );
+            if let Some(error) = service_error {
+                return Err(error);
+            }
         }
         if let Some(ctx) = self.capture.inline_render.as_ref()
             && ctx.take_stale_silence()
@@ -227,131 +240,6 @@ impl<'a> DuplexChannelApi<'a> {
 
         self.check_time_and_run()?;
         Ok(())
-    }
-
-    fn run_cycle_with_assist(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
-        let frames = self.capture.chsamples as i64;
-        let mut cycle_end;
-        {
-            let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
-            cycle_end = self.capture.shared_cycle_end_add(frames);
-            self.update_now()?;
-
-            let xrun = self.xrun_gap();
-            if xrun > 0 {
-                let skip = xrun + frames;
-                cycle_end = self.capture.shared_cycle_end_add(skip);
-                self.capture
-                    .channel
-                    .jump_read_progress(skip, self.capture.buffer_frames());
-                self.playback.channel.jump_write_progress(skip);
-                self.capture.channel.reset_buffers(
-                    self.capture.channel.end_frames() + skip,
-                    self.capture.frame_size(),
-                );
-                self.playback.channel.reset_buffers(
-                    self.playback.channel.end_frames() + skip,
-                    self.playback.frame_size(),
-                );
-            }
-        }
-
-        self.wait_for_capture_primary(assist_lock)?;
-
-        {
-            let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
-            let mut inbuf = self.capture.channel.take_buffer();
-            if self
-                .capture
-                .channels
-                .iter()
-                .any(crate::hw::ports::has_audio_connections)
-            {
-                convert_in_to_i32_connected(
-                    self.capture.format,
-                    self.capture.chsamples,
-                    inbuf.as_slice(),
-                    self.capture.buffer.as_mut(),
-                    &self.capture.channels,
-                );
-            }
-            inbuf.reset();
-            let in_end = cycle_end + frames;
-            if !self.capture.channel.set_buffer(inbuf, in_end) {
-                return Err(std::io::Error::other("failed to requeue capture buffer"));
-            }
-            self.capture.process_ports();
-            self.update_now()?;
-        }
-
-        if let Some(ctx) = self.capture.inline_render.as_ref() {
-            ctx.render_cycle(
-                self.capture.chsamples as u32,
-                self.capture.current_read_frame(),
-            );
-        }
-        if let Some(ctx) = self.capture.inline_render.as_ref()
-            && ctx.take_stale_silence()
-        {
-            // Phase 4 back-pressure: the inline render was stale (the device
-            // moved a full period past the tagged transport). Write silence
-            // for this cycle instead of draining the arena — never emit
-            // stale content. The ring resyncs via the existing xrun jump
-            // machinery at the next cycle start.
-            self.playback.write_silence_once();
-        }
-
-        self.wait_for_playback_primary(assist_lock)?;
-
-        {
-            let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
-            self.playback.process_ports();
-            let mut outbuf = self.playback.channel.take_buffer();
-            convert_out_from_i32_interleaved(
-                self.playback.format,
-                self.playback.channels.len(),
-                self.playback.chsamples,
-                self.playback.buffer.as_mut(),
-                outbuf.as_mut_slice(),
-            );
-            let mut out_end = self.capture.shared_cycle_end_get() + frames;
-            out_end += self.playback.playback_correction();
-            if !self.playback.channel.set_buffer(outbuf, out_end) {
-                return Err(std::io::Error::other("failed to requeue playback buffer"));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn wait_for_capture_primary(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
-        loop {
-            self.check_stop()?;
-            let wake = {
-                let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
-                self.update_now()?;
-                if self.capture.channel.primary_finished(self.now) {
-                    return Ok(());
-                }
-                self.next_wakeup()
-            };
-            self.sleep_until(wake)?;
-        }
-    }
-
-    fn wait_for_playback_primary(&mut self, assist_lock: &Mutex<()>) -> std::io::Result<()> {
-        loop {
-            self.check_stop()?;
-            let wake = {
-                let _guard = assist_lock.lock().expect("OSS assist mutex poisoned");
-                self.update_now()?;
-                if self.playback.channel.primary_finished(self.now) {
-                    return Ok(());
-                }
-                self.next_wakeup()
-            };
-            self.sleep_until(wake)?;
-        }
     }
 
     fn process_one_now(audio: &mut Audio, now: i64) -> std::io::Result<()> {
@@ -395,10 +283,6 @@ impl<'a> DuplexChannelApi<'a> {
     }
 
     fn xrun_gap(&mut self) -> i64 {
-        let capture_enhanced_gap = self.capture.detect_xrun_enhanced();
-        let playback_enhanced_gap = self.playback.detect_xrun_enhanced();
-        let enhanced_gap = capture_enhanced_gap.max(playback_enhanced_gap);
-
         let max_end = self
             .capture
             .channel
@@ -410,16 +294,11 @@ impl<'a> DuplexChannelApi<'a> {
             0
         };
 
-        let gap = enhanced_gap.max(buffer_gap);
-
-        if gap > 0 && enhanced_gap == 0 && buffer_gap > 0 {
-            tracing::debug!(
-                "OSS duplex buffer-position xrun detected (gap {} frames)",
-                buffer_gap
-            );
+        if buffer_gap > 0 {
+            self.capture.xrun_count += 1;
+            self.playback.xrun_count += 1;
         }
-
-        gap
+        buffer_gap
     }
 
     fn all_finished(&self) -> bool {
