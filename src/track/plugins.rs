@@ -813,7 +813,8 @@ impl TrackData {
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| format!("Clip CLAP instance {} not found", instance_id))?;
-        instance.processor.restore_state(state)
+        instance.processor.restore_state(state)?;
+        Ok(())
     }
 
     #[cfg(unix)]
