@@ -292,6 +292,12 @@ impl Engine {
                 let normalized = self.transport.normalize_transport_sample(next);
                 let wrapped = normalized != next;
                 self.transport.transport_sample = normalized;
+                if wrapped {
+                    // Capture keeps advancing while the transport loops back.
+                    // Re-anchor before the next render so the loop length is
+                    // not mistaken for missed device periods.
+                    self.inline_render.invalidate_anchor();
+                }
                 self.advance_render_clock(cycle_samples);
                 // The per-cycle advance reaches tracks through the mirrored
                 // lock-free snapshot, so no generation bump is needed here.
