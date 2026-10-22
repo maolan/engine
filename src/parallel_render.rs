@@ -120,10 +120,22 @@ impl ParallelRender {
     /// `None` requests silence. Running jobs still own their buffers until
     /// `finish_pending`, which must run after the playback drain and before
     /// publishing HWFinished, including driver-error and shutdown paths.
+    #[cfg(test)]
     pub(crate) fn render(
         &mut self,
         plan: SharedPlan,
         period: Duration,
+    ) -> Option<Vec<NodeJobResult>> {
+        self.render_with_service(plan, period, &mut || Duration::MAX)
+    }
+
+    /// Service backend buffers while node workers own the render arena.
+    /// The callback returns the maximum time to wait before servicing again.
+    pub(crate) fn render_with_service(
+        &mut self,
+        plan: SharedPlan,
+        period: Duration,
+        service: &mut impl FnMut() -> Duration,
     ) -> Option<Vec<NodeJobResult>> {
         // Never reuse an arena while a previous cycle still owns it.
         if self.active_plan.is_some() {
@@ -237,7 +249,10 @@ impl ParallelRender {
             }
             // Blocking lets lower-priority node workers run on a single CPU.
             // Unpark tokens cover completions between polling and parking.
-            thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+            let service_wait = service();
+            thread::park_timeout(
+                service_wait.min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         self.fail()
     }
@@ -401,6 +416,38 @@ mod tests {
 
     fn shared(collector: &basedrop::Collector, plan: RenderPlan) -> SharedPlan {
         Arc::new(basedrop::Owned::new(&collector.handle(), plan))
+    }
+
+    #[test]
+    fn services_backend_repeatedly_while_workers_are_busy() {
+        let collector = basedrop::Collector::new();
+        let plan = shared(&collector, plan());
+        let started = Arc::new(AtomicBool::new(false));
+        let serviced = Arc::new(AtomicUsize::new(0));
+        let mut pool = Pool::new(1, {
+            let started = started.clone();
+            let serviced = serviced.clone();
+            move |job| {
+                started.store(true, Ordering::Release);
+                let limit = Instant::now() + Duration::from_secs(2);
+                while serviced.load(Ordering::Acquire) < 3 && Instant::now() < limit {
+                    thread::sleep(Duration::from_micros(100));
+                }
+                assert!(serviced.load(Ordering::Acquire) >= 3);
+                Worker::process_node_job_result(0, job)
+            }
+        });
+        let result = pool
+            .render
+            .render_with_service(plan, Duration::from_secs(5), &mut || {
+                if started.load(Ordering::Acquire) {
+                    serviced.fetch_add(1, Ordering::AcqRel);
+                }
+                Duration::from_micros(100)
+            });
+        assert!(result.is_some());
+        assert!(serviced.load(Ordering::Acquire) >= 3);
+        assert!(pool.render.finish_pending().is_none());
     }
 
     #[test]

@@ -158,6 +158,21 @@ impl DoubleBufferedChannel {
         std::mem::take(&mut self.buffer_b.buffer)
     }
 
+    /// Silence queued audio without moving it relative to the capture grid.
+    pub(super) fn silence_buffers(&mut self) {
+        self.buffer_a.buffer.clear();
+        self.buffer_b.buffer.clear();
+    }
+
+    pub(super) fn capture_overshoot(&self) -> i64 {
+        match &self.kind {
+            ChannelKind::Read(read) => {
+                (read.st.last_progress - (self.end_frames() - read.st.max_progress)).max(0)
+            }
+            ChannelKind::Write(_) => 0,
+        }
+    }
+
     pub(super) fn reset_buffers(&mut self, end_frames: i64, frame_size: usize) {
         if self.buffer_a.valid() {
             self.buffer_a.buffer.clear();
@@ -170,55 +185,11 @@ impl DoubleBufferedChannel {
         }
     }
 
-    /// Jump the read channel's progress bookkeeping forward by `frames`,
-    /// declaring them lost. Used when the duplex cycle skips ahead over a
-    /// gap (transport stop with DMA left running: capture accumulates a
-    /// stale backlog while no cycles consume it): without the jump, the
-    /// read side waits for real capture progress to reach the new position
-    /// and catches up at real-time rate, stalling the cycle for the
-    /// duration of the gap. Follows the existing loss convention.
-    pub(super) fn jump_read_progress(&mut self, frames: i64, buffer_frames: i64) {
-        if frames <= 0 {
-            return;
-        }
-        if let ChannelKind::Read(read) = &mut self.kind {
-            read.st.total_loss += frames;
-            read.st.last_progress += frames;
-            read.read_position = read.st.last_progress - buffer_frames;
-        }
-    }
-
-    /// Jump the write channel's progress bookkeeping forward by `frames`
-    /// (symmetric with `jump_read_progress`): while stopped, the ring kept
-    /// draining with no writes, so on resume the device position is ahead
-    /// of the write frontier by the stop gap.
-    pub(super) fn jump_write_progress(&mut self, frames: i64) {
-        if frames <= 0 {
-            return;
-        }
-        if let ChannelKind::Write(write) = &mut self.kind {
-            write.st.total_loss += frames;
-            write.st.last_progress += frames;
-            write.write_position += frames;
-        }
-    }
-
     pub(super) fn end_frames(&self) -> i64 {
         if self.buffer_a.valid() {
             self.buffer_a.end_frames
         } else {
             0
-        }
-    }
-
-    /// Read cursor in the channel's scheduling timeline, including its
-    /// resynchronization adjustments. Inline render anchors transport to
-    /// this cursor rather than the raw CURRENT_IPTR capture head, which
-    /// can lead it by the ring backlog. `None` for write channels.
-    pub(super) fn read_data_end_frame(&self) -> Option<i64> {
-        match &self.kind {
-            ChannelKind::Read(read) => Some(read.read_position),
-            ChannelKind::Write(_) => None,
         }
     }
 
@@ -359,11 +330,7 @@ impl DoubleBufferedChannel {
             }
         }
 
-        if !audio.mapped
-            && read.st.freewheel()
-            && now >= rec.end_frames + read.st.balance
-            && !rec.buffer.done()
-        {
+        if read.st.freewheel() && now >= rec.end_frames + read.st.balance && !rec.buffer.done() {
             rec.buffer.position().fill(0);
             let advanced = rec.buffer.advance(rec.buffer.remaining());
             read.read_position += (advanced / audio.frame_size()) as i64;
@@ -467,6 +434,13 @@ impl DoubleBufferedChannel {
                     .remaining()
                     .min(((audio.buffer_frames() - offset) as usize) * audio.frame_size());
                 let written = audio.write_map(Some(rec.buffer.position()), pointer, len);
+                if written > 0 {
+                    crate::cycle_trace::set_frame_metric(
+                        crate::cycle_trace::FrameMetric::PlaybackLeadFrames,
+                        offset,
+                    );
+                    crate::cycle_trace::mark(crate::cycle_trace::TracePoint::PlaybackMapDone);
+                }
                 rec.buffer.advance(written);
                 write.write_position =
                     rec.end_frames - (rec.buffer.remaining() / audio.frame_size()) as i64;
@@ -508,13 +482,26 @@ impl DoubleBufferedChannel {
         }
 
         if write.st.freewheel() && now >= rec.end_frames + write.st.balance && !rec.buffer.done() {
-            rec.buffer.advance(rec.buffer.remaining());
+            let advanced = rec.buffer.advance(rec.buffer.remaining());
+            write.write_position += (advanced / audio.frame_size()) as i64;
         }
 
         Ok(())
     }
 
     pub(super) fn wakeup_time(&self, audio: &Audio, now: i64) -> i64 {
+        let available = match &self.kind {
+            ChannelKind::Read(read) => read.st.last_progress - read.read_position,
+            ChannelKind::Write(write) => {
+                write.st.last_progress + audio.buffer_frames() - write.write_position
+            }
+        };
+        if available > 0
+            && ((self.buffer_a.valid() && !self.buffer_a.buffer.done())
+                || (self.buffer_b.valid() && !self.buffer_b.buffer.done()))
+        {
+            return now;
+        }
         let sync_frames = if !self.buffer_a.valid() {
             i64::MAX
         } else if !self.finished(now) {
@@ -565,10 +552,6 @@ impl DoubleBufferedChannel {
         }
     }
 
-    pub(super) fn primary_finished(&self, now: i64) -> bool {
-        self.buffer_a.valid() && self.finished(now)
-    }
-
     pub(super) fn total_finished(&self, now: i64) -> bool {
         if !self.buffer_a.valid() {
             return true;
@@ -609,5 +592,183 @@ impl DoubleBufferedChannel {
             ChannelKind::Read(read) => read.st.balance,
             ChannelKind::Write(write) => write.st.balance,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hw::oss::{
+        ioctl::BufferInfo,
+        position::MmapProgress,
+        sync::{DuplexSync, FrameClock},
+    };
+    use nix::libc;
+    use std::{
+        fs::File,
+        sync::{Arc, Mutex, atomic::AtomicBool},
+    };
+
+    // Anonymous memory and /dev/null keep these tests independent of the
+    // user's live audio device. Injected channel progress avoids ioctls.
+    fn mapped_audio() -> Audio {
+        let capacity = 8;
+        // SAFETY: anonymous private mapping, owned and unmapped by Audio::drop.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        Audio {
+            dsp: File::open("/dev/null").unwrap(),
+            channels: vec![],
+            input: false,
+            output_gain_linear: 1.0,
+            output_balance: 0.0,
+            rate: 48_000,
+            format: super::super::AFMT_U8,
+            chsamples: 4,
+            buffer: vec![0; 4],
+            f32_buffer: vec![],
+            buffer_info: BufferInfo {
+                fragments: 2,
+                fragstotal: 2,
+                fragsize: 4,
+                bytes: capacity as i32,
+            },
+            frame_size_bytes: 1,
+            fragment_bytes: 4,
+            buffer_frames_cached: capacity as i64,
+            caps: 0,
+            mapped: true,
+            map,
+            zero_block: vec![],
+            map_progress: MmapProgress::default(),
+            last_published_balance: 0,
+            frame_clock: FrameClock::default(),
+            frame_stamp: 1008,
+            duplex_sync: Arc::new(Mutex::new(DuplexSync::new(48_000, 4))),
+            channel: DoubleBufferedChannel::new_empty_write(),
+            consumed_capture_end: None,
+            xrun_count: 0,
+            playing: Arc::new(AtomicBool::new(true)),
+            was_playing_last_cycle: true,
+            stop_fade_remaining_frames: 0,
+            stop_fade_total_frames: 0,
+            plan_slot: None,
+            inline_render: None,
+            stale_silence_once: false,
+        }
+    }
+
+    fn writer(head: i64, physical: i64) -> WriteChannel {
+        WriteChannel {
+            st: ChannelState {
+                last_processing: 1008,
+                last_progress: head,
+                sync_level: 0,
+                ..ChannelState::default()
+            },
+            map_progress: physical,
+            write_position: head,
+        }
+    }
+
+    fn block(end_frames: i64) -> BufferRecord {
+        BufferRecord {
+            buffer: Buffer {
+                data: vec![1, 2, 3, 4],
+                pos: 0,
+            },
+            end_frames,
+        }
+    }
+
+    fn ring(audio: &Audio) -> Vec<u8> {
+        let mut result = vec![0; 8];
+        assert_eq!(audio.read_map(&mut result, 0, 8), 8);
+        result
+    }
+
+    #[test]
+    fn mapped_period_wraps_without_overwriting_other_frames() {
+        let mut audio = mapped_audio();
+        let mut write = writer(8, 6);
+        let mut rec = block(12);
+        DoubleBufferedChannel::process_write(&mut audio, &mut write, &mut rec, 1008).unwrap();
+        assert!(rec.buffer.done());
+        assert_eq!(ring(&audio), [3, 4, 0, 0, 0, 0, 1, 2]);
+        assert_eq!(write.write_position, 12);
+    }
+
+    #[test]
+    fn late_write_keeps_the_unplayed_suffix() {
+        let mut audio = mapped_audio();
+        let mut write = writer(10, 8);
+        let mut rec = block(12);
+        DoubleBufferedChannel::process_write(&mut audio, &mut write, &mut rec, 1008).unwrap();
+        assert!(rec.buffer.done());
+        assert_eq!(ring(&audio), [3, 4, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn full_ring_retains_pending_output_until_space_opens() {
+        let mut audio = mapped_audio();
+        let mut write = writer(8, 6);
+        // Earlier output already occupies frames 8..14.
+        write.write_position = 14;
+        let mut rec = block(18);
+        DoubleBufferedChannel::process_write(&mut audio, &mut write, &mut rec, 1008).unwrap();
+        assert_eq!(rec.buffer.pos, 2);
+        assert_eq!(ring(&audio), [0, 0, 0, 0, 1, 2, 0, 0]);
+        write.st.last_progress = 10;
+        write.map_progress = 8;
+        DoubleBufferedChannel::process_write(&mut audio, &mut write, &mut rec, 1008).unwrap();
+        assert!(rec.buffer.done());
+        assert_eq!(ring(&audio), [0, 0, 0, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn capture_prefetch_does_not_advance_primary_period() {
+        let mut audio = mapped_audio();
+        audio.input = true;
+        audio.write_map(Some(&mut [8, 9, 10, 11, 4, 5, 6, 7]), 0, 8);
+        let mut channel = DoubleBufferedChannel::new_read(4, 4);
+        channel.reset_buffers(8, 1);
+        if let ChannelKind::Read(read) = &mut channel.kind {
+            read.st.last_processing = 1008;
+            read.st.last_progress = 12;
+            read.st.sync_level = 0;
+            read.map_progress = 12;
+            read.read_position = 4;
+        }
+        assert_eq!(channel.wakeup_time(&audio, 1008), 1008);
+        channel.process(&mut audio, 1008).unwrap();
+        assert_eq!(channel.end_frames(), 8);
+        assert_eq!(channel.take_buffer().as_slice(), [4, 5, 6, 7]);
+        assert_eq!(channel.end_frames(), 12);
+        assert_eq!(channel.take_buffer().as_slice(), [8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn recovery_moves_buffer_grid_without_faking_device_progress() {
+        let mut channel = DoubleBufferedChannel::new_write(4, 4);
+        channel.kind = ChannelKind::Write(writer(1024, 1024));
+        channel.reset_buffers(1032, 1);
+        assert_eq!(channel.end_frames(), 1032);
+        assert_eq!(channel.total_end(), 1036);
+        if let ChannelKind::Write(write) = &channel.kind {
+            assert_eq!(write.st.last_progress, 1024);
+            assert_eq!(write.map_progress, 1024);
+        }
+        channel.silence_buffers();
+        assert_eq!(channel.end_frames(), 1032);
+        assert_eq!(channel.total_end(), 1036);
     }
 }

@@ -50,8 +50,7 @@ pub(crate) enum TracePoint {
     TransportAdvanced,
     GoSent,
     GoReceived,
-    /// Direct-mmap path only: the period was copied into the playback ring
-    /// and the post-copy deadline check passed.
+    /// Most recent copy of queued output into the OSS playback ring.
     #[cfg(target_os = "freebsd")]
     PlaybackMapDone = 11,
 }
