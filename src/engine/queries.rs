@@ -25,19 +25,32 @@ impl Engine {
     /// while wrapped in `Ok(Action::...)` were query answers and now live
     /// there. `OfflineBounceFinished` errors keep the error-packet behavior.
     ///
-    /// Events are best-effort reports (meters also flow via the triple
-    /// buffer), so a client whose channel is full drops this event instead
-    /// of stalling the engine behind a slow consumer; Responses and
-    /// QueryReplies keep their awaited sends. Dead senders are pruned.
+    /// Repeated telemetry is best-effort so a slow consumer cannot stall
+    /// playback. State changes and operation completion events must arrive:
+    /// saving, for example, waits for every plugin snapshot and completion.
     pub(crate) async fn notify_event(&mut self, event: Event) {
+        let best_effort = matches!(
+            event,
+            Event::TransportPositionAt { .. }
+                | Event::TransportPosition(_)
+                | Event::TrackMeters { .. }
+                | Event::SessionRuntimeReport { .. }
+                | Event::AudioXruns { .. }
+                | Event::IoDelayReport { .. }
+                | Event::TrackAutomationLevel { .. }
+                | Event::TrackAutomationBalance { .. }
+                | Event::Log { .. }
+        );
         self.clients.retain(|client| !client.is_closed());
         for client in self.clients.iter() {
+            if !best_effort {
+                let _ = client.send(Message::Event(event.clone())).await;
+                continue;
+            }
             match client.try_send(Message::Event(event.clone())) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Saturated client: dropping the event is acceptable
-                    // (see doc comment); the next event gets through once
-                    // the client drains.
+                    // Repeated telemetry can be refreshed by a later report.
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     // Pruned by the retain below.
@@ -422,5 +435,61 @@ impl Engine {
             _ => {}
         }
         false
+    }
+}
+
+#[cfg(all(test, feature = "plugins"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn save_events_survive_a_full_client_queue() {
+        let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(1);
+        let mut engine = Engine::new(engine_rx, engine_tx);
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(1);
+        client_tx
+            .send(Message::Event(Event::HistoryState { dirty: true }))
+            .await
+            .unwrap();
+        engine.clients.push(client_tx);
+
+        let send = async {
+            engine
+                .notify_event(Event::TrackClapStateSnapshot {
+                    track_name: "G2L2".into(),
+                    instance_id: 0,
+                    plugin_id: "modeler".into(),
+                    state: Box::new(crate::clap::ClapPluginState {
+                        bytes: vec![1, 2, 3],
+                    }),
+                })
+                .await;
+            engine
+                .notify_event(Event::TrackSnapshotAllClapStatesDone {
+                    track_name: "G2L2".into(),
+                })
+                .await;
+        };
+        let receive = async {
+            assert!(matches!(
+                client_rx.recv().await,
+                Some(Message::Event(Event::HistoryState { dirty: true }))
+            ));
+            assert!(matches!(
+                client_rx.recv().await,
+                Some(Message::Event(Event::TrackClapStateSnapshot { state, .. }))
+                    if state.bytes == [1, 2, 3]
+            ));
+            assert!(matches!(
+                client_rx.recv().await,
+                Some(Message::Event(Event::TrackSnapshotAllClapStatesDone { track_name }))
+                    if track_name == "G2L2"
+            ));
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(send, receive);
+        })
+        .await
+        .expect("save notifications must arrive even when the client queue was full");
     }
 }
