@@ -2317,7 +2317,26 @@ impl Engine {
 
         let mut disconnect_actions = Vec::new();
 
-        // Remove all existing audio and MIDI connections involving this track.
+        // Keep routes within the moved subtree, including child-to-folder outputs.
+        // Audio output connections are bidirectional, so removing every connection
+        // on the folder output would also disconnect its children.
+        let mut internal_audio_ports = Vec::new();
+        let mut internal_midi_ports = Vec::new();
+        let mut internal_tracks = std::collections::HashSet::new();
+        let mut pending = vec![track.clone()];
+        while let Some(member) = pending.pop() {
+            let member = member.lock();
+            if !internal_tracks.insert(member.name.clone()) {
+                continue;
+            }
+            internal_audio_ports.extend(member.audio.ins.iter().cloned());
+            internal_audio_ports.extend(member.audio.outs.iter().cloned());
+            internal_midi_ports.extend(member.midi.ins.iter().cloned());
+            internal_midi_ports.extend(member.midi.outs.iter().cloned());
+            pending.extend(member.child_tracks.iter().cloned());
+        }
+
+        // Remove external audio and MIDI connections involving this track.
         {
             let state = self.state.lock();
             let hw_inputs = self.all_hw_input_audio_ports();
@@ -2327,6 +2346,12 @@ impl Engine {
                 for (port_idx, inp) in child.audio.ins.iter().enumerate() {
                     let sources = inp.connections();
                     for src in sources.iter() {
+                        if internal_audio_ports
+                            .iter()
+                            .any(|port| Arc::ptr_eq(port, src))
+                        {
+                            continue;
+                        }
                         crate::report_error(
                             AudioIO::disconnect(src, inp),
                             "Failed to disconnect removed hardware input",
@@ -2358,6 +2383,12 @@ impl Engine {
                 for (port_idx, out) in child.audio.outs.iter().enumerate() {
                     let targets = out.connections();
                     for tgt in targets.iter() {
+                        if internal_audio_ports
+                            .iter()
+                            .any(|port| Arc::ptr_eq(port, tgt))
+                        {
+                            continue;
+                        }
                         crate::report_error(
                             AudioIO::disconnect(out, tgt),
                             "Failed to disconnect removed hardware output",
@@ -2428,6 +2459,12 @@ impl Engine {
                 for (port_idx, out) in child.midi.outs.iter().enumerate() {
                     let targets = out.connections();
                     for tgt in targets {
+                        if internal_midi_ports
+                            .iter()
+                            .any(|port| Arc::ptr_eq(port, &tgt))
+                        {
+                            continue;
+                        }
                         if let Some((tgt_name, tgt_port, _)) =
                             self.find_midi_io_owner(self.state.as_ref(), &tgt)
                         {
@@ -2456,7 +2493,7 @@ impl Engine {
                     Vec::new()
                 };
             for (other_name, other_track) in &state.tracks {
-                if other_name.as_str() == track_name {
+                if internal_tracks.contains(other_name) {
                     continue;
                 }
                 let other = other_track.lock();

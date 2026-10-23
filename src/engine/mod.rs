@@ -3241,6 +3241,55 @@ mod tests {
         false
     }
 
+    #[tokio::test]
+    async fn moving_nested_folder_preserves_child_routes() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        for name in ["outer", "inner"] {
+            insert_track(
+                &mut engine,
+                Track::new_folder(name.to_string(), 2, 2, 1, 1, 64, 48_000.0),
+            );
+        }
+        insert_track(
+            &mut engine,
+            Track::new("leaf".to_string(), 2, 2, 1, 1, 64, 48_000.0),
+        );
+        engine.handle_track_set_parent("leaf", Some("inner")).await;
+        for parent in [Some("outer"), None, Some("outer")] {
+            engine.handle_track_set_parent("inner", parent).await;
+            let state = engine.state.lock();
+            let inner = state.tracks.get("inner").unwrap().lock();
+            let leaf = state.tracks.get("leaf").unwrap().lock();
+            assert_eq!(leaf.parent_track.as_deref(), Some("inner"));
+            for i in 0..2 {
+                assert!(
+                    leaf.audio.ins[i]
+                        .connections()
+                        .iter()
+                        .any(|port| Arc::ptr_eq(port, &inner.audio.ins[i]))
+                );
+                assert!(
+                    leaf.audio.outs[i]
+                        .connections()
+                        .iter()
+                        .any(|port| Arc::ptr_eq(port, &inner.audio.outs[i]))
+                );
+            }
+            assert!(
+                leaf.midi.ins[0]
+                    .connections()
+                    .iter()
+                    .any(|port| Arc::ptr_eq(port, &inner.midi.ins[0]))
+            );
+            assert!(
+                leaf.midi.outs[0]
+                    .connections()
+                    .iter()
+                    .any(|port| Arc::ptr_eq(port, &inner.midi.outs[0]))
+            );
+        }
+    }
+
     #[test]
     fn nested_folder_expands_in_render_plan() {
         use crate::message::ProcessTask;
