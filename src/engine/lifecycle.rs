@@ -260,12 +260,9 @@ impl Engine {
     pub(crate) async fn handle_quit(&mut self, a: Action) {
         self.flush_recordings().await;
         // Stop the HW worker before notifying the GUI so the
-        // OSS audio channels are halted and closed from the
-        // worker's own thread. The GUI calls exit(0) upon
-        // receiving the Quit response, which skips Rust
-        // destructors. Without this, the kernel's dsp_close
-        // drains pending audio buffers for up to CHN_TIMEOUT
-        // (5s) during process teardown.
+        // OSS audio device is closed from the worker's own
+        // thread. The GUI calls exit(0) upon receiving the Quit
+        // response, which skips Rust destructors.
         if let Some(mut worker) = self.hw_worker.take() {
             // Send MIDI panic (All Sound Off) for any active
             // notes before stopping the worker.
@@ -288,9 +285,9 @@ impl Engine {
         }
         // Explicitly close audio and MIDI fds before sending
         // the Quit response. The GUI calls exit(0) upon
-        // receiving it, which skips destructors — any
-        // still-open device fd would trigger the kernel's
-        // 5-second drain during process teardown.
+        // receiving it, which skips destructors, so the device
+        // fds must already be closed (the kernel deinitializes
+        // the OSS channels on close).
         if let Some(hw) = self.hw_driver.as_mut() {
             hw.close_fds();
         }
