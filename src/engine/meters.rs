@@ -98,24 +98,34 @@ impl Engine {
             self.update_meter_decay_after_stop();
             return;
         }
-        let tracks: Vec<(String, crate::state::TrackHandle)> = self
-            .state_snapshot
-            .load_full()
+        let state = self.state_snapshot.load_full();
+        let tracks: Vec<(String, crate::state::TrackHandle)> = state
             .tracks
             .iter()
             .map(|(name, track)| (name.clone(), track.clone()))
             .collect();
         let mut snapshot = Vec::with_capacity(tracks.len());
         for (name, track) in &tracks {
-            let track = track.lock();
-            let linear = if track.muted() {
-                vec![0.0; track.audio.outs.len()]
+            let (output_enabled, output_channels, fallback_linear) = {
+                let track = track.lock();
+                (
+                    track.output_enabled(),
+                    track.audio.outs.len(),
+                    track.output_meter_linear(),
+                )
+            };
+            // The mute/solo policy sets this for the track and every
+            // descendant of a muted folder. Disabled tracks can stop
+            // updating their render meter cache, so publish silence instead
+            // of leaving their last peak visible.
+            let linear = if !output_enabled {
+                vec![0.0; output_channels]
             } else {
                 self.meters
                     .track_meter_linear_by_track
                     .get(name)
                     .cloned()
-                    .unwrap_or_else(|| track.output_meter_linear())
+                    .unwrap_or(fallback_linear)
             };
             let output_db = linear
                 .iter()
