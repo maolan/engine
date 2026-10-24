@@ -351,13 +351,10 @@ impl HwWorkerDriver for HwDriver {
     }
 
     fn request_stop(&mut self) {
+        // Unblock any cycle blocked on device I/O; the kernel deinitializes
+        // the channel when the fd is closed (close_fds/drop), so no trigger
+        // or halt ioctls are issued here.
         self.stop_requested.store(true, Ordering::Release);
-        crate::report_error(
-            self.playback.stop_trigger(),
-            "Failed to stop OSS playback trigger",
-        );
-        crate::report_error(self.playback.halt(), "Failed to halt OSS playback");
-        crate::report_error(self.capture.halt(), "Failed to halt OSS capture");
     }
 
     #[cfg(unix)]
