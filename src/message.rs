@@ -238,6 +238,21 @@ pub enum PitchCorrectionMode {
     Resynth,
 }
 
+/// Default fade-in/fade-out length, in samples, applied to a newly created
+/// audio clip (matches Ardour).
+pub const DEFAULT_FADE_SAMPLES: usize = 64;
+
+/// Enforces the minimum fade length: when `fade_enabled` is true, the returned
+/// length is at least [`DEFAULT_FADE_SAMPLES`]. Disabled fades keep their
+/// stored length untouched.
+pub fn clamp_fade_samples(fade_enabled: bool, samples: usize) -> usize {
+    if fade_enabled {
+        samples.max(DEFAULT_FADE_SAMPLES)
+    } else {
+        samples
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AudioClipData {
     #[serde(default)]
@@ -1990,7 +2005,10 @@ pub enum Message {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioClipData, MidiClipData, PitchCorrectionPointData};
+    use super::{
+        AudioClipData, DEFAULT_FADE_SAMPLES, MidiClipData, PitchCorrectionPointData,
+        clamp_fade_samples,
+    };
     use serde_json::json;
 
     #[test]
@@ -2122,5 +2140,30 @@ mod tests {
         assert!(restored.pitch_correction_points.is_empty());
         #[cfg(feature = "plugins")]
         assert!(restored.plugin_graph_json.is_none());
+    }
+
+    #[test]
+    fn clamp_fade_samples_enforces_minimum_only_when_enabled() {
+        assert_eq!(
+            clamp_fade_samples(true, 10),
+            DEFAULT_FADE_SAMPLES,
+            "enabled fades shorter than the minimum are raised"
+        );
+        assert_eq!(
+            clamp_fade_samples(true, DEFAULT_FADE_SAMPLES),
+            DEFAULT_FADE_SAMPLES,
+            "the minimum itself is preserved"
+        );
+        assert_eq!(
+            clamp_fade_samples(true, 960),
+            960,
+            "longer enabled fades are untouched"
+        );
+        assert_eq!(
+            clamp_fade_samples(false, 10),
+            10,
+            "disabled fades keep their stored length"
+        );
+        assert_eq!(clamp_fade_samples(false, 0), 0);
     }
 }
