@@ -107,7 +107,7 @@ pub(crate) struct OssCount {
 
 #[repr(C)]
 #[derive(Debug, Default)]
-pub(super) struct AudioErrInfo {
+pub(crate) struct AudioErrInfo {
     pub(super) play_underruns: libc::c_int,
     pub(super) rec_overruns: libc::c_int,
     pub(super) play_ptradjust: libc::c_uint,
@@ -123,7 +123,7 @@ pub(super) struct AudioErrInfo {
 
 #[repr(C)]
 #[derive(Debug)]
-pub(super) struct OssSysInfo {
+pub(crate) struct OssSysInfo {
     pub(super) product: [libc::c_char; 32],
     pub(super) version: [libc::c_char; 32],
     pub(super) versionnum: libc::c_int,
@@ -184,7 +184,6 @@ impl OssSyncGroup {
 }
 
 const SNDCTL_DSP_MAGIC: u8 = b'P';
-const SNDCTL_DSP_HALT: u8 = 0;
 const SNDCTL_DSP_SPEED: u8 = 2;
 const SNDCTL_DSP_SETFMT: u8 = 5;
 const SNDCTL_DSP_CHANNELS: u8 = 6;
@@ -200,7 +199,6 @@ const SNDCTL_DSP_COOKEDMODE: u8 = 30;
 const SNDCTL_DSP_CURRENT_IPTR: u8 = 35;
 const SNDCTL_DSP_CURRENT_OPTR: u8 = 36;
 
-nix::ioctl_none!(oss_halt, SNDCTL_DSP_MAGIC, SNDCTL_DSP_HALT);
 nix::ioctl_readwrite!(oss_set_channels, SNDCTL_DSP_MAGIC, SNDCTL_DSP_CHANNELS, i32);
 nix::ioctl_readwrite!(
     oss_set_fragment,
@@ -321,6 +319,30 @@ pub(crate) fn set_cooked(fd: i32, enabled: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn set_trigger(fd: i32, mask: i32) -> std::io::Result<()> {
+    let value = mask;
+    unsafe { oss_set_trigger(fd, &value) }?;
+    Ok(())
+}
+
+pub(crate) fn engine_info(fd: i32) -> std::io::Result<AudioInfo> {
+    let mut info = AudioInfo::new();
+    unsafe { oss_get_info(fd, &mut info) }?;
+    Ok(info)
+}
+
+pub(crate) fn sys_info(fd: i32) -> std::io::Result<OssSysInfo> {
+    let mut info = OssSysInfo::default();
+    unsafe { oss_get_sysinfo(fd, &mut info) }?;
+    Ok(info)
+}
+
+pub(crate) fn error_info(fd: i32) -> std::io::Result<AudioErrInfo> {
+    let mut info = AudioErrInfo::default();
+    unsafe { oss_get_error(fd, &mut info) }?;
+    Ok(info)
+}
+
 pub(crate) fn set_fragment(fd: i32, fragments: i32, frag_exp: i32) -> std::io::Result<()> {
     let mut value = (fragments << 16) | frag_exp;
     unsafe { oss_set_fragment(fd, &mut value) }?;
@@ -355,5 +377,5 @@ pub fn start_sync_group(fd: i32, group: i32) -> std::io::Result<()> {
     let id = group;
     unsafe { oss_start_group(fd, &id) }
         .map(|_| ())
-        .map_err(|_| std::io::Error::last_os_error())
+        .map_err(std::io::Error::from)
 }

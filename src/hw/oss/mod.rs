@@ -29,7 +29,7 @@ mod sync;
 pub use self::channel::OSSChannel;
 pub use self::consts::*;
 pub use self::driver::HwDriver;
-pub use self::ioctl::{AudioInfo, BufferInfo, add_to_sync_group, start_sync_group};
+pub use self::ioctl::{BufferInfo, add_to_sync_group, start_sync_group};
 pub use crate::hw::options::HwOptions;
 
 use self::audio_core::DoubleBufferedChannel;
@@ -148,17 +148,15 @@ impl Audio {
         let mut last_errno = None;
         let mut last_unsupported = None;
         for candidate in candidates {
-            let mut negotiated = candidate;
-            let setfmt = unsafe { oss_set_format(fd, &mut negotiated) };
-            match setfmt {
-                Ok(_) => {
+            match set_format(fd, candidate) {
+                Ok(negotiated) => {
                     if supported_sample_format(negotiated) {
                         return Ok(negotiated);
                     }
                     last_unsupported = Some(negotiated);
                 }
-                Err(_) => {
-                    last_errno = Some(std::io::Error::last_os_error());
+                Err(e) => {
+                    last_errno = Some(e);
                 }
             }
         }
@@ -238,10 +236,6 @@ impl Audio {
         self.set_trigger_mask(trig)
     }
 
-    pub fn stop_trigger(&self) -> std::io::Result<()> {
-        self.set_trigger_mask(0)
-    }
-
     /// Set the full SNDCTL_DSP_TRIGGER mask for this fd. On a device whose
     /// capture/playback fds are joined in a sync group, clearing only
     /// `PCM_ENABLE_OUTPUT` on the playback fd halts playback DMA while
@@ -252,21 +246,14 @@ impl Audio {
             return Ok(());
         }
         let trig: i32 = mask;
-        unsafe { oss_set_trigger(self.dsp.as_raw_fd(), &trig) }
-            .map(|_| ())
-            .map_err(|_| std::io::Error::last_os_error())
+        set_trigger(self.dsp.as_raw_fd(), trig)
     }
 
-    pub fn halt(&self) -> std::io::Result<()> {
-        unsafe { oss_halt(self.dsp.as_raw_fd()) }
-            .map(|_| ())
-            .map_err(|_| std::io::Error::last_os_error())
-    }
-
-    /// Halt the device and explicitly close the fd so the kernel
-    /// cannot drain pending buffers during process exit.
+    /// Close the device fd; the kernel deinitializes the channel on close.
+    /// The fd is replaced with `/dev/null` so any stray per-cycle ioctl
+    /// fails with ENOTTY on `/dev/null` instead of hitting a recycled fd
+    /// owned by an unrelated file.
     pub fn close_fd(&mut self) {
-        crate::report_error(self.halt(), "Failed to halt OSS device before closing");
         if let Ok(devnull) = File::open("/dev/null") {
             drop(std::mem::replace(&mut self.dsp, devnull));
         }
@@ -308,11 +295,7 @@ impl Audio {
             );
         }
 
-        let mut audio_info = AudioInfo::new();
-        unsafe {
-            oss_get_info(dsp.as_raw_fd(), &mut audio_info)
-                .map_err(|_| std::io::Error::last_os_error())?;
-        }
+        let audio_info = engine_info(dsp.as_raw_fd())?;
         let mut channels = if audio_info.max_channels > 0 {
             audio_info.max_channels
         } else {
@@ -320,12 +303,8 @@ impl Audio {
         };
         let mut effective_rate = rate;
         let format = Self::negotiate_sample_format(dsp.as_raw_fd(), bits)?;
-        unsafe {
-            oss_set_channels(dsp.as_raw_fd(), &mut channels)
-                .map_err(|_| std::io::Error::last_os_error())?;
-            oss_set_speed(dsp.as_raw_fd(), &mut effective_rate)
-                .map_err(|_| std::io::Error::last_os_error())?;
-        }
+        channels = set_channels(dsp.as_raw_fd(), channels)?;
+        effective_rate = set_speed(dsp.as_raw_fd(), effective_rate)?;
         if effective_rate != rate {
             return Err(std::io::Error::other(format!(
                 "OSS device forced sample rate {effective_rate} (requested {rate})"
@@ -350,16 +329,11 @@ impl Audio {
         let _requested_fragment_bytes =
             Self::request_fragment_layout(dsp.as_raw_fd(), frame_size, ring_frames)?;
 
-        let mut buffer_info = BufferInfo::new();
-        unsafe {
-            if input {
-                oss_input_buffer_info(dsp.as_raw_fd(), &mut buffer_info)
-                    .map_err(|_| std::io::Error::last_os_error())?;
-            } else {
-                oss_output_buffer_info(dsp.as_raw_fd(), &mut buffer_info)
-                    .map_err(|_| std::io::Error::last_os_error())?;
-            }
-        }
+        let mut buffer_info = if input {
+            input_buffer_info(dsp.as_raw_fd())?
+        } else {
+            output_buffer_info(dsp.as_raw_fd())?
+        };
 
         if buffer_info.fragments < 1 {
             buffer_info.fragments = buffer_info.fragstotal;
@@ -371,16 +345,8 @@ impl Audio {
             return Err(std::io::Error::other("OSS buffer size is invalid"));
         }
 
-        let mut caps = 0_i32;
-        unsafe {
-            oss_get_caps(dsp.as_raw_fd(), &mut caps)
-                .map_err(|_| std::io::Error::last_os_error())?;
-        }
-        let mut sys = OssSysInfo::default();
-        unsafe {
-            oss_get_sysinfo(dsp.as_raw_fd(), &mut sys)
-                .map_err(|_| std::io::Error::last_os_error())?;
-        }
+        let mut caps = get_caps(dsp.as_raw_fd())?;
+        let sys = sys_info(dsp.as_raw_fd())?;
         if (caps & PCM_CAP_MMAP) != 0 {
             let ver = cstr_fixed_prefix(&sys.version);
             if ver.len() >= 7 && ver.as_bytes()[..7].cmp(b"1302000") == std::cmp::Ordering::Less {
@@ -560,12 +526,11 @@ impl Audio {
     }
 
     fn stream_frame(&self) -> std::io::Result<i64> {
-        let mut info = OssCount::default();
-        if self.input {
-            unsafe { oss_current_iptr(self.fd(), &mut info) }?;
+        let info = if self.input {
+            ioctl::current_iptr(self.fd())?
         } else {
-            unsafe { oss_current_optr(self.fd(), &mut info) }?;
-        }
+            ioctl::current_optr(self.fd())?
+        };
         stream_frame(&info, self.input)
     }
 
@@ -593,25 +558,24 @@ impl Audio {
     }
 
     fn queued_samples(&self) -> i32 {
-        let mut ptr = OssCount::default();
         let req = if self.input {
-            unsafe { oss_current_iptr(self.dsp.as_raw_fd(), &mut ptr) }
+            ioctl::current_iptr(self.dsp.as_raw_fd())
         } else {
-            unsafe { oss_current_optr(self.dsp.as_raw_fd(), &mut ptr) }
+            ioctl::current_optr(self.dsp.as_raw_fd())
         };
-        if req.is_ok() { ptr.fifo_samples } else { 0 }
+        req.map(|ptr| ptr.fifo_samples).unwrap_or(0)
     }
 
     fn get_play_underruns(&self) -> i32 {
-        let mut err = AudioErrInfo::default();
-        let rc = unsafe { oss_get_error(self.dsp.as_raw_fd(), &mut err) };
-        if rc.is_ok() { err.play_underruns } else { 0 }
+        ioctl::error_info(self.dsp.as_raw_fd())
+            .map(|err| err.play_underruns)
+            .unwrap_or(0)
     }
 
     fn get_rec_overruns(&self) -> i32 {
-        let mut err = AudioErrInfo::default();
-        let rc = unsafe { oss_get_error(self.dsp.as_raw_fd(), &mut err) };
-        if rc.is_ok() { err.rec_overruns } else { 0 }
+        ioctl::error_info(self.dsp.as_raw_fd())
+            .map(|err| err.rec_overruns)
+            .unwrap_or(0)
     }
 
     /// Current capture frame position reported by the OSS driver via
@@ -937,11 +901,8 @@ impl Audio {
 
 impl Drop for Audio {
     fn drop(&mut self) {
-        // Reset the OSS channel to discard pending buffers. Without this,
-        // the kernel's dsp_close() calls chn_flush() on playback channels
-        // which drains remaining audio data — sleeping up to CHN_TIMEOUT
-        // (5 seconds by default) before actually closing the fd.
-        crate::report_error(self.halt(), "Failed to halt OSS device during drop");
+        // No ioctl teardown: the kernel deinitializes the channel when the
+        // dsp fd is closed. Just unmap the ring before the fd goes away.
         if self.mapped && !self.map.is_null() && self.buffer_info.bytes > 0 {
             unsafe {
                 if libc::munmap(self.map, self.buffer_info.bytes as usize) != 0 {
