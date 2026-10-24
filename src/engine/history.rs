@@ -150,7 +150,11 @@ impl Engine {
             Action::EndSessionRestore => {
                 self.history.clear();
                 self.history_suspended = false;
-                self.preload_track_clips_spawn();
+                self.preload_track_clips().await;
+                self.publish_state_snapshot();
+                if let Err(error) = self.plan_builder.rebuild().await {
+                    self.notify_clients(Err(error)).await;
+                }
                 if !self.transport.playing && self.state.lock().iodelay.is_some() {
                     self.handle_pause(Action::Pause).await;
                 }

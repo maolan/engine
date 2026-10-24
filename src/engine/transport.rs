@@ -468,6 +468,9 @@ impl Engine {
             self.transport.awaiting_hwfinished,
             self.transport.handling_hwfinished
         );
+        // Cold caches can require file I/O and decoder/thread setup. Finish
+        // that work before starting hardware or publishing a running transport.
+        self.preload_track_clips().await;
         self.meters.meter_decay_after_stop = None;
         self.restart_render_clock();
         self.transport.playing = true;
@@ -490,7 +493,6 @@ impl Engine {
         self.notify_clients(Ok(Action::Play)).await;
         self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
             .await;
-        self.preload_track_clips().await;
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
             self.dispatch_automation_echoes(echoes).await;
@@ -522,6 +524,7 @@ impl Engine {
         self.transport.transport_running = false;
         self.publish_transport_snapshot();
         if !self.transport.playing {
+            self.preload_track_clips().await;
             self.transport.playing = true;
             self.bump_prepare_generation();
             self.transport.clear_processing_buffers_pending = true;
@@ -538,7 +541,6 @@ impl Engine {
             {
                 self.notify_clients(Err(e)).await;
             }
-            self.preload_track_clips().await;
             if !self.transport.awaiting_hwfinished && !self.transport.handling_hwfinished {
                 let completed = self.start_plan_cycle().await;
                 if completed {
@@ -629,6 +631,7 @@ impl Engine {
             return false;
         };
 
+        self.preload_track_clips().await;
         self.stop_render_clock();
         self.transport.playing = true;
         self.transport.transport_running = false;
@@ -663,7 +666,6 @@ impl Engine {
         }
         self.notify_event(Event::TransportPosition(self.audible_transport_sample()))
             .await;
-        self.preload_track_clips().await;
         {
             let echoes = self.apply_modulators(self.active_transport_sample());
             self.dispatch_automation_echoes(echoes).await;
