@@ -68,7 +68,10 @@ use crate::workers::sndio_worker::HwWorker;
 use crate::{
     history::UndoEntry,
     kind::Kind,
-    message::{Action, Event, HwMidiEvent, Message, MidiControllerData, MidiNoteData, QueryReply},
+    message::{
+        Action, DEFAULT_FADE_SAMPLES, Event, HwMidiEvent, Message, MidiControllerData,
+        MidiNoteData, QueryReply, clamp_fade_samples,
+    },
     midi::io::MidiEvent,
     osc::OscServer,
     state::{State, StateSlot},
@@ -855,6 +858,149 @@ mod tests {
         engine.transport.transport_sample = 48_000;
         engine.seed_record_start_discard();
         assert_eq!(engine.recording.discard_remaining_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn overlapping_added_clips_preserve_supplied_fades() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("takes".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        for (index, (start, length, fade)) in [
+            (384_007, 382_976, 240),
+            (384_000, 382_976, 240),
+            (384_000, 62_983, 240),
+            (480_000, 200_000, 960),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine
+                .handle_request(Action::AddClip {
+                    clip_id: format!("take-{index}"),
+                    name: format!("audio/take-{index}.wav"),
+                    track_name: "takes".to_string(),
+                    start,
+                    length,
+                    offset: 0,
+                    input_channel: 0,
+                    muted: false,
+                    reversed: false,
+                    gain_db: 0.0,
+                    peaks_file: None,
+                    kind: Kind::Audio,
+                    fade_enabled: true,
+                    fade_in_samples: fade,
+                    fade_out_samples: fade,
+                    source_name: None,
+                    source_offset: None,
+                    source_length: None,
+                    preview_name: None,
+                    pitch_correction_points: vec![],
+                    pitch_correction_frame_likeness: None,
+                    pitch_correction_inertia_ms: None,
+                    pitch_correction_formant_compensation: None,
+                    pitch_correction_detector: Default::default(),
+                    pitch_correction_mode: Default::default(),
+                    #[cfg(feature = "plugins")]
+                    plugin_graph_json: None,
+                })
+                .await;
+        }
+        let state = engine.state.lock();
+        let track = state.tracks.get("takes").unwrap().lock();
+        let clips = track.audio.clips();
+        assert_eq!(clips.len(), 4);
+        for (clip, expected) in clips.iter().zip([240, 240, 240, 960]) {
+            assert_eq!(clip.fade_in_samples, expected);
+            assert_eq!(clip.fade_out_samples, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_fades_are_clamped_to_minimum_on_add_and_set() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("fades".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        engine
+            .handle_request(Action::AddClip {
+                clip_id: "short".to_string(),
+                name: "audio/short.wav".to_string(),
+                track_name: "fades".to_string(),
+                start: 0,
+                length: 10_000,
+                offset: 0,
+                input_channel: 0,
+                muted: false,
+                reversed: false,
+                gain_db: 0.0,
+                peaks_file: None,
+                kind: Kind::Audio,
+                fade_enabled: true,
+                fade_in_samples: 10,
+                fade_out_samples: 10,
+                source_name: None,
+                source_offset: None,
+                source_length: None,
+                preview_name: None,
+                pitch_correction_points: vec![],
+                pitch_correction_frame_likeness: None,
+                pitch_correction_inertia_ms: None,
+                pitch_correction_formant_compensation: None,
+                pitch_correction_detector: Default::default(),
+                pitch_correction_mode: Default::default(),
+                #[cfg(feature = "plugins")]
+                plugin_graph_json: None,
+            })
+            .await;
+        {
+            let state = engine.state.lock();
+            let track = state.tracks.get("fades").unwrap().lock();
+            let clip = &track.audio.clips()[0];
+            assert_eq!(clip.fade_in_samples, DEFAULT_FADE_SAMPLES);
+            assert_eq!(clip.fade_out_samples, DEFAULT_FADE_SAMPLES);
+        }
+
+        engine
+            .handle_request(Action::SetClipFade {
+                track_name: "fades".to_string(),
+                clip_index: 0,
+                kind: Kind::Audio,
+                fade_enabled: true,
+                fade_in_samples: 10,
+                fade_out_samples: DEFAULT_FADE_SAMPLES,
+            })
+            .await;
+        {
+            let state = engine.state.lock();
+            let track = state.tracks.get("fades").unwrap().lock();
+            let clip = &track.audio.clips()[0];
+            assert_eq!(clip.fade_in_samples, DEFAULT_FADE_SAMPLES);
+            assert_eq!(clip.fade_out_samples, DEFAULT_FADE_SAMPLES);
+        }
+
+        engine
+            .handle_request(Action::SetClipFade {
+                track_name: "fades".to_string(),
+                clip_index: 0,
+                kind: Kind::Audio,
+                fade_enabled: false,
+                fade_in_samples: 10,
+                fade_out_samples: 0,
+            })
+            .await;
+        let state = engine.state.lock();
+        let track = state.tracks.get("fades").unwrap().lock();
+        let clip = &track.audio.clips()[0];
+        assert!(!clip.fade_enabled);
+        assert_eq!(
+            clip.fade_in_samples, 10,
+            "disabled fades keep stored values"
+        );
+        assert_eq!(clip.fade_out_samples, 0);
     }
 
     fn insert_track(engine: &mut Engine, track: Track) {

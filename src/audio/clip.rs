@@ -1,4 +1,4 @@
-use crate::message::PitchCorrectionPointData;
+use crate::message::{DEFAULT_FADE_SAMPLES, PitchCorrectionPointData};
 use serde_json::Value;
 
 #[derive(Default, Clone, Debug)]
@@ -42,8 +42,8 @@ impl AudioClip {
             gain_db: 0.0,
             peaks_file: None,
             fade_enabled: true,
-            fade_in_samples: 240,
-            fade_out_samples: 240,
+            fade_in_samples: DEFAULT_FADE_SAMPLES,
+            fade_out_samples: DEFAULT_FADE_SAMPLES,
             pitch_correction_preview_name: None,
             pitch_correction_source_name: None,
             pitch_correction_source_offset: None,
@@ -75,8 +75,8 @@ mod tests {
         assert!(!clip.reversed);
         assert_eq!(clip.peaks_file, None);
         assert!(clip.fade_enabled);
-        assert_eq!(clip.fade_in_samples, 240);
-        assert_eq!(clip.fade_out_samples, 240);
+        assert_eq!(clip.fade_in_samples, crate::message::DEFAULT_FADE_SAMPLES);
+        assert_eq!(clip.fade_out_samples, crate::message::DEFAULT_FADE_SAMPLES);
         assert!(clip.pitch_correction_preview_name.is_none());
         assert!(clip.pitch_correction_source_name.is_none());
         assert!(clip.pitch_correction_points.is_empty());

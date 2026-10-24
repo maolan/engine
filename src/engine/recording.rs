@@ -1,5 +1,10 @@
 use super::*;
-use crate::{audio::clip::AudioClip, kind::Kind, message::Action, midi::clip::MIDIClip};
+use crate::{
+    audio::clip::AudioClip,
+    kind::Kind,
+    message::{Action, DEFAULT_FADE_SAMPLES},
+    midi::clip::MIDIClip,
+};
 #[cfg(feature = "midi")]
 use midly::{
     Arena, Format, Header, MetaMessage, Smf, Timing, TrackEvent, TrackEventKind,
@@ -770,8 +775,8 @@ impl Engine {
             peaks_file: None,
             kind: Kind::MIDI,
             fade_enabled: true,
-            fade_in_samples: 240,
-            fade_out_samples: 240,
+            fade_in_samples: DEFAULT_FADE_SAMPLES,
+            fade_out_samples: DEFAULT_FADE_SAMPLES,
             source_name: None,
             source_offset: None,
             source_length: None,

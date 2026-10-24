@@ -20,81 +20,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 impl Engine {
-    fn apply_audio_cross_section_fades(clips: &mut [AudioClip], inserted: &mut AudioClip) {
-        let inserted_start = inserted.start;
-        let inserted_end = inserted.end;
-        let inserted_len = inserted.end.saturating_sub(inserted.start).max(1);
-        let mut inserted_fade_in = None::<usize>;
-        let mut inserted_fade_out = None::<usize>;
-
-        for clip in clips
-            .iter_mut()
-            .filter(|clip| clip.input_channel == inserted.input_channel)
-        {
-            let clip_start = clip.start;
-            let clip_end = clip.end;
-            let clip_len = clip.end.saturating_sub(clip.start).max(1);
-            let mut clip_fade_in = None::<usize>;
-            let mut clip_fade_out = None::<usize>;
-            let overlap_start = inserted_start.max(clip_start);
-            let overlap_end = inserted_end.min(clip_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
-
-            let overlap_len = overlap_end.saturating_sub(overlap_start);
-            if inserted_start == overlap_start && inserted_start != clip_start {
-                let fade = overlap_len.min(inserted_len);
-                inserted_fade_in = Some(inserted_fade_in.map_or(fade, |current| current.max(fade)));
-            }
-            if inserted_end == overlap_end && inserted_end != clip_end {
-                let fade = overlap_len.min(inserted_len);
-                inserted_fade_out =
-                    Some(inserted_fade_out.map_or(fade, |current| current.max(fade)));
-            }
-            if clip_start == overlap_start && clip_start != inserted_start {
-                let fade = overlap_len.min(clip_len);
-                clip_fade_in = Some(clip_fade_in.map_or(fade, |current| current.max(fade)));
-            }
-            if clip_end == overlap_end && clip_end != inserted_end {
-                let fade = overlap_len.min(clip_len);
-                clip_fade_out = Some(clip_fade_out.map_or(fade, |current| current.max(fade)));
-            }
-            if let Some(fade_in) = clip_fade_in {
-                clip.fade_enabled = true;
-                clip.fade_in_samples = fade_in;
-            }
-            if let Some(fade_out) = clip_fade_out {
-                clip.fade_enabled = true;
-                clip.fade_out_samples = fade_out;
-            }
-        }
-
-        if let Some(fade_in) = inserted_fade_in {
-            inserted.fade_enabled = true;
-            inserted.fade_in_samples = fade_in;
-        }
-        if let Some(fade_out) = inserted_fade_out {
-            inserted.fade_enabled = true;
-            inserted.fade_out_samples = fade_out;
-        }
-    }
-
-    fn push_audio_clip_with_cross_section_fades(
-        track: &mut crate::track::TrackData,
-        mut clip: AudioClip,
-    ) {
-        let mut clips = track
-            .audio
-            .clips()
-            .iter()
-            .map(|clip| (**clip).clone())
-            .collect::<Vec<_>>();
-        Self::apply_audio_cross_section_fades(&mut clips, &mut clip);
-        clips.push(clip);
-        track.audio.set_clips(clips);
-    }
-
     pub(crate) fn is_track_frozen(&self, track_name: &str) -> bool {
         self.state
             .lock()
@@ -698,8 +623,10 @@ impl Engine {
                     clip.gain_db = request.gain_db;
                     clip.peaks_file = request.peaks_file;
                     clip.fade_enabled = request.fade_enabled;
-                    clip.fade_in_samples = request.fade_in_samples;
-                    clip.fade_out_samples = request.fade_out_samples;
+                    clip.fade_in_samples =
+                        clamp_fade_samples(request.fade_enabled, request.fade_in_samples);
+                    clip.fade_out_samples =
+                        clamp_fade_samples(request.fade_enabled, request.fade_out_samples);
                     clip.pitch_correction_preview_name = request.preview_name;
                     clip.pitch_correction_source_name = request.source_name;
                     clip.pitch_correction_source_offset = request.source_offset;
@@ -713,7 +640,7 @@ impl Engine {
                     {
                         clip.plugin_graph_json = request.plugin_graph_json;
                     }
-                    Self::push_audio_clip_with_cross_section_fades(&mut track, clip);
+                    track.audio.push_clip(clip);
                     #[cfg(unix)]
                     track.rt.clip_pitch_shifters.clear();
                 }
@@ -758,8 +685,8 @@ impl Engine {
         clip.gain_db = data.gain_db;
         clip.peaks_file = data.peaks_file.clone();
         clip.fade_enabled = data.fade_enabled;
-        clip.fade_in_samples = data.fade_in_samples;
-        clip.fade_out_samples = data.fade_out_samples;
+        clip.fade_in_samples = clamp_fade_samples(data.fade_enabled, data.fade_in_samples);
+        clip.fade_out_samples = clamp_fade_samples(data.fade_enabled, data.fade_out_samples);
         clip.pitch_correction_preview_name = data.preview_name.clone();
         clip.pitch_correction_source_name = data.source_name.clone();
         clip.pitch_correction_source_offset = data.source_offset;
@@ -824,7 +751,7 @@ impl Engine {
                         let max_lane = track.audio.ins.len().saturating_sub(1);
                         clip.input_channel = clip.input_channel.min(max_lane);
                         let clip_id = clip.id.clone();
-                        Self::push_audio_clip_with_cross_section_fades(&mut track, clip);
+                        track.audio.push_clip(clip);
                         #[cfg(unix)]
                         track.rt.clip_pitch_shifters.clear();
                         track
@@ -1152,8 +1079,8 @@ impl Engine {
             Kind::Audio => {
                 track.audio.update_clip(clip_index, |clip| {
                     clip.fade_enabled = fade_enabled;
-                    clip.fade_in_samples = fade_in_samples;
-                    clip.fade_out_samples = fade_out_samples;
+                    clip.fade_in_samples = clamp_fade_samples(fade_enabled, fade_in_samples);
+                    clip.fade_out_samples = clamp_fade_samples(fade_enabled, fade_out_samples);
                 });
             }
             Kind::MIDI => {}
@@ -2616,7 +2543,7 @@ impl Engine {
             && let Some(to_track_handle) = self.state.lock().tracks.get(&to.track_name)
         {
             let from_track = from_track_handle.lock();
-            let mut to_track = to_track_handle.lock();
+            let to_track = to_track_handle.lock();
             match kind {
                 Kind::Audio => {
                     if from.clip_index >= from_track.audio.clips().len() {
@@ -2653,7 +2580,7 @@ impl Engine {
                     clip_copy.end = clip_copy.start.saturating_add(clip_len);
                     let max_lane = to_track.audio.ins.len().saturating_sub(1);
                     clip_copy.input_channel = to.input_channel.min(max_lane);
-                    Self::push_audio_clip_with_cross_section_fades(&mut to_track, clip_copy);
+                    to_track.audio.push_clip(clip_copy);
                 }
                 Kind::MIDI => {
                     if from.clip_index >= from_track.midi.clips().len() {
@@ -4089,8 +4016,8 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
                             peaks_file: None,
                             kind: Kind::MIDI,
                             fade_enabled: true,
-                            fade_in_samples: 240,
-                            fade_out_samples: 240,
+                            fade_in_samples: DEFAULT_FADE_SAMPLES,
+                            fade_out_samples: DEFAULT_FADE_SAMPLES,
                             source_name: None,
                             source_offset: None,
                             source_length: None,
@@ -4271,8 +4198,8 @@ pub(crate) fn undo_inverse(action: &Action, state: &State) -> Option<Action> {
                     clip_index: *clip_index,
                     kind: *kind,
                     fade_enabled: true,
-                    fade_in_samples: 240,
-                    fade_out_samples: 240,
+                    fade_in_samples: DEFAULT_FADE_SAMPLES,
+                    fade_out_samples: DEFAULT_FADE_SAMPLES,
                 }),
             }
         }
@@ -5085,8 +5012,8 @@ pub(crate) fn undo_inverse_actions(action: &Action, state: &State) -> Option<Vec
                     peaks_file: None,
                     kind: Kind::MIDI,
                     fade_enabled: true,
-                    fade_in_samples: 240,
-                    fade_out_samples: 240,
+                    fade_in_samples: DEFAULT_FADE_SAMPLES,
+                    fade_out_samples: DEFAULT_FADE_SAMPLES,
                     source_name: None,
                     source_offset: None,
                     source_length: None,
@@ -5423,42 +5350,5 @@ impl Engine {
                 kind: Kind::MIDI,
             });
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn audio_clip(start: usize, len: usize) -> AudioClip {
-        AudioClip::new("clip.wav".to_string(), start, start.saturating_add(len))
-    }
-
-    #[test]
-    fn cross_section_fades_match_non_aligned_overlap_length() {
-        let mut existing = vec![audio_clip(0, 100)];
-        let mut inserted = audio_clip(80, 100);
-
-        Engine::apply_audio_cross_section_fades(&mut existing, &mut inserted);
-
-        assert!(existing[0].fade_enabled);
-        assert_eq!(existing[0].fade_out_samples, 20);
-        assert!(inserted.fade_enabled);
-        assert_eq!(inserted.fade_in_samples, 20);
-    }
-
-    #[test]
-    fn cross_section_fades_ignore_aligned_starts_and_ends() {
-        let mut same_start = vec![audio_clip(0, 100)];
-        let mut inserted_same_start = audio_clip(0, 40);
-        Engine::apply_audio_cross_section_fades(&mut same_start, &mut inserted_same_start);
-        assert_eq!(same_start[0].fade_in_samples, 240);
-        assert_eq!(inserted_same_start.fade_in_samples, 240);
-
-        let mut same_end = vec![audio_clip(0, 100)];
-        let mut inserted_same_end = audio_clip(60, 40);
-        Engine::apply_audio_cross_section_fades(&mut same_end, &mut inserted_same_end);
-        assert_eq!(same_end[0].fade_out_samples, 240);
-        assert_eq!(inserted_same_end.fade_out_samples, 240);
     }
 }
