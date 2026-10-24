@@ -40,6 +40,7 @@ pub struct PlanBuilder {
     quit: Arc<AtomicBool>,
     thread: std::thread::Thread,
     join: Option<JoinHandle<()>>,
+    rebuild_requests: std::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl PlanBuilder {
@@ -54,17 +55,31 @@ impl PlanBuilder {
     ) -> Self {
         let dirty = Arc::new(AtomicBool::new(true));
         let quit = Arc::new(AtomicBool::new(false));
+        let (rebuild_requests, rebuild_rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn({
             let dirty = dirty.clone();
             let quit = quit.clone();
-            move || builder_loop(state, hw, slot, collector, dirty, quit)
+            move || builder_loop(state, hw, slot, collector, dirty, quit, rebuild_rx)
         });
         Self {
             dirty,
             quit,
             thread: join.thread().clone(),
             join: Some(join),
+            rebuild_requests,
         }
+    }
+
+    /// Wait for a plan compiled after this request to be published. Session
+    /// restore uses this barrier before announcing that playback is ready.
+    pub async fn rebuild(&self) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.rebuild_requests
+            .send(tx)
+            .map_err(|_| "Render plan builder stopped".to_string())?;
+        self.thread.unpark();
+        rx.await
+            .map_err(|_| "Render plan builder stopped".to_string())
     }
 
     /// Mark the topology dirty. Cheap and idempotent: repeated calls before
@@ -94,6 +109,7 @@ fn builder_loop(
     mut collector: basedrop::Collector,
     dirty: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
+    rebuild_requests: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
 ) {
     loop {
         // The timeout bounds shutdown latency and guards against a missed
@@ -107,7 +123,8 @@ fn builder_loop(
             }
             break;
         }
-        if !dirty.swap(false, Ordering::AcqRel) {
+        let waiters: Vec<_> = rebuild_requests.try_iter().collect();
+        if !dirty.swap(false, Ordering::AcqRel) && waiters.is_empty() {
             continue;
         }
         let HwPorts {
@@ -118,8 +135,45 @@ fn builder_loop(
         let state = state.load_full();
         let plan = RenderPlan::compile(&state, &ins, &outs, buffer_size.max(1));
         slot.store(Arc::new(basedrop::Owned::new(&collector.handle(), plan)));
+        for waiter in waiters {
+            let _ = waiter.send(());
+        }
         // Free whatever retired plans have been fully released since the
         // last build (the swapped-out one included, once workers let go).
         collector.collect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rebuild_acknowledges_a_plan_with_the_latest_ports() {
+        let snapshot = crate::state::State::default().lock().snapshot();
+        let state = Arc::new(StateSlot::from_pointee(snapshot.clone()));
+        let hw = Arc::new(ArcSwap::from_pointee(HwPorts {
+            buffer_size: 32,
+            ..Default::default()
+        }));
+        let collector = basedrop::Collector::new();
+        let slot = Arc::new(PlanSlot::from_pointee(basedrop::Owned::new(
+            &collector.handle(),
+            RenderPlan::compile(&snapshot, &[], &[], 32),
+        )));
+        let builder = PlanBuilder::spawn(state, hw.clone(), slot.clone(), collector);
+        for buffer_size in [64, 128, 256] {
+            hw.store(Arc::new(HwPorts {
+                buffer_size,
+                ..Default::default()
+            }));
+            tokio::time::timeout(Duration::from_secs(5), builder.rebuild())
+                .await
+                .expect("builder timeout")
+                .expect("rebuild");
+            assert_eq!(slot.load().buffer_size, buffer_size);
+        }
+        drop(slot);
+        drop(builder);
     }
 }

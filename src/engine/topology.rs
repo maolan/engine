@@ -3691,21 +3691,6 @@ impl Engine {
 }
 
 impl Engine {
-    pub(crate) fn preload_track_clips_spawn(&self) {
-        let tracks: Vec<_> = self
-            .state_snapshot
-            .load_full()
-            .tracks
-            .values()
-            .cloned()
-            .collect();
-        for track in tracks {
-            tokio::task::spawn_blocking(move || {
-                track.lock().preload_clips();
-            });
-        }
-    }
-
     /// Preload all track clips and wait for completion. Used on transport
     /// play paths: the audio cycle must not start until clip caches are
     /// populated, otherwise the preload tasks' `&mut Track` access races the
