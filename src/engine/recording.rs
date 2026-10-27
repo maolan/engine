@@ -639,10 +639,10 @@ impl Engine {
             .get(&track_name)
             .cloned()
         {
-            tokio::task::spawn_blocking(move || {
-                track.lock().preload_clips();
-                tracing::debug!("Preloaded clips for track '{}' after recording", track_name);
-            });
+            // Track::lock() is not a mutex. Finish cache mutations at this
+            // cycle boundary before another request or audio cycle can use the track.
+            track.lock().preload_clips();
+            tracing::debug!("Preloaded clips for track '{}' after recording", track_name);
         }
     }
 
@@ -798,13 +798,13 @@ impl Engine {
             .get(&track_name)
             .cloned()
         {
-            tokio::task::spawn_blocking(move || {
-                track.lock().preload_clips();
-                tracing::debug!(
-                    "Preloaded clips for track '{}' after MIDI recording",
-                    track_name
-                );
-            });
+            // Track::lock() is not a mutex. Finish cache mutations at this
+            // cycle boundary before another request or audio cycle can use the track.
+            track.lock().preload_clips();
+            tracing::debug!(
+                "Preloaded clips for track '{}' after MIDI recording",
+                track_name
+            );
         }
     }
 

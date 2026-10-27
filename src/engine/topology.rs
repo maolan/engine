@@ -2739,11 +2739,10 @@ impl Engine {
             plugin_graph_json: plugin_graph_json.clone(),
         });
         if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-            let track_name = track_name.clone();
-            tokio::task::spawn_blocking(move || {
-                track.lock().preload_clips();
-                tracing::debug!("Preloaded clips for track '{}' after AddClip", track_name);
-            });
+            // Track::lock() is not a mutex. Finish cache mutations at this
+            // cycle boundary before another request or audio cycle can use the track.
+            track.lock().preload_clips();
+            tracing::debug!("Preloaded clips for track '{}' after AddClip", track_name);
         }
 
         false
@@ -3050,14 +3049,13 @@ impl Engine {
 
         self.add_grouped_clip_to_track(track_name, kind, audio_clip.clone(), midi_clip.clone());
         if let Some(track) = self.state.lock().tracks.get(track_name).cloned() {
-            let track_name = track_name.clone();
-            tokio::task::spawn_blocking(move || {
-                track.lock().preload_clips();
-                tracing::debug!(
-                    "Preloaded clips for track '{}' after AddGroupedClip",
-                    track_name
-                );
-            });
+            // Track::lock() is not a mutex. Finish cache mutations at this
+            // cycle boundary before another request or audio cycle can use the track.
+            track.lock().preload_clips();
+            tracing::debug!(
+                "Preloaded clips for track '{}' after AddGroupedClip",
+                track_name
+            );
         }
 
         false
