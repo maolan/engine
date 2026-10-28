@@ -111,9 +111,7 @@ impl Engine {
                 if self.can_schedule_hw_cycle() {
                     self.request_hw_cycle().await;
                 } else {
-                    while let Some(next) = self.dispatch.pending_requests.pop_front() {
-                        self.handle_request(next).await;
-                    }
+                    self.drain_pending_requests_if_idle().await;
                 }
             }
         };
@@ -476,8 +474,8 @@ impl Engine {
         crate::cycle_trace::mark(crate::cycle_trace::TracePoint::RenderEnd);
         // Hand deferred bounce jobs to their workers now that no plan cycle
         // is in flight (see handle_track_offline_bounce).
-        self.handoff_pending_bounce_starts().await;
         self.collect_hw_midi_out_for_next_cycle();
+        self.handoff_pending_bounce_starts().await;
         self.request_hw_cycle().await;
     }
 
@@ -627,7 +625,11 @@ impl Engine {
             | Action::TrackOfflineBounceCancel { .. }
             | Action::TrackOfflineBounceCancelAll
             | Action::TrackOfflineBounceCanceled { .. }
-            | Action::TrackOfflineBounceProgress { .. } => {
+            | Action::TrackOfflineBounceProgress { .. }
+            | Action::StemsOfflineBounce { .. }
+            | Action::StemsOfflineBounced { .. }
+            | Action::StemsOfflineBounceCanceled
+            | Action::StemsOfflineBounceProgress { .. } => {
                 if self.handle_bounce_request(a.clone()).await {
                     return;
                 }
@@ -994,13 +996,9 @@ impl Engine {
                     self.plan_builder.mark_dirty();
                 }
                 Message::OfflineBounceFinished { result } => {
-                    if let Ok(Action::TrackOfflineBounce { track_name, .. })
-                    | Ok(Action::TrackOfflineBounceCanceled { track_name, .. }) = &result
-                    {
-                        self.dispatch.offline_bounce_jobs.remove(track_name);
-                    }
+                    // The terminal Ready releases ownership of the graph on
+                    // success, cancellation, and error alike.
                     self.notify_clients(result).await;
-                    self.drain_pending_requests_if_idle().await;
                 }
                 Message::Event(event @ Event::AudioXruns { .. }) => {
                     self.notify_event(event).await;

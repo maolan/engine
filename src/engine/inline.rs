@@ -65,10 +65,12 @@ impl Engine {
         // poll drain): deliver them to the routed track ports now so the
         // upcoming render sees them. Events drained on the cycle thread were
         // already delivered there.
-        self.push_pending_hw_midi_in_to_ports();
+        if render {
+            self.push_pending_hw_midi_in_to_ports();
+        }
 
         // Resolve the current routes to track handles for the cycle thread.
-        let routes = {
+        let routes = if render {
             let state = self.state_snapshot.load_full();
             self.hw_midi
                 .midi_hw_in_routes
@@ -83,6 +85,8 @@ impl Engine {
                     })
                 })
                 .collect()
+        } else {
+            Vec::new()
         };
         self.inline_render.publish_midi_routes(routes);
         // Phase 4: tag the cycle with the transport position it renders for;

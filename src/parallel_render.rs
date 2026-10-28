@@ -419,6 +419,56 @@ mod tests {
     }
 
     #[test]
+    fn offline_parallel_matches_serial_across_blocks() {
+        let collector = basedrop::Collector::new();
+        let chained_plan = || {
+            let mut plan = plan();
+            // Extend the output with a linear chain so this comparison also
+            // exercises coalesced jobs rather than only fork/join boundaries.
+            for id in 5..8 {
+                plan.buffers.push(UnsafeCell::new(vec![0.0; 8]));
+                plan.buffer_latencies.push(AtomicUsize::new(0));
+                plan.nodes.push(Op::Sum {
+                    inputs: vec![id - 1],
+                    delays: vec![UnsafeCell::new(DelayLine::new())],
+                    output: id,
+                });
+                plan.indegree.push(1);
+                plan.dependents[(id - 1) as usize].push(id);
+                plan.dependents.push(vec![]);
+            }
+            plan
+        };
+        let parallel = shared(&collector, chained_plan());
+        let serial = shared(&collector, chained_plan());
+        let selected: Vec<_> = (0..parallel.nodes.len() as u32).collect();
+        let render = crate::offline_render::OfflineRender::new(&parallel, &selected);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for _ in 0..32 {
+            pool.install(|| render.render(0, &parallel));
+            for &node in &selected {
+                Worker::process_node_job_result(
+                    0,
+                    NodeJob {
+                        epoch: 0,
+                        plan: serial.clone(),
+                        node,
+                    },
+                );
+            }
+            for buffer in 0..parallel.buffers.len() as u32 {
+                // Both executions joined all writers before reading the arenas.
+                assert_eq!(unsafe { parallel.buffer(buffer) }, unsafe {
+                    serial.buffer(buffer)
+                });
+            }
+        }
+    }
+
+    #[test]
     fn services_backend_repeatedly_while_workers_are_busy() {
         let collector = basedrop::Collector::new();
         let plan = shared(&collector, plan());

@@ -1434,7 +1434,7 @@ mod tests {
         ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
     )]
     #[tokio::test]
-    async fn track_offline_bounce_allows_different_track_concurrently() {
+    async fn track_offline_bounce_queues_different_track() {
         let (mut engine, _client_rx) = make_engine_with_client();
         insert_track(
             &mut engine,
@@ -1446,6 +1446,11 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         );
+        let (worker_tx, mut worker_rx) = channel(1);
+        engine
+            .workers
+            .push(WorkerData::new(worker_tx, tokio::spawn(async {})));
+        engine.dispatch.ready_workers.push(0);
 
         engine
             .handle_request(Action::TrackOfflineBounce {
@@ -1459,7 +1464,82 @@ mod tests {
             .await;
 
         assert!(engine.dispatch.offline_bounce_jobs.contains_key("other"));
+        assert_eq!(engine.dispatch.offline_bounce_jobs.len(), 1);
+        assert!(worker_rx.try_recv().is_err());
         assert_eq!(engine.dispatch.pending_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn offline_bounce_queue_starts_only_one_stem_at_a_time() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        let mut receivers = Vec::new();
+        for (index, name) in ["first", "second", "third"].into_iter().enumerate() {
+            insert_track(
+                &mut engine,
+                Track::new(name.into(), 1, 1, 0, 0, 64, 48_000.0),
+            );
+            let (tx, rx) = channel(1);
+            engine
+                .workers
+                .push(WorkerData::new(tx, tokio::spawn(async {})));
+            engine.dispatch.ready_workers.push(index);
+            receivers.push(rx);
+            engine
+                .dispatch
+                .pending_requests
+                .push_back(Action::TrackOfflineBounce {
+                    track_name: name.into(),
+                    output_path: format!("/tmp/{name}.wav"),
+                    start_sample: 0,
+                    length_samples: 128,
+                    automation_lanes: vec![],
+                    apply_fader: false,
+                });
+        }
+
+        for (remaining, name) in [(2, "first"), (1, "second"), (0, "third")] {
+            engine.drain_pending_requests_if_idle().await;
+            assert_eq!(engine.dispatch.offline_bounce_jobs.len(), 1);
+            assert!(engine.dispatch.offline_bounce_jobs.contains_key(name));
+            assert_eq!(engine.dispatch.pending_requests.len(), remaining);
+            let (worker, _) = engine.dispatch.bounce_worker_tracks.iter().next().unwrap();
+            let worker = *worker;
+            assert!(
+                matches!(receivers[worker].try_recv(), Ok(Message::ProcessOfflineBounce(job)) if job.track_name == name)
+            );
+            for rx in &mut receivers {
+                assert!(rx.try_recv().is_err());
+            }
+            // Repeated dispatcher wakeups must leave later stems queued.
+            engine.drain_pending_requests_if_idle().await;
+            assert_eq!(engine.dispatch.pending_requests.len(), remaining);
+            engine.dispatch.bounce_worker_tracks.remove(&worker);
+            engine.dispatch.offline_bounce_jobs.remove(name);
+            engine.push_ready_worker(worker);
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_bounce_queue_without_ready_worker_returns() {
+        let (mut engine, _client_rx) = make_engine_with_client();
+        insert_track(
+            &mut engine,
+            Track::new("track".into(), 1, 1, 0, 0, 64, 48_000.0),
+        );
+        engine
+            .dispatch
+            .pending_requests
+            .push_back(Action::TrackOfflineBounce {
+                track_name: "track".into(),
+                output_path: "/tmp/queued.wav".into(),
+                start_sample: 0,
+                length_samples: 128,
+                automation_lanes: vec![],
+                apply_fader: false,
+            });
+        engine.drain_pending_requests_if_idle().await;
+        assert_eq!(engine.dispatch.pending_requests.len(), 1);
+        assert!(engine.dispatch.offline_bounce_jobs.is_empty());
     }
 
     #[cfg_attr(

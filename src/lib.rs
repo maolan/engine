@@ -1,6 +1,7 @@
 mod audio;
 #[cfg(feature = "audio")]
 pub mod audio_codec;
+pub mod wav_stream;
 #[cfg(target_os = "macos")]
 pub mod audio_devices {
     pub use crate::hw::coreaudio::{
@@ -35,6 +36,7 @@ pub mod meter;
 pub mod midi;
 pub mod modulator;
 pub mod mtdm;
+mod offline_render;
 mod osc;
 mod parallel_render;
 #[cfg(unix)]

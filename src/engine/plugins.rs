@@ -3123,6 +3123,9 @@ impl Engine {
     }
 
     pub(crate) async fn publish_clap_state_dirty(&mut self) {
+        if !self.dispatch.offline_bounce_jobs.is_empty() {
+            return;
+        }
         let tracks: Vec<(String, crate::state::TrackHandle)> = self
             .state_snapshot
             .load_full()
@@ -3145,7 +3148,10 @@ impl Engine {
 
 impl Engine {
     pub(crate) async fn poll_stopped_plugin_parameter_echoes(&mut self) {
-        if self.transport.playing || self.transport.transport_running {
+        if self.transport.playing
+            || self.transport.transport_running
+            || !self.dispatch.offline_bounce_jobs.is_empty()
+        {
             return;
         }
 

@@ -13,40 +13,14 @@ use oxideav_core::{
     StreamInfo, TimeBase,
 };
 
-/// Export format selector for [`encode_audio_to_file`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioEncodeFormat {
-    /// Microsoft RIFF/WAVE, integer or float PCM.
-    Wav(WavBitDepth),
-    /// Native FLAC (`*.flac`). The `u16` is the desired bit depth
-    /// (16, 24 or 32).
-    Flac(u16),
-    /// Ogg-encapsulated FLAC (`*.ogg`). The `u16` is the desired bit
-    /// depth (16, 24 or 32).
-    OggFlac(u16),
-    /// MPEG-1/2/2.5 Layer III (`*.mp3`). Uses a sensible CBR bitrate
-    /// chosen from the standard Layer III ladder based on sample rate
-    /// and channel count.
-    Mp3,
-}
+/// Export format selector and WAV bit-depth / dither types live in
+/// `wav_stream` (always compiled) so offline-bounce message types can use
+/// them without the `audio` feature; re-exported here for compatibility.
+pub use crate::wav_stream::{AudioDither, AudioEncodeFormat, WavBitDepth};
+use crate::wav_stream::{DitherRng, dither_offset, quantize_with_dither};
 
-/// WAV PCM bit-depth / sample-format choices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WavBitDepth {
-    Int16,
-    Int24,
-    Int32,
-    Float32,
-}
-
-/// Dither mode applied when quantising floating-point samples to an
-/// integer target format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AudioDither {
-    #[default]
-    None,
-    Rectangular,
-    Triangular,
+fn oxideav_err_to_io(e: oxideav_core::Error) -> io::Error {
+    io::Error::other(format!("OxideAV error: {e}"))
 }
 
 /// Decode an audio file to interleaved `f32` samples.
@@ -817,7 +791,16 @@ fn encode_flac_to_file(
 ) -> io::Result<()> {
     let (packets, output_params) =
         encode_flac_packets(samples, channels, sample_rate, bits_per_sample, dither)?;
+    write_flac_packets_to_file(path, &packets, &output_params, sample_rate)
+}
 
+/// Mux encoded FLAC packets into a native FLAC file.
+fn write_flac_packets_to_file(
+    path: &Path,
+    packets: &[Packet],
+    output_params: &CodecParameters,
+    sample_rate: u32,
+) -> io::Result<()> {
     let mut ctx = RuntimeContext::new();
     oxideav_flac::register(&mut ctx);
 
@@ -826,7 +809,7 @@ fn encode_flac_to_file(
         time_base: TimeBase::new(1, sample_rate as i64),
         duration: None,
         start_time: Some(0),
-        params: output_params,
+        params: output_params.clone(),
     };
     let file = std::fs::File::create(path)?;
     let output: Box<dyn oxideav_core::WriteSeek> = Box::new(file);
@@ -835,7 +818,7 @@ fn encode_flac_to_file(
         .open_muxer("flac", output, std::slice::from_ref(&stream))
         .map_err(oxideav_err_to_io)?;
     mux.write_header().map_err(oxideav_err_to_io)?;
-    for pkt in &packets {
+    for pkt in packets {
         mux.write_packet(pkt).map_err(oxideav_err_to_io)?;
     }
     mux.write_trailer().map_err(oxideav_err_to_io)?;
@@ -894,7 +877,15 @@ fn encode_ogg_flac(
 ) -> io::Result<()> {
     let (packets, output_params) =
         encode_flac_packets(samples, channels, sample_rate, bits_per_sample, dither)?;
+    write_ogg_flac_file(path, &packets, &output_params)
+}
 
+/// Assemble encoded FLAC packets into a FLAC-in-Ogg file.
+fn write_ogg_flac_file(
+    path: &Path,
+    packets: &[Packet],
+    output_params: &CodecParameters,
+) -> io::Result<()> {
     // Build the FLAC-in-Ogg mapping header packet:
     // 0x7F "FLAC" major minor header_packets_be "fLaC"
     let mut mapping = Vec::with_capacity(13);
@@ -906,7 +897,7 @@ fn encode_ogg_flac(
     mapping.extend_from_slice(&1u16.to_be_bytes());
     mapping.extend_from_slice(b"fLaC");
 
-    let streaminfo = output_params.extradata;
+    let streaminfo = output_params.extradata.clone();
 
     let mut writer = oxideav_ogg::framing::PageWriter::new(0).with_page_target(4096);
     writer.push_packet(&mapping, 0);
@@ -914,7 +905,7 @@ fn encode_ogg_flac(
     writer.push_packet(&streaminfo, 0);
     writer.flush_page();
 
-    for pkt in &packets {
+    for pkt in packets {
         let granule = pkt
             .pts
             .map(|pts| pts + pkt.duration.unwrap_or(0))
@@ -1049,27 +1040,36 @@ fn pack_interleaved_samples(
     format: SampleFormat,
     dither: AudioDither,
 ) -> io::Result<Vec<u8>> {
+    let mut rng = DitherRng::new(0x1234_5678_9abc_defe);
+    pack_interleaved_samples_with_rng(samples, format, &mut rng, dither)
+}
+
+fn pack_interleaved_samples_with_rng(
+    samples: &[f32],
+    format: SampleFormat,
+    rng: &mut DitherRng,
+    dither: AudioDither,
+) -> io::Result<Vec<u8>> {
     let bytes_per_sample = format.bytes_per_sample();
     let mut out = Vec::with_capacity(samples.len().saturating_mul(bytes_per_sample));
-    let mut rng = DitherRng::new(0x1234_5678_9abc_defe);
 
     for &sample in samples {
         let s = sample.clamp(-1.0, 1.0);
         match format {
             SampleFormat::U8 => {
-                let v = ((s + 1.0) * 127.5 + dither_offset(&mut rng, dither)).round() as u8;
+                let v = ((s + 1.0) * 127.5 + dither_offset(rng, dither)).round() as u8;
                 out.push(v);
             }
             SampleFormat::S16 => {
                 let scale = i16::MAX as f32;
-                let q = quantize_with_dither(s, scale, &mut rng, dither)
+                let q = quantize_with_dither(s, scale, rng, dither)
                     .round()
                     .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                 out.extend_from_slice(&q.to_le_bytes());
             }
             SampleFormat::S24 => {
                 let scale = 8_388_607.0;
-                let q = quantize_with_dither(s, scale, &mut rng, dither)
+                let q = quantize_with_dither(s, scale, rng, dither)
                     .round()
                     .clamp(-8_388_608.0, 8_388_607.0) as i32;
                 let b = q.to_le_bytes();
@@ -1077,7 +1077,7 @@ fn pack_interleaved_samples(
             }
             SampleFormat::S32 => {
                 let scale = i32::MAX as f32;
-                let q = quantize_with_dither(s, scale, &mut rng, dither)
+                let q = quantize_with_dither(s, scale, rng, dither)
                     .round()
                     .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
                 out.extend_from_slice(&q.to_le_bytes());
@@ -1095,45 +1095,199 @@ fn pack_interleaved_samples(
     Ok(out)
 }
 
-fn quantize_with_dither(sample: f32, scale: f32, rng: &mut DitherRng, dither: AudioDither) -> f32 {
-    let d = dither_offset(rng, dither);
-    (sample + d / scale).clamp(-1.0, 1.0) * scale
+/// Per-file streaming encoder for offline stem export.
+///
+/// All conversion (sample format, bit depth, dither) happens per block
+/// before anything is persisted: WAV writes incrementally, while FLAC,
+/// Ogg-FLAC and MP3 buffer their compressed packets in memory and assemble
+/// the file at [`finish`](Self::finish) — FLAC STREAMINFO (MD5, totals) and
+/// MP3 frame emission only become final at encoder flush.
+pub(crate) enum StreamingEncoder {
+    Wav(crate::wav_stream::WavStreamWriter),
+    Buffered {
+        encoder: Box<dyn oxideav_core::Encoder>,
+        packets: Vec<Packet>,
+        format: AudioEncodeFormat,
+        path: PathBuf,
+        channels: usize,
+        sample_rate: u32,
+        sample_format: SampleFormat,
+        dither: AudioDither,
+        rng: DitherRng,
+        frames_fed: u64,
+    },
 }
 
-fn dither_offset(rng: &mut DitherRng, dither: AudioDither) -> f32 {
-    match dither {
-        AudioDither::None => 0.0,
-        AudioDither::Rectangular => rng.uniform_half(),
-        AudioDither::Triangular => rng.uniform_half() + rng.uniform_half(),
+impl StreamingEncoder {
+    pub fn create(
+        path: &Path,
+        format: AudioEncodeFormat,
+        channels: usize,
+        sample_rate: u32,
+        dither: AudioDither,
+    ) -> Result<Self, String> {
+        match format {
+            AudioEncodeFormat::Wav(depth) => crate::wav_stream::WavStreamWriter::create(
+                path,
+                channels,
+                sample_rate,
+                depth,
+                dither,
+            )
+            .map(Self::Wav)
+            .map_err(|e| e.to_string()),
+            AudioEncodeFormat::Flac(bits) => {
+                Self::create_codec(path, format, channels, sample_rate, dither, bits)
+            }
+            AudioEncodeFormat::OggFlac(bits) => {
+                Self::create_codec(path, format, channels, sample_rate, dither, bits)
+            }
+            AudioEncodeFormat::Mp3 => {
+                if channels > 2 {
+                    return Err("MP3 encode: only mono and stereo are supported".to_string());
+                }
+                Self::create_codec(path, format, channels, sample_rate, dither, 16)
+            }
+        }
     }
-}
 
-fn oxideav_err_to_io(e: oxideav_core::Error) -> io::Error {
-    io::Error::other(format!("OxideAV error: {e}"))
-}
-
-/// Tiny deterministic PRNG used for export dither.
-struct DitherRng {
-    state: u64,
-}
-
-impl DitherRng {
-    fn new(seed: u64) -> Self {
-        Self { state: seed.max(1) }
+    fn create_codec(
+        path: &Path,
+        format: AudioEncodeFormat,
+        channels: usize,
+        sample_rate: u32,
+        dither: AudioDither,
+        bits: u16,
+    ) -> Result<Self, String> {
+        let (codec_id, sample_format, bit_rate) = match format {
+            AudioEncodeFormat::Flac(_) => (
+                "flac",
+                flac_sample_format(bits).map_err(|e| e.to_string())?,
+                None,
+            ),
+            AudioEncodeFormat::OggFlac(_) => (
+                "flac",
+                flac_sample_format(bits).map_err(|e| e.to_string())?,
+                None,
+            ),
+            AudioEncodeFormat::Mp3 => (
+                "mp3",
+                SampleFormat::S16,
+                Some(mp3_default_bitrate(sample_rate, channels) as u64),
+            ),
+            AudioEncodeFormat::Wav(_) => unreachable!("WAV handled by the streaming arm"),
+        };
+        let mut ctx = RuntimeContext::new();
+        if codec_id == "flac" {
+            oxideav_flac::register(&mut ctx);
+        } else {
+            oxideav_mp3::register(&mut ctx);
+        }
+        let params = audio_codec_params(codec_id, channels, sample_rate, sample_format, bit_rate);
+        let encoder = ctx
+            .codecs
+            .first_encoder(&params)
+            .map_err(|e| e.to_string())?;
+        Ok(Self::Buffered {
+            encoder,
+            packets: Vec::new(),
+            format,
+            path: path.to_path_buf(),
+            channels,
+            sample_rate,
+            sample_format,
+            dither,
+            rng: DitherRng::new(0x1234_5678_9abc_defe),
+            frames_fed: 0,
+        })
     }
 
-    fn next_u64(&mut self) -> u64 {
-        // xorshift64*
-        self.state ^= self.state >> 12;
-        self.state ^= self.state << 25;
-        self.state ^= self.state >> 27;
-        self.state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    /// Feed one block of interleaved f32 samples.
+    pub fn encode_block(&mut self, samples: &[f32]) -> io::Result<()> {
+        match self {
+            Self::Wav(writer) => writer.write_interleaved_f32(samples),
+            Self::Buffered {
+                encoder,
+                packets,
+                channels,
+                sample_format,
+                dither,
+                rng,
+                frames_fed,
+                ..
+            } => {
+                if samples.is_empty() {
+                    return Ok(());
+                }
+                if !samples.len().is_multiple_of(*channels) {
+                    return Err(io::Error::other(
+                        "encode: sample slice length is not a multiple of channels",
+                    ));
+                }
+                let bytes =
+                    pack_interleaved_samples_with_rng(samples, *sample_format, rng, *dither)?;
+                let frame = AudioFrame {
+                    samples: (samples.len() / *channels) as u32,
+                    pts: Some(*frames_fed as i64),
+                    data: vec![bytes],
+                };
+                encoder
+                    .send_frame(&Frame::Audio(frame))
+                    .map_err(oxideav_err_to_io)?;
+                *frames_fed += (samples.len() / *channels) as u64;
+                Self::drain_packets(encoder, packets)
+            }
+        }
     }
 
-    /// Uniform random value in [-0.5, 0.5).
-    fn uniform_half(&mut self) -> f32 {
-        let u = self.next_u64() >> 32;
-        (u as f32 / 4_294_967_296.0) - 0.5
+    fn drain_packets(
+        encoder: &mut Box<dyn oxideav_core::Encoder>,
+        packets: &mut Vec<Packet>,
+    ) -> io::Result<()> {
+        loop {
+            match encoder.receive_packet() {
+                Ok(packet) => packets.push(packet),
+                Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => return Ok(()),
+                Err(e) => return Err(oxideav_err_to_io(e)),
+            }
+        }
+    }
+
+    /// Flush the encoder and write the complete file.
+    pub fn finish(mut self) -> io::Result<()> {
+        match &mut self {
+            Self::Wav(writer) => writer.finalize(),
+            Self::Buffered {
+                encoder,
+                packets,
+                format,
+                path,
+                sample_rate,
+                ..
+            } => {
+                encoder.flush().map_err(oxideav_err_to_io)?;
+                Self::drain_packets(encoder, packets)?;
+                match format {
+                    AudioEncodeFormat::Flac(_) => write_flac_packets_to_file(
+                        path,
+                        packets,
+                        encoder.output_params(),
+                        *sample_rate,
+                    ),
+                    AudioEncodeFormat::OggFlac(_) => {
+                        write_ogg_flac_file(path, packets, encoder.output_params())
+                    }
+                    AudioEncodeFormat::Mp3 => {
+                        let mut file = std::fs::File::create(path)?;
+                        for packet in packets.iter() {
+                            file.write_all(&packet.data)?;
+                        }
+                        Ok(())
+                    }
+                    AudioEncodeFormat::Wav(_) => unreachable!("WAV handled by the streaming arm"),
+                }
+            }
+        }
     }
 }
 
