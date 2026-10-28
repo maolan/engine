@@ -2237,6 +2237,10 @@ mod undo_consistency {
             | Action::TrackOfflineBounceCancelAll
             | Action::TrackOfflineBounceCanceled { .. }
             | Action::TrackOfflineBounceProgress { .. }
+            | Action::StemsOfflineBounce { .. }
+            | Action::StemsOfflineBounced { .. }
+            | Action::StemsOfflineBounceCanceled
+            | Action::StemsOfflineBounceProgress { .. }
             | Action::PianoKey { .. }
             | Action::TrackClearDefaultPassthrough { .. }
             | Action::OpenAudioDevice { .. }

@@ -1393,6 +1393,65 @@ mod tests {
     }
 
     #[test]
+    fn offline_subset_matches_full_render_and_skips_unrelated_work() {
+        use crate::audio::clip::AudioClip;
+        use crate::executor::NodeJob;
+        use crate::render_plan::RenderPlan;
+        use crate::state::State;
+        use crate::track::AudioClipBuffer;
+        use crate::workers::worker::Worker;
+        use std::time::Instant;
+
+        let mut state = State::default();
+        for index in 0..64 {
+            let mut track = Track::new(format!("track-{index}"), 1, 1, 0, 0, 64, 48_000.0);
+            let mut clip = AudioClip::new("clip".into(), 0, 64);
+            clip.fade_enabled = false;
+            track.audio.push_clip(clip);
+            track.rt.audio_clip_cache.insert(
+                "clip".into(),
+                Arc::new(AudioClipBuffer::Buffered {
+                    channels: 1,
+                    samples: vec![0.25; 64],
+                }),
+            );
+            state.tracks.insert(track.name.clone(), Arc::new(track));
+        }
+        let state = state.snapshot();
+        let target = state.tracks["track-0"].clone();
+        let collector = basedrop::Collector::new();
+        let plan = RenderPlan::compile(&state, &[], &[], 64);
+        let selected = plan.nodes_for_track_output(&target);
+        let all: Vec<_> = (0..plan.nodes.len() as u32).collect();
+        assert_eq!(selected.len() * 64, all.len());
+        let plan = Arc::new(basedrop::Owned::new(&collector.handle(), plan));
+        let mut outputs = Vec::new();
+        for nodes in [&all, &selected] {
+            let start = Instant::now();
+            for _ in 0..128 {
+                for &node in nodes {
+                    Worker::process_node_job_result(
+                        0,
+                        NodeJob {
+                            epoch: 0,
+                            plan: plan.clone(),
+                            node,
+                        },
+                    );
+                }
+            }
+            eprintln!(
+                "offline render: {} nodes/block, 128 blocks in {:?}",
+                nodes.len(),
+                start.elapsed()
+            );
+            outputs.push(target.lock().last_audio_outputs().to_vec());
+        }
+        assert!(outputs[0][0].iter().any(|&sample| sample != 0.0));
+        assert_eq!(outputs[0], outputs[1]);
+    }
+
+    #[test]
     fn clip_playback_audible_with_input_monitor_off() {
         let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
         track.set_input_monitor(vec![false]);

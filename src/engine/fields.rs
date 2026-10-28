@@ -279,7 +279,7 @@ pub struct DispatchFields {
     /// Bounce jobs registered while a plan cycle was still in flight; the
     /// work is handed to the reserved worker when the cycle completes
     /// (`on_all_tracks_finished`), so the bounce never races RT workers.
-    pub pending_bounce_starts: Vec<(usize, crate::message::OfflineBounceWork)>,
+    pub pending_bounce_starts: Vec<(usize, crate::message::PendingBounceWork)>,
     /// Worker index → track name for in-flight bounce jobs; the worker's
     /// terminal `Ready(id)` removes the job even on error/cancel paths
     /// whose `OfflineBounceFinished` payload carries no track name.

@@ -358,6 +358,43 @@ impl RenderPlan {
         b.finish()
     }
 
+    /// Select a track's output task and all of its prerequisites for an
+    /// offline bounce. Follow plan edges, rather than track names or audio
+    /// wiring alone, so folder, plugin, sidechain and MIDI dependencies stay
+    /// intact. Preserve the plan's execution order, including feedback nodes.
+    pub(crate) fn nodes_for_track_output(&self, target: &TrackHandle) -> Vec<NodeId> {
+        let mut prerequisites = vec![Vec::new(); self.nodes.len()];
+        for (from, dependents) in self.dependents.iter().enumerate() {
+            for &to in dependents {
+                prerequisites[to as usize].push(from as NodeId);
+            }
+        }
+        let mut pending: Vec<_> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(id, op)| match op {
+                Op::Task {
+                    task: ProcessTask::Track(track) | ProcessTask::FolderOutput(track),
+                    ..
+                } if Arc::ptr_eq(track, target) => Some(id as NodeId),
+                _ => None,
+            })
+            .collect();
+        let mut required = vec![false; self.nodes.len()];
+        while let Some(node) = pending.pop() {
+            if std::mem::replace(&mut required[node as usize], true) {
+                continue;
+            }
+            pending.extend(&prerequisites[node as usize]);
+        }
+        required
+            .into_iter()
+            .enumerate()
+            .filter_map(|(id, required)| required.then_some(id as NodeId))
+            .collect()
+    }
+
     /// Verify the plan invariants (see the module docs). Called by `compile`
     /// (violations are logged) and by tests. Returns the first violation.
     pub fn verify(&self) -> Result<(), String> {
@@ -1117,6 +1154,62 @@ mod tests {
     }
     fn is_folder_output(t: &ProcessTask) -> bool {
         matches!(t, ProcessTask::FolderOutput(_))
+    }
+
+    #[test]
+    fn offline_subset_keeps_audio_and_midi_sources_without_downstream_tracks() {
+        let audio = make_track("audio", 1, 1);
+        let midi = Arc::new(Track::new("midi".into(), 0, 0, 0, 1, 64, 48_000.0));
+        let target = Arc::new(Track::new("target".into(), 1, 1, 1, 0, 64, 48_000.0));
+        let downstream = make_track("downstream", 1, 1);
+        let unrelated = make_track("unrelated", 1, 1);
+        connect(&audio, 0, &target, 0);
+        connect(&target, 0, &downstream, 0);
+        crate::midi::io::MIDIIO::connect(&midi.lock().midi.outs[0], &target.lock().midi.ins[0]);
+        let plan = RenderPlan::compile(
+            &state_with(vec![audio, midi, target.clone(), downstream, unrelated]),
+            &[],
+            &[],
+            64,
+        );
+        let selected = plan.nodes_for_track_output(&target);
+        for name in ["audio", "midi", "target"] {
+            assert!(selected.contains(&(task_node(&plan, name, is_track) as NodeId)));
+        }
+        for name in ["downstream", "unrelated"] {
+            assert!(!selected.contains(&(task_node(&plan, name, is_track) as NodeId)));
+        }
+        // No selected node can read a producer omitted from the subset.
+        for (from, dependents) in plan.dependents.iter().enumerate() {
+            for to in dependents {
+                if selected.contains(to) {
+                    assert!(selected.contains(&(from as NodeId)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offline_subset_distinguishes_child_stems_from_folder_stems() {
+        let folder = make_track("folder", 1, 1);
+        folder.lock().is_folder = true;
+        let child = make_track("child", 1, 1);
+        let sibling = make_track("sibling", 1, 1);
+        for track in [&child, &sibling] {
+            track.lock().parent_track = Some("folder".into());
+            folder.lock().child_tracks.push(track.clone());
+        }
+        let plan = RenderPlan::compile(
+            &state_with(vec![folder.clone(), child.clone(), sibling]),
+            &[],
+            &[],
+            64,
+        );
+        let child_nodes = plan.nodes_for_track_output(&child);
+        assert!(child_nodes.contains(&(task_node(&plan, "folder", is_folder_input) as NodeId)));
+        assert!(!child_nodes.contains(&(task_node(&plan, "folder", is_folder_output) as NodeId)));
+        assert!(!child_nodes.contains(&(task_node(&plan, "sibling", is_track) as NodeId)));
+        assert_eq!(plan.nodes_for_track_output(&folder).len(), plan.nodes.len());
     }
 
     #[test]

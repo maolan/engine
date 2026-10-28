@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "maolan-engine"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "alsa",
  "arc-swap",
@@ -2282,6 +2282,7 @@ dependencies = [
  "oxideav-flac",
  "oxideav-mp3",
  "oxideav-ogg",
+ "rayon",
  "rtrb",
  "rubato",
  "serde",

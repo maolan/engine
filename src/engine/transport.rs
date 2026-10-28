@@ -194,11 +194,20 @@ impl Engine {
             }
         }
         #[cfg(unix)]
-        if self.jack_runtime.is_some() {
+        if self.jack_runtime.is_some() && self.dispatch.offline_bounce_jobs.is_empty() {
             self.sync_from_jack_transport().await;
         }
-        while let Some(a) = self.dispatch.pending_requests.pop_front() {
-            self.handle_request(a).await;
+        self.drain_pending_requests_if_idle().await;
+        if !self.dispatch.offline_bounce_jobs.is_empty() {
+            // The bounce owns the live track bodies, including setup, MIDI,
+            // meters, and automation state. Resume those on a later cycle.
+            self.transport.handling_hwfinished = false;
+            self.request_hw_cycle().await;
+            #[cfg(unix)]
+            if self.jack_runtime.is_some() {
+                self.transport.awaiting_hwfinished = true;
+            }
+            return;
         }
         self.apply_mute_solo_policy();
         self.append_recorded_cycle();

@@ -1329,6 +1329,15 @@ impl TrackData {
         previous_shift
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_audio_clip_buffer_for_test(
+        &mut self,
+        name: &str,
+        buffer: std::sync::Arc<crate::track::AudioClipBuffer>,
+    ) {
+        self.rt.audio_clip_cache.insert(name.to_string(), buffer);
+    }
+
     pub(crate) fn preload_audio_clip_cache(&mut self) {
         // Every clip now streams, so each preloaded clip spawns a producer
         // thread. A global cap (`streaming::MAX_STREAMING_PRODUCERS`) bounds

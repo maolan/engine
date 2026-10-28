@@ -189,6 +189,75 @@ pub struct OfflineBounceWork {
     pub apply_fader: bool,
 }
 
+/// One track's slice of a multi-stem offline bounce. The engine renders the
+/// graph once and captures every stem's output per block, the way realtime
+/// playback renders all tracks in a single pass. All conversion (sample-rate
+/// conversion, bit depth, dither, limiter) is applied before samples are
+/// persisted; each output is written directly in the requested format.
+#[derive(Clone, Debug)]
+pub struct OfflineBounceStem {
+    pub track_name: String,
+    /// First session-rate sample of the export window.
+    pub start_sample: usize,
+    /// Render window length in session-rate samples.
+    pub length_samples: usize,
+    /// Requested export sample rate (the engine resamples to it).
+    pub sample_rate: u32,
+    /// Master-limiter ceiling in dBTP applied per block before encoding.
+    /// `None` when the caller applies limiting in a later sweep.
+    pub limiter_ceiling: Option<f32>,
+    pub automation_lanes: Vec<OfflineAutomationLane>,
+    pub apply_fader: bool,
+    pub outputs: Vec<OfflineStemOutput>,
+}
+
+/// One encoded output file of a stem.
+#[derive(Clone, Debug)]
+pub struct OfflineStemOutput {
+    pub path: String,
+    pub format: crate::wav_stream::AudioEncodeFormat,
+    pub dither: crate::wav_stream::AudioDither,
+}
+
+/// Reserved `offline_bounce_jobs` key for the multi-stem bounce job. Not a
+/// valid track name, so it can never collide with a per-track bounce.
+pub const STEMS_BOUNCE_JOB_KEY: &str = "\0stems";
+
+#[derive(Clone, Debug)]
+pub struct OfflineStemsBounceWork {
+    pub state: Arc<crate::state::StateSnapshot>,
+    pub stems: Vec<OfflineBounceStem>,
+    pub tempo_bpm: f64,
+    pub tsig_num: u16,
+    pub tsig_denom: u16,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// A bounce job deferred until no plan cycle is in flight; handed to its
+/// reserved worker at a cycle boundary.
+#[derive(Debug)]
+pub enum PendingBounceWork {
+    Track(OfflineBounceWork),
+    Stems(OfflineStemsBounceWork),
+}
+
+impl PendingBounceWork {
+    /// Key under which the job is registered in `offline_bounce_jobs`.
+    pub fn job_key(&self) -> &str {
+        match self {
+            Self::Track(job) => &job.track_name,
+            Self::Stems(_) => STEMS_BOUNCE_JOB_KEY,
+        }
+    }
+
+    pub fn into_message(self) -> Message {
+        match self {
+            Self::Track(job) => Message::ProcessOfflineBounce(job),
+            Self::Stems(job) => Message::ProcessOfflineStemsBounce(job),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PitchCorrectionPointData {
     pub start_sample: usize,
@@ -1322,6 +1391,21 @@ pub enum Action {
         progress: f32,
         operation: Option<String>,
     },
+    /// Render every listed track's output in a single offline pass,
+    /// capturing all stems simultaneously like realtime playback.
+    StemsOfflineBounce {
+        stems: Vec<OfflineBounceStem>,
+    },
+    /// Terminal report of a completed multi-stem bounce; echoes the stems
+    /// (with `output_path` / `length_samples`) so callers can collect them.
+    StemsOfflineBounced {
+        stems: Vec<OfflineBounceStem>,
+    },
+    StemsOfflineBounceCanceled,
+    StemsOfflineBounceProgress {
+        progress: f32,
+        operation: Option<String>,
+    },
     PianoKey {
         track_name: String,
         note: u8,
@@ -1963,6 +2047,7 @@ pub enum Message {
         latency_changed: bool,
     },
     ProcessOfflineBounce(OfflineBounceWork),
+    ProcessOfflineStemsBounce(OfflineStemsBounceWork),
     Channel(Sender<Self>),
     /// Unsolicited state report / event broadcast to clients.
     Event(Event),
