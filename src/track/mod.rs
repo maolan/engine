@@ -2020,6 +2020,64 @@ mod tests {
     }
 
     #[test]
+    fn midi_clip_sends_note_off_at_transport_loop_end_before_clip_end() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.rt.transport_sample = 6;
+        track.rt.loop_enabled = true;
+        track.rt.loop_range_samples = Some((0, 8));
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            16,
+        ));
+        track.rt.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (12, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 2);
+        assert_eq!(
+            track.rt.pending_hw_midi_out_events[0].event,
+            crate::midi::io::MidiEvent::new(2, vec![0x80, 60, 64])
+        );
+        assert_eq!(
+            track.rt.pending_hw_midi_out_events[1].event,
+            crate::midi::io::MidiEvent::new(2, vec![0x90, 60, 100])
+        );
+    }
+
+    #[test]
+    fn midi_clip_sends_note_off_when_cycle_ends_at_transport_loop_end() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 4, 48_000.0);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.rt.transport_sample = 4;
+        track.rt.loop_enabled = true;
+        track.rt.loop_range_samples = Some((0, 8));
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            16,
+        ));
+        track.rt.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (12, vec![0x80, 60, 64])]),
+        );
+
+        track.process();
+
+        assert_eq!(track.rt.pending_hw_midi_out_events.len(), 1);
+        assert_eq!(
+            track.rt.pending_hw_midi_out_events[0].event,
+            crate::midi::io::MidiEvent::new(3, vec![0x80, 60, 64])
+        );
+    }
+
+    #[test]
     fn midi_clip_with_mpe_allocates_note_to_member_channel() {
         let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
         track.set_disk_monitor(vec![true]);
@@ -2930,6 +2988,39 @@ mod tests {
                 .pending_hw_midi_out_events
                 .iter()
                 .any(|e| e.event.data == vec![0x80, 60, 64])
+        );
+    }
+
+    #[test]
+    fn stop_queues_note_offs_for_arrangement_midi_notes() {
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        track.set_disk_monitor(vec![true]);
+        track.rt.clip_playback_enabled = true;
+        track.rt.transport_sample = 8;
+        track.midi.push_clip(crate::midi::clip::MIDIClip::new(
+            "clip.mid".to_string(),
+            0,
+            16,
+        ));
+        track.rt.midi_clip_cache.insert(
+            "clip.mid".to_string(),
+            Arc::new(vec![(0, vec![0x90, 60, 100]), (12, vec![0x80, 60, 64])]),
+        );
+
+        track.stop_all_session_clips_immediate();
+
+        assert_eq!(track.rt.pending_session_midi_note_offs.len(), 1);
+        assert_eq!(
+            track.rt.pending_session_midi_note_offs[0].data,
+            vec![0x80, 60, 64]
+        );
+        track.process();
+        assert!(
+            track
+                .rt
+                .pending_hw_midi_out_events
+                .iter()
+                .any(|event| event.event.data == vec![0x80, 60, 64])
         );
     }
 
