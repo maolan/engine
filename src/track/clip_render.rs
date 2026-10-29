@@ -1195,13 +1195,25 @@ impl TrackData {
                     );
                 }
             }
-            if to == clip_end {
+            let at_loop_end = self.rt.loop_enabled
+                && self
+                    .rt
+                    .loop_range_samples
+                    .is_some_and(|(_, loop_end)| loop_end == to);
+            if to == clip_end || at_loop_end {
                 let frame_idx = out_offset
-                    .saturating_add(clip_end.saturating_sub(*segment_start))
+                    .saturating_add(to.saturating_sub(*segment_start))
                     .min(frames.saturating_sub(1));
-                for data in
-                    Self::synthetic_note_offs_at_clip_end(events.as_ref(), clip.offset, clip_len)
-                {
+                let (synthetic_from, synthetic_to) = if clip.reversed {
+                    (source_from, clip.offset.saturating_add(clip_len))
+                } else {
+                    (clip.offset, source_to)
+                };
+                for data in Self::synthetic_note_offs_in_range(
+                    events.as_ref(),
+                    synthetic_from,
+                    synthetic_to,
+                ) {
                     input_events[input_lane]
                         .extend(self.allocate_mpe_event(MidiEvent::new(frame_idx as u32, data)));
                 }
@@ -1220,19 +1232,18 @@ impl TrackData {
         }
     }
 
-    pub(crate) fn synthetic_note_offs_at_clip_end(
+    pub(crate) fn synthetic_note_offs_in_range(
         events: &[(usize, Vec<u8>)],
-        clip_offset: usize,
-        clip_len: usize,
+        source_start: usize,
+        source_end: usize,
     ) -> Vec<Vec<u8>> {
-        let clip_end = clip_offset.saturating_add(clip_len);
         let mut active = std::collections::BTreeSet::<(u8, u8)>::new();
 
         for (sample, data) in events {
-            if *sample < clip_offset {
+            if *sample < source_start {
                 continue;
             }
-            if *sample > clip_end {
+            if *sample > source_end {
                 break;
             }
             let Some(status) = data.first().copied() else {
@@ -1261,6 +1272,65 @@ impl TrackData {
             .into_iter()
             .map(|(channel, note)| vec![0x80 | channel.min(15), note.min(127), 64])
             .collect()
+    }
+
+    pub(crate) fn arrangement_midi_note_offs_at_position(&mut self) -> Vec<MidiEvent> {
+        let position = self.rt.transport_sample;
+        let mut note_offs = Vec::new();
+        for clip in self.midi.clips().iter() {
+            self.collect_arrangement_note_offs_recursive(clip, 0, position, &mut note_offs);
+        }
+        note_offs
+    }
+
+    fn collect_arrangement_note_offs_recursive(
+        &mut self,
+        clip: &crate::midi::clip::MIDIClip,
+        parent_start: usize,
+        position: usize,
+        note_offs: &mut Vec<MidiEvent>,
+    ) {
+        let clip_start = parent_start.saturating_add(clip.start);
+        let clip_len = clip.end.saturating_sub(clip.start);
+        if clip_len == 0 || clip.muted {
+            return;
+        }
+        if !clip.grouped_clips.is_empty() {
+            for child in &clip.grouped_clips {
+                self.collect_arrangement_note_offs_recursive(
+                    child, clip_start, position, note_offs,
+                );
+            }
+            return;
+        }
+        if position < clip_start || position >= clip_start.saturating_add(clip_len) {
+            return;
+        }
+        let input_lane = clip.input_channel;
+        if !self
+            .midi_disk_monitor()
+            .get(input_lane)
+            .copied()
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let Some(events) = self.rt.midi_clip_cache.get(&clip.name).cloned() else {
+            return;
+        };
+        let local_to = position.saturating_sub(clip_start);
+        let (source_from, source_to) = if clip.reversed {
+            (
+                clip.offset
+                    .saturating_add(clip_len.saturating_sub(local_to)),
+                clip.offset.saturating_add(clip_len),
+            )
+        } else {
+            (clip.offset, clip.offset.saturating_add(local_to))
+        };
+        for data in Self::synthetic_note_offs_in_range(events.as_ref(), source_from, source_to) {
+            note_offs.extend(self.allocate_mpe_event(MidiEvent::new(0, data)));
+        }
     }
 
     #[cfg(feature = "plugins")]

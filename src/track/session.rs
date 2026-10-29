@@ -118,6 +118,7 @@ impl TrackData {
     /// flushed on the next processed cycle.
     pub fn stop_all_session_clips_immediate(&mut self) {
         self.rt.pending_session_launches.clear();
+        let arrangement_note_offs = self.arrangement_midi_note_offs_at_position();
         let mut note_offs = Vec::new();
         for clip in self.rt.playing_session_clips.drain(..) {
             if clip.kind == Kind::MIDI {
@@ -129,6 +130,9 @@ impl TrackData {
                 }
             }
         }
+        self.rt
+            .pending_session_midi_note_offs
+            .extend(arrangement_note_offs);
         self.rt.pending_session_midi_note_offs.extend(note_offs);
     }
 
