@@ -122,9 +122,9 @@ impl LivePitchShifter {
             }
         }
 
-        let params = self.params(channels);
         let expected_len = self.block_size * channels;
-        let corrected = timestretch::pitch_shift(&self.interleaved, &params, pitch_scale)
+        let corrected = self
+            .pitch_shift(&self.interleaved, channels, pitch_scale)
             .unwrap_or_else(|error| {
                 tracing::warn!("timestretch pitch shift failed: {error}");
                 self.interleaved.clone()
@@ -159,9 +159,9 @@ impl LivePitchShifter {
     }
 
     fn pitch_shift_planar_channels(&mut self, pitch_scale: f64) {
-        let params = self.params(1);
         for channel in 0..self.channels {
-            let corrected = timestretch::pitch_shift(&self.input[channel], &params, pitch_scale)
+            let corrected = self
+                .pitch_shift(&self.input[channel], 1, pitch_scale)
                 .unwrap_or_else(|error| {
                     tracing::warn!("timestretch pitch shift failed: {error}");
                     self.input[channel].clone()
@@ -172,14 +172,20 @@ impl LivePitchShifter {
         }
     }
 
-    fn params(&self, channels: usize) -> timestretch::StretchParams {
-        let mut params = timestretch::StretchParams::new(1.0)
-            .with_sample_rate(self.sample_rate)
-            .with_channels(channels as u32);
-        if !self.formant_preserved {
-            params.envelope_preservation = false;
-            params.envelope_strength = 0.0;
-        }
-        params
+    fn pitch_shift(
+        &self,
+        samples: &[f32],
+        channels: usize,
+        pitch_scale: f64,
+    ) -> Result<Vec<f32>, timestretch::SessionError> {
+        let mut config = timestretch::SessionConfig {
+            source_sample_rate: self.sample_rate,
+            output_sample_rate: self.sample_rate,
+            channels,
+            parameters: timestretch::Parameters::keylock(timestretch::TempoRate::default()),
+            ..timestretch::SessionConfig::default()
+        };
+        config.parameters.pitch = timestretch::PitchRatio::new(pitch_scale)?;
+        timestretch::render(samples, config).map(|rendered| rendered.samples)
     }
 }
