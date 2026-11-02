@@ -148,10 +148,10 @@ impl LivePitchShifter {
             }
         } else {
             for frame in 0..self.block_size {
-                for channel in 0..channels {
+                for (channel, output) in self.output.iter_mut().enumerate().take(channels) {
                     let sample_index = frame * channels + channel;
                     if sample_index < corrected.len().min(expected_len) {
-                        self.output[channel][frame] = corrected[sample_index];
+                        output[frame] = corrected[sample_index];
                     }
                 }
             }

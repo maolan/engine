@@ -7,8 +7,12 @@
 //! variant. MIDI is not part of this dispatch — both backends share the
 //! Windows MIDI hub (`wasapi::MidiHub`).
 
+pub mod asio;
+pub mod midi;
+pub mod wasapi;
+
 use crate::audio::io::AudioIO;
-use crate::hw::{asio, options::HwOptions, traits, wasapi};
+use crate::hw::{options::HwOptions, traits};
 use std::sync::Arc;
 
 pub enum HwDriver {

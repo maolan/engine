@@ -21,6 +21,7 @@ mod channel;
 pub(crate) mod consts;
 mod convert;
 mod driver;
+pub mod freebsd;
 mod io_util;
 pub(crate) mod ioctl;
 pub(crate) mod position;
@@ -744,7 +745,7 @@ impl Audio {
             // transport). Emit silence; the transport resyncs in the
             // dispatcher and the ring resyncs via the xrun jump machinery.
             self.stale_silence_once = false;
-            self.buffer.as_mut_slice().fill(0);
+            self.buffer.fill(0);
             return;
         }
         let num_channels = self.channels.len();

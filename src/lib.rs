@@ -23,28 +23,20 @@ pub mod connectable;
 mod cycle_trace;
 mod engine;
 pub use engine::Engine;
-pub mod executor;
 pub mod history;
 mod hw;
-mod inline_render;
-#[cfg(target_os = "freebsd")]
 pub mod iodelay;
-pub mod iodelay_node;
 pub mod kind;
 pub mod message;
 pub mod meter;
 pub mod midi;
 pub mod modulator;
-pub mod mtdm;
-mod offline_render;
 mod osc;
-mod parallel_render;
 #[cfg(unix)]
 mod pitch_shift;
-mod plan_builder;
+pub mod plan;
 #[cfg(feature = "plugins")]
 pub mod plugins;
-pub mod render_plan;
 mod routing;
 pub mod simd;
 pub mod state;
@@ -53,6 +45,9 @@ mod timeutil;
 mod track;
 pub mod triple_buffer;
 pub mod workers;
+pub use iodelay::{iodelay_node, mtdm};
+pub use plan::{executor, render_plan};
+pub(crate) use plan::{inline_render, offline_render, parallel_render, plan_builder};
 pub use workers::worker;
 
 #[cfg(all(target_os = "macos", feature = "plugins"))]

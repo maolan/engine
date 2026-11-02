@@ -23,6 +23,8 @@
 //!   overflow only, the consumer mutex); it never calls into driver code
 //!   that could re-enter the HAL IO thread.
 
+pub mod midi;
+
 use crate::audio::io::AudioIO;
 use crate::hw::{common, latency, options::HwOptions, traits};
 use rtrb::{Consumer, Producer, RingBuffer};
