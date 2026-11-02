@@ -1,17 +1,11 @@
 #[cfg(target_os = "linux")]
 pub mod alsa;
-#[cfg(target_os = "windows")]
-pub mod asio;
 pub mod common;
 pub mod config;
 pub mod convert_policy;
 #[cfg(target_os = "macos")]
 pub mod coreaudio;
-#[cfg(target_os = "macos")]
-pub mod coremidi;
 pub mod error_fmt;
-#[cfg(target_os = "freebsd")]
-pub mod freebsd;
 #[cfg(unix)]
 pub mod jack;
 pub mod latency;
@@ -25,8 +19,13 @@ pub mod ports;
 pub mod sndio;
 pub mod traits;
 #[cfg(target_os = "windows")]
-pub mod wasapi;
-#[cfg(target_os = "windows")]
 pub mod windows;
+
+#[cfg(target_os = "macos")]
+pub use coreaudio::midi as coremidi;
+#[cfg(target_os = "freebsd")]
+pub use oss::freebsd;
 #[cfg(target_os = "windows")]
-pub mod windows_midi;
+pub use windows::midi as windows_midi;
+#[cfg(target_os = "windows")]
+pub use windows::{asio, wasapi};

@@ -230,7 +230,8 @@ impl Engine {
                     {
                         let from = offset.min(audio_frames);
                         let to = offset.saturating_add(keep).min(audio_frames);
-                        for frame in from..to {
+                        for (frame, _) in track.rt.record_tap_outs[0][from..to].iter().enumerate() {
+                            let frame = from + frame;
                             let is_new_stripe =
                                 entry.current_stripe_frames % RECORDING_STRIPE_FRAMES == 0;
                             for ch in 0..audio_channels {

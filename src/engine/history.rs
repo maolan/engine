@@ -2020,7 +2020,7 @@ mod undo_consistency {
         }
         #[cfg(feature = "plugins")]
         {
-            if matches!(
+            let limited = matches!(
                 action,
                 Action::TrackUnloadClapPlugin { .. }
                     | Action::TrackUnloadClapPluginInstance { .. }
@@ -2029,20 +2029,21 @@ mod undo_consistency {
                     | Action::ClipSetClapParameter { .. }
                     | Action::TrackSetVst3Parameter { .. }
                     | Action::TrackSetPluginBypassed { .. }
-            ) {
+            );
+            if limited {
                 return true;
             }
         }
         #[cfg(all(unix, feature = "plugins"))]
-        if matches!(
+        let limited = matches!(
             action,
             Action::TrackLoadLv2Plugin { .. }
                 | Action::TrackUnloadLv2PluginInstance { .. }
                 | Action::TrackSetLv2ControlValue { .. }
-        ) {
-            return true;
-        }
-        false
+        );
+        #[cfg(not(all(unix, feature = "plugins")))]
+        let limited = false;
+        limited
     }
 
     #[test]
