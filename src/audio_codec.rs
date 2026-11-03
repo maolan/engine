@@ -1296,6 +1296,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn decode_stereo_wav_returns_interleaved_samples() {
         let path =
             std::env::temp_dir().join(format!("maolan_stereo_decode_{}.wav", std::process::id()));
@@ -1328,6 +1329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn oxideav_fallback_decodes_flac_and_mp3() {
         let sample_rate = 44_100u32;
         let channels = 2usize;
@@ -1376,6 +1378,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn probe_audio_file_reports_wav_metadata() {
         let sample_rate = 48_000u32;
         let channels = 2usize;
@@ -1404,6 +1407,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn probe_audio_file_reports_flac_metadata() {
         let sample_rate = 44_100u32;
         let channels = 1usize;
@@ -1438,6 +1442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn streaming_decoder_yields_incremental_flac_chunks() {
         let sample_rate = 44_100u32;
         let channels = 2usize;

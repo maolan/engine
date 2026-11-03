@@ -715,8 +715,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "process facilities not supported by Miri on FreeBSD"
+        miri,
+        ignore = "Miri isolation does not support spawning child processes"
     )]
     #[test]
     fn watchdog_sets_flag_on_killed_child() {
@@ -733,8 +733,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "process facilities not supported by Miri on FreeBSD"
+        miri,
+        ignore = "Miri isolation does not support spawning child processes"
     )]
     #[test]
     fn watchdog_unwatched_clean_exit_does_not_set_flag() {

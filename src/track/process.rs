@@ -1173,9 +1173,11 @@ impl TrackData {
         &self.rt.last_audio_outputs
     }
 
-    pub fn clear_output_meters(&mut self) {
-        self.rt.output_meter_linear_cache.fill(0.0);
-        self.rt.meter_peak_hold_linear.fill(0.0);
+    pub fn clear_output_meters(&self) {
+        self.rt.with_rt(|rt| {
+            rt.output_meter_linear_cache.fill(0.0);
+            rt.meter_peak_hold_linear.fill(0.0);
+        });
     }
 
     /// Clear reusable track-side audio/MIDI state before a new transport run.

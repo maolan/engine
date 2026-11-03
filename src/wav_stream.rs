@@ -268,6 +268,10 @@ mod tests {
 
     #[cfg(feature = "audio")]
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri isolation does not support filesystem and realtime clock access"
+    )]
     fn stream_writer_round_trips_float_wav() {
         use super::{AudioDither, WavBitDepth};
         round_trip(WavBitDepth::Float32, AudioDither::None);
@@ -275,6 +279,10 @@ mod tests {
 
     #[cfg(feature = "audio")]
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri isolation does not support filesystem and realtime clock access"
+    )]
     fn stream_writer_round_trips_int16_wav() {
         use super::{AudioDither, WavBitDepth};
         round_trip(WavBitDepth::Int16, AudioDither::Triangular);
@@ -282,6 +290,10 @@ mod tests {
 
     #[cfg(feature = "audio")]
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri isolation does not support filesystem and realtime clock access"
+    )]
     fn stream_writer_round_trips_int24_wav() {
         use super::{AudioDither, WavBitDepth};
         round_trip(WavBitDepth::Int24, AudioDither::Rectangular);

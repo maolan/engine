@@ -771,6 +771,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "CoreMIDI FFI is not supported by Miri")]
     fn trait_open_input_uses_inherent_impl_not_default() {
         let mut hub = MidiHub::default();
         let err = <MidiHub as crate::hw::traits::HwMidiHub>::open_input(
@@ -787,6 +788,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "CoreMIDI FFI is not supported by Miri")]
     fn trait_open_output_uses_inherent_impl_not_default() {
         let mut hub = MidiHub::default();
         let err = <MidiHub as crate::hw::traits::HwMidiHub>::open_output(

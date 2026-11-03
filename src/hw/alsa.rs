@@ -1394,6 +1394,7 @@ mod mmap_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "ALSA device syscalls are not supported by Miri")]
     fn duplex_start_and_restart_prime_playback_and_start_capture() {
         let mut driver = HwDriver::new_with_options(
             "null",
@@ -1417,6 +1418,7 @@ mod mmap_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "ALSA device syscalls are not supported by Miri")]
     fn capture_transfers_and_restarts_in_both_access_modes() {
         for access in [Access::MMapInterleaved, Access::RWInterleaved] {
             let pcm = PCM::new("null", Direction::Capture, false).unwrap();
@@ -1462,6 +1464,7 @@ mod mmap_tests {
     // ALSA's null PCM exercises access negotiation and mmap begin/commit
     // without requiring a sound card or emitting audio.
     #[test]
+    #[cfg_attr(miri, ignore = "ALSA device syscalls are not supported by Miri")]
     fn playback_transfers_and_restarts_in_both_access_modes() {
         for access in [Access::MMapInterleaved, Access::RWInterleaved] {
             let pcm = PCM::new("null", Direction::Playback, false).unwrap();

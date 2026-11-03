@@ -668,6 +668,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn seekable_stream_exact_first_samples_and_audible_through_track() {
         use crate::track::Track;
 
@@ -731,6 +732,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn seekable_stream_mid_buffer_seek_is_exact() {
         let (path, source) = tone_wav("maolan_seekstream_seek", 48_000, 0.5, 440.0);
         let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 128, 4).unwrap();
@@ -756,6 +758,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn seekable_stream_can_seek_again_after_eof() {
         let (path, source) = tone_wav("maolan_seekstream_after_eof", 48_000, 0.05, 440.0);
         let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 128, 4).unwrap();
@@ -826,6 +829,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn seekable_stream_underrun_silence_fills_and_counts() {
         let (path, _source) = tone_wav("maolan_seekstream_underrun", 48_000, 0.2, 440.0);
         let buffer =
@@ -855,6 +859,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn seekable_read_window_at_start_middle_and_eof() {
         let (path, source) = tone_wav("maolan_seekstream_window", 48_000, 0.2, 440.0);
         let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 64, 4)
@@ -904,6 +909,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn seekable_rejects_foreign_rate_and_non_pcm() {
         let (path, _source) = tone_wav("maolan_seekstream_rate", 44_100, 0.1, 440.0);
         assert!(

@@ -8,7 +8,7 @@ use crate::{
     render_plan::Op,
     state::TrackHandle,
 };
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 use nix::libc;
 use rubato::Resampler as _;
 use std::sync::Arc;
@@ -991,7 +991,7 @@ impl Worker {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(miri)))]
     pub(crate) fn try_enable_realtime(priority: i32) -> Result<(), String> {
         let thread = unsafe { libc::pthread_self() };
         let policy = libc::SCHED_FIFO;
@@ -1006,6 +1006,11 @@ impl Worker {
         } else {
             Err(format!("pthread_setschedparam failed with errno {}", rc))
         }
+    }
+
+    #[cfg(all(unix, miri))]
+    pub(crate) fn try_enable_realtime(_priority: i32) -> Result<(), String> {
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
@@ -1482,8 +1487,10 @@ mod tests {
     use crate::state::State;
     use crate::track::Track;
     use std::path::PathBuf;
-    use std::sync::{Arc, atomic::AtomicBool};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
     use tokio::sync::mpsc::channel;
 
     fn make_state_with_track(track: Track) -> State {
@@ -1493,11 +1500,9 @@ mod tests {
     }
 
     fn unique_temp_wav(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("maolan_{name}_{nanos}.wav"))
+        static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("maolan_{name}_{id}.wav"))
     }
 
     #[test]
@@ -1609,8 +1614,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn process_node_job_sums_arena_buffers() {
@@ -1626,7 +1635,7 @@ mod tests {
             tx,
             realtime_priority: 0,
         };
-        let collector = basedrop::Collector::new();
+        let mut collector = basedrop::Collector::new();
         let plan = RenderPlan {
             buffer_size: 4,
             buffers: (0..3).map(|_| UnsafeCell::new(vec![0.0; 4])).collect(),
@@ -1689,11 +1698,18 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+        drop(shared);
+        collector.collect();
+        assert!(collector.try_cleanup().is_ok());
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn process_offline_bounce_errors_when_track_is_missing() {
@@ -1730,8 +1746,19 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos"))
+        ),
+        ignore = "Offline bounce cancellation uses unlink, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn process_offline_bounce_cancels_and_restores_track_state() {
@@ -1777,8 +1804,19 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos"))
+        ),
+        ignore = "Offline bounce cleanup uses unlink, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn process_offline_bounce_restores_track_state_on_write_failure() {
@@ -1838,8 +1876,19 @@ mod tests {
 
     #[cfg(feature = "audio")]
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos"))
+        ),
+        ignore = "Offline bounce test uses statx and unlink, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn process_offline_bounce_emits_progress_and_completion() {
@@ -1983,8 +2032,19 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos"))
+        ),
+        ignore = "Offline bounce test uses statx and unlink, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn process_offline_stems_bounce_captures_every_track_in_one_pass() {
@@ -2101,8 +2161,19 @@ mod tests {
 
     #[cfg(feature = "audio")]
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos"))
+        ),
+        ignore = "Offline bounce test uses statx and unlink, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn process_offline_stems_bounce_resamples_and_converts_bit_depth() {
@@ -2170,8 +2241,19 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos"))
+        ),
+        ignore = "Offline stems test uses statx, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn process_offline_stems_bounce_errors_when_track_is_missing() {
@@ -2218,8 +2300,19 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos"))
+        ),
+        ignore = "Offline bounce cancellation uses unlink, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn process_offline_stems_bounce_cancels_and_restores_track_state() {

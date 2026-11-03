@@ -1906,9 +1906,23 @@ mod stop_silence_tests {
         (context, producer)
     }
 
+    struct TestBuffer(*mut f32, usize);
+
+    impl Drop for TestBuffer {
+        fn drop(&mut self) {
+            // SAFETY: these are the pointer and length of the boxed slice
+            // leaked in `make_abl`, and this guard is its unique owner.
+            unsafe {
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    self.0, self.1,
+                )));
+            }
+        }
+    }
+
     /// One interleaved HAL buffer filled with a 7.0 sentinel so tests can
     /// detect both unwritten and stale regions.
-    fn make_abl(frames: usize, channels: usize) -> (AudioBufferList, *mut f32, usize) {
+    fn make_abl(frames: usize, channels: usize) -> (AudioBufferList, *mut f32, usize, TestBuffer) {
         let len = frames.saturating_mul(channels);
         let storage = vec![7.0_f32; len].into_boxed_slice();
         let ptr = Box::into_raw(storage).cast::<f32>();
@@ -1920,7 +1934,7 @@ mod stop_silence_tests {
                 m_data: ptr.cast::<c_void>(),
             }],
         };
-        (list, ptr, len)
+        (list, ptr, len, TestBuffer(ptr, len))
     }
 
     unsafe fn read_abl(ptr: *const f32, len: usize) -> Vec<f32> {
@@ -1930,7 +1944,7 @@ mod stop_silence_tests {
     #[test]
     fn starved_callback_emits_silence_immediately_when_not_playing() {
         let (mut context, _producer) = test_context(4096, Duration::from_secs(5));
-        let (mut list, ptr, len) = make_abl(64, 2);
+        let (mut list, ptr, len, _storage) = make_abl(64, 2);
         let start = Instant::now();
         fill_output_buffers(&mut context, 64, &mut list);
         assert!(
@@ -1946,7 +1960,7 @@ mod stop_silence_tests {
     fn starved_callback_still_backpressures_while_playing() {
         let (mut context, _producer) = test_context(4096, Duration::from_millis(150));
         context.shared.playing.store(true, Ordering::Release);
-        let (mut list, _, _) = make_abl(64, 2);
+        let (mut list, _, _, _storage) = make_abl(64, 2);
         let start = Instant::now();
         fill_output_buffers(&mut context, 64, &mut list);
         assert!(
@@ -1959,7 +1973,7 @@ mod stop_silence_tests {
     #[test]
     fn drained_ring_never_repeats_stale_audio() {
         let (mut context, mut producer) = test_context(4096, Duration::from_secs(5));
-        let (mut list, ptr, len) = make_abl(64, 2);
+        let (mut list, ptr, len, _storage) = make_abl(64, 2);
         for sample in std::iter::repeat_n(0.5_f32, 128) {
             producer.push(sample).expect("push into test ring");
         }
@@ -1977,7 +1991,7 @@ mod stop_silence_tests {
     #[test]
     fn ring_delivery_preserves_interleaved_order() {
         let (mut context, mut producer) = test_context(4096, Duration::from_secs(5));
-        let (mut list, ptr, len) = make_abl(64, 2);
+        let (mut list, ptr, len, _storage) = make_abl(64, 2);
         let expected: Vec<f32> = (0..128).map(|i| i as f32 * 0.25).collect();
         for sample in &expected {
             producer.push(*sample).expect("push into test ring");

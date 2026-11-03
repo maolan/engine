@@ -748,6 +748,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri execution exceeds one minute")]
     fn streaming_clip_audible_through_track_render() {
         // Regression test: a 44.1 kHz stereo FLAC (foreign rate → Streaming
         // strategy) must produce audible-level track output. The original bug
@@ -762,6 +763,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem access")]
     fn streaming_real_flac_file_audible() {
         let path = PathBuf::from(
             "/home/meka/Files/Music/Guitar/Audioslave - Discography (2002-2006) [FLAC]/[2002] Audioslave/01. Cochise.flac",
@@ -788,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn streaming_flac_resamples_and_preserves_tone() {
         if let Err(error) = tracing_subscriber::fmt().with_test_writer().try_init() {
             tracing::debug!("Test tracing subscriber was already initialized: {error}");
@@ -853,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn streaming_underrun_silence_fills_and_counts() {
         let path = tone_flac("maolan_stream_underrun", 48_000, 0.2, 440.0);
         let buffer =
@@ -883,6 +887,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn streaming_read_window_at_middle_and_eof() {
         let path = tone_flac("maolan_stream_window", 48_000, 0.2, 440.0);
         let info = probe_audio_file(&path).expect("probe");
@@ -920,6 +925,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn streaming_seek_restarts_decode() {
         let path = tone_flac("maolan_stream_seek", 48_000, 0.5, 440.0);
         let buffer =

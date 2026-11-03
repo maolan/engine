@@ -111,7 +111,7 @@ pub fn report_winmm_status(status: u32, context: &str) {
 }
 
 pub fn enable_flush_denormals_to_zero() {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), not(miri)))]
     unsafe {
         let mut mxcsr: u32 = 0;
         std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr);
@@ -119,7 +119,7 @@ pub fn enable_flush_denormals_to_zero() {
         std::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr);
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     unsafe {
         let mut fpcr: u64;
         std::arch::asm!("mrs {0}, fpcr", out(reg) fpcr);
@@ -135,12 +135,15 @@ pub struct WindowsTimerResolutionGuard;
 #[cfg(target_os = "windows")]
 impl Drop for WindowsTimerResolutionGuard {
     fn drop(&mut self) {
-        #[link(name = "winmm")]
-        unsafe extern "system" {
-            fn timeEndPeriod(period: u32) -> u32;
-        }
-        unsafe {
-            timeEndPeriod(1);
+        #[cfg(not(miri))]
+        {
+            #[link(name = "winmm")]
+            unsafe extern "system" {
+                fn timeEndPeriod(period: u32) -> u32;
+            }
+            unsafe {
+                timeEndPeriod(1);
+            }
         }
     }
 }
@@ -151,17 +154,23 @@ impl Drop for WindowsTimerResolutionGuard {
 /// chain is processed too slowly on Windows and WASAPI output underruns.
 #[cfg(target_os = "windows")]
 pub fn enable_windows_high_resolution_timer() -> Option<WindowsTimerResolutionGuard> {
-    #[link(name = "winmm")]
-    unsafe extern "system" {
-        fn timeBeginPeriod(period: u32) -> u32;
-    }
-    unsafe {
-        if timeBeginPeriod(1) == 0 {
-            tracing::info!("Windows timer resolution set to 1 ms");
-            Some(WindowsTimerResolutionGuard)
-        } else {
-            tracing::warn!("Failed to set Windows timer resolution to 1 ms");
-            None
+    #[cfg(miri)]
+    return None;
+
+    #[cfg(not(miri))]
+    {
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            fn timeBeginPeriod(period: u32) -> u32;
+        }
+        unsafe {
+            if timeBeginPeriod(1) == 0 {
+                tracing::info!("Windows timer resolution set to 1 ms");
+                Some(WindowsTimerResolutionGuard)
+            } else {
+                tracing::warn!("Failed to set Windows timer resolution to 1 ms");
+                None
+            }
         }
     }
 }

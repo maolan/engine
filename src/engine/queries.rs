@@ -442,6 +442,14 @@ impl Engine {
 mod tests {
     use super::*;
 
+    #[cfg_attr(
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
     #[tokio::test]
     async fn save_events_survive_a_full_client_queue() {
         let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(1);

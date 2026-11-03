@@ -2,88 +2,96 @@ use fearless_simd::prelude::*;
 use fearless_simd::{Level, dispatch};
 use fearless_simd_macros::simd;
 
+pub(crate) fn level() -> Level {
+    if cfg!(miri) {
+        Level::fallback()
+    } else {
+        Level::new()
+    }
+}
+
 pub fn add_inplace(dst: &mut [f32], src: &[f32]) {
-    dispatch!(Level::new(), simd => add_inplace_kernel(simd, dst, src));
+    dispatch!(level(), simd => add_inplace_kernel(simd, dst, src));
 }
 
 pub fn mul_inplace(dst: &mut [f32], gain: f32) {
-    dispatch!(Level::new(), simd => mul_inplace_kernel(simd, dst, gain));
+    dispatch!(level(), simd => mul_inplace_kernel(simd, dst, gain));
 }
 
 pub fn add_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
-    dispatch!(Level::new(), simd => add_scaled_inplace_kernel(simd, dst, src, gain));
+    dispatch!(level(), simd => add_scaled_inplace_kernel(simd, dst, src, gain));
 }
 
 pub fn copy_scaled_inplace(dst: &mut [f32], src: &[f32], gain: f32) {
-    dispatch!(Level::new(), simd => copy_scaled_inplace_kernel(simd, dst, src, gain));
+    dispatch!(level(), simd => copy_scaled_inplace_kernel(simd, dst, src, gain));
 }
 
 pub fn add_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
-    dispatch!(Level::new(), simd => add_sanitized_inplace_kernel(simd, dst, src));
+    dispatch!(level(), simd => add_sanitized_inplace_kernel(simd, dst, src));
 }
 
 pub fn copy_sanitized_inplace(dst: &mut [f32], src: &[f32]) {
-    dispatch!(Level::new(), simd => copy_sanitized_inplace_kernel(simd, dst, src));
+    dispatch!(level(), simd => copy_sanitized_inplace_kernel(simd, dst, src));
 }
 
 pub fn sanitize_finite_inplace(buf: &mut [f32]) {
-    dispatch!(Level::new(), simd => sanitize_finite_inplace_kernel(simd, buf));
+    dispatch!(level(), simd => sanitize_finite_inplace_kernel(simd, buf));
 }
 
 pub fn peak_abs(buf: &[f32]) -> f32 {
-    dispatch!(Level::new(), simd => peak_abs_kernel(simd, buf))
+    dispatch!(level(), simd => peak_abs_kernel(simd, buf))
 }
 
 pub fn clamp_inplace(buf: &mut [f32], min: f32, max: f32) {
-    dispatch!(Level::new(), simd => clamp_inplace_kernel(simd, buf, min, max));
+    dispatch!(level(), simd => clamp_inplace_kernel(simd, buf, min, max));
 }
 
 pub fn convert_i32_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
-    dispatch!(Level::new(), simd => convert_i32_to_f32_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_i32_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_i16_to_f32(src: &[i16], dst: &mut [f32], gain: f32) {
-    dispatch!(Level::new(), simd => convert_i16_to_f32_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_i16_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_i8_to_f32(src: &[i8], dst: &mut [f32], gain: f32) {
-    dispatch!(Level::new(), simd => convert_i8_to_f32_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_i8_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_i24_to_f32(src: &[i32], dst: &mut [f32], gain: f32) {
-    dispatch!(Level::new(), simd => convert_i24_to_f32_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_i24_to_f32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i24(src: &[f32], dst: &mut [i32], gain: f32) {
-    dispatch!(Level::new(), simd => convert_f32_to_i24_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_f32_to_i24_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i32(src: &[f32], dst: &mut [i32], gain: f32) {
-    dispatch!(Level::new(), simd => convert_f32_to_i32_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_f32_to_i32_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i16(src: &[f32], dst: &mut [i16], gain: f32) {
-    dispatch!(Level::new(), simd => convert_f32_to_i16_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_f32_to_i16_kernel(simd, src, dst, gain));
 }
 
 pub fn convert_f32_to_i8(src: &[f32], dst: &mut [i8], gain: f32) {
-    dispatch!(Level::new(), simd => convert_f32_to_i8_kernel(simd, src, dst, gain));
+    dispatch!(level(), simd => convert_f32_to_i8_kernel(simd, src, dst, gain));
 }
 
 pub fn apply_fade_in_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
-    dispatch!(Level::new(), simd => apply_fade_in_kernel(simd, buf, start_t, dt));
+    dispatch!(level(), simd => apply_fade_in_kernel(simd, buf, start_t, dt));
 }
 
 pub fn apply_fade_out_inplace(buf: &mut [f32], start_t: f32, dt: f32) {
-    dispatch!(Level::new(), simd => apply_fade_out_kernel(simd, buf, start_t, dt));
+    dispatch!(level(), simd => apply_fade_out_kernel(simd, buf, start_t, dt));
 }
 
 pub fn interleave_stereo(l: &[f32], r: &[f32], dst: &mut [f32]) {
-    dispatch!(Level::new(), simd => interleave_stereo_kernel(simd, l, r, dst));
+    dispatch!(level(), simd => interleave_stereo_kernel(simd, l, r, dst));
 }
 
 pub fn deinterleave_stereo(l: &mut [f32], r: &mut [f32], src: &[f32]) {
-    dispatch!(Level::new(), simd => deinterleave_stereo_kernel(simd, l, r, src));
+    dispatch!(level(), simd => deinterleave_stereo_kernel(simd, l, r, src));
 }
 
 #[simd]
@@ -708,7 +716,9 @@ mod tests {
             let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
             *v *= (t * std::f32::consts::FRAC_PI_2).sin();
         }
-        assert_eq!(buf, expected);
+        for (actual, expected) in buf.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -721,7 +731,9 @@ mod tests {
             let t = (start_t + i as f32 * dt).clamp(0.0, 1.0);
             *v *= (t * std::f32::consts::FRAC_PI_2).cos();
         }
-        assert_eq!(buf, expected);
+        for (actual, expected) in buf.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 
     #[test]

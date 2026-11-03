@@ -2165,13 +2165,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
-    )]
     #[test]
     fn midi_learn_monitor_toggle_flips_all_lanes() {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
         runtime.block_on(async {
             let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
             let mut engine = Engine::new(engine_rx, engine_tx);
@@ -2228,6 +2226,7 @@ mod tests {
 
     #[cfg(feature = "midi")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn mpe_expression_round_trips_through_midi_file() {
         let sample_rate = 48_000;
         let channel = 1; // MIDI channel 2 (0-indexed)

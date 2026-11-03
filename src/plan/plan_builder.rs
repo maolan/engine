@@ -148,6 +148,14 @@ fn builder_loop(
 mod tests {
     use super::*;
 
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
     #[tokio::test]
     async fn rebuild_acknowledges_a_plan_with_the_latest_ports() {
         let snapshot = crate::state::State::default().lock().snapshot();

@@ -1851,6 +1851,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn clip_strategy_engine_rate_wav_uses_seekable_streaming() {
         let path = std::env::temp_dir().join(format!(
             "maolan_strategy_engine_wav_{}.wav",
@@ -1872,6 +1873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
     fn clip_strategy_flac_uses_compressed_streaming() {
         let path =
             std::env::temp_dir().join(format!("maolan_strategy_flac_{}.flac", std::process::id()));

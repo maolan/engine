@@ -213,6 +213,10 @@ pub fn drop_host(
     child: Option<Child>,
     shm_name: String,
 ) {
+    if mapping.is_none() && events.is_none() && child.is_none() && shm_name.is_empty() {
+        return;
+    }
+
     if let Some(ref mapping) = mapping
         && let Some(ref events) = events
     {
@@ -413,6 +417,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Miri does not support the Windows event APIs and clock used by EventPair"
+    )]
     fn wait_block_response_consumes_completion_sent_before_wait() {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(7);
@@ -428,6 +436,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Miri does not support the Windows event APIs and clock used by EventPair"
+    )]
     fn wait_block_response_ignores_stale_control_event() {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(0);
@@ -446,6 +458,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Miri does not support the Windows event APIs and clock used by EventPair"
+    )]
     fn wait_block_response_times_out_when_host_silent() {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(0);
@@ -465,6 +481,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Miri does not support the Windows event APIs and clock used by EventPair"
+    )]
     fn wait_block_response_wakes_when_host_finishes() {
         let events = EventPair::new().expect("event pair");
         let counter = AtomicU32::new(0);

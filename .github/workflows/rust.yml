@@ -21,9 +21,10 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt, clippy
+          toolchain: nightly-2026-10-31
+          components: rustfmt, clippy, miri
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -82,3 +83,9 @@ jobs:
 
       - name: Run tests (all features)
         run: cargo test --all-targets --all-features
+
+      - name: Set up Miri
+        run: cargo miri setup
+
+      - name: Run full test suite under Miri
+        run: cargo miri test --all-targets --all-features --no-fail-fast

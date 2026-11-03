@@ -873,6 +873,22 @@ mod tests {
     /// the driver's stop flag and shut the worker down. Before the fix the
     /// message loop could not process `Quit` until the cycle returned, so a
     /// stalled cycle deadlocked process exit forever.
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(
+            miri,
+            not(any(target_os = "freebsd", target_os = "windows", target_os = "macos")),
+            any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        ignore = "Miri does not support the inline assembly used to configure denormals"
+    )]
     #[tokio::test]
     async fn quit_interrupts_stalled_cycle() {
         let driver = StallingDriver {
