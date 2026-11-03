@@ -2165,6 +2165,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+    )]
     #[test]
     fn midi_learn_monitor_toggle_flips_all_lanes() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");

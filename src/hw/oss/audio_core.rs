@@ -696,6 +696,10 @@ mod tests {
         result
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Syscall open is not supported by Miri"
+    )]
     #[test]
     fn mapped_period_wraps_without_overwriting_other_frames() {
         let mut audio = mapped_audio();
@@ -707,6 +711,10 @@ mod tests {
         assert_eq!(write.write_position, 12);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Syscall open is not supported by Miri"
+    )]
     #[test]
     fn late_write_keeps_the_unplayed_suffix() {
         let mut audio = mapped_audio();
@@ -717,6 +725,10 @@ mod tests {
         assert_eq!(ring(&audio), [3, 4, 0, 0, 0, 0, 0, 0]);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Syscall open is not supported by Miri"
+    )]
     #[test]
     fn full_ring_retains_pending_output_until_space_opens() {
         let mut audio = mapped_audio();
@@ -734,6 +746,10 @@ mod tests {
         assert_eq!(ring(&audio), [0, 0, 0, 0, 1, 2, 3, 4]);
     }
 
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Syscall open is not supported by Miri"
+    )]
     #[test]
     fn capture_prefetch_does_not_advance_primary_period() {
         let mut audio = mapped_audio();
