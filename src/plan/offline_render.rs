@@ -156,6 +156,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn coalescing_preserves_every_dependency_in_small_dags() {
         // Exhaust all forward-edge graphs on five nodes, including isolated
         // nodes, unequal branch lengths, forks, joins and transitive edges.

@@ -234,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri execution exceeds one minute")]
     fn concurrent_latest_value_is_monotonic() {
         let (mut producer, mut consumer) = triple_buffer(0usize);
         let done = Arc::new(AtomicBool::new(false));

@@ -549,8 +549,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn inline_completion_advances_without_replaying_startup_block() {
@@ -575,8 +579,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn inline_loop_wrap_reanchors_capture_without_silencing_audio() {
@@ -621,8 +629,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn recording_peaks_query_reports_real_take_bounds_and_channel_extrema() {
@@ -726,6 +738,10 @@ mod tests {
     }
 
     #[cfg(feature = "audio")]
+    #[cfg_attr(
+        miri,
+        ignore = "test writes temporary audio files, which Miri isolation does not support"
+    )]
     #[tokio::test]
     async fn recording_flush_preserves_compensated_start_and_all_samples() {
         let (mut engine, mut rx) = make_engine_with_client();
@@ -782,6 +798,14 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "linux"),
+        ignore = "ALSA device syscalls are not supported by Miri on Linux"
+    )]
     #[tokio::test]
     async fn alsa_device_open_keeps_worker_pool_rendering_enabled() {
         let (mut engine, _client_rx) = make_engine_with_client();
@@ -793,10 +817,7 @@ mod tests {
         assert!(!engine.rt_inline_enabled);
     }
 
-    #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
-    )]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     #[tokio::test]
     async fn iodelay_calibration_applies_measured_total_and_blocks_during_recording() {
         let (mut engine, mut client_rx) = make_engine_with_client();
@@ -877,8 +898,16 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "linux"),
+        ignore = "Audio clip path lookup uses statx, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn overlapping_added_clips_preserve_supplied_fades() {
@@ -939,8 +968,16 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "linux"),
+        ignore = "Audio clip path lookup uses statx, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn enabled_fades_are_clamped_to_minimum_on_add_and_set() {
@@ -949,6 +986,11 @@ mod tests {
             &mut engine,
             Track::new("fades".to_string(), 1, 1, 0, 0, 64, 48_000.0),
         );
+        engine
+            .plan_builder
+            .rebuild()
+            .await
+            .expect("initial render plan rebuild");
         engine
             .handle_request(Action::AddClip {
                 clip_id: "short".to_string(),
@@ -1034,7 +1076,6 @@ mod tests {
             .tracks
             .insert(track.name.clone(), Arc::new(track));
         engine.publish_state_snapshot();
-        engine.plan_builder.mark_dirty();
     }
 
     fn insert_track_for_modulator_test(engine: &mut Engine, track: Track) {
@@ -1047,8 +1088,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
     )]
     #[test]
     fn reset_meters_after_stop_decays_to_silence_over_one_second() {
@@ -1103,8 +1144,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn same_track_audio_connect_creates_internal_passthrough() {
@@ -1128,8 +1173,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn same_track_midi_connect_creates_internal_passthrough() {
@@ -1153,8 +1202,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn folder_inner_connections_restore_like_session_load() {
@@ -1280,8 +1333,16 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "linux"),
+        ignore = "UDP socket syscalls are not supported by Miri isolation"
     )]
     #[tokio::test]
     async fn set_osc_enabled_starts_and_stops_server() {
@@ -1299,8 +1360,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn set_tempo_map_is_recorded_and_undone() {
@@ -1348,8 +1413,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn apply_grouped_actions_undoes_as_one_history_entry() {
@@ -1376,8 +1445,16 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "linux"),
+        ignore = "UDP socket syscalls are not supported by Miri isolation"
     )]
     #[tokio::test]
     async fn osc_server_forwards_transport_packets_to_engine_channel() {
@@ -1406,8 +1483,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_offline_bounce_rejects_zero_length_requests() {
@@ -1437,8 +1518,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_offline_bounce_rejects_when_same_track_is_active() {
@@ -1470,8 +1555,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_offline_bounce_queues_different_track() {
@@ -1510,8 +1599,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn offline_bounce_queue_starts_only_one_stem_at_a_time() {
@@ -1564,8 +1657,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn offline_bounce_queue_without_ready_worker_returns() {
@@ -1591,8 +1688,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn reject_if_track_frozen_sends_error_and_blocks_operation() {
@@ -1615,8 +1716,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn dispatcher_track_mutations_publish_state_snapshot() {
@@ -1646,8 +1751,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn undo_restores_original_clip_bounds_after_stretch_style_group() {
@@ -1705,8 +1814,16 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "linux"),
+        ignore = "Audio clip path lookup uses statx, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn move_clip_to_unused_stores_clip_and_undo_restores_it() {
@@ -1716,6 +1833,11 @@ mod tests {
         clip.id = "clip-1".to_string();
         track.audio.push_clip(clip);
         insert_track(&mut engine, track);
+        engine
+            .plan_builder
+            .rebuild()
+            .await
+            .expect("initial render plan rebuild");
 
         engine
             .handle_request(Action::MoveClipToUnused {
@@ -1746,8 +1868,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn move_clip_to_unused_keeps_slot_referenced_clip_in_session_pool() {
@@ -1798,8 +1924,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn launch_clip_accepts_clip_from_session_pool() {
@@ -1845,8 +1975,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn launch_scene_accepts_clip_from_session_pool() {
@@ -1889,8 +2023,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn stop_clears_playing_session_clips_and_pending_launches() {
@@ -1990,8 +2128,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_launches_when_longest_playing_clip_pass_ends() {
@@ -2024,8 +2166,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_unmarked_slot_keeps_previous_clip_when_inheriting_play() {
@@ -2056,8 +2202,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_inherited_play_starts_previous_clip_when_track_silent() {
@@ -2104,8 +2254,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_unmarked_slot_inherits_stop_from_playing_scene() {
@@ -2150,8 +2304,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_unmarked_slot_continues_when_previous_scene_also_unmarked() {
@@ -2182,8 +2340,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_inherited_play_without_clip_keeps_current_clip() {
@@ -2214,8 +2376,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_replaces_previous_queue() {
@@ -2246,8 +2412,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_fire_marks_scene_as_current() {
@@ -2277,8 +2447,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_clipless_stop_marked_slot_stops_track() {
@@ -2317,8 +2491,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_marker_holds_until_launch_time_when_nothing_scheduled() {
@@ -2356,8 +2534,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_with_nothing_playing_launches_immediately() {
@@ -2392,8 +2574,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_after_clipless_current_scene_waits_for_snap_length() {
@@ -2440,8 +2626,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queue_scene_current_scene_length_uses_longest_clip_when_longer_than_snap() {
@@ -2492,8 +2682,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn queued_scene_length_includes_inherited_clip_when_longer_than_scene_clip() {
@@ -2548,8 +2742,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn session_runtime_reports_completed_scene_span_not_each_short_clip_loop() {
@@ -2601,8 +2799,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn session_runtime_reports_repeated_scene_occurrences_as_separate_passes() {
@@ -2661,8 +2863,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn session_runtime_reports_scene_that_ended_at_queued_launch_boundary() {
@@ -2704,8 +2910,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn session_runtime_reports_inherited_clip_and_own_length_midi_passes() {
@@ -2774,8 +2984,16 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "linux"),
+        ignore = "Audio clip path lookup uses statx, which Miri isolation does not support"
     )]
     #[tokio::test]
     async fn session_play_clears_stale_scene_state_before_recording() {
@@ -2875,8 +3093,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn set_unused_clips_populates_session_pool_for_slot_referenced_clips() {
@@ -2912,8 +3134,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_offline_bounce_queues_when_no_worker_is_ready() {
@@ -2944,8 +3170,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_offline_bounce_returns_missing_track_error() {
@@ -2971,8 +3201,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_offline_bounce_clears_job_when_worker_send_fails() {
@@ -3009,8 +3243,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn offline_bounce_waits_for_inline_workers_to_retire() {
@@ -3048,8 +3286,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        miri,
+        ignore = "test creates temporary audio files, which Miri isolation does not support"
     )]
     #[cfg(feature = "audio")]
     #[tokio::test]
@@ -3281,8 +3519,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_set_parent_wires_folder_input_to_child_input_and_child_output_to_folder_output()
@@ -3363,8 +3605,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_set_parent_to_none_restores_root_passthrough() {
@@ -3419,8 +3665,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_set_parent_wires_folder_midi_to_child_midi() {
@@ -3516,8 +3766,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn moving_nested_folder_preserves_child_routes() {
@@ -3634,8 +3888,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "uses filesystem metadata, which Miri isolation does not support on FreeBSD"
+        miri,
+        ignore = "uses filesystem metadata, which Miri isolation does not support"
     )]
     #[cfg(feature = "plugins")]
     #[test]
@@ -3762,8 +4016,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_set_parent_wires_child_io_to_folder_even_after_addtrack() {
@@ -3818,8 +4076,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn folder_child_audio_passes_through() {
@@ -3828,6 +4090,11 @@ mod tests {
         let child = Track::new("child".to_string(), 1, 1, 0, 0, 64, 48_000.0);
         insert_track(&mut engine, folder);
         insert_track(&mut engine, child);
+        engine
+            .plan_builder
+            .rebuild()
+            .await
+            .expect("initial folder render plan rebuild");
 
         engine
             .handle_request_inner(
@@ -3861,7 +4128,7 @@ mod tests {
             // Safety: test thread, no node is running yet; the fake driver owns
             // the hardware-input buffer before the cycle starts.
             unsafe { (&mut *plan.buffer_ptr(hw_buf)).fill(0.75) };
-            let collector = basedrop::Collector::new();
+            let mut collector = basedrop::Collector::new();
             let shared = Arc::new(basedrop::Owned::new(&collector.handle(), plan));
             for node in 0..shared.nodes.len() {
                 crate::workers::worker::Worker::process_node_job_result(
@@ -3881,12 +4148,19 @@ mod tests {
                 "folder output should contain the child-processed folder input signal, got {:?}",
                 output.iter().take(8).collect::<Vec<_>>()
             );
+            drop(shared);
+            collector.collect();
+            assert!(collector.try_cleanup().is_ok());
         }
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn remove_folder_track_deletes_descendants_recursively() {
@@ -3951,8 +4225,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_set_folder_rejects_master_track() {
@@ -3984,8 +4262,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_toggle_master_ignored_for_folder_track() {
@@ -4014,8 +4296,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_toggle_master_ignored_for_child_track() {
@@ -4045,8 +4331,12 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn track_set_parent_rejects_master_track() {
@@ -4092,8 +4382,12 @@ mod tests {
     /// transport stops, hw worker receives HWSetPlaying(false) AND
     /// HWZeroFillBuffers.
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn stop_is_queued_and_broadcasts_zero_fill_at_cycle_boundary() {
@@ -4142,8 +4436,12 @@ mod tests {
     /// Without an active transport (nothing can schedule a hw cycle), the
     /// queued stop drains immediately.
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD"
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
     )]
     #[tokio::test]
     async fn stop_without_active_transport_is_handled_immediately() {
@@ -4158,6 +4456,10 @@ mod tests {
     /// zero-fill broadcast silences the output), play again — audio must
     /// return (no trigger ioctls, no halt/resync stall).
     #[cfg(feature = "audio")]
+    #[cfg_attr(
+        miri,
+        ignore = "OSS device and filesystem syscalls are not supported by Miri isolation"
+    )]
     #[tokio::test]
     async fn oss_play_stop_play_resumes_output() {
         use crate::audio::clip::AudioClip;

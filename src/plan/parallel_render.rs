@@ -418,9 +418,34 @@ mod tests {
         Arc::new(basedrop::Owned::new(&collector.handle(), plan))
     }
 
+    struct TestCollector(Option<basedrop::Collector>);
+
+    impl std::ops::Deref for TestCollector {
+        type Target = basedrop::Collector;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+
+    impl Drop for TestCollector {
+        fn drop(&mut self) {
+            let mut collector = self.0.take().unwrap();
+            collector.collect();
+            assert!(
+                collector.try_cleanup().is_ok(),
+                "test left basedrop handles or allocations alive"
+            );
+        }
+    }
+
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Crossbeam epoch pointer handling is incompatible with Miri"
+    )]
     fn offline_parallel_matches_serial_across_blocks() {
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let chained_plan = || {
             let mut plan = plan();
             // Extend the output with a linear chain so this comparison also
@@ -470,7 +495,7 @@ mod tests {
 
     #[test]
     fn services_backend_repeatedly_while_workers_are_busy() {
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let plan = shared(&collector, plan());
         let started = Arc::new(AtomicBool::new(false));
         let serviced = Arc::new(AtomicUsize::new(0));
@@ -506,7 +531,7 @@ mod tests {
         use crate::state::State;
         use crate::track::Track;
 
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let input = Arc::new(AudioIO::new(64));
         let output = Arc::new(AudioIO::new(64));
         let folder = Arc::new(Track::new("folder".into(), 0, 1, 0, 0, 64, 48_000.0));
@@ -557,7 +582,7 @@ mod tests {
 
     #[test]
     fn independent_nodes_overlap_and_fan_in_waits_for_both_producers() {
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let plan = shared(&collector, plan());
         let entered = Arc::new(AtomicUsize::new(0));
         let overlapping = Arc::new(AtomicUsize::new(0));
@@ -593,17 +618,19 @@ mod tests {
 
     #[test]
     fn timeout_returns_before_writer_finishes_and_next_plan_waits_for_retirement() {
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let plan = shared(&collector, plan());
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let started = Arc::new(AtomicBool::new(false));
+        let started = Arc::new((Mutex::new(false), Condvar::new()));
         let finished = Arc::new(AtomicBool::new(false));
         let mut pool = Pool::new(1, {
             let gate = gate.clone();
             let started = started.clone();
             let finished = finished.clone();
             move |job| {
-                started.store(true, Ordering::Release);
+                let (lock, condition) = &*started;
+                *lock.lock().unwrap() = true;
+                condition.notify_one();
                 let (lock, condition) = &*gate;
                 let guard = lock.lock().unwrap();
                 drop(condition.wait_while(guard, |released| !*released).unwrap());
@@ -612,10 +639,21 @@ mod tests {
                 result
             }
         });
-        // A generous scheduling window ensures the job actually starts; the
-        // gate makes it impossible to complete until render has returned.
-        let result = pool.render.render(plan.clone(), Duration::from_millis(100));
-        let saw_started = started.load(Ordering::Acquire);
+        // Wait for the worker to take ownership before letting the render
+        // deadline expire. Miri can take longer than a short wall-clock
+        // scheduling window to run the worker thread.
+        let result =
+            pool.render
+                .render_with_service(plan.clone(), Duration::from_millis(100), &mut || {
+                    let (lock, condition) = &*started;
+                    let started = lock.lock().unwrap();
+                    let (started, timeout) = condition
+                        .wait_timeout_while(started, Duration::from_secs(5), |started| !*started)
+                        .unwrap();
+                    assert!(*started && !timeout.timed_out(), "worker did not start");
+                    Duration::MAX
+                });
+        let saw_started = *started.0.lock().unwrap();
         let saw_finished = finished.load(Ordering::Acquire);
         let refused_reuse = pool
             .render
@@ -646,7 +684,7 @@ mod tests {
 
     #[test]
     fn panicking_worker_fails_closed_and_can_process_the_next_cycle() {
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let plan = shared(&collector, plan());
         let first = Arc::new(AtomicBool::new(true));
         let mut pool = Pool::new(1, move |job| {
@@ -667,7 +705,7 @@ mod tests {
 
     #[test]
     fn feedback_plans_run_serially_in_plan_order_on_workers() {
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let mut graph = plan();
         graph.forced = vec![1, 2, 3, 4];
         graph.dependents[4].push(1);
@@ -688,7 +726,7 @@ mod tests {
 
     #[test]
     fn missing_workers_fail_closed_without_executing_nodes() {
-        let collector = basedrop::Collector::new();
+        let collector = TestCollector(Some(basedrop::Collector::new()));
         let plan = shared(&collector, plan());
         let mut render = ParallelRender::new();
         assert!(render.render(plan, Duration::from_secs(1)).is_none());

@@ -1163,8 +1163,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+        miri,
+        ignore = "plugin host integration requires child processes and OS facilities unavailable under Miri"
     )]
     #[test]
     fn clap_processor_processes_audio() {
@@ -1223,8 +1223,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+        miri,
+        ignore = "plugin host integration requires child processes and OS facilities unavailable under Miri"
     )]
     #[test]
     fn clap_processor_crash_bypass() {
@@ -1272,8 +1272,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+        miri,
+        ignore = "plugin host integration requires child processes and OS facilities unavailable under Miri"
     )]
     #[test]
     fn clap_bypass_reports_zero_latency() {
@@ -1296,8 +1296,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+        miri,
+        ignore = "plugin host integration requires child processes and OS facilities unavailable under Miri"
     )]
     #[test]
     fn clap_track_integration() {
@@ -1360,8 +1360,8 @@ mod tests {
     }
 
     #[cfg_attr(
-        all(miri, target_os = "freebsd"),
-        ignore = "plugin host discovery/runtime uses OS facilities not supported by Miri on FreeBSD"
+        miri,
+        ignore = "plugin host integration requires child processes and OS facilities unavailable under Miri"
     )]
     #[test]
     fn clap_processor_forwards_midi_input_port_events_to_synth() {

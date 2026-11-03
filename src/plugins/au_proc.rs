@@ -803,7 +803,7 @@ mod tests {
                 flags: 0,
             },
         ];
-        let mut scratch = vec![0u8; SCRATCH_SIZE];
+        let mut scratch = vec![0u8; LAYOUT_SIZE];
         unsafe {
             write_test_au_params(scratch.as_mut_ptr(), &params).expect("write");
             let decoded = read_au_params_from_scratch(scratch.as_mut_ptr()).expect("read");
@@ -815,7 +815,7 @@ mod tests {
     /// `write_au_params_to_scratch` so the reader can be exercised in-tree.
     ///
     /// # Safety
-    /// `ptr` must point to a `SCRATCH_SIZE` allocation.
+    /// `ptr` must point to an allocation of at least `LAYOUT_SIZE` bytes.
     unsafe fn write_test_au_params(ptr: *mut u8, params: &[AuParamInfo]) -> Result<(), String> {
         unsafe {
             let mut dest = scratch_ptr(ptr).add(AU_PARAMS_OFFSET);

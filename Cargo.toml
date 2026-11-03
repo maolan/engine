@@ -26,7 +26,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 maolan-plugin-protocol = { version = "0.0.20", optional = true }
 uuid = { version = "1.29.0", features = ["v4"] }
-fearless_simd = "1.2.0"
+fearless_simd = { version = "1.2.0", features = ["force_support_fallback"] }
 fearless_simd_macros = "0.1"
 arc-swap = "1.9.3"
 basedrop = "0.1.3"
@@ -36,7 +36,7 @@ rubato = "5.0.1"
 audioadapter = "5.0"
 audioadapter-buffers = "5.2"
 timestretch = "0.16.0"
-mixosc = { version = "0.0.16", optional = true }
+mixosc = { version = "0.0.17", optional = true, default-features = false }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.23"

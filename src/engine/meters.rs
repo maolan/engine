@@ -248,7 +248,7 @@ impl Engine {
         self.meters.track_meter_linear_by_track.clear();
         let mut snapshot = Vec::with_capacity(tracks.len());
         for (name, track) in tracks {
-            let mut t = track.lock();
+            let t = track.lock();
             t.clear_output_meters();
             let width = t.output_meter_linear().len();
             let zero_linear = vec![0.0; width];

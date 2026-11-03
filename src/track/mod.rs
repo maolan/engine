@@ -1393,6 +1393,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri execution exceeds one minute")]
     fn offline_subset_matches_full_render_and_skips_unrelated_work() {
         use crate::audio::clip::AudioClip;
         use crate::executor::NodeJob;

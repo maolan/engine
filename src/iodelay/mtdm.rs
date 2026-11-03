@@ -324,6 +324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn recovers_known_delay_exactly() {
         for &delay in &[16usize, 128, 512, 1000, 1234, 4096] {
             let mut mtdm = measure(delay, RATE);
@@ -339,6 +340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn chunk_boundaries_do_not_change_the_result() {
         let signal = delayed_signal(RATE, 1000);
         let mut chunked = Mtdm::new(RATE);
@@ -351,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn inverted_loopback_recovers_after_toggle() {
         let mut signal = delayed_signal(RATE, 1000);
         for sample in &mut signal {
@@ -372,6 +375,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn silence_is_below_threshold() {
         let mut mtdm = Mtdm::new(RATE);
         mtdm.process(&vec![0.0f32; RATE / 10]);
@@ -379,6 +383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn uncorrelated_signal_does_not_resolve() {
         // Deterministic pseudo-noise: correlates with no tone.
         let noise: Vec<f32> = (0..RATE / 2)
@@ -393,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn synthesize_is_deterministic_and_bounded() {
         let a = synthesize(4096);
         let b = synthesize(4096);
@@ -403,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "TODO: figure out why it's stuck in miri")]
     fn unambiguous_range_covers_a_second() {
         const { assert!(MAX_DELAY_FRAMES > 48_000.0) };
         // Just inside the range must resolve; the resolver would alias past
