@@ -28,6 +28,9 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
       - name: Cache apt packages
         if: contains(matrix.os, 'ubuntu')
         uses: actions/cache@v4
@@ -64,6 +67,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Audit dependencies
+        run: cargo audit
 
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings

@@ -949,6 +949,10 @@ mod tests {
     /// stop again. Readable proxies (the hardware refuses a ring read-back
     /// mapping): DMA advancing during stop, and post-resume cycles at block
     /// rate with no underrun accumulation.
+    #[cfg_attr(
+        all(miri, target_os = "freebsd"),
+        ignore = "Syscall open is not supported by Miri"
+    )]
     #[test]
     fn play_stop_play_stop_keeps_dma_healthy() {
         let device = std::env::var("OSS_TEST_DEVICE").unwrap_or_else(|_| "/dev/dsp5".to_string());
