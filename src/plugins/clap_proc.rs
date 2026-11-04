@@ -126,11 +126,26 @@ impl ClapProcessor {
                 .unwrap_or_else(|| plugin_id.to_string())
         };
 
-        let (actual_audio_in, actual_audio_out, actual_midi_in, actual_midi_out) = unsafe {
-            let counts =
-                maolan_plugin_protocol::protocol::read_port_counts_from_scratch(mapping.as_ptr());
+        let (
+            actual_audio_in,
+            actual_audio_out,
+            actual_midi_in,
+            actual_midi_out,
+            actual_main_audio_in,
+            actual_main_audio_out,
+        ) = unsafe {
+            let counts = maolan_plugin_protocol::protocol::read_port_counts_with_main_from_scratch(
+                mapping.as_ptr(),
+            );
 
-            counts.unwrap_or((input_count as u32, output_count as u32, 0, 0))
+            counts.unwrap_or((
+                input_count as u32,
+                output_count as u32,
+                0,
+                0,
+                input_count as u32,
+                output_count as u32,
+            ))
         };
 
         let audio_inputs = (0..actual_audio_in as usize)
@@ -168,8 +183,8 @@ impl ClapProcessor {
             buffer_size,
             audio_inputs: ArcSwap::from_pointee(audio_inputs),
             audio_outputs: ArcSwap::from_pointee(audio_outputs),
-            main_audio_inputs: AtomicUsize::new(actual_audio_in as usize),
-            main_audio_outputs: AtomicUsize::new(actual_audio_out as usize),
+            main_audio_inputs: AtomicUsize::new(actual_main_audio_in as usize),
+            main_audio_outputs: AtomicUsize::new(actual_main_audio_out as usize),
             midi_input_count: actual_midi_in as usize,
             midi_output_count: actual_midi_out as usize,
             midi_input_ports,
@@ -219,37 +234,44 @@ impl ClapProcessor {
     }
 
     fn refresh_audio_ports_from_scratch(&self, ptr: *mut u8) -> bool {
-        let Some((audio_in, audio_out, _, _)) = (unsafe { read_port_counts_from_scratch(ptr) })
+        let Some((audio_in, audio_out, _, _, main_audio_in, main_audio_out)) =
+            (unsafe { read_port_counts_with_main_from_scratch(ptr) })
         else {
             return false;
         };
         let audio_in = audio_in as usize;
         let audio_out = audio_out as usize;
+        let main_audio_in = main_audio_in as usize;
+        let main_audio_out = main_audio_out as usize;
         let mut changed = false;
 
         let current_inputs = self.audio_inputs.load_full();
         let current_input_len = current_inputs.len();
         drop(current_inputs);
-        if current_input_len != audio_in
-            || self.main_audio_inputs.load(Ordering::Acquire) != audio_in
-        {
+        if current_input_len != audio_in {
             let mut inputs = self.audio_inputs.load_full().as_ref().clone();
             Self::resize_audio_ports(&mut inputs, audio_in, self.buffer_size);
             self.audio_inputs.store(Arc::new(inputs));
-            self.main_audio_inputs.store(audio_in, Ordering::Release);
+            changed = true;
+        }
+        if self.main_audio_inputs.load(Ordering::Acquire) != main_audio_in {
+            self.main_audio_inputs
+                .store(main_audio_in, Ordering::Release);
             changed = true;
         }
 
         let current_outputs = self.audio_outputs.load_full();
         let current_output_len = current_outputs.len();
         drop(current_outputs);
-        if current_output_len != audio_out
-            || self.main_audio_outputs.load(Ordering::Acquire) != audio_out
-        {
+        if current_output_len != audio_out {
             let mut outputs = self.audio_outputs.load_full().as_ref().clone();
             Self::resize_audio_ports(&mut outputs, audio_out, self.buffer_size);
             self.audio_outputs.store(Arc::new(outputs));
-            self.main_audio_outputs.store(audio_out, Ordering::Release);
+            changed = true;
+        }
+        if self.main_audio_outputs.load(Ordering::Acquire) != main_audio_out {
+            self.main_audio_outputs
+                .store(main_audio_out, Ordering::Release);
             changed = true;
         }
         changed
@@ -1429,5 +1451,87 @@ mod tests {
             "MIDI note-on did not reach the synth; output is silent (peak={})",
             peak
         );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "plugin host integration requires child processes and OS facilities unavailable under Miri"
+    )]
+    #[test]
+    fn track_clap_external_sidechain_keeps_two_main_inputs() {
+        use crate::track::Track;
+
+        let host_bin = find_host_binary();
+        if !host_bin.exists() {
+            return;
+        }
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let plugin_path = std::path::Path::new(&manifest)
+            .parent()
+            .unwrap()
+            .join("plugins")
+            .join("target")
+            .join("debug")
+            .join("libmaolan_plugins.so");
+        if !plugin_path.exists() {
+            return;
+        }
+
+        let bundle_dir =
+            std::env::temp_dir().join(format!("maolan-gate-test-{}", std::process::id()));
+        std::fs::create_dir_all(&bundle_dir).expect("test bundle directory should be created");
+        let bundle = bundle_dir.join("Maolan.clap");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&plugin_path, &bundle).expect("test CLAP bundle should link");
+        #[cfg(not(unix))]
+        std::fs::copy(&plugin_path, &bundle).expect("test CLAP bundle should copy");
+
+        let mut track = Track::new("gate-test".to_string(), 2, 2, 0, 0, 256, 48_000.0);
+        track
+            .load_clap_plugin(&format!("{}::rs.maolan.gate", bundle.display()), None)
+            .expect("Maolan Gate should load");
+        let processor = track.clap_plugins[0].processor.clone();
+        assert_eq!(processor.audio_inputs().len(), 2);
+        assert_eq!(processor.main_audio_input_count(), 2);
+
+        let external_sidechain = processor
+            .parameter_infos()
+            .into_iter()
+            .find(|param| param.name == "External Sidechain")
+            .expect("Gate should expose External Sidechain")
+            .id;
+        processor
+            .set_parameter(external_sidechain, 1.0)
+            .expect("external sidechain should be enabled");
+
+        let input_buffers = [vec![0.0; 256], vec![0.0; 256]];
+        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut reconfigured = false;
+        for _ in 0..4 {
+            let mut output_buffers = [vec![0.0; 256], vec![0.0; 256]];
+            let mut outputs = output_buffers
+                .iter_mut()
+                .map(Vec::as_mut_slice)
+                .collect::<Vec<_>>();
+            processor.process_with_audio_buffers(
+                256,
+                &[],
+                ClapTransportInfo::default(),
+                &inputs,
+                &mut outputs,
+            );
+            reconfigured = track.setup();
+            if reconfigured {
+                break;
+            }
+        }
+
+        assert!(reconfigured, "track should refresh Gate audio ports");
+        assert_eq!(processor.audio_inputs().len(), 4);
+        assert_eq!(processor.main_audio_input_count(), 2);
+        let graph = track.plugin_graph_plugins(false);
+        assert_eq!(graph[0].audio_inputs, 4);
+        assert_eq!(graph[0].main_audio_inputs, 2);
+        std::fs::remove_dir_all(bundle_dir).expect("test bundle directory should be removed");
     }
 }

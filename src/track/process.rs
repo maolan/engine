@@ -157,6 +157,21 @@ impl TrackData {
         #[cfg(not(feature = "plugins"))]
         let reconfigured = false;
         #[cfg(feature = "plugins")]
+        for instance in &self.clap_plugins {
+            instance.processor.run_host_callbacks_main_thread();
+            match instance.processor.reconfigure_ports_if_needed() {
+                Ok(true) => reconfigured = true,
+                Err(e) => {
+                    tracing::warn!(
+                        "CLAP port reconfiguration failed for '{}': {}",
+                        instance.processor.name(),
+                        e
+                    );
+                }
+                Ok(false) => {}
+            }
+        }
+        #[cfg(feature = "plugins")]
         for runtime in self.rt.clip_plugin_tracks.values() {
             for instance in &runtime.clap_plugins {
                 instance.processor.run_host_callbacks_main_thread();
