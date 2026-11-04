@@ -1,6 +1,6 @@
 [package]
 name = "maolan-engine"
-version = "0.4.20"
+version = "0.4.21"
 edition = "2024"
 description = "Audio engine for the Maolan DAW with audio/MIDI tracks, routing, export, and out-of-process CLAP/VST3/LV2 plugin support"
 license = "BSD-2-Clause"
@@ -24,7 +24,7 @@ tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 midly = { version = "0.5.3", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-maolan-plugin-protocol = { version = "0.0.20", optional = true }
+maolan-plugin-protocol = { version = "0.0.21", optional = true }
 uuid = { version = "1.29.0", features = ["v4"] }
 fearless_simd = { version = "1.2.0", features = ["force_support_fallback"] }
 fearless_simd_macros = "0.1"
