@@ -1880,6 +1880,12 @@ impl TrackData {
         Ok(())
     }
 
+    fn plugin_process_order_into(&self, order: &mut Vec<(PluginKind, usize)>) {
+        if order.is_empty() {
+            *order = self.plugin_process_order();
+        }
+    }
+
     pub(crate) fn plugin_process_order(&self) -> Vec<(PluginKind, usize)> {
         let mut entries: Vec<(PluginGraphNode, PluginKind, usize)> = Vec::new();
         for (idx, instance) in self.clap_plugins.iter().enumerate() {
@@ -2557,13 +2563,13 @@ impl TrackData {
         nodes.into_iter().collect()
     }
 
-    fn plugin_output_keys(&self) -> HashSet<usize> {
-        let mut keys = HashSet::new();
+    fn plugin_output_keys_into(&self, keys: &mut HashSet<usize>) {
+        keys.clear();
         for instance in &self.clap_plugins {
             keys.extend(
                 instance
                     .processor
-                    .audio_outputs()
+                    .audio_outputs_snapshot()
                     .iter()
                     .map(|port| Arc::as_ptr(port) as usize),
             );
@@ -2597,74 +2603,50 @@ impl TrackData {
                     .map(|port| Arc::as_ptr(port) as usize),
             );
         }
-        keys
     }
 
-    fn zero_plugin_output_buffers(&self, frames: usize) -> Vec<(usize, Vec<f32>)> {
-        let mut buffers = Vec::new();
-        for instance in &self.clap_plugins {
-            buffers.extend(
-                instance
-                    .processor
-                    .audio_outputs()
-                    .iter()
-                    .map(|port| (Arc::as_ptr(port) as usize, vec![0.0; frames])),
-            );
+    fn zero_plugin_output_buffers_into(
+        frames: usize,
+        output_keys: &HashSet<usize>,
+        ready_outputs: &HashSet<usize>,
+        output_buffers: &mut HashMap<usize, Vec<f32>>,
+    ) {
+        for &key in output_keys {
+            let buffer = output_buffers.entry(key).or_default();
+            if !ready_outputs.contains(&key) {
+                buffer.clear();
+            }
+            buffer.resize(frames, 0.0);
         }
-        for instance in &self.vst3_plugins {
-            buffers.extend(
-                instance
-                    .processor
-                    .audio_outputs()
-                    .iter()
-                    .map(|port| (Arc::as_ptr(port) as usize, vec![0.0; frames])),
-            );
-        }
-        #[cfg(target_os = "macos")]
-        for instance in &self.au_plugins {
-            buffers.extend(
-                instance
-                    .processor
-                    .audio_outputs()
-                    .iter()
-                    .map(|port| (Arc::as_ptr(port) as usize, vec![0.0; frames])),
-            );
-        }
-        #[cfg(unix)]
-        for instance in &self.lv2_plugins {
-            buffers.extend(
-                instance
-                    .processor
-                    .audio_outputs()
-                    .iter()
-                    .map(|port| (Arc::as_ptr(port) as usize, vec![0.0; frames])),
-            );
-        }
-        buffers
     }
 
     fn graph_audio_inputs_ready(
         input_ports: &[Arc<AudioIO>],
         plugin_output_keys: &HashSet<usize>,
-        output_buffers: &HashMap<usize, Vec<f32>>,
+        ready_outputs: &HashSet<usize>,
     ) -> bool {
-        input_ports.iter().all(|input| {
-            input.connections().iter().all(|source| {
+        let mut ready = true;
+        for input in input_ports {
+            input.visit_connections(|source| {
                 let key = Arc::as_ptr(source) as usize;
-                !plugin_output_keys.contains(&key) || output_buffers.contains_key(&key)
-            })
-        })
+                if plugin_output_keys.contains(&key) && !ready_outputs.contains(&key) {
+                    ready = false;
+                }
+            });
+            if !ready {
+                return false;
+            }
+        }
+        true
     }
 
     fn source_slice_for_graph_key<'a>(
-        &'a self,
+        audio_inputs: &[Arc<AudioIO>],
         key: usize,
         track_inputs: &'a [&mut [f32]],
         output_buffers: &'a HashMap<usize, Vec<f32>>,
     ) -> Option<&'a [f32]> {
-        if let Some((idx, _)) = self
-            .audio
-            .ins
+        if let Some((idx, _)) = audio_inputs
             .iter()
             .enumerate()
             .find(|(_, input)| Arc::as_ptr(input) as usize == key)
@@ -2674,62 +2656,63 @@ impl TrackData {
         output_buffers.get(&key).map(Vec::as_slice)
     }
 
-    fn plugin_graph_source_latencies(&self) -> HashMap<usize, usize> {
-        self.audio
-            .ins
-            .iter()
-            .map(|input| (Arc::as_ptr(input) as usize, 0))
-            .collect()
-    }
-
     fn plugin_node_input_latency(
         &self,
         node: &PluginGraphNode,
         source_latencies: &HashMap<usize, usize>,
     ) -> usize {
-        self.plugin_audio_input_ports_for_node(node)
-            .iter()
-            .flat_map(|input| input.connections().iter().cloned().collect::<Vec<_>>())
-            .map(|source| {
-                source_latencies
-                    .get(&(Arc::as_ptr(&source) as usize))
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn plugin_audio_input_ports_for_node(&self, node: &PluginGraphNode) -> Vec<Arc<AudioIO>> {
+        let mut max_latency = 0;
+        let mut visit_ports = |ports: &[Arc<AudioIO>]| {
+            for input in ports {
+                input.visit_connections(|source| {
+                    let key = Arc::as_ptr(source) as usize;
+                    max_latency = max_latency.max(source_latencies.get(&key).copied().unwrap_or(0));
+                });
+            }
+        };
         match node {
-            PluginGraphNode::ClapPluginInstance(instance_id) => self
-                .clap_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_inputs().to_vec())
-                .unwrap_or_default(),
-            PluginGraphNode::Vst3PluginInstance(instance_id) => self
-                .vst3_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_inputs().to_vec())
-                .unwrap_or_default(),
+            PluginGraphNode::ClapPluginInstance(instance_id) => {
+                if let Some(instance) = self
+                    .clap_plugins
+                    .iter()
+                    .find(|instance| instance.id == *instance_id)
+                {
+                    let ports = instance.processor.audio_inputs_snapshot();
+                    visit_ports(&ports);
+                }
+            }
+            PluginGraphNode::Vst3PluginInstance(instance_id) => {
+                if let Some(instance) = self
+                    .vst3_plugins
+                    .iter()
+                    .find(|instance| instance.id == *instance_id)
+                {
+                    visit_ports(instance.processor.audio_inputs());
+                }
+            }
             #[cfg(target_os = "macos")]
-            PluginGraphNode::AuPluginInstance(instance_id) => self
-                .au_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_inputs().to_vec())
-                .unwrap_or_default(),
+            PluginGraphNode::AuPluginInstance(instance_id) => {
+                if let Some(instance) = self
+                    .au_plugins
+                    .iter()
+                    .find(|instance| instance.id == *instance_id)
+                {
+                    visit_ports(instance.processor.audio_inputs());
+                }
+            }
             #[cfg(unix)]
-            PluginGraphNode::Lv2PluginInstance(instance_id) => self
-                .lv2_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_inputs().to_vec())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+            PluginGraphNode::Lv2PluginInstance(instance_id) => {
+                if let Some(instance) = self
+                    .lv2_plugins
+                    .iter()
+                    .find(|instance| instance.id == *instance_id)
+                {
+                    visit_ports(instance.processor.audio_inputs());
+                }
+            }
+            _ => {}
         }
+        max_latency
     }
 
     pub(crate) fn plugin_latency_samples(&self, kind: PluginKind, index: usize) -> usize {
@@ -2786,121 +2769,45 @@ impl TrackData {
         clap_changed || vst3_changed || lv2_changed || au_changed
     }
 
-    pub(crate) fn plugin_graph_latency_samples(&self) -> usize {
-        let source_latencies = self.current_plugin_graph_source_latencies();
-        self.audio
-            .outs
+    pub(crate) fn output_latency_from_plan(&self, plan: &crate::render_plan::RenderPlan) -> usize {
+        self.rt
+            .internal_output_routes_cache
             .iter()
-            .flat_map(|output| output.connections().iter().cloned().collect::<Vec<_>>())
-            .map(|source| {
-                source_latencies
-                    .get(&(Arc::as_ptr(&source) as usize))
-                    .copied()
-                    .unwrap_or(0)
-            })
+            .flatten()
+            .filter_map(|source| plan.port_map.get(&(Arc::as_ptr(source) as usize)))
+            .map(|&buffer| plan.buffer_latency(buffer))
             .max()
             .unwrap_or(0)
     }
 
-    pub(crate) fn current_plugin_graph_source_latencies(&self) -> HashMap<usize, usize> {
-        let mut source_latencies = self.plugin_graph_source_latencies();
-        for (kind, index) in self.plugin_process_order() {
-            let node = match kind {
-                PluginKind::Clap => self
-                    .clap_plugins
-                    .get(index)
-                    .map(|instance| PluginGraphNode::ClapPluginInstance(instance.id)),
-                PluginKind::Vst3 => self
-                    .vst3_plugins
-                    .get(index)
-                    .map(|instance| PluginGraphNode::Vst3PluginInstance(instance.id)),
-                #[cfg(target_os = "macos")]
-                PluginKind::Au => self
-                    .au_plugins
-                    .get(index)
-                    .map(|instance| PluginGraphNode::AuPluginInstance(instance.id)),
-                #[cfg(unix)]
-                PluginKind::Lv2 => self
-                    .lv2_plugins
-                    .get(index)
-                    .map(|instance| PluginGraphNode::Lv2PluginInstance(instance.id)),
-            };
-            let Some(node) = node else {
-                continue;
-            };
-            let latency = self
-                .plugin_node_input_latency(&node, &source_latencies)
-                .saturating_add(self.plugin_latency_samples(kind, index));
-            for output in self.plugin_audio_output_ports_for_node(&node) {
-                source_latencies.insert(Arc::as_ptr(&output) as usize, latency);
-            }
-        }
-        source_latencies
-    }
-
-    fn plugin_audio_output_ports_for_node(&self, node: &PluginGraphNode) -> Vec<Arc<AudioIO>> {
-        match node {
-            PluginGraphNode::ClapPluginInstance(instance_id) => self
-                .clap_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_outputs().to_vec())
-                .unwrap_or_default(),
-            PluginGraphNode::Vst3PluginInstance(instance_id) => self
-                .vst3_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_outputs().to_vec())
-                .unwrap_or_default(),
-            #[cfg(target_os = "macos")]
-            PluginGraphNode::AuPluginInstance(instance_id) => self
-                .au_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_outputs().to_vec())
-                .unwrap_or_default(),
-            #[cfg(unix)]
-            PluginGraphNode::Lv2PluginInstance(instance_id) => self
-                .lv2_plugins
-                .iter()
-                .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.audio_outputs().to_vec())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn sum_graph_audio_inputs(
+    fn sum_graph_audio_inputs_into(
         &mut self,
         input_ports: &[Arc<AudioIO>],
         frames: usize,
         track_inputs: &[&mut [f32]],
         output_buffers: &HashMap<usize, Vec<f32>>,
         source_latencies: &HashMap<usize, usize>,
-    ) -> Vec<Vec<f32>> {
-        input_ports
-            .iter()
-            .map(|input| {
-                let mut dst = vec![0.0; frames];
-                let sources = input.connections();
-                let max_latency = sources
-                    .iter()
-                    .map(|source| {
-                        source_latencies
-                            .get(&(Arc::as_ptr(source) as usize))
-                            .copied()
-                            .unwrap_or(0)
-                    })
-                    .max()
-                    .unwrap_or(0);
-                for (source_idx, source) in sources.iter().enumerate() {
-                    let key = Arc::as_ptr(source) as usize;
-                    let Some(src) =
-                        self.source_slice_for_graph_key(key, track_inputs, output_buffers)
-                    else {
-                        continue;
-                    };
-                    let src = src.to_vec();
+        input_buffers: &mut Vec<Vec<f32>>,
+    ) {
+        input_buffers.resize_with(input_ports.len(), Vec::new);
+        for (input, dst) in input_ports.iter().zip(input_buffers.iter_mut()) {
+            dst.clear();
+            dst.resize(frames, 0.0);
+            let mut max_latency = 0;
+            input.visit_connections(|source| {
+                let key = Arc::as_ptr(source) as usize;
+                max_latency = max_latency.max(source_latencies.get(&key).copied().unwrap_or(0));
+            });
+            let mut source_idx = 0;
+            input.visit_connections(|source| {
+                let key = Arc::as_ptr(source) as usize;
+                let src = Self::source_slice_for_graph_key(
+                    &self.audio.ins,
+                    key,
+                    track_inputs,
+                    output_buffers,
+                );
+                if let Some(src) = src {
                     let latency = source_latencies.get(&key).copied().unwrap_or(0);
                     let delay = max_latency.saturating_sub(latency);
                     let line = self
@@ -2908,346 +2815,413 @@ impl TrackData {
                         .plugin_delay_lines
                         .entry((Arc::as_ptr(input) as usize, source_idx))
                         .or_default();
-                    line.process(&src, delay, &mut dst, source_idx != 0);
+                    line.process(src, delay, dst, source_idx != 0);
                 }
-                dst
-            })
-            .collect()
+                source_idx += 1;
+            });
+        }
     }
 
     pub(crate) fn process_track_plugins_in_graph_order_with_audio_buffers(
         &mut self,
         frames: usize,
         track_inputs: &[&mut [f32]],
-    ) -> Vec<(usize, Vec<f32>)> {
+        scratch: &mut PluginGraphScratch,
+    ) {
         self.apply_transport_sample_snapshot();
-        let track_input_events = self.rt.folder_input_midi_events.clone();
-        let order = self.plugin_process_order();
-        let mut processed = HashSet::<(PluginKind, usize)>::new();
-        let mut output_buffers = HashMap::<usize, Vec<f32>>::new();
-        let mut source_latencies = self.plugin_graph_source_latencies();
-        let plugin_output_keys = self.plugin_output_keys();
+        let mut order = std::mem::take(&mut scratch.order);
+        self.plugin_process_order_into(&mut order);
+        let mut processed = std::mem::take(&mut scratch.processed);
+        processed.clear();
+        let mut output_buffers = std::mem::take(&mut scratch.output_buffers);
+        let mut source_latencies = std::mem::take(&mut scratch.source_latencies);
+        source_latencies.clear();
+        source_latencies.extend(
+            self.audio
+                .ins
+                .iter()
+                .map(|input| (Arc::as_ptr(input) as usize, 0)),
+        );
+        let mut plugin_output_keys = std::mem::take(&mut scratch.output_keys);
+        self.plugin_output_keys_into(&mut plugin_output_keys);
+        output_buffers.retain(|key, _| plugin_output_keys.contains(key));
+        let mut ready_outputs = std::mem::take(&mut scratch.ready_outputs);
+        ready_outputs.clear();
         self.rt.folder_processed_midi_plugins.clear();
         self.rt.folder_plugin_midi_node_events.clear();
         self.rt.echoed_parameter_updates.clear();
-        let track_name = self.name.clone();
 
         let can_skip_plugins = !self.is_realtime_domain()
             && self.rt.last_render_block_silent
-            && track_input_events.is_empty()
+            && self.rt.folder_input_midi_events.is_empty()
             && track_inputs
                 .iter()
                 .all(|input| input.iter().all(|&sample| sample == 0.0));
-        if can_skip_plugins {
-            return self.zero_plugin_output_buffers(frames);
+        if !can_skip_plugins {
+            while processed.len() < order.len() {
+                let mut progressed = false;
+                for &(kind, idx) in &order {
+                    if processed.contains(&(kind, idx)) {
+                        continue;
+                    }
+                    match kind {
+                        PluginKind::Clap => {
+                            let processor = self.clap_plugins[idx].processor.clone();
+                            let input_ports = processor.audio_inputs_snapshot();
+                            if !Self::graph_audio_inputs_ready(
+                                &input_ports,
+                                &plugin_output_keys,
+                                &ready_outputs,
+                            ) {
+                                continue;
+                            }
+                            let node =
+                                PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
+                            self.plugin_midi_input_events(
+                                &node,
+                                processor.midi_input_count(),
+                                &self.rt.folder_input_midi_events,
+                                &self.rt.folder_plugin_midi_node_events,
+                            );
+                            scratch.input_slices.clear();
+                            self.sum_graph_audio_inputs_into(
+                                &input_ports,
+                                frames,
+                                track_inputs,
+                                &output_buffers,
+                                &source_latencies,
+                                &mut scratch.input_buffers,
+                            );
+                            scratch
+                                .input_slices
+                                .extend(scratch.input_buffers.iter().map(|buffer| unsafe {
+                                    std::slice::from_raw_parts(buffer.as_ptr(), buffer.len())
+                                }));
+                            scratch.output_ptrs.clear();
+                            scratch.output_slices.clear();
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                let buffer = output_buffers.entry(key).or_default();
+                                buffer.clear();
+                                buffer.resize(frames, 0.0);
+                                scratch.output_ptrs.push(buffer);
+                            }
+                            scratch.output_slices.extend(
+                                scratch
+                                    .output_ptrs
+                                    .iter()
+                                    .map(|ptr| unsafe { (&mut **ptr).as_mut_slice() }),
+                            );
+                            let midi_outputs = processor.process_with_audio_buffers(
+                                frames,
+                                &[],
+                                crate::plugins::types::ClapTransportInfo {
+                                    transport_sample: self.rt.transport_sample,
+                                    playing: (self.disk_monitor().iter().any(|&m| m)
+                                        || self.midi_disk_monitor().iter().any(|&m| m))
+                                        && self.rt.clip_playback_enabled,
+                                    loop_enabled: self.rt.loop_enabled,
+                                    loop_range_samples: self.rt.loop_range_samples,
+                                    bpm: self.rt.tempo_bpm,
+                                    tsig_num: self.rt.tsig_num,
+                                    tsig_denom: self.rt.tsig_denom,
+                                },
+                                &scratch.input_slices,
+                                &mut scratch.output_slices,
+                            );
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                ready_outputs.insert(key);
+                                source_latencies.insert(
+                                    key,
+                                    self.plugin_node_input_latency(&node, &source_latencies)
+                                        .saturating_add(processor.latency_samples()),
+                                );
+                            }
+                            for ev in processor.drain_echoed_parameters() {
+                                self.rt.echoed_parameter_updates.push(
+                                    crate::message::Action::TrackSetClapParameter {
+                                        track_name: self.name.clone(),
+                                        instance_id: self.clap_plugins[idx].id,
+                                        param_id: ev.param_index,
+                                        value: ev.value as f64,
+                                    },
+                                );
+                            }
+                            for evt in midi_outputs {
+                                self.rt
+                                    .folder_plugin_midi_node_events
+                                    .entry((node.clone(), evt.port))
+                                    .or_default()
+                                    .push(evt.event);
+                            }
+                            self.rt.folder_processed_midi_plugins.insert(node);
+                        }
+                        PluginKind::Vst3 => {
+                            let processor = self.vst3_plugins[idx].processor.clone();
+                            let input_ports = processor.audio_inputs_snapshot();
+                            if !Self::graph_audio_inputs_ready(
+                                input_ports,
+                                &plugin_output_keys,
+                                &ready_outputs,
+                            ) {
+                                continue;
+                            }
+                            let node =
+                                PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
+                            self.plugin_midi_input_events(
+                                &node,
+                                processor.midi_input_count(),
+                                &self.rt.folder_input_midi_events,
+                                &self.rt.folder_plugin_midi_node_events,
+                            );
+                            scratch.input_slices.clear();
+                            self.sum_graph_audio_inputs_into(
+                                input_ports,
+                                frames,
+                                track_inputs,
+                                &output_buffers,
+                                &source_latencies,
+                                &mut scratch.input_buffers,
+                            );
+                            scratch
+                                .input_slices
+                                .extend(scratch.input_buffers.iter().map(|buffer| unsafe {
+                                    std::slice::from_raw_parts(buffer.as_ptr(), buffer.len())
+                                }));
+                            scratch.output_ptrs.clear();
+                            scratch.output_slices.clear();
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                let buffer = output_buffers.entry(key).or_default();
+                                buffer.clear();
+                                buffer.resize(frames, 0.0);
+                                scratch.output_ptrs.push(buffer);
+                            }
+                            scratch.output_slices.extend(
+                                scratch
+                                    .output_ptrs
+                                    .iter()
+                                    .map(|ptr| unsafe { (&mut **ptr).as_mut_slice() }),
+                            );
+                            let midi_outputs = processor.process_with_audio_buffers(
+                                frames,
+                                &scratch.input_slices,
+                                &mut scratch.output_slices,
+                            );
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                ready_outputs.insert(key);
+                                source_latencies.insert(
+                                    key,
+                                    self.plugin_node_input_latency(&node, &source_latencies)
+                                        .saturating_add(processor.latency_samples()),
+                                );
+                            }
+                            for ev in processor.drain_echoed_parameters() {
+                                self.rt.echoed_parameter_updates.push(
+                                    crate::message::Action::TrackSetVst3Parameter {
+                                        track_name: self.name.clone(),
+                                        instance_id: self.vst3_plugins[idx].id,
+                                        param_id: ev.param_index,
+                                        value: ev.value,
+                                    },
+                                );
+                            }
+                            if !midi_outputs.is_empty() {
+                                self.rt
+                                    .folder_plugin_midi_node_events
+                                    .insert((node.clone(), 0), midi_outputs);
+                            }
+                            self.rt.folder_processed_midi_plugins.insert(node);
+                        }
+                        #[cfg(target_os = "macos")]
+                        PluginKind::Au => {
+                            let processor = self.au_plugins[idx].processor.clone();
+                            let input_ports = processor.audio_inputs_snapshot();
+                            if !Self::graph_audio_inputs_ready(
+                                input_ports,
+                                &plugin_output_keys,
+                                &ready_outputs,
+                            ) {
+                                continue;
+                            }
+                            let node = PluginGraphNode::AuPluginInstance(self.au_plugins[idx].id);
+                            self.plugin_midi_input_events(
+                                &node,
+                                processor.midi_input_count(),
+                                &self.rt.folder_input_midi_events,
+                                &self.rt.folder_plugin_midi_node_events,
+                            );
+                            scratch.input_slices.clear();
+                            self.sum_graph_audio_inputs_into(
+                                input_ports,
+                                frames,
+                                track_inputs,
+                                &output_buffers,
+                                &source_latencies,
+                                &mut scratch.input_buffers,
+                            );
+                            scratch
+                                .input_slices
+                                .extend(scratch.input_buffers.iter().map(|buffer| unsafe {
+                                    std::slice::from_raw_parts(buffer.as_ptr(), buffer.len())
+                                }));
+                            scratch.output_ptrs.clear();
+                            scratch.output_slices.clear();
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                let buffer = output_buffers.entry(key).or_default();
+                                buffer.clear();
+                                buffer.resize(frames, 0.0);
+                                scratch.output_ptrs.push(buffer);
+                            }
+                            scratch.output_slices.extend(
+                                scratch
+                                    .output_ptrs
+                                    .iter()
+                                    .map(|ptr| unsafe { (&mut **ptr).as_mut_slice() }),
+                            );
+                            let midi_outputs = processor.process_with_audio_buffers(
+                                frames,
+                                &scratch.input_slices,
+                                &mut scratch.output_slices,
+                            );
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                ready_outputs.insert(key);
+                                source_latencies.insert(
+                                    key,
+                                    self.plugin_node_input_latency(&node, &source_latencies)
+                                        .saturating_add(processor.latency_samples()),
+                                );
+                            }
+                            for ev in processor.drain_echoed_parameters() {
+                                self.rt.echoed_parameter_updates.push(
+                                    crate::message::Action::TrackSetAuParameter {
+                                        track_name: self.name.clone(),
+                                        instance_id: self.au_plugins[idx].id,
+                                        param_index: ev.param_index,
+                                        value: ev.value,
+                                    },
+                                );
+                            }
+                            if !midi_outputs.is_empty() {
+                                self.rt
+                                    .folder_plugin_midi_node_events
+                                    .insert((node.clone(), 0), midi_outputs);
+                            }
+                            self.rt.folder_processed_midi_plugins.insert(node);
+                        }
+                        #[cfg(unix)]
+                        PluginKind::Lv2 => {
+                            let processor = self.lv2_plugins[idx].processor.clone();
+                            let input_ports = processor.audio_inputs_snapshot();
+                            if !Self::graph_audio_inputs_ready(
+                                input_ports,
+                                &plugin_output_keys,
+                                &ready_outputs,
+                            ) {
+                                continue;
+                            }
+                            let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
+                            self.plugin_midi_input_events(
+                                &node,
+                                processor.midi_input_count(),
+                                &self.rt.folder_input_midi_events,
+                                &self.rt.folder_plugin_midi_node_events,
+                            );
+                            scratch.input_slices.clear();
+                            self.sum_graph_audio_inputs_into(
+                                input_ports,
+                                frames,
+                                track_inputs,
+                                &output_buffers,
+                                &source_latencies,
+                                &mut scratch.input_buffers,
+                            );
+                            scratch
+                                .input_slices
+                                .extend(scratch.input_buffers.iter().map(|buffer| unsafe {
+                                    std::slice::from_raw_parts(buffer.as_ptr(), buffer.len())
+                                }));
+                            scratch.output_ptrs.clear();
+                            scratch.output_slices.clear();
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                let buffer = output_buffers.entry(key).or_default();
+                                buffer.clear();
+                                buffer.resize(frames, 0.0);
+                                scratch.output_ptrs.push(buffer);
+                            }
+                            scratch.output_slices.extend(
+                                scratch
+                                    .output_ptrs
+                                    .iter()
+                                    .map(|ptr| unsafe { (&mut **ptr).as_mut_slice() }),
+                            );
+                            let midi_outputs = processor.process_with_audio_buffers(
+                                frames,
+                                crate::plugins::types::Lv2TransportInfo {
+                                    transport_sample: self.rt.transport_sample,
+                                    playing: (self.disk_monitor().iter().any(|&m| m)
+                                        || self.midi_disk_monitor().iter().any(|&m| m))
+                                        && self.rt.clip_playback_enabled,
+                                    bpm: self.rt.tempo_bpm,
+                                    tsig_num: self.rt.tsig_num,
+                                    tsig_denom: self.rt.tsig_denom,
+                                },
+                                &scratch.input_slices,
+                                &mut scratch.output_slices,
+                            );
+                            for port in processor.audio_outputs_snapshot().iter() {
+                                let key = Arc::as_ptr(port) as usize;
+                                ready_outputs.insert(key);
+                                source_latencies.insert(
+                                    key,
+                                    self.plugin_node_input_latency(&node, &source_latencies)
+                                        .saturating_add(processor.latency_samples()),
+                                );
+                            }
+                            for ev in processor.drain_echoed_parameters() {
+                                self.rt.echoed_parameter_updates.push(
+                                    crate::message::Action::TrackSetLv2ControlValue {
+                                        track_name: self.name.clone(),
+                                        instance_id: self.lv2_plugins[idx].id,
+                                        index: ev.param_index,
+                                        value: ev.value,
+                                    },
+                                );
+                            }
+                            if !midi_outputs.is_empty() {
+                                self.rt
+                                    .folder_plugin_midi_node_events
+                                    .insert((node.clone(), 0), midi_outputs);
+                            }
+                            self.rt.folder_processed_midi_plugins.insert(node);
+                        }
+                    }
+                    processed.insert((kind, idx));
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
+            }
         }
 
-        while processed.len() < order.len() {
-            let mut progressed = false;
-            for &(kind, idx) in &order {
-                if processed.contains(&(kind, idx)) {
-                    continue;
-                }
-                match kind {
-                    PluginKind::Clap => {
-                        let processor = self.clap_plugins[idx].processor.clone();
-                        let input_ports = processor.audio_inputs();
-                        if !Self::graph_audio_inputs_ready(
-                            &input_ports,
-                            &plugin_output_keys,
-                            &output_buffers,
-                        ) {
-                            continue;
-                        }
-                        let node = PluginGraphNode::ClapPluginInstance(self.clap_plugins[idx].id);
-                        self.plugin_midi_input_events(
-                            &node,
-                            processor.midi_input_count(),
-                            &track_input_events,
-                            &self.rt.folder_plugin_midi_node_events,
-                        );
-                        let input_buffers = self.sum_graph_audio_inputs(
-                            &input_ports,
-                            frames,
-                            track_inputs,
-                            &output_buffers,
-                            &source_latencies,
-                        );
-                        let mut output_buffers_for_plugin =
-                            vec![vec![0.0; frames]; processor.audio_outputs().len()];
-                        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                        let mut outputs = output_buffers_for_plugin
-                            .iter_mut()
-                            .map(Vec::as_mut_slice)
-                            .collect::<Vec<_>>();
-                        let midi_outputs = processor.process_with_audio_buffers(
-                            frames,
-                            &[],
-                            crate::plugins::types::ClapTransportInfo {
-                                transport_sample: self.rt.transport_sample,
-                                playing: (self.disk_monitor().iter().any(|&m| m)
-                                    || self.midi_disk_monitor().iter().any(|&m| m))
-                                    && self.rt.clip_playback_enabled,
-                                loop_enabled: self.rt.loop_enabled,
-                                loop_range_samples: self.rt.loop_range_samples,
-                                bpm: self.rt.tempo_bpm,
-                                tsig_num: self.rt.tsig_num,
-                                tsig_denom: self.rt.tsig_denom,
-                            },
-                            &inputs,
-                            &mut outputs,
-                        );
-                        for (port, buffer) in processor
-                            .audio_outputs()
-                            .iter()
-                            .zip(output_buffers_for_plugin)
-                        {
-                            let key = Arc::as_ptr(port) as usize;
-                            output_buffers.insert(key, buffer);
-                            source_latencies.insert(
-                                key,
-                                self.plugin_node_input_latency(&node, &source_latencies)
-                                    .saturating_add(processor.latency_samples()),
-                            );
-                        }
-                        for ev in processor.drain_echoed_parameters() {
-                            self.rt.echoed_parameter_updates.push(
-                                crate::message::Action::TrackSetClapParameter {
-                                    track_name: track_name.clone(),
-                                    instance_id: self.clap_plugins[idx].id,
-                                    param_id: ev.param_index,
-                                    value: ev.value as f64,
-                                },
-                            );
-                        }
-                        for evt in midi_outputs {
-                            self.rt
-                                .folder_plugin_midi_node_events
-                                .entry((node.clone(), evt.port))
-                                .or_default()
-                                .push(evt.event);
-                        }
-                        self.rt.folder_processed_midi_plugins.insert(node);
-                    }
-                    PluginKind::Vst3 => {
-                        let processor = self.vst3_plugins[idx].processor.clone();
-                        let input_ports = processor.audio_inputs();
-                        if !Self::graph_audio_inputs_ready(
-                            input_ports,
-                            &plugin_output_keys,
-                            &output_buffers,
-                        ) {
-                            continue;
-                        }
-                        let node = PluginGraphNode::Vst3PluginInstance(self.vst3_plugins[idx].id);
-                        let midi_inputs = self.plugin_midi_input_events(
-                            &node,
-                            processor.midi_input_count(),
-                            &track_input_events,
-                            &self.rt.folder_plugin_midi_node_events,
-                        );
-                        let _vst3_input = midi_inputs.first().cloned().unwrap_or_default();
-                        let input_buffers = self.sum_graph_audio_inputs(
-                            input_ports,
-                            frames,
-                            track_inputs,
-                            &output_buffers,
-                            &source_latencies,
-                        );
-                        let mut output_buffers_for_plugin =
-                            vec![vec![0.0; frames]; processor.audio_outputs().len()];
-                        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                        let mut outputs = output_buffers_for_plugin
-                            .iter_mut()
-                            .map(Vec::as_mut_slice)
-                            .collect::<Vec<_>>();
-                        let midi_outputs =
-                            processor.process_with_audio_buffers(frames, &inputs, &mut outputs);
-                        for (port, buffer) in processor
-                            .audio_outputs()
-                            .iter()
-                            .zip(output_buffers_for_plugin)
-                        {
-                            let key = Arc::as_ptr(port) as usize;
-                            output_buffers.insert(key, buffer);
-                            source_latencies.insert(
-                                key,
-                                self.plugin_node_input_latency(&node, &source_latencies)
-                                    .saturating_add(processor.latency_samples()),
-                            );
-                        }
-                        for ev in processor.drain_echoed_parameters() {
-                            self.rt.echoed_parameter_updates.push(
-                                crate::message::Action::TrackSetVst3Parameter {
-                                    track_name: track_name.clone(),
-                                    instance_id: self.vst3_plugins[idx].id,
-                                    param_id: ev.param_index,
-                                    value: ev.value,
-                                },
-                            );
-                        }
-                        if !midi_outputs.is_empty() {
-                            self.rt
-                                .folder_plugin_midi_node_events
-                                .insert((node.clone(), 0), midi_outputs);
-                        }
-                        self.rt.folder_processed_midi_plugins.insert(node);
-                    }
-                    #[cfg(target_os = "macos")]
-                    PluginKind::Au => {
-                        let processor = self.au_plugins[idx].processor.clone();
-                        let input_ports = processor.audio_inputs();
-                        if !Self::graph_audio_inputs_ready(
-                            input_ports,
-                            &plugin_output_keys,
-                            &output_buffers,
-                        ) {
-                            continue;
-                        }
-                        let node = PluginGraphNode::AuPluginInstance(self.au_plugins[idx].id);
-                        let midi_inputs = self.plugin_midi_input_events(
-                            &node,
-                            processor.midi_input_count(),
-                            &track_input_events,
-                            &self.rt.folder_plugin_midi_node_events,
-                        );
-                        let _au_input = midi_inputs.first().cloned().unwrap_or_default();
-                        let input_buffers = self.sum_graph_audio_inputs(
-                            input_ports,
-                            frames,
-                            track_inputs,
-                            &output_buffers,
-                            &source_latencies,
-                        );
-                        let mut output_buffers_for_plugin =
-                            vec![vec![0.0; frames]; processor.audio_outputs().len()];
-                        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                        let mut outputs = output_buffers_for_plugin
-                            .iter_mut()
-                            .map(Vec::as_mut_slice)
-                            .collect::<Vec<_>>();
-                        let midi_outputs =
-                            processor.process_with_audio_buffers(frames, &inputs, &mut outputs);
-                        for (port, buffer) in processor
-                            .audio_outputs()
-                            .iter()
-                            .zip(output_buffers_for_plugin)
-                        {
-                            let key = Arc::as_ptr(port) as usize;
-                            output_buffers.insert(key, buffer);
-                            source_latencies.insert(
-                                key,
-                                self.plugin_node_input_latency(&node, &source_latencies)
-                                    .saturating_add(processor.latency_samples()),
-                            );
-                        }
-                        for ev in processor.drain_echoed_parameters() {
-                            self.rt.echoed_parameter_updates.push(
-                                crate::message::Action::TrackSetAuParameter {
-                                    track_name: track_name.clone(),
-                                    instance_id: self.au_plugins[idx].id,
-                                    param_index: ev.param_index,
-                                    value: ev.value,
-                                },
-                            );
-                        }
-                        if !midi_outputs.is_empty() {
-                            self.rt
-                                .folder_plugin_midi_node_events
-                                .insert((node.clone(), 0), midi_outputs);
-                        }
-                        self.rt.folder_processed_midi_plugins.insert(node);
-                    }
-                    #[cfg(unix)]
-                    PluginKind::Lv2 => {
-                        let processor = self.lv2_plugins[idx].processor.clone();
-                        let input_ports = processor.audio_inputs();
-                        if !Self::graph_audio_inputs_ready(
-                            input_ports,
-                            &plugin_output_keys,
-                            &output_buffers,
-                        ) {
-                            continue;
-                        }
-                        let node = PluginGraphNode::Lv2PluginInstance(self.lv2_plugins[idx].id);
-                        let midi_inputs = self.plugin_midi_input_events(
-                            &node,
-                            processor.midi_input_count(),
-                            &track_input_events,
-                            &self.rt.folder_plugin_midi_node_events,
-                        );
-                        let _lv2_input = midi_inputs.first().cloned().unwrap_or_default();
-                        let input_buffers = self.sum_graph_audio_inputs(
-                            input_ports,
-                            frames,
-                            track_inputs,
-                            &output_buffers,
-                            &source_latencies,
-                        );
-                        let mut output_buffers_for_plugin =
-                            vec![vec![0.0; frames]; processor.audio_outputs().len()];
-                        let inputs = input_buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                        let mut outputs = output_buffers_for_plugin
-                            .iter_mut()
-                            .map(Vec::as_mut_slice)
-                            .collect::<Vec<_>>();
-                        let midi_outputs = processor.process_with_audio_buffers(
-                            frames,
-                            crate::plugins::types::Lv2TransportInfo {
-                                transport_sample: self.rt.transport_sample,
-                                playing: (self.disk_monitor().iter().any(|&m| m)
-                                    || self.midi_disk_monitor().iter().any(|&m| m))
-                                    && self.rt.clip_playback_enabled,
-                                bpm: self.rt.tempo_bpm,
-                                tsig_num: self.rt.tsig_num,
-                                tsig_denom: self.rt.tsig_denom,
-                            },
-                            &inputs,
-                            &mut outputs,
-                        );
-                        for (port, buffer) in processor
-                            .audio_outputs()
-                            .iter()
-                            .zip(output_buffers_for_plugin)
-                        {
-                            let key = Arc::as_ptr(port) as usize;
-                            output_buffers.insert(key, buffer);
-                            source_latencies.insert(
-                                key,
-                                self.plugin_node_input_latency(&node, &source_latencies)
-                                    .saturating_add(processor.latency_samples()),
-                            );
-                        }
-                        for ev in processor.drain_echoed_parameters() {
-                            self.rt.echoed_parameter_updates.push(
-                                crate::message::Action::TrackSetLv2ControlValue {
-                                    track_name: track_name.clone(),
-                                    instance_id: self.lv2_plugins[idx].id,
-                                    index: ev.param_index,
-                                    value: ev.value,
-                                },
-                            );
-                        }
-                        if !midi_outputs.is_empty() {
-                            self.rt
-                                .folder_plugin_midi_node_events
-                                .insert((node.clone(), 0), midi_outputs);
-                        }
-                        self.rt.folder_processed_midi_plugins.insert(node);
-                    }
-                }
-                processed.insert((kind, idx));
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
-        }
-
-        for (key, buffer) in self.zero_plugin_output_buffers(frames) {
-            output_buffers.entry(key).or_insert(buffer);
-        }
-        output_buffers.into_iter().collect()
+        Self::zero_plugin_output_buffers_into(
+            frames,
+            &plugin_output_keys,
+            &ready_outputs,
+            &mut output_buffers,
+        );
+        scratch.order = order;
+        scratch.processed = processed;
+        scratch.output_buffers = output_buffers;
+        scratch.source_latencies = source_latencies;
+        scratch.output_keys = plugin_output_keys;
+        scratch.ready_outputs = ready_outputs;
     }
 
     pub(crate) fn plugin_midi_ready(
@@ -3279,60 +3253,42 @@ impl TrackData {
     pub(crate) fn plugin_midi_input_events(
         &self,
         node: &PluginGraphNode,
-        midi_inputs: usize,
+        _midi_inputs: usize,
         _track_input_events: &[Vec<MidiEvent>],
         _node_events: &HashMap<(PluginGraphNode, usize), Vec<MidiEvent>>,
-    ) -> Vec<Vec<MidiEvent>> {
-        let ports = self.plugin_midi_input_ports_for_node(node);
-        let mut per_port: Vec<Vec<MidiEvent>> = ports
-            .iter()
-            .map(|port| {
-                // Safety: plan single-writer invariant — this task is the sole
-                // writer of its own ports this cycle; sources it reads were
-                // produced by earlier plan nodes (LOCKLESS.md Phase 3).
-                unsafe { port.process() };
-                // Safety: as above — this task just produced the buffer.
-                unsafe { port.buffer() }.to_vec()
-            })
-            .collect();
-        if per_port.len() < midi_inputs {
-            per_port.resize_with(midi_inputs, Vec::new);
-        }
-        per_port
-    }
-
-    pub(crate) fn plugin_midi_input_ports_for_node(
-        &self,
-        node: &PluginGraphNode,
-    ) -> Vec<Arc<MIDIIO>> {
-        match node {
+    ) {
+        let ports = match node {
             PluginGraphNode::ClapPluginInstance(instance_id) => self
                 .clap_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.midi_input_ports().to_vec())
-                .unwrap_or_default(),
+                .map(|instance| instance.processor.midi_input_ports()),
             PluginGraphNode::Vst3PluginInstance(instance_id) => self
                 .vst3_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.midi_input_ports().to_vec())
-                .unwrap_or_default(),
+                .map(|instance| instance.processor.midi_input_ports()),
             #[cfg(target_os = "macos")]
             PluginGraphNode::AuPluginInstance(instance_id) => self
                 .au_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.midi_input_ports().to_vec())
-                .unwrap_or_default(),
+                .map(|instance| instance.processor.midi_input_ports()),
             #[cfg(unix)]
             PluginGraphNode::Lv2PluginInstance(instance_id) => self
                 .lv2_plugins
                 .iter()
                 .find(|instance| instance.id == *instance_id)
-                .map(|instance| instance.processor.midi_input_ports().to_vec())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+                .map(|instance| instance.processor.midi_input_ports()),
+            _ => None,
+        };
+        if let Some(ports) = ports {
+            for port in ports.iter() {
+                // Safety: plan single-writer invariant — this task is the sole
+                // writer of its own ports this cycle; sources it reads were
+                // produced by earlier plan nodes (LOCKLESS.md Phase 3).
+                unsafe { port.process() };
+            }
         }
     }
 

@@ -275,10 +275,22 @@ impl StreamingClipBuffer {
     /// decoder (decode-and-discard up to `start`, then read `len` frames)
     /// and never touches the SPSC rings, so the real-time read position and
     /// the producer are undisturbed.
+    #[cfg(all(test, feature = "audio"))]
     pub fn read_window(&self, start: usize, len: usize) -> io::Result<Vec<Vec<f32>>> {
+        let mut window = Vec::new();
+        self.read_window_into(start, len, &mut window)?;
+        Ok(window)
+    }
+
+    pub fn read_window_into(
+        &self,
+        start: usize,
+        len: usize,
+        window: &mut Vec<Vec<f32>>,
+    ) -> io::Result<()> {
         #[cfg(not(feature = "audio"))]
         {
-            let _ = (start, len);
+            let _ = (start, len, window);
             return Err(io::Error::other(
                 "audio codec support is disabled (enable the `audio` cargo feature)",
             ));
@@ -286,9 +298,13 @@ impl StreamingClipBuffer {
         #[cfg(feature = "audio")]
         {
             let channels = self.channels.max(1);
-            let mut window = vec![vec![0.0_f32; len]; channels];
+            window.resize_with(channels, Vec::new);
+            for plane in &mut *window {
+                plane.clear();
+                plane.resize(len, 0.0);
+            }
             if len == 0 {
-                return Ok(window);
+                return Ok(());
             }
             let mut decoder = StreamingDecoder::new(&self.path)?;
             let mut position = 0usize;
@@ -313,7 +329,7 @@ impl StreamingClipBuffer {
                 filled += take;
                 position += frames;
             }
-            Ok(window)
+            Ok(())
         }
     }
 

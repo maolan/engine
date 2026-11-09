@@ -83,6 +83,7 @@ pub(crate) struct SharedAudioPreview {
 
 /// Everything the dispatcher needs back from one inline cycle. Published by
 /// `render_cycle` on the cycle thread, consumed by the `HWFinished` handler.
+#[derive(Default)]
 pub(crate) struct InlineCycleOutcome {
     /// The plan that was rendered; `None` when the cycle replayed the arena
     /// without rendering (transport paused mid-stream, offline bounce
@@ -106,6 +107,7 @@ pub(crate) struct InlineCycleOutcome {
 
 struct OutcomeMailbox {
     ready: Option<InlineCycleOutcome>,
+    spare: Option<InlineCycleOutcome>,
 }
 
 /// Shared RT-inline render context. Owned by the `Engine`, cloned into the
@@ -152,7 +154,10 @@ impl InlineRender {
             cycle_plan: PlanSlot::from(plan_slot.load_full()),
             plan_slot,
             render_requested: AtomicBool::new(false),
-            mailbox: Mutex::new(OutcomeMailbox { ready: None }),
+            mailbox: Mutex::new(OutcomeMailbox {
+                ready: None,
+                spare: None,
+            }),
             midi_source: Mutex::new(None),
             midi_routes: arc_swap::ArcSwap::from_pointee(Vec::new()),
             preview: arc_swap::ArcSwap::from_pointee(None),
@@ -254,6 +259,13 @@ impl InlineRender {
         self.lock_mailbox().ready.take()
     }
 
+    pub(crate) fn recycle_outcome(&self, mut outcome: InlineCycleOutcome) {
+        outcome.plan = None;
+        outcome.results.clear();
+        outcome.midi_in_events.clear();
+        self.lock_mailbox().spare = Some(outcome);
+    }
+
     /// Dispatcher (Go path, Phase 4): tag the cycle with the transport
     /// position it renders for. `reanchor` re-establishes the
     /// capture-frame ↔ transport mapping at the cycle thread (transport
@@ -339,24 +351,29 @@ impl InlineRender {
             }
         }
 
+        let mut outcome = self.lock_mailbox().spare.take().unwrap_or_default();
+        outcome.transport_rendered = tag;
+        outcome.stale = stale;
+        outcome.skipped_frames = skipped;
+        outcome.midi_in_events.reserve(64);
+
         // Hardware MIDI-in: drained right after the capture read. On the
         // render path events land in the routed track ports before any task
         // runs, so this cycle's render sees them. A stale cycle must not push:
         // the events belong to the next (resynced) render, delivered via the
         // dispatcher buffer.
-        let mut midi_events: Vec<HwMidiEvent> = Vec::with_capacity(64);
         let source = self.lock_midi_source().clone();
         if let Some(source) = source
             && let Ok(mut source) = source.lock()
         {
-            source.read_midi_events_into(&mut midi_events);
+            source.read_midi_events_into(&mut outcome.midi_in_events);
         }
-        if midi_events.len() > 1 && frames > 1 {
-            spread_event_frames(&mut midi_events, frames);
+        if outcome.midi_in_events.len() > 1 && frames > 1 {
+            spread_event_frames(&mut outcome.midi_in_events, frames);
         }
-        if render && !stale && !midi_events.is_empty() {
+        if render && !stale && !outcome.midi_in_events.is_empty() {
             let routes = self.midi_routes.load();
-            for hw_event in &midi_events {
+            for hw_event in &outcome.midi_in_events {
                 for route in routes.iter().filter(|r| r.device == hw_event.device) {
                     route.track.lock().push_hw_midi_events_to_port(
                         route.port,
@@ -366,15 +383,6 @@ impl InlineRender {
             }
         }
 
-        let mut outcome = InlineCycleOutcome {
-            plan: None,
-            results: Vec::new(),
-            midi_in_events: midi_events,
-            transport_rendered: tag,
-            stale,
-            skipped_frames: skipped,
-        };
-
         if !stale && (render || self.preview_active()) {
             let plan = self.cycle_plan();
             if render {
@@ -383,14 +391,17 @@ impl InlineRender {
                     let period = std::time::Duration::from_secs_f64(
                         f64::from(frames) / self.sample_rate.load(Ordering::Acquire).max(1) as f64,
                     );
-                    let results = self
+                    let rendered = self
                         .parallel
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .render_with_service(plan.clone(), period, &mut service);
-                    if let Some(results) = results {
-                        outcome.results = results;
-                    } else {
+                        .render_with_service_into(
+                            plan.clone(),
+                            period,
+                            &mut service,
+                            &mut outcome.results,
+                        );
+                    if rendered.is_none() {
                         outcome.stale = true;
                         outcome.skipped_frames = u64::from(frames);
                         self.stale_silence.store(true, Ordering::Release);

@@ -223,7 +223,9 @@ impl TrackData {
             return;
         }
         #[cfg(feature = "plugins")]
-        let mut active_clip_plugin_keys = HashSet::new();
+        let mut active_clip_plugin_keys = std::mem::take(&mut self.rt.active_clip_plugin_keys);
+        #[cfg(feature = "plugins")]
+        active_clip_plugin_keys.clear();
         let channel_count = inputs.len();
         let clip_count = self.rt.playing_session_clips.len();
         let mut position_updates = Vec::new();
@@ -292,14 +294,11 @@ impl TrackData {
                     break;
                 }
                 let segment_len = (frames - out_offset).min(remaining_segment);
-                let mut session_clip = (*arrangement_clip).clone();
-                session_clip.start = 0;
-                session_clip.end = clip_length;
 
                 if self
-                    .render_audio_clip_segment(
-                        &session_clip,
-                        0,
+                    .render_audio_clip_segment_range(
+                        arrangement_clip.as_ref(),
+                        (0, clip_length),
                         play_position,
                         segment_len,
                         #[cfg(feature = "plugins")]
@@ -354,7 +353,11 @@ impl TrackData {
         #[cfg(feature = "plugins")]
         self.rt
             .clip_plugin_tracks
-            .retain(|key, _| active_clip_plugin_keys.contains(key));
+            .retain(|key, _| active_clip_plugin_keys.contains(key.as_str()));
+        #[cfg(feature = "plugins")]
+        {
+            self.rt.active_clip_plugin_keys = active_clip_plugin_keys;
+        }
         let peak = inputs
             .iter()
             .map(|input| crate::simd::peak_abs(input))

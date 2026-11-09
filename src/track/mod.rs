@@ -1,7 +1,6 @@
 use super::{audio::track::AudioTrack, midi::mpe::MpeState, midi::track::MIDITrack};
 #[cfg(feature = "plugins")]
-use crate::message::{PluginGraphConnection, PluginGraphNode};
-#[cfg(unix)]
+use crate::message::{PluginGraphConnection, PluginGraphNode, PluginKind};
 use crate::pitch_shift::LivePitchShifter;
 
 use crate::kind::Kind;
@@ -92,9 +91,13 @@ pub(crate) enum AudioClipBuffer {
     SeekableStreaming(Arc<seekable_streaming::SeekableStreamingClipBuffer>),
 }
 
-#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct ClipPitchShifter {
+    start: usize,
+    end: usize,
+    offset: usize,
+    input_channel: usize,
+    reversed: bool,
     shifter: LivePitchShifter,
 }
 
@@ -736,6 +739,36 @@ impl Default for TransportSampleSnapshot {
 
 /// Per-cycle (real-time) state of a [`Track`].
 #[derive(Debug)]
+#[cfg(feature = "plugins")]
+struct CachedClipPluginKey {
+    start: usize,
+    end: usize,
+    offset: usize,
+    input_channel: usize,
+    reversed: bool,
+    input_count: usize,
+    output_count: usize,
+    graph: Option<serde_json::Value>,
+    key: Arc<str>,
+}
+
+#[cfg(feature = "plugins")]
+#[derive(Default)]
+pub(crate) struct PluginGraphScratch {
+    order: Vec<(PluginKind, usize)>,
+    processed: HashSet<(PluginKind, usize)>,
+    output_buffers: HashMap<usize, Vec<f32>>,
+    source_latencies: HashMap<usize, usize>,
+    output_keys: HashSet<usize>,
+    ready_outputs: HashSet<usize>,
+    input_buffers: Vec<Vec<f32>>,
+    // Slice lifetimes are unbound only for the current plugin call. Clear
+    // these vectors before mutating their backing buffers or output map.
+    input_slices: Vec<&'static [f32]>,
+    output_ptrs: Vec<*mut Vec<f32>>,
+    output_slices: Vec<&'static mut [f32]>,
+}
+
 pub struct TrackRt {
     pub echoed_parameter_updates: Vec<crate::message::Action>,
     pub pending_hw_midi_out_events: Vec<HwMidiOutEvent>,
@@ -760,7 +793,10 @@ pub struct TrackRt {
     audio_clip_cache: HashMap<String, Arc<AudioClipBuffer>>,
     #[cfg(feature = "plugins")]
     clip_plugin_tracks: HashMap<String, ClipPluginRuntime>,
-    #[cfg(unix)]
+    #[cfg(feature = "plugins")]
+    clip_plugin_runtime_keys: HashMap<String, CachedClipPluginKey>,
+    #[cfg(feature = "plugins")]
+    active_clip_plugin_keys: HashSet<Arc<str>>,
     pub(crate) clip_pitch_shifters: HashMap<String, ClipPitchShifter>,
     midi_clip_cache: HashMap<String, MidiClipEvents>,
     internal_output_routes_cache: Vec<Vec<Arc<AudioIO>>>,
@@ -785,6 +821,9 @@ pub struct TrackRt {
     folder_processed_midi_plugins: HashSet<PluginGraphNode>,
     folder_clip_playback_active: bool,
     folder_record_tap_input_snapshots: Vec<Vec<f32>>,
+    output_delay_scratch: Vec<f32>,
+    #[cfg(feature = "plugins")]
+    plugin_graph_scratch: PluginGraphScratch,
     plugin_delay_lines: HashMap<(usize, usize), crate::render_plan::DelayLine>,
     /// Reusable render target for `render_audio_clip_segment` (grown on
     /// demand, cleared per use). Passed down recursion as `out`; never
@@ -797,6 +836,10 @@ pub struct TrackRt {
     clip_render_group_scratch: Vec<Vec<f32>>,
     /// Reusable temporary for streaming clip decode (source channel planes).
     clip_render_stream_scratch: Vec<Vec<f32>>,
+    clip_window_scratch: Vec<Vec<f32>>,
+    clip_window_bytes: Vec<u8>,
+    clip_window_interleaved: Vec<f32>,
+    cycle_segments_scratch: Vec<(usize, usize, usize)>,
 }
 
 impl TrackRt {
@@ -825,7 +868,10 @@ impl TrackRt {
             audio_clip_cache: HashMap::new(),
             #[cfg(feature = "plugins")]
             clip_plugin_tracks: HashMap::new(),
-            #[cfg(unix)]
+            #[cfg(feature = "plugins")]
+            clip_plugin_runtime_keys: HashMap::new(),
+            #[cfg(feature = "plugins")]
+            active_clip_plugin_keys: HashSet::new(),
             clip_pitch_shifters: HashMap::new(),
             midi_clip_cache: HashMap::new(),
             internal_output_routes_cache: Vec::new(),
@@ -847,10 +893,17 @@ impl TrackRt {
             folder_processed_midi_plugins: HashSet::new(),
             folder_clip_playback_active: false,
             folder_record_tap_input_snapshots: Vec::new(),
+            output_delay_scratch: vec![0.0; buffer_size],
+            #[cfg(feature = "plugins")]
+            plugin_graph_scratch: PluginGraphScratch::default(),
             plugin_delay_lines: HashMap::new(),
             clip_render_scratch: Vec::new(),
             clip_render_group_scratch: Vec::new(),
             clip_render_stream_scratch: Vec::new(),
+            clip_window_scratch: Vec::new(),
+            clip_window_bytes: Vec::new(),
+            clip_window_interleaved: Vec::new(),
+            cycle_segments_scratch: Vec::new(),
         }
     }
 

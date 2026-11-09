@@ -6,6 +6,7 @@ use crate::workers::sndio_worker::HwWorker;
 use crate::{
     history::UndoEntry,
     message::{Action, Message, ProcessTask},
+    state::TrackHandle,
 };
 use std::{
     sync::atomic::Ordering,
@@ -182,14 +183,16 @@ impl Engine {
         }
     }
 
-    pub(crate) fn task_track_name(task: &ProcessTask) -> String {
+    pub(crate) fn task_track(task: &ProcessTask) -> &TrackHandle {
         match task {
-            ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => {
-                t.lock().name.clone()
-            }
+            ProcessTask::Track(t) | ProcessTask::FolderInput(t) | ProcessTask::FolderOutput(t) => t,
             #[cfg(feature = "plugins")]
-            ProcessTask::Plugin { track, .. } => track.lock().name.clone(),
+            ProcessTask::Plugin { track, .. } => track,
         }
+    }
+
+    pub(crate) fn task_track_name(task: &ProcessTask) -> String {
+        Self::task_track(task).lock().name.clone()
     }
 
     /// Pushes the current transport state into the task's track before the
@@ -357,7 +360,6 @@ impl Engine {
         worker_id: usize,
         epoch: u64,
         node: u32,
-        output_linear: Vec<f32>,
         parameter_updates: Vec<Action>,
         latency_changed: bool,
     ) {
@@ -378,6 +380,7 @@ impl Engine {
         }
         let plan = self.executor.plan().clone();
         if let Some(crate::render_plan::Op::Task { task, .. }) = plan.nodes.get(node as usize) {
+            let output_linear = Self::task_track(task).lock().output_meter_linear();
             let track_name = Self::task_track_name(task);
             self.meters
                 .track_meter_linear_by_track
@@ -415,7 +418,6 @@ impl Engine {
                 result.worker_id,
                 result.epoch,
                 result.node,
-                result.output_linear,
                 result.parameter_updates,
                 result.latency_changed,
             )
@@ -961,19 +963,11 @@ impl Engine {
                     worker_id,
                     epoch,
                     node,
-                    output_linear,
                     parameter_updates,
                     latency_changed,
                 } => {
-                    self.on_node_done(
-                        worker_id,
-                        epoch,
-                        node,
-                        output_linear,
-                        parameter_updates,
-                        latency_changed,
-                    )
-                    .await;
+                    self.on_node_done(worker_id, epoch, node, parameter_updates, latency_changed)
+                        .await;
                 }
                 Message::Channel(s) => {
                     self.clients.push(s);
@@ -1007,7 +1001,7 @@ impl Engine {
                     self.handle_hw_finished().await;
                     self.drain_iodelay_report().await;
                 }
-                Message::HWMidiEvents(events) => {
+                Message::HWMidiEvents(mut events) => {
                     // Events from the hw worker's between-cycle drains; they
                     // are buffered for the track-port push (which the pool
                     // path runs in `handle_hw_finished` and the inline path
@@ -1015,7 +1009,7 @@ impl Engine {
                     // cycle thread arrive via `drain_inline_outcome` already
                     // delivered to the ports and call this with
                     // `buffer_for_ports = false`.
-                    self.handle_hw_midi_in_events(events, true).await;
+                    self.handle_hw_midi_in_events(&mut events, true).await;
                 }
                 Message::StartAudioPreview {
                     samples,

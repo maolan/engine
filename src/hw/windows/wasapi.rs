@@ -158,6 +158,8 @@ pub struct HwDriver {
     output_stream: OutputStream,
     input_rx: Option<Receiver<Vec<f32>>>,
     output_tx: SyncSender<Vec<f32>>,
+    output_recycle_rx: Receiver<Vec<f32>>,
+    output_period_pool: Vec<Vec<f32>>,
     cycle_tick_rx: Receiver<()>,
     input_queue: Vec<f32>,
     audio_ins: Vec<Arc<AudioIO>>,
@@ -192,6 +194,8 @@ impl HwDriver {
         let requested_period_frames = options.period_frames.max(1);
         let output_queue_periods = options.nperiods.max(4);
         let (output_tx, output_rx) = mpsc::sync_channel::<Vec<f32>>(output_queue_periods);
+        let (output_recycle_tx, output_recycle_rx) =
+            mpsc::sync_channel::<Vec<f32>>(output_queue_periods);
         let (cycle_tick_tx, cycle_tick_rx) =
             mpsc::sync_channel::<()>(output_queue_periods.saturating_mul(4));
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -202,6 +206,7 @@ impl HwDriver {
             requested_period_frames,
             mode,
             output_rx,
+            output_recycle_tx,
             cycle_tick_tx,
         )?;
 
@@ -247,6 +252,8 @@ impl HwDriver {
             output_stream,
             input_rx,
             output_tx,
+            output_recycle_rx,
+            output_period_pool: Vec::new(),
             cycle_tick_rx,
             input_queue: Vec::new(),
             audio_ins,
@@ -327,6 +334,9 @@ impl HwDriver {
     }
 
     pub fn run_cycle(&mut self) -> Result<(), String> {
+        while let Ok(period) = self.output_recycle_rx.try_recv() {
+            self.output_period_pool.push(period);
+        }
         let input_frames = self.period_frames;
         let input_channels = self.input_channels.max(1);
         if let Some(rx) = &self.input_rx {
@@ -362,7 +372,9 @@ impl HwDriver {
         let channels = self.output_channels;
         let gain = self.output_gain_linear;
         let balance = self.output_balance;
-        let mut interleaved = vec![0.0_f32; frames.saturating_mul(channels)];
+        let mut interleaved = self.output_period_pool.pop().unwrap_or_default();
+        interleaved.clear();
+        interleaved.resize(frames.saturating_mul(channels), 0.0);
         if self.playing
             && let Some(slot) = &self.plan_slot
         {
@@ -462,6 +474,7 @@ fn start_output_stream(
     period_frames: usize,
     mode: WasapiMode,
     output_rx: Receiver<Vec<f32>>,
+    output_recycle_tx: SyncSender<Vec<f32>>,
     cycle_tick_tx: SyncSender<()>,
 ) -> Result<(OutputStream, StreamInfo), String> {
     let shutdown_event = create_event("WASAPI output shutdown", true)?;
@@ -478,6 +491,7 @@ fn start_output_stream(
                 mode,
                 OutputThreadChannels {
                     output_rx,
+                    output_recycle_tx,
                     cycle_tick_tx,
                     ready_tx: ready_tx.clone(),
                     shutdown_event,
@@ -593,6 +607,7 @@ fn start_input_stream(
 
 struct OutputThreadChannels {
     output_rx: Receiver<Vec<f32>>,
+    output_recycle_tx: SyncSender<Vec<f32>>,
     cycle_tick_tx: SyncSender<()>,
     ready_tx: SyncSender<Result<StreamInfo, String>>,
     shutdown_event: HANDLE,
@@ -607,6 +622,7 @@ fn run_output_thread(
 ) -> Result<(), String> {
     let OutputThreadChannels {
         output_rx,
+        output_recycle_tx,
         cycle_tick_tx,
         ready_tx,
         shutdown_event,
@@ -654,6 +670,7 @@ fn run_output_thread(
             &client,
             &render_client,
             &output_rx,
+            &output_recycle_tx,
             &cycle_tick_tx,
             &mut pending,
         )?;
@@ -985,6 +1002,7 @@ fn fill_output_available(
     client: &WasapiClient,
     render_client: &IAudioRenderClient,
     output_rx: &Receiver<Vec<f32>>,
+    output_recycle_tx: &SyncSender<Vec<f32>>,
     cycle_tick_tx: &SyncSender<()>,
     pending: &mut VecDeque<f32>,
 ) -> Result<usize, String> {
@@ -1002,7 +1020,8 @@ fn fill_output_available(
     while pending.len() < available_frames.saturating_mul(client.channels) {
         match output_rx.try_recv() {
             Ok(period) => {
-                pending.extend(period);
+                pending.extend(period.iter().copied());
+                let _ = output_recycle_tx.try_send(period);
                 if let Err(TrySendError::Disconnected(())) = cycle_tick_tx.try_send(()) {
                     tracing::debug!("WASAPI cycle tick receiver has been dropped");
                 }
@@ -1365,7 +1384,7 @@ impl MidiHub {
                 if let Ok(mut events) = queue.lock() {
                     events.push(HwMidiEvent {
                         device: event_device.clone(),
-                        event: MidiEvent::new(0, data.to_vec()),
+                        event: MidiEvent::from_slice(0, data),
                     });
                 }
             })

@@ -11,6 +11,7 @@ pub struct LivePitchShifter {
     formant_preserved: bool,
     input: Vec<Vec<f32>>,
     output: Vec<Vec<f32>>,
+    rendered: Vec<Vec<f32>>,
     interleaved: Vec<f32>,
 }
 
@@ -33,6 +34,7 @@ impl LivePitchShifter {
             formant_preserved,
             input: vec![vec![0.0; block_size]; channels],
             output: vec![vec![0.0; block_size]; channels],
+            rendered: vec![Vec::new(); channels],
             interleaved: vec![0.0; block_size * channels.min(2)],
         })
     }
@@ -61,7 +63,7 @@ impl LivePitchShifter {
         request_start_frame: usize,
         frames: usize,
         mut fill_input: F,
-    ) -> Vec<Vec<f32>>
+    ) -> &[Vec<f32>]
     where
         F: FnMut(usize, &mut [Vec<f32>]) -> f64,
     {
@@ -69,7 +71,11 @@ impl LivePitchShifter {
             self.reset(request_start_frame);
         }
 
-        let mut rendered = vec![vec![0.0; frames]; self.channels];
+        self.rendered.resize_with(self.channels, Vec::new);
+        for channel in &mut self.rendered {
+            channel.clear();
+            channel.resize(frames, 0.0);
+        }
         let mut written = 0usize;
         while written < frames {
             for channel in &mut self.input {
@@ -79,7 +85,7 @@ impl LivePitchShifter {
             self.pitch_shift_block(pitch_scale);
 
             let copy_len = self.block_size.min(frames - written);
-            for (dst, src) in rendered.iter_mut().zip(&self.output) {
+            for (dst, src) in self.rendered.iter_mut().zip(&self.output) {
                 dst[written..written + copy_len].copy_from_slice(&src[..copy_len]);
             }
             self.next_input_frame = self.next_input_frame.saturating_add(self.block_size);
@@ -87,7 +93,7 @@ impl LivePitchShifter {
             written += copy_len;
         }
 
-        rendered
+        &self.rendered
     }
 
     fn pitch_shift_block(&mut self, pitch_scale: f64) {
@@ -187,5 +193,31 @@ impl LivePitchShifter {
         };
         config.parameters.pitch = timestretch::PitchRatio::new(pitch_scale)?;
         timestretch::render(samples, config).map(|rendered| rendered.samples)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Timestretch DSP interpretation exceeds one minute")]
+    fn non_identity_pitch_shift_produces_finite_frames() {
+        let mut shifter = LivePitchShifter::new(48_000, 2, false).expect("pitch shifter");
+        let rendered = shifter.render(0, DEFAULT_BLOCK_SIZE, |_start, input| {
+            for plane in input {
+                for (index, sample) in plane.iter_mut().enumerate() {
+                    *sample = (index as f32 * 0.01).sin();
+                }
+            }
+            1.25
+        });
+
+        assert_eq!(rendered.len(), 2);
+        for plane in rendered {
+            assert_eq!(plane.len(), DEFAULT_BLOCK_SIZE);
+            assert!(plane.iter().all(|sample| sample.is_finite()));
+            assert!(plane.iter().any(|sample| sample.abs() > f32::EPSILON));
+        }
     }
 }

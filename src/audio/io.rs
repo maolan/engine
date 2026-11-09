@@ -35,6 +35,13 @@ impl AudioIO {
         Arc::new(live)
     }
 
+    pub fn visit_connections(&self, mut visit: impl FnMut(&Arc<Self>)) {
+        let connections = self.connections.load();
+        for connection in connections.iter().filter_map(Weak::upgrade) {
+            visit(&connection);
+        }
+    }
+
     pub fn store_connections(&self, connections: Vec<Arc<Self>>) {
         let len = connections.len();
         self.connections

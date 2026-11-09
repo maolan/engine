@@ -36,7 +36,9 @@ impl TrackData {
         // Collect raw events from MIDI inputs first; allocation needs mutable
         // access to `self` (for the MPE voice allocator), so it is done after
         // the input borrow is released.
-        let mut lane_buffers: Vec<Vec<MidiEvent>> = Vec::with_capacity(self.midi.ins.len());
+        let mut lane_buffers = std::mem::take(&mut self.rt.folder_input_midi_events);
+        lane_buffers.resize_with(self.midi.ins.len(), Vec::new);
+        lane_buffers.truncate(self.midi.ins.len());
         for (lane, input) in self.midi.ins.iter().enumerate() {
             // Safety: plan single-writer invariant — this task is the sole
             // writer of its own ports this cycle; sources it reads were
@@ -57,7 +59,7 @@ impl TrackData {
             }
             buffer.sort_by_key(|event| event.frame);
             input.mark_finished();
-            lane_buffers.push(std::mem::take(&mut *buffer));
+            std::mem::swap(&mut *buffer, &mut lane_buffers[lane]);
         }
         for buffer in &mut lane_buffers {
             *buffer = self.allocate_mpe_events(std::mem::take(buffer));

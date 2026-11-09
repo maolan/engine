@@ -635,6 +635,7 @@ mod tests {
             format: super::super::AFMT_U8,
             chsamples: 4,
             buffer: vec![0; 4],
+            raw_buffer: vec![],
             f32_buffer: vec![],
             buffer_info: BufferInfo {
                 fragments: 2,
