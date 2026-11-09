@@ -19,7 +19,6 @@ pub(crate) struct NodeJobResult {
     pub(crate) worker_id: usize,
     pub(crate) epoch: u64,
     pub(crate) node: u32,
-    pub(crate) output_linear: Vec<f32>,
     pub(crate) parameter_updates: Vec<Action>,
     pub(crate) latency_changed: bool,
 }
@@ -1161,264 +1160,259 @@ impl Worker {
     /// so downstream `Sum` nodes and the hardware drain see the result.
     pub(crate) fn process_node_job_result(worker_id: usize, job: NodeJob) -> NodeJobResult {
         let NodeJob { epoch, plan, node } = job;
-        let (output_linear, parameter_updates, latency_changed) =
-            Self::with_node_scratch(|scratch| {
-                match &plan.nodes[node as usize] {
-                    Op::Zero { output } => {
-                        // Safety: this worker executes this node; the plan's
-                        // single-producer-chain invariant guarantees exclusive
-                        // access to the output buffer.
-                        unsafe { &mut *plan.buffer_ptr(*output) }.fill(0.0);
-                        plan.set_buffer_latency(*output, 0);
-                        (Vec::new(), Vec::new(), false)
-                    }
-                    Op::Sum {
-                        inputs,
-                        delays,
-                        output,
-                    } => {
-                        // Safety: see `Op::Zero`; additionally, every input buffer's
-                        // producer completed before this node was dispatched.
-                        let out = unsafe { &mut *plan.buffer_ptr(*output) };
-                        out.fill(0.0);
-                        let max_latency = inputs
-                            .iter()
-                            .map(|&input| plan.buffer_latency(input))
-                            .max()
-                            .unwrap_or(0);
-                        for (idx, &input) in inputs.iter().enumerate() {
-                            let src = unsafe { plan.buffer(input) };
-                            let delay = max_latency.saturating_sub(plan.buffer_latency(input));
-                            // Safety: this Sum node is the only writer of its delay
-                            // lines during this cycle, and the executor never
-                            // dispatches the same node concurrently.
-                            let line = unsafe { &mut *delays[idx].get() };
-                            line.process(src, delay, out, idx != 0);
-                        }
-                        plan.set_buffer_latency(*output, max_latency);
-                        (Vec::new(), Vec::new(), false)
-                    }
-                    Op::HwInput { output, .. } => {
-                        // The hardware driver wrote this buffer before the cycle
-                        // started; nothing to do.
-                        plan.set_buffer_latency(*output, 0);
-                        (Vec::new(), Vec::new(), false)
-                    }
-                    Op::IoDelayGenerator { node, output } => {
-                        // Safety: this worker owns the generator output buffer.
-                        let out_buf = unsafe { &mut *plan.buffer_ptr(*output) };
-                        node.process_generator(out_buf);
-                        plan.set_buffer_latency(*output, 0);
-                        (Vec::new(), Vec::new(), false)
-                    }
-                    Op::IoDelayMeasurement { node, input } => {
-                        // Safety: this worker reads the input after its Sum node completed.
-                        let in_buf = unsafe { plan.buffer(*input) };
-                        node.process(in_buf);
-                        (Vec::new(), Vec::new(), false)
-                    }
-                    Op::Task { task, ins, outs } => {
-                        let track = match task {
-                            ProcessTask::Track(t)
-                            | ProcessTask::FolderInput(t)
-                            | ProcessTask::FolderOutput(t) => t,
-                            #[cfg(feature = "plugins")]
-                            ProcessTask::Plugin { track, .. } => track,
-                        };
-                        let mut t = track.lock();
-                        // The dispatcher may skip `prepare_task_track` entirely
-                        // (generation fast path), so the worker marks the track as
-                        // processing for the whole task; task bodies clear the flag
-                        // at the end. Plugin-mutation handlers rely on this flag to
-                        // reject changes while a task holds the track.
-                        t.audio.set_processing(true);
-                        match task {
-                            ProcessTask::Track(_) => {
-                                let audio_out_count = t.audio.outs.len();
-                                let metronome_output =
-                                    Self::metronome_output_buffer(&plan, &t, outs);
-                                // Safety: track tasks are registered as in-place
-                                // writers for their input buffers.
-                                scratch
-                                    .input_ptrs
-                                    .extend(ins.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }));
-                                // Safety: each pointer came from a task input buffer
-                                // this node owns in-place.
-                                scratch.inputs_mut.extend(
-                                    scratch
-                                        .input_ptrs
-                                        .iter()
-                                        .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
-                                );
-                                // The track body appends its own inputs and
-                                // inline plugin outputs after processing them.
-                                // Do not borrow arena inputs while inputs_mut
-                                // owns them, or unrelated workers' buffers.
-                                // Keep only input latency metadata here; the
-                                // track replaces the empty slices after its
-                                // in-place input processing has finished.
-                                scratch
-                                    .source_buffers
-                                    .extend(t.audio.ins.iter().zip(ins).map(|(port, &buffer)| {
-                                        (
-                                            Arc::as_ptr(port) as usize,
-                                            &[][..],
-                                            plan.buffer_latency(buffer),
-                                        )
-                                    }));
-                                // Safety: this worker executes the unique producer
-                                // node for each output buffer.
-                                scratch.output_ptrs.extend(
-                                    outs.iter()
-                                        .take(audio_out_count)
-                                        .map(|&buf| unsafe { plan.buffer_ptr(buf) }),
-                                );
-                                // Safety: each pointer came from a distinct task
-                                // output buffer owned by this node.
-                                scratch.outputs_mut.extend(
-                                    scratch
-                                        .output_ptrs
-                                        .iter()
-                                        .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
-                                );
-                                let metronome_output_ptr = metronome_output.map(|buf| {
-                                    // Safety: the track task is the registered
-                                    // producer of the metronome side-output buffer.
-                                    unsafe { plan.buffer_ptr(buf) }
-                                });
-                                let metronome_output = metronome_output_ptr.map(|ptr| {
-                                    // Safety: the side-output buffer is excluded from
-                                    // the normal audio output slice above.
-                                    unsafe { (&mut *ptr).as_mut_slice() }
-                                });
-                                t.process_render_block_with_audio_buffers_and_metronome(
-                                    &mut scratch.inputs_mut,
-                                    &mut scratch.outputs_mut,
-                                    &mut scratch.source_buffers,
-                                    metronome_output,
-                                );
-                                #[cfg(feature = "plugins")]
-                                for &out in outs.iter().take(audio_out_count) {
-                                    plan.set_buffer_latency(out, t.plugin_graph_latency_samples());
-                                }
-                            }
-                            ProcessTask::FolderInput(_) => {
-                                let metronome_output =
-                                    Self::metronome_output_buffer(&plan, &t, outs);
-                                // Safety: folder-input tasks are registered as
-                                // in-place writers for their input buffers.
-                                scratch
-                                    .input_ptrs
-                                    .extend(ins.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }));
-                                // Safety: each pointer came from a task input buffer
-                                // this node owns in-place.
-                                scratch.inputs_mut.extend(
-                                    scratch
-                                        .input_ptrs
-                                        .iter()
-                                        .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
-                                );
-                                let metronome_output_ptr = metronome_output.map(|buf| {
-                                    // Safety: the folder-input task is the registered
-                                    // producer of the metronome side-output buffer.
-                                    unsafe { plan.buffer_ptr(buf) }
-                                });
-                                let metronome_output = metronome_output_ptr.map(|ptr| {
-                                    // Safety: this buffer is a side output, distinct
-                                    // from the folder input buffers.
-                                    unsafe { (&mut *ptr).as_mut_slice() }
-                                });
-                                t.process_folder_input_with_audio_buffers_and_metronome(
-                                    &mut scratch.inputs_mut,
-                                    metronome_output,
-                                );
-                                for &input in ins {
-                                    plan.set_buffer_latency(input, 0);
-                                }
-                            }
-                            ProcessTask::FolderOutput(_) => {
-                                Self::collect_arena_source_slices(
-                                    &plan,
-                                    &t.internal_audio_sources(),
-                                    outs,
-                                    &mut scratch.source_buffers,
-                                );
-                                // Safety: this worker executes the unique producer
-                                // node for each output buffer.
-                                scratch.output_ptrs.extend(
-                                    outs.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }),
-                                );
-                                // Safety: each pointer came from a distinct task
-                                // output buffer owned by this node.
-                                scratch.outputs_mut.extend(
-                                    scratch
-                                        .output_ptrs
-                                        .iter()
-                                        .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
-                                );
-                                t.process_folder_output_with_audio_buffers(
-                                    &mut scratch.outputs_mut,
-                                    &scratch.source_buffers,
-                                );
-                                #[cfg(feature = "plugins")]
-                                for &out in outs {
-                                    plan.set_buffer_latency(out, t.plugin_graph_latency_samples());
-                                }
-                            }
-                            #[cfg(feature = "plugins")]
-                            ProcessTask::Plugin { kind, index, .. } => {
-                                let input_latency = ins
-                                    .iter()
-                                    .map(|&input| plan.buffer_latency(input))
-                                    .max()
-                                    .unwrap_or(0);
-                                Self::collect_arena_input_slices(
-                                    &plan,
-                                    ins,
-                                    &mut scratch.inputs_shared,
-                                );
-                                // Safety: this worker executes the unique producer
-                                // node for each output buffer.
-                                scratch.output_ptrs.extend(
-                                    outs.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }),
-                                );
-                                // Safety: each pointer came from a distinct task
-                                // output buffer owned by this node.
-                                scratch.outputs_mut.extend(
-                                    scratch
-                                        .output_ptrs
-                                        .iter()
-                                        .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
-                                );
-                                t.process_plugin_with_audio_buffers(
-                                    *kind,
-                                    *index,
-                                    &scratch.inputs_shared,
-                                    &mut scratch.outputs_mut,
-                                );
-                                let latency = input_latency
-                                    .saturating_add(t.plugin_latency_samples(*kind, *index));
-                                for &out in outs {
-                                    plan.set_buffer_latency(out, latency);
-                                }
-                            }
-                        }
-                        t.audio.set_processing(false);
-                        #[cfg(feature = "plugins")]
-                        let latency_changed = t.take_plugin_latency_changed();
-                        #[cfg(not(feature = "plugins"))]
-                        let latency_changed = false;
-                        let updates = std::mem::take(&mut t.rt.echoed_parameter_updates);
-                        let meter = t.output_meter_linear();
-                        (meter, updates, latency_changed)
-                    }
+        let (parameter_updates, latency_changed) = Self::with_node_scratch(|scratch| {
+            match &plan.nodes[node as usize] {
+                Op::Zero { output } => {
+                    // Safety: this worker executes this node; the plan's
+                    // single-producer-chain invariant guarantees exclusive
+                    // access to the output buffer.
+                    unsafe { &mut *plan.buffer_ptr(*output) }.fill(0.0);
+                    plan.set_buffer_latency(*output, 0);
+                    (Vec::new(), false)
                 }
-            });
+                Op::Sum {
+                    inputs,
+                    delays,
+                    output,
+                } => {
+                    // Safety: see `Op::Zero`; additionally, every input buffer's
+                    // producer completed before this node was dispatched.
+                    let out = unsafe { &mut *plan.buffer_ptr(*output) };
+                    out.fill(0.0);
+                    let max_latency = inputs
+                        .iter()
+                        .map(|&input| plan.buffer_latency(input))
+                        .max()
+                        .unwrap_or(0);
+                    for (idx, &input) in inputs.iter().enumerate() {
+                        let src = unsafe { plan.buffer(input) };
+                        let delay = max_latency.saturating_sub(plan.buffer_latency(input));
+                        // Safety: this Sum node is the only writer of its delay
+                        // lines during this cycle, and the executor never
+                        // dispatches the same node concurrently.
+                        let line = unsafe { &mut *delays[idx].get() };
+                        line.process(src, delay, out, idx != 0);
+                    }
+                    plan.set_buffer_latency(*output, max_latency);
+                    (Vec::new(), false)
+                }
+                Op::HwInput { output, .. } => {
+                    // The hardware driver wrote this buffer before the cycle
+                    // started; nothing to do.
+                    plan.set_buffer_latency(*output, 0);
+                    (Vec::new(), false)
+                }
+                Op::IoDelayGenerator { node, output } => {
+                    // Safety: this worker owns the generator output buffer.
+                    let out_buf = unsafe { &mut *plan.buffer_ptr(*output) };
+                    node.process_generator(out_buf);
+                    plan.set_buffer_latency(*output, 0);
+                    (Vec::new(), false)
+                }
+                Op::IoDelayMeasurement { node, input } => {
+                    // Safety: this worker reads the input after its Sum node completed.
+                    let in_buf = unsafe { plan.buffer(*input) };
+                    node.process(in_buf);
+                    (Vec::new(), false)
+                }
+                Op::Task { task, ins, outs } => {
+                    let track = match task {
+                        ProcessTask::Track(t)
+                        | ProcessTask::FolderInput(t)
+                        | ProcessTask::FolderOutput(t) => t,
+                        #[cfg(feature = "plugins")]
+                        ProcessTask::Plugin { track, .. } => track,
+                    };
+                    let mut t = track.lock();
+                    // The dispatcher may skip `prepare_task_track` entirely
+                    // (generation fast path), so the worker marks the track as
+                    // processing for the whole task; task bodies clear the flag
+                    // at the end. Plugin-mutation handlers rely on this flag to
+                    // reject changes while a task holds the track.
+                    t.audio.set_processing(true);
+                    match task {
+                        ProcessTask::Track(_) => {
+                            let audio_out_count = t.audio.outs.len();
+                            let metronome_output = Self::metronome_output_buffer(&plan, &t, outs);
+                            // Safety: track tasks are registered as in-place
+                            // writers for their input buffers.
+                            scratch
+                                .input_ptrs
+                                .extend(ins.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }));
+                            // Safety: each pointer came from a task input buffer
+                            // this node owns in-place.
+                            scratch.inputs_mut.extend(
+                                scratch
+                                    .input_ptrs
+                                    .iter()
+                                    .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
+                            );
+                            // The track body appends its own inputs and
+                            // inline plugin outputs after processing them.
+                            // Do not borrow arena inputs while inputs_mut
+                            // owns them, or unrelated workers' buffers.
+                            // Keep only input latency metadata here; the
+                            // track replaces the empty slices after its
+                            // in-place input processing has finished.
+                            scratch
+                                .source_buffers
+                                .extend(t.audio.ins.iter().zip(ins).map(|(port, &buffer)| {
+                                    (
+                                        Arc::as_ptr(port) as usize,
+                                        &[][..],
+                                        plan.buffer_latency(buffer),
+                                    )
+                                }));
+                            // Safety: this worker executes the unique producer
+                            // node for each output buffer.
+                            scratch.output_ptrs.extend(
+                                outs.iter()
+                                    .take(audio_out_count)
+                                    .map(|&buf| unsafe { plan.buffer_ptr(buf) }),
+                            );
+                            // Safety: each pointer came from a distinct task
+                            // output buffer owned by this node.
+                            scratch.outputs_mut.extend(
+                                scratch
+                                    .output_ptrs
+                                    .iter()
+                                    .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
+                            );
+                            let metronome_output_ptr = metronome_output.map(|buf| {
+                                // Safety: the track task is the registered
+                                // producer of the metronome side-output buffer.
+                                unsafe { plan.buffer_ptr(buf) }
+                            });
+                            let metronome_output = metronome_output_ptr.map(|ptr| {
+                                // Safety: the side-output buffer is excluded from
+                                // the normal audio output slice above.
+                                unsafe { (&mut *ptr).as_mut_slice() }
+                            });
+                            t.process_render_block_with_audio_buffers_and_metronome(
+                                &mut scratch.inputs_mut,
+                                &mut scratch.outputs_mut,
+                                &mut scratch.source_buffers,
+                                metronome_output,
+                            );
+                            #[cfg(feature = "plugins")]
+                            for &out in outs.iter().take(audio_out_count) {
+                                plan.set_buffer_latency(out, t.output_latency_from_plan(&plan));
+                            }
+                        }
+                        ProcessTask::FolderInput(_) => {
+                            let metronome_output = Self::metronome_output_buffer(&plan, &t, outs);
+                            // Safety: folder-input tasks are registered as
+                            // in-place writers for their input buffers.
+                            scratch
+                                .input_ptrs
+                                .extend(ins.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }));
+                            // Safety: each pointer came from a task input buffer
+                            // this node owns in-place.
+                            scratch.inputs_mut.extend(
+                                scratch
+                                    .input_ptrs
+                                    .iter()
+                                    .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
+                            );
+                            let metronome_output_ptr = metronome_output.map(|buf| {
+                                // Safety: the folder-input task is the registered
+                                // producer of the metronome side-output buffer.
+                                unsafe { plan.buffer_ptr(buf) }
+                            });
+                            let metronome_output = metronome_output_ptr.map(|ptr| {
+                                // Safety: this buffer is a side output, distinct
+                                // from the folder input buffers.
+                                unsafe { (&mut *ptr).as_mut_slice() }
+                            });
+                            t.process_folder_input_with_audio_buffers_and_metronome(
+                                &mut scratch.inputs_mut,
+                                metronome_output,
+                            );
+                            for &input in ins {
+                                plan.set_buffer_latency(input, 0);
+                            }
+                        }
+                        ProcessTask::FolderOutput(_) => {
+                            Self::collect_arena_source_slices(
+                                &plan,
+                                &t.internal_audio_sources(),
+                                outs,
+                                &mut scratch.source_buffers,
+                            );
+                            // Safety: this worker executes the unique producer
+                            // node for each output buffer.
+                            scratch
+                                .output_ptrs
+                                .extend(outs.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }));
+                            // Safety: each pointer came from a distinct task
+                            // output buffer owned by this node.
+                            scratch.outputs_mut.extend(
+                                scratch
+                                    .output_ptrs
+                                    .iter()
+                                    .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
+                            );
+                            t.process_folder_output_with_audio_buffers(
+                                &mut scratch.outputs_mut,
+                                &scratch.source_buffers,
+                            );
+                            #[cfg(feature = "plugins")]
+                            for &out in outs {
+                                plan.set_buffer_latency(out, t.output_latency_from_plan(&plan));
+                            }
+                        }
+                        #[cfg(feature = "plugins")]
+                        ProcessTask::Plugin { kind, index, .. } => {
+                            let input_latency = ins
+                                .iter()
+                                .map(|&input| plan.buffer_latency(input))
+                                .max()
+                                .unwrap_or(0);
+                            Self::collect_arena_input_slices(
+                                &plan,
+                                ins,
+                                &mut scratch.inputs_shared,
+                            );
+                            // Safety: this worker executes the unique producer
+                            // node for each output buffer.
+                            scratch
+                                .output_ptrs
+                                .extend(outs.iter().map(|&buf| unsafe { plan.buffer_ptr(buf) }));
+                            // Safety: each pointer came from a distinct task
+                            // output buffer owned by this node.
+                            scratch.outputs_mut.extend(
+                                scratch
+                                    .output_ptrs
+                                    .iter()
+                                    .map(|&ptr| unsafe { (&mut *ptr).as_mut_slice() }),
+                            );
+                            t.process_plugin_with_audio_buffers(
+                                *kind,
+                                *index,
+                                &scratch.inputs_shared,
+                                &mut scratch.outputs_mut,
+                            );
+                            let latency = input_latency
+                                .saturating_add(t.plugin_latency_samples(*kind, *index));
+                            for &out in outs {
+                                plan.set_buffer_latency(out, latency);
+                            }
+                        }
+                    }
+                    t.audio.set_processing(false);
+                    #[cfg(feature = "plugins")]
+                    let latency_changed = t.take_plugin_latency_changed();
+                    #[cfg(not(feature = "plugins"))]
+                    let latency_changed = false;
+                    let updates = std::mem::take(&mut t.rt.echoed_parameter_updates);
+                    (updates, latency_changed)
+                }
+            }
+        });
         NodeJobResult {
             worker_id,
             epoch,
             node,
-            output_linear,
             parameter_updates,
             latency_changed,
         }
@@ -1470,7 +1464,6 @@ impl From<NodeJobResult> for Message {
             worker_id: result.worker_id,
             epoch: result.epoch,
             node: result.node,
-            output_linear: result.output_linear,
             parameter_updates: result.parameter_updates,
             latency_changed: result.latency_changed,
         }
@@ -1688,13 +1681,11 @@ mod tests {
                 worker_id,
                 epoch,
                 node,
-                output_linear,
                 ..
             } => {
                 assert_eq!(worker_id, 4);
                 assert_eq!(epoch, 1);
                 assert_eq!(node, 0);
-                assert!(output_linear.is_empty());
             }
             other => panic!("unexpected message: {other:?}"),
         }

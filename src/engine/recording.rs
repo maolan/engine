@@ -277,7 +277,7 @@ impl Engine {
                             continue;
                         }
                         let abs_sample = start as u64 + (frame - from) as u64;
-                        entry.events.push((abs_sample, event.data.clone()));
+                        entry.events.push((abs_sample, event.data.to_vec()));
                     }
                 }
 

@@ -290,6 +290,14 @@ impl ClapProcessor {
         }
     }
 
+    pub fn audio_inputs_snapshot(&self) -> Arc<Vec<Arc<AudioIO>>> {
+        self.audio_inputs.load_full()
+    }
+
+    pub fn audio_outputs_snapshot(&self) -> Arc<Vec<Arc<AudioIO>>> {
+        self.audio_outputs.load_full()
+    }
+
     pub fn audio_inputs(&self) -> Vec<Arc<AudioIO>> {
         self.audio_inputs.load_full().as_ref().clone()
     }
@@ -843,7 +851,7 @@ impl ClapProcessor {
                 let midi_out_ring =
                     RingBuffer::new(midi_out_buf, midi_out_w, midi_out_r, RING_CAPACITY);
                 while let Some(ev) = midi_out_ring.pop() {
-                    let event = crate::midi::io::MidiEvent::new(ev.sample_offset, ev.data.to_vec());
+                    let event = crate::midi::io::MidiEvent::from_slice(ev.sample_offset, &ev.data);
                     port_buffer.push(event.clone());
                     midi_out.push(ClapMidiOutputEvent {
                         port: port_idx,
@@ -1121,7 +1129,7 @@ impl ClapProcessor {
             while let Some(ev) = ring.pop() {
                 result.push(crate::midi::io::MidiEvent {
                     frame: ev.sample_offset,
-                    data: ev.data.to_vec(),
+                    data: ev.data.as_slice().into(),
                 });
             }
         }

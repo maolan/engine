@@ -328,6 +328,14 @@ impl AuProcessor {
         }
     }
 
+    pub fn audio_inputs_snapshot(&self) -> &[Arc<AudioIO>] {
+        &self.audio_inputs
+    }
+
+    pub fn audio_outputs_snapshot(&self) -> &[Arc<AudioIO>] {
+        &self.audio_outputs
+    }
+
     pub fn audio_inputs(&self) -> &[Arc<AudioIO>] {
         &self.audio_inputs
     }
@@ -608,7 +616,7 @@ impl AuProcessor {
                 while let Some(ev) = ring.pop() {
                     let event = MidiEvent {
                         frame: ev.sample_offset,
-                        data: ev.data.to_vec(),
+                        data: ev.data.as_slice().into(),
                     };
                     port_buffer.push(event.clone());
                     output_events.push(event);

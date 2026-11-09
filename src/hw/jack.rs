@@ -68,6 +68,7 @@ struct Process {
     /// RT side of the MIDI-out ring: this callback is the sole consumer, the
     /// engine thread produces after each completed cycle.
     midi_out_consumer: rtrb::Consumer<MidiEvent>,
+    midi_out_scratch: Vec<MidiEvent>,
     /// In-events dropped because the engine did not drain fast enough.
     midi_in_dropped: Arc<AtomicU64>,
     output_gain_linear: Arc<AtomicU32>,
@@ -188,7 +189,7 @@ impl Process {
     fn collect_midi_input(&mut self, ps: &ProcessScope) {
         for port in &self.midi_in_ports {
             for raw in port.iter(ps) {
-                let event = MidiEvent::new(raw.time, raw.bytes.to_vec());
+                let event = MidiEvent::from_slice(raw.time, raw.bytes);
                 if self.midi_in_producer.push(event).is_err() {
                     self.midi_in_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -201,16 +202,16 @@ impl Process {
             while self.midi_out_consumer.pop().is_ok() {}
             return;
         }
-        let mut events = Vec::new();
+        self.midi_out_scratch.clear();
         while let Ok(event) = self.midi_out_consumer.pop() {
-            events.push(event);
+            self.midi_out_scratch.push(event);
         }
-        if events.is_empty() {
+        if self.midi_out_scratch.is_empty() {
             return;
         }
         for out_port in &mut self.midi_out_ports {
             let mut writer = out_port.writer(ps);
-            for event in &events {
+            for event in &self.midi_out_scratch {
                 let raw = RawMidi {
                     time: event.frame,
                     bytes: &event.data,
@@ -384,6 +385,7 @@ impl JackRuntime {
             plan_slot,
             midi_in_producer,
             midi_out_consumer,
+            midi_out_scratch: Vec::new(),
             midi_in_dropped: midi_in_dropped.clone(),
             output_gain_linear: output_gain_linear.clone(),
             output_balance: output_balance.clone(),

@@ -88,27 +88,36 @@ const RT_POLICY: i32 = libc::SCHED_FIFO;
 const RT_PRIORITY_WORKER: i32 = 18;
 
 impl<B: Backend> HwWorker<B> {
-    fn configure_rt_thread(name: &str, priority: i32) -> Result<(), String> {
+    fn configure_rt_thread(name: &'static str, priority: i32) -> Result<(), String> {
         #[cfg(unix)]
         {
             let thread = unsafe { libc::pthread_self() };
-            #[cfg(unix)]
-            let c_name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
-            #[cfg(target_os = "linux")]
-            unsafe {
-                let rc = libc::pthread_setname_np(thread, c_name.as_ptr());
-                crate::report_status(rc, "Failed to name hardware worker thread");
+            std::thread_local! {
+                static NAMED_RT_THREAD: std::cell::Cell<Option<&'static str>> =
+                    const { std::cell::Cell::new(None) };
             }
-            #[cfg(target_os = "macos")]
-            unsafe {
-                // macOS names the current thread and takes no thread handle.
-                let rc = libc::pthread_setname_np(c_name.as_ptr());
-                crate::report_status(rc, "Failed to name hardware worker thread");
-            }
-            #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-            unsafe {
-                libc::pthread_set_name_np(thread, c_name.as_ptr());
-            }
+            NAMED_RT_THREAD.with(|configured| {
+                if configured.get() != Some(name) {
+                    let c_name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
+                    #[cfg(target_os = "linux")]
+                    unsafe {
+                        let rc = libc::pthread_setname_np(thread, c_name.as_ptr());
+                        crate::report_status(rc, "Failed to name hardware worker thread");
+                    }
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        // macOS names the current thread and takes no thread handle.
+                        let rc = libc::pthread_setname_np(c_name.as_ptr());
+                        crate::report_status(rc, "Failed to name hardware worker thread");
+                    }
+                    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+                    unsafe {
+                        libc::pthread_set_name_np(thread, c_name.as_ptr());
+                    }
+                    configured.set(Some(name));
+                }
+                Ok::<(), String>(())
+            })?;
 
             let param = unsafe {
                 let mut p = std::mem::zeroed::<libc::sched_param>();

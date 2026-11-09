@@ -197,6 +197,8 @@ impl TrackData {
 
     pub fn invalidate_audio_route_cache(&mut self) {
         self.rt.audio_route_cache_dirty = true;
+        #[cfg(feature = "plugins")]
+        self.rt.plugin_graph_scratch.order.clear();
     }
 
     pub fn primary_audio_ins(&self) -> usize {
@@ -234,6 +236,8 @@ impl TrackData {
 
     pub fn invalidate_midi_route_cache(&mut self) {
         self.rt.midi_route_cache_dirty = true;
+        #[cfg(feature = "plugins")]
+        self.rt.plugin_graph_scratch.order.clear();
     }
 
     pub(crate) fn ensure_midi_route_cache(&mut self) {
@@ -357,8 +361,9 @@ impl TrackData {
         if !samples_per_beat.is_finite() || samples_per_beat <= 1.0 {
             return;
         }
-        let segments = self.cycle_segments(frames);
-        for (seg_start, seg_end, frame_offset) in segments {
+        let mut segments = std::mem::take(&mut self.rt.cycle_segments_scratch);
+        self.cycle_segments_into(frames, &mut segments);
+        for &(seg_start, seg_end, frame_offset) in &segments {
             if seg_end <= seg_start {
                 continue;
             }
@@ -393,6 +398,7 @@ impl TrackData {
                 beat_idx = beat_idx.saturating_add(1);
             }
         }
+        self.rt.cycle_segments_scratch = segments;
     }
 
     #[cfg(test)]
@@ -436,42 +442,41 @@ impl TrackData {
             metronome_output.as_deref_mut(),
         );
         #[cfg(feature = "plugins")]
-        let plugin_outputs =
-            self.process_track_plugins_in_graph_order_with_audio_buffers(frames, audio_inputs);
-        // Safety: the input buffers and `plugin_outputs` outlive the
-        // `process_folder_output_with_audio_buffers` call below, which is the
-        // only consumer of the appended entries; the caller clears `sources`
-        // afterwards (see doc comment).
+        let mut plugin_scratch = std::mem::take(&mut self.rt.plugin_graph_scratch);
+        #[cfg(feature = "plugins")]
+        self.process_track_plugins_in_graph_order_with_audio_buffers(
+            frames,
+            audio_inputs,
+            &mut plugin_scratch,
+        );
+        // Safety: the input buffers and plugin scratch outlive the output
+        // call below, which is the only consumer of the appended entries.
         for (audio_in, buffer) in self.audio.ins.iter().zip(audio_inputs.iter()) {
             let key = Arc::as_ptr(audio_in) as usize;
             let slice: &[f32] = buffer;
-            // Safety: processing of these inputs has finished; the slice is
-            // consumed only by folder-output processing below, before the
-            // caller reuses its mutable input buffers.
             let slice = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
             if let Some((_, source, _)) = sources
                 .iter_mut()
                 .find(|(candidate, _, _)| *candidate == key)
             {
-                // The worker supplied latency without borrowing the input
-                // during its in-place writes. Retain that latency here.
                 *source = slice;
             } else {
                 sources.push((key, slice, 0));
             }
         }
         #[cfg(feature = "plugins")]
-        {
-            let graph_latencies = self.current_plugin_graph_source_latencies();
-            sources.extend(plugin_outputs.iter().map(|(key, buffer)| {
-                let slice = buffer.as_slice();
-                (
-                    *key,
-                    unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) },
-                    graph_latencies.get(key).copied().unwrap_or(0),
-                )
-            }));
-        }
+        sources.extend(plugin_scratch.output_buffers.iter().map(|(key, buffer)| {
+            let slice = buffer.as_slice();
+            (
+                *key,
+                unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) },
+                plugin_scratch
+                    .source_latencies
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        }));
         // Publish the synthesized metronome side buffer so the output stage
         // can sum it into the track outputs through the route cache.
         let metronome_buf = metronome_output.map(|buf| &*buf);
@@ -486,6 +491,10 @@ impl TrackData {
             }
         }
         self.process_folder_output_with_audio_buffers(audio_outputs, sources);
+        #[cfg(feature = "plugins")]
+        {
+            self.rt.plugin_graph_scratch = plugin_scratch;
+        }
         frames
     }
 
@@ -587,10 +596,11 @@ impl TrackData {
         let record_tap_active = self.armed() && self.rt.record_tap_enabled;
         {
             let snapshots = &mut self.rt.folder_record_tap_input_snapshots;
-            snapshots.clear();
-            if record_tap_active {
-                for audio_in in audio_inputs.iter() {
-                    snapshots.push(audio_in.to_vec());
+            snapshots.resize_with(audio_inputs.len(), Vec::new);
+            for (snapshot, audio_in) in snapshots.iter_mut().zip(audio_inputs.iter()) {
+                snapshot.clear();
+                if record_tap_active {
+                    snapshot.extend_from_slice(audio_in);
                 }
             }
         }
@@ -744,7 +754,7 @@ impl TrackData {
                     audio_inputs,
                     audio_outputs,
                 );
-                let track_name = self.name.clone();
+                let track_name = &self.name;
                 for ev in processor.drain_echoed_parameters() {
                     self.rt.echoed_parameter_updates.push(
                         crate::message::Action::TrackSetClapParameter {
@@ -773,16 +783,15 @@ impl TrackData {
                 if !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins) {
                     return;
                 }
-                let midi_inputs = self.plugin_midi_input_events(
+                self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
                     &self.rt.folder_input_midi_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
-                let _vst3_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs =
                     processor.process_with_audio_buffers(frames, audio_inputs, audio_outputs);
-                let track_name = self.name.clone();
+                let track_name = &self.name;
                 for ev in processor.drain_echoed_parameters() {
                     self.rt.echoed_parameter_updates.push(
                         crate::message::Action::TrackSetVst3Parameter {
@@ -810,16 +819,15 @@ impl TrackData {
                 if !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins) {
                     return;
                 }
-                let midi_inputs = self.plugin_midi_input_events(
+                self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
                     &self.rt.folder_input_midi_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
-                let _au_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs =
                     processor.process_with_audio_buffers(frames, audio_inputs, audio_outputs);
-                let track_name = self.name.clone();
+                let track_name = &self.name;
                 for ev in processor.drain_echoed_parameters() {
                     self.rt.echoed_parameter_updates.push(
                         crate::message::Action::TrackSetAuParameter {
@@ -847,13 +855,12 @@ impl TrackData {
                 if !self.plugin_midi_ready(&node, &self.rt.folder_processed_midi_plugins) {
                     return;
                 }
-                let midi_inputs = self.plugin_midi_input_events(
+                self.plugin_midi_input_events(
                     &node,
                     processor.midi_input_count(),
                     &self.rt.folder_input_midi_events,
                     &self.rt.folder_plugin_midi_node_events,
                 );
-                let _lv2_input = midi_inputs.first().cloned().unwrap_or_default();
                 let outputs = processor.process_with_audio_buffers(
                     frames,
                     crate::plugins::types::Lv2TransportInfo {
@@ -868,7 +875,7 @@ impl TrackData {
                     audio_inputs,
                     audio_outputs,
                 );
-                let track_name = self.name.clone();
+                let track_name = &self.name;
                 for ev in processor.drain_echoed_parameters() {
                     self.rt.echoed_parameter_updates.push(
                         crate::message::Action::TrackSetLv2ControlValue {
@@ -988,13 +995,10 @@ impl TrackData {
                     && (!c.rt.playing_session_clips.is_empty()
                         || !c.rt.pending_session_launches.is_empty())
             });
-        // Take (rather than clone) the record-tap input snapshots captured by
-        // the folder-input pass: the loop below only reads them, and the
-        // field is restored before this function returns, so nothing can
-        // observe the temporary emptiness. This avoids copying every input
-        // buffer's samples once per block.
         let record_tap_input_snapshots =
             std::mem::take(&mut self.rt.folder_record_tap_input_snapshots);
+        let output_routes = std::mem::take(&mut self.rt.internal_output_routes_cache);
+        let mut delayed = std::mem::take(&mut self.rt.output_delay_scratch);
         let input_monitor = self.input_monitor();
         let mut all_outputs_zero = true;
         for out_idx in 0..self.audio.outs.len().min(audio_outputs.len()) {
@@ -1020,11 +1024,11 @@ impl TrackData {
             };
             let output_gain = linear_gain * balance_gain * phase_multiplier;
             let unity_output_gain = (output_gain - 1.0).abs() <= f32::EPSILON;
-            let sources = self.rt.internal_output_routes_cache.get(out_idx).cloned();
-            let has_sources = sources.as_ref().is_some_and(|s| !s.is_empty());
+            let sources = output_routes.get(out_idx);
+            let has_sources = sources.is_some_and(|s| !s.is_empty());
             let mut wrote_output = false;
             if self.output_enabled()
-                && let Some(sources) = &sources
+                && let Some(sources) = sources
             {
                 let mut seeded = false;
                 let max_latency = sources
@@ -1059,7 +1063,7 @@ impl TrackData {
                                 Arc::as_ptr(source) as usize,
                             ))
                             .or_default();
-                        let mut delayed = vec![0.0; out_samples.len()];
+                        delayed.resize(out_samples.len(), 0.0);
                         line.process(source_buf, delay, &mut delayed, false);
                         if !seeded {
                             if unity_output_gain {
@@ -1154,6 +1158,8 @@ impl TrackData {
         }
 
         self.rt.folder_record_tap_input_snapshots = record_tap_input_snapshots;
+        self.rt.internal_output_routes_cache = output_routes;
+        self.rt.output_delay_scratch = delayed;
         self.rt.last_render_block_silent = all_outputs_zero;
         self.audio.set_finished(true);
         self.audio.set_processing(false);

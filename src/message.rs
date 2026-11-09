@@ -2042,7 +2042,6 @@ pub enum Message {
         worker_id: usize,
         epoch: u64,
         node: u32,
-        output_linear: Vec<f32>,
         parameter_updates: Vec<Action>,
         latency_changed: bool,
     },

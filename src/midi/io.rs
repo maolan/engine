@@ -4,14 +4,103 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MidiData {
+    Inline { len: u8, bytes: [u8; 3] },
+    Heap(Vec<u8>),
+}
+
+impl MidiData {
+    pub fn from_slice(data: &[u8]) -> Self {
+        if data.len() <= 3 {
+            let mut bytes = [0; 3];
+            bytes[..data.len()].copy_from_slice(data);
+            Self::Inline {
+                len: data.len() as u8,
+                bytes,
+            }
+        } else {
+            Self::Heap(data.to_vec())
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_ref().to_vec()
+    }
+}
+
+impl Default for MidiData {
+    fn default() -> Self {
+        Self::Inline {
+            len: 0,
+            bytes: [0; 3],
+        }
+    }
+}
+
+impl From<Vec<u8>> for MidiData {
+    fn from(data: Vec<u8>) -> Self {
+        if data.len() <= 3 {
+            Self::from_slice(&data)
+        } else {
+            Self::Heap(data)
+        }
+    }
+}
+
+impl From<&[u8]> for MidiData {
+    fn from(data: &[u8]) -> Self {
+        Self::from_slice(data)
+    }
+}
+
+impl AsRef<[u8]> for MidiData {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            Self::Heap(data) => data,
+        }
+    }
+}
+
+impl std::ops::Deref for MidiData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl PartialEq<Vec<u8>> for MidiData {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_ref() == other
+    }
+}
+
+impl PartialEq<MidiData> for Vec<u8> {
+    fn eq(&self, other: &MidiData) -> bool {
+        self == other.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidiEvent {
     pub frame: u32,
-    pub data: Vec<u8>,
+    pub data: MidiData,
 }
 
 impl MidiEvent {
-    pub fn new(frame: u32, data: Vec<u8>) -> Self {
-        Self { frame, data }
+    pub fn new(frame: u32, data: impl Into<MidiData>) -> Self {
+        Self {
+            frame,
+            data: data.into(),
+        }
+    }
+
+    pub fn from_slice(frame: u32, data: &[u8]) -> Self {
+        Self {
+            frame,
+            data: MidiData::from_slice(data),
+        }
     }
 }
 

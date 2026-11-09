@@ -1,5 +1,5 @@
 use crate::message::HwMidiEvent;
-use crate::midi::io::MidiEvent;
+use crate::midi::io::{MidiData, MidiEvent};
 use nix::libc;
 use std::{
     fs::File,
@@ -591,24 +591,24 @@ struct MidiParser {
 }
 
 impl MidiParser {
-    fn feed(&mut self, byte: u8) -> Option<Vec<u8>> {
+    fn feed(&mut self, byte: u8) -> Option<MidiData> {
         if byte & 0x80 != 0 {
             if self.in_sysex {
                 if byte == 0xF7 {
                     self.sysex.push(byte);
                     self.in_sysex = false;
-                    return Some(std::mem::take(&mut self.sysex));
+                    return Some(MidiData::Heap(std::mem::take(&mut self.sysex)));
                 }
 
                 if byte >= 0xF8 {
-                    return Some(vec![byte]);
+                    return Some(MidiData::from_slice(&[byte]));
                 }
 
                 self.in_sysex = false;
                 self.sysex.clear();
             }
             if byte >= 0xF8 {
-                return Some(vec![byte]);
+                return Some(MidiData::from_slice(&[byte]));
             }
             if byte == 0xF0 {
                 self.in_sysex = true;
@@ -623,7 +623,7 @@ impl MidiParser {
             self.len = 0;
             self.needed = status_data_len(byte);
             if self.needed == 0 {
-                return Some(vec![byte]);
+                return Some(MidiData::from_slice(&[byte]));
             }
             return None;
         }
@@ -642,15 +642,15 @@ impl MidiParser {
             return None;
         }
 
-        let mut message = Vec::with_capacity(1 + self.needed);
-        message.push(status);
-        message.extend_from_slice(&self.data[..self.needed]);
+        let mut message = [0; 3];
+        message[0] = status;
+        message[1..1 + self.needed].copy_from_slice(&self.data[..self.needed]);
         self.len = 0;
         if status >= 0xF0 {
             self.status = None;
             self.needed = 0;
         }
-        Some(message)
+        Some(MidiData::from_slice(&message[..1 + self.needed]))
     }
 }
 

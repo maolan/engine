@@ -32,7 +32,6 @@ pub mod meter;
 pub mod midi;
 pub mod modulator;
 mod osc;
-#[cfg(unix)]
 mod pitch_shift;
 pub mod plan;
 #[cfg(feature = "plugins")]

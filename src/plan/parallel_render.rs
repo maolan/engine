@@ -126,17 +126,34 @@ impl ParallelRender {
         plan: SharedPlan,
         period: Duration,
     ) -> Option<Vec<NodeJobResult>> {
-        self.render_with_service(plan, period, &mut || Duration::MAX)
+        let mut results = Vec::new();
+        self.render_with_service_into(plan, period, &mut || Duration::MAX, &mut results)
+            .map(|()| results)
     }
 
-    /// Service backend buffers while node workers own the render arena.
-    /// The callback returns the maximum time to wait before servicing again.
+    #[cfg(test)]
     pub(crate) fn render_with_service(
         &mut self,
         plan: SharedPlan,
         period: Duration,
         service: &mut impl FnMut() -> Duration,
     ) -> Option<Vec<NodeJobResult>> {
+        let mut results = Vec::new();
+        self.render_with_service_into(plan, period, service, &mut results)
+            .map(|()| results)
+    }
+
+    /// Service backend buffers while node workers own the render arena.
+    /// The callback returns the maximum time to wait before servicing again.
+    pub(crate) fn render_with_service_into(
+        &mut self,
+        plan: SharedPlan,
+        period: Duration,
+        service: &mut impl FnMut() -> Duration,
+        results: &mut Vec<NodeJobResult>,
+    ) -> Option<()> {
+        results.clear();
+        results.reserve(plan.nodes.len());
         // Never reuse an arena while a previous cycle still owns it.
         if self.active_plan.is_some() {
             return None;
@@ -162,7 +179,6 @@ impl ParallelRender {
             self.ready.extend(plan.sources.iter().copied());
         }
         let mut completed = 0;
-        let mut results = Vec::with_capacity(plan.nodes.len());
         let waiter = thread::current();
         loop {
             if Instant::now() >= deadline {
@@ -198,7 +214,7 @@ impl ParallelRender {
                     break;
                 }
                 self.active_plan = None;
-                return Some(results);
+                return Some(());
             }
             // Hardware input nodes are already complete at capture fill.
             // All actual processing, including Zero/Sum, stays on workers.
@@ -272,7 +288,7 @@ impl ParallelRender {
         }
     }
 
-    fn fail(&mut self) -> Option<Vec<NodeJobResult>> {
+    fn fail(&mut self) -> Option<()> {
         self.cancelled.store(true, Ordering::Release);
         self.ready.clear();
         self.missed = true;

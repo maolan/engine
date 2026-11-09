@@ -139,7 +139,7 @@ impl Engine {
     /// thru-routing / MIDI-learn / step-record (already delivered to track
     /// ports by the cycle thread, so they are not buffered again).
     pub(crate) async fn drain_inline_outcome(&mut self) {
-        let Some(outcome) = self.inline_render.take_outcome() else {
+        let Some(mut outcome) = self.inline_render.take_outcome() else {
             return;
         };
         if outcome.stale {
@@ -160,19 +160,21 @@ impl Engine {
             self.advance_render_clock(outcome.skipped_frames as usize);
             self.inline_render.invalidate_anchor();
         }
-        if let Some(plan) = outcome.plan {
-            for result in outcome.results {
+        if let Some(plan) = outcome.plan.take() {
+            for result in &mut outcome.results {
                 if let Some(Op::Task { task, .. }) = plan.nodes.get(result.node as usize) {
+                    let track = Self::task_track(task);
                     let track_name = Self::task_track_name(task);
+                    let output_linear = track.lock().output_meter_linear();
                     self.meters
                         .track_meter_linear_by_track
-                        .insert(track_name, result.output_linear);
+                        .insert(track_name, output_linear);
                 }
                 if result.latency_changed {
                     self.publish_state_snapshot();
                     self.plan_builder.mark_dirty();
                 }
-                for action in result.parameter_updates {
+                for action in result.parameter_updates.drain(..) {
                     self.notify_clients(Ok(action)).await;
                 }
             }
@@ -181,9 +183,10 @@ impl Engine {
             self.apply_hw_out_meter_from_plan(&plan).await;
         }
         if !outcome.midi_in_events.is_empty() {
-            self.handle_hw_midi_in_events(outcome.midi_in_events, false)
+            self.handle_hw_midi_in_events(&mut outcome.midi_in_events, false)
                 .await;
         }
+        self.inline_render.recycle_outcome(outcome);
     }
 
     /// Hardware MIDI-in event handling shared by the `HWMidiEvents` message
@@ -192,10 +195,10 @@ impl Engine {
     /// forward (already delivered to ports; only thru/learn/step-record here).
     pub(crate) async fn handle_hw_midi_in_events(
         &mut self,
-        events: Vec<HwMidiEvent>,
+        events: &mut Vec<HwMidiEvent>,
         buffer_for_ports: bool,
     ) {
-        for hw_event in events {
+        for hw_event in events.drain(..) {
             let thru_targets: Vec<String> = self
                 .hw_midi
                 .midi_hw_thru_routes

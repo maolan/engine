@@ -63,6 +63,7 @@ pub struct Audio {
     pub format: u32,
     pub chsamples: usize,
     buffer: Vec<i32>,
+    raw_buffer: Vec<u8>,
     f32_buffer: Vec<f32>,
     pub buffer_info: BufferInfo,
     frame_size_bytes: usize,
@@ -425,6 +426,7 @@ impl Audio {
             format,
             chsamples,
             buffer: vec![0_i32; chsamples * (channels as usize)],
+            raw_buffer: vec![0_u8; buffer_bytes],
             f32_buffer: Vec::new(),
             buffer_info,
             frame_size_bytes: frame_size,
@@ -824,9 +826,11 @@ impl Audio {
     }
 
     pub fn process(&mut self, stop_requested: &AtomicBool) -> std::io::Result<()> {
-        if self.input {
-            let period_bytes = self.chsamples * self.frame_size();
-            let mut raw = vec![0_u8; period_bytes];
+        let period_bytes = self.chsamples * self.frame_size();
+        let mut raw = std::mem::take(&mut self.raw_buffer);
+        raw.clear();
+        raw.resize(period_bytes, 0);
+        let result = if self.input {
             self.read_full_period(&mut raw, stop_requested)?;
             convert_in_to_i32_connected(
                 self.format,
@@ -836,10 +840,9 @@ impl Audio {
                 &self.channels,
             );
             self.fill_input_ports();
+            Ok(())
         } else {
             self.fill_output_buffer();
-            let period_bytes = self.chsamples * self.frame_size();
-            let mut raw = vec![0_u8; period_bytes];
             convert_out_from_i32_interleaved(
                 self.format,
                 self.channels.len(),
@@ -847,10 +850,10 @@ impl Audio {
                 self.buffer.as_mut_slice(),
                 raw.as_mut_slice(),
             );
-            self.write_full_period(&raw, stop_requested)?;
-        }
-
-        Ok(())
+            self.write_full_period(&raw, stop_requested)
+        };
+        self.raw_buffer = raw;
+        result
     }
 
     /// Write the persistent zero buffer (sized to the mapped ring, filled
@@ -868,11 +871,11 @@ impl Audio {
             if self.zero_block.len() != total {
                 self.zero_block = vec![0_u8; total];
             }
-            let block = std::mem::take(&mut self.zero_block);
+            let mut block = std::mem::take(&mut self.zero_block);
             let mut written = 0;
             while written < total {
                 let len = (64 * 1024).min(total - written);
-                let chunk = &mut block[written..written + len].to_vec();
+                let chunk = &mut block[written..written + len];
                 let n = self.write_map(Some(chunk), written, len);
                 if n == 0 {
                     break;

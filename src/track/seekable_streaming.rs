@@ -25,7 +25,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -208,6 +208,15 @@ struct SeekControl {
     seek_request: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
     eof: Arc<AtomicBool>,
+    producer_thread: Arc<OnceLock<std::thread::Thread>>,
+}
+
+impl SeekControl {
+    fn wake(&self) {
+        if let Some(thread) = self.producer_thread.get() {
+            thread.unpark();
+        }
+    }
 }
 
 fn deinterleave(
@@ -263,11 +272,8 @@ pub struct SeekableStreamingClipBuffer {
     pub channels: usize,
     pub engine_sample_rate: usize,
     total_frames: usize,
-    /// Only read by `read_window` (random-access offline reads: pitch
-    /// correction on Unix, reversed playback with `audio`).
-    #[cfg(any(unix, feature = "audio"))]
+    /// Only read by `read_window` for random-access offline reads.
     path: PathBuf,
-    #[cfg(any(unix, feature = "audio"))]
     layout: WavPcmLayout,
     rings: Vec<Mutex<Consumer<QueuedSample>>>,
     eof: Arc<AtomicBool>,
@@ -336,6 +342,7 @@ impl SeekableStreamingClipBuffer {
             seek_request: Arc::new(AtomicUsize::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
             eof: Arc::new(AtomicBool::new(false)),
+            producer_thread: Arc::new(OnceLock::new()),
         };
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let thread_control = control.clone();
@@ -353,13 +360,15 @@ impl SeekableStreamingClipBuffer {
                 super::streaming::release_producer_slot();
                 io::Error::other(format!("Failed to spawn seekable streaming producer: {e}"))
             })?;
+        control
+            .producer_thread
+            .set(handle.thread().clone())
+            .expect("seekable producer thread handle already set");
         Ok(Self {
             channels,
             engine_sample_rate: engine_rate,
             total_frames,
-            #[cfg(any(unix, feature = "audio"))]
             path: path.to_path_buf(),
-            #[cfg(any(unix, feature = "audio"))]
             layout,
             rings,
             eof: control.eof.clone(),
@@ -465,6 +474,7 @@ impl SeekableStreamingClipBuffer {
                 );
             }
         }
+        self.control.wake();
         frames
     }
 
@@ -474,40 +484,57 @@ impl SeekableStreamingClipBuffer {
     ///
     /// This opens a short-lived file handle on the calling thread and never
     /// touches the SPSC rings, so the real-time read position is undisturbed.
-    #[cfg(any(unix, feature = "audio"))]
+    #[cfg(all(test, feature = "audio"))]
     pub fn read_window(&self, start: usize, len: usize) -> io::Result<Vec<Vec<f32>>> {
+        let mut window = Vec::new();
+        let mut bytes = Vec::new();
+        let mut interleaved = Vec::new();
+        self.read_window_into(start, len, &mut window, &mut bytes, &mut interleaved)?;
+        Ok(window)
+    }
+
+    pub fn read_window_into(
+        &self,
+        start: usize,
+        len: usize,
+        window: &mut Vec<Vec<f32>>,
+        bytes: &mut Vec<u8>,
+        interleaved: &mut Vec<f32>,
+    ) -> io::Result<()> {
         let channels = self.channels.max(1);
-        let mut window = vec![vec![0.0_f32; len]; channels];
+        window.resize_with(channels, Vec::new);
+        for plane in &mut *window {
+            plane.clear();
+            plane.resize(len, 0.0);
+        }
         if len == 0 {
-            return Ok(window);
+            return Ok(());
         }
         let available = self.total_frames.saturating_sub(start);
         let real = len.min(available);
         if real == 0 {
-            return Ok(window);
+            return Ok(());
         }
         let block_align = self.layout.block_align();
         let position = self
             .layout
             .data_offset
             .saturating_add(start as u64 * block_align as u64);
-        let mut bytes = vec![0u8; real.saturating_mul(block_align)];
+        bytes.clear();
+        bytes.resize(real.saturating_mul(block_align), 0);
         let file = File::open(self.layout_path_hint())?;
-        read_exact_at(&file, position, &mut bytes)?;
-        let mut interleaved = Vec::new();
-        self.layout
-            .convert_interleaved(&bytes, real, &mut interleaved);
+        read_exact_at(&file, position, bytes)?;
+        self.layout.convert_interleaved(bytes, real, interleaved);
         for (channel, plane) in window.iter_mut().enumerate() {
             for (i, sample) in plane.iter_mut().enumerate().take(real) {
                 *sample = interleaved[i * channels + channel];
             }
         }
-        Ok(window)
+        Ok(())
     }
 
     /// Path kept only so [`Self::read_window`] can open its own handle; the
     /// producer thread holds the primary one.
-    #[cfg(any(unix, feature = "audio"))]
     fn layout_path_hint(&self) -> PathBuf {
         self.path.clone()
     }
@@ -516,6 +543,7 @@ impl SeekableStreamingClipBuffer {
 impl Drop for SeekableStreamingClipBuffer {
     fn drop(&mut self) {
         self.control.stop.store(true, Ordering::Release);
+        self.control.wake();
         if let Ok(mut guard) = self.producer.lock()
             && let Some(producer) = guard.take()
             && !producer.handle.is_finished()
@@ -581,7 +609,11 @@ fn run_producer(
         if at_eof {
             // A seekable clip may be looped after reaching EOF. Keep the
             // producer alive so a later seek can refill the rings.
-            std::thread::sleep(Duration::from_millis(1));
+            if !control.stop.load(Ordering::Acquire)
+                && control.generation.load(Ordering::Acquire) == generation
+            {
+                std::thread::park();
+            }
             continue;
         }
 
@@ -620,12 +652,22 @@ fn run_producer(
             next_frame += push_frames;
         }
         if push_frames != frames {
-            let rest: Vec<f32> = data[push_frames * channels..].to_vec();
-            pending = Some((rest, frames - push_frames));
+            pending = if push_frames == 0 {
+                Some((data, frames))
+            } else {
+                Some((
+                    data[push_frames * channels..].to_vec(),
+                    frames - push_frames,
+                ))
+            };
             if control.stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(1));
+            if control.generation.load(Ordering::Acquire) == generation
+                && rings.iter().map(Producer::slots).min().unwrap_or(0) == 0
+            {
+                std::thread::park();
+            }
         }
     }
 }
@@ -729,6 +771,23 @@ mod tests {
             "block {} after first exact block is not frame-exact",
             cycle + 1
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
+    fn seekable_stream_wakes_after_full_ring_is_consumed() {
+        let (path, source) = tone_wav("maolan_seekstream_full_ring", 48_000, 0.5, 440.0);
+        let buffer = SeekableStreamingClipBuffer::start(&path, 48_000, 16, 1).unwrap();
+        assert_eq!(wait_for_frames(&buffer, 16, Duration::from_secs(5)), 16);
+
+        let mut out = vec![vec![0.0; 16]];
+        assert_eq!(buffer.read_frames(0, 1, &mut out), 1);
+        assert_eq!(wait_for_frames(&buffer, 16, Duration::from_secs(5)), 16);
+        assert_eq!(buffer.read_frames(1, 16, &mut out), 16);
+        for (&actual, &expected) in out[0].iter().zip(&source[1..17]) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        std::fs::remove_file(path).expect("remove temporary test file");
     }
 
     #[test]

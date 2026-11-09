@@ -744,7 +744,7 @@ unsafe fn collect_packets(context: &InputCallbackContext, packet_list: *const Mi
             if let Ok(mut events) = context.queue.lock() {
                 events.push(HwMidiEvent {
                     device: context.device.clone(),
-                    event: MidiEvent::new(0, data.to_vec()),
+                    event: MidiEvent::from_slice(0, data),
                 });
             }
         }
