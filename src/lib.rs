@@ -1,6 +1,7 @@
 mod audio;
 #[cfg(feature = "audio")]
 pub mod audio_codec;
+pub mod preferences;
 pub mod wav_stream;
 #[cfg(target_os = "macos")]
 pub mod audio_devices {
