@@ -1440,6 +1440,7 @@ impl Engine {
         self.hw_midi
             .midi_hw_out_routes
             .retain(|r| r.from_track != *name);
+        self.hw_midi.master_routes_dirty = true;
         if self
             .midi_learn
             .pending_midi_learn
@@ -1951,6 +1952,8 @@ impl Engine {
                             .await;
                             return;
                         }
+                        #[cfg(target_os = "freebsd")]
+                        t_t.hardware_midi_input();
                         let route = MidiHwInRoute {
                             device: device.to_string(),
                             to_track: to_track.to_string(),
@@ -1983,6 +1986,7 @@ impl Engine {
                         };
                         if !self.hw_midi.midi_hw_out_routes.iter().any(|r| r == &route) {
                             self.hw_midi.midi_hw_out_routes.push(route);
+                            self.hw_midi.master_routes_dirty = true;
                         }
                     } else {
                         self.notify_clients(Err(format!(
@@ -2140,6 +2144,7 @@ impl Engine {
                     !(r.from_track == *from_track && r.from_port == from_port && r.device == device)
                 });
                 if self.hw_midi.midi_hw_out_routes.len() < before {
+                    self.hw_midi.master_routes_dirty = true;
                     self.notify_clients(Ok(action.clone())).await;
                 } else {
                     self.notify_clients(Err(format!(
@@ -2381,6 +2386,7 @@ impl Engine {
                 self.hw_midi
                     .midi_hw_out_routes
                     .retain(|r| r.from_track != track_name);
+                self.hw_midi.master_routes_dirty = true;
 
                 // Remove track-to-track MIDI connections where this track is the source.
                 for (port_idx, out) in child.midi.outs.iter().enumerate() {

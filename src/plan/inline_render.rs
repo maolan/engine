@@ -125,7 +125,7 @@ pub struct InlineRender {
     mailbox: Mutex<OutcomeMailbox>,
     /// Installed once by the hw worker at spawn; read (briefly locked) by
     /// the cycle thread to drain MIDI input mid-cycle.
-    midi_source: Mutex<Option<Arc<Mutex<dyn MidiInSource + Send>>>>,
+    midi_source: arc_swap::ArcSwapOption<MutexMidiSource>,
     /// Hardware-MIDI-input routes resolved to track handles; rebuilt by the
     /// dispatcher before each Go.
     midi_routes: arc_swap::ArcSwap<Vec<MidiInRoute>>,
@@ -148,6 +148,8 @@ pub struct InlineRender {
     parallel: Mutex<crate::parallel_render::ParallelRender>,
 }
 
+struct MutexMidiSource(Arc<Mutex<dyn MidiInSource + Send>>);
+
 impl InlineRender {
     pub fn new(plan_slot: Arc<PlanSlot>) -> Arc<Self> {
         Arc::new(Self {
@@ -158,7 +160,7 @@ impl InlineRender {
                 ready: None,
                 spare: None,
             }),
-            midi_source: Mutex::new(None),
+            midi_source: arc_swap::ArcSwapOption::empty(),
             midi_routes: arc_swap::ArcSwap::from_pointee(Vec::new()),
             preview: arc_swap::ArcSwap::from_pointee(None),
             go_tag: AtomicI64::new(0),
@@ -211,7 +213,8 @@ impl InlineRender {
 
     /// RT thread was configured: the hw worker installs its MIDI hub share.
     pub fn set_midi_source(&self, source: &Arc<Mutex<dyn MidiInSource + Send>>) {
-        *self.lock_midi_source() = Some(source.clone());
+        self.midi_source
+            .store(Some(Arc::new(MutexMidiSource(source.clone()))));
     }
 
     /// Dispatcher (Go path): whether the upcoming cycle should execute the
@@ -292,12 +295,6 @@ impl InlineRender {
         self.mailbox.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn lock_midi_source(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Option<Arc<Mutex<dyn MidiInSource + Send>>>> {
-        self.midi_source.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// Execute one inline render cycle on the hardware cycle thread. Called
     /// by the backend after the capture fill and before the playback drain.
     ///
@@ -362,9 +359,9 @@ impl InlineRender {
         // runs, so this cycle's render sees them. A stale cycle must not push:
         // the events belong to the next (resynced) render, delivered via the
         // dispatcher buffer.
-        let source = self.lock_midi_source().clone();
-        if let Some(source) = source
-            && let Ok(mut source) = source.lock()
+        let source = self.midi_source.load();
+        if let Some(source) = source.as_ref()
+            && let Ok(mut source) = source.0.lock()
         {
             source.read_midi_events_into(&mut outcome.midi_in_events);
         }

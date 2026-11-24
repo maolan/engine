@@ -4,6 +4,22 @@ use crate::track::Track;
 use tracing::error;
 
 impl Engine {
+    pub(crate) fn external_transport_position_owned(&self) -> bool {
+        self.hw_midi.timecode_enabled || self.hw_midi.midi_clock_input_enabled
+    }
+
+    pub(crate) fn transport_loop_enabled(&self) -> bool {
+        self.transport.loop_enabled && !self.external_transport_position_owned()
+    }
+
+    pub(crate) fn normalize_transport_position(&self, sample: usize) -> usize {
+        if self.external_transport_position_owned() {
+            sample
+        } else {
+            self.transport.normalize_transport_sample(sample)
+        }
+    }
+
     pub(crate) fn update_global_tempo_from_map(&mut self) {
         let (bpm, num, den) = self.transport.timing_at_sample(0);
         self.transport.tempo_bpm = bpm;
@@ -20,23 +36,43 @@ impl Engine {
 
     fn audible_transport_sample_after(&self, frames: usize) -> usize {
         match self.transport.render_clock {
-            Some((origin, elapsed)) if self.transport.transport_running => {
-                self.transport.normalize_transport_sample(
+            Some((origin, elapsed)) if self.transport.transport_running => self
+                .normalize_transport_position(
                     origin.saturating_add(
                         elapsed
                             .saturating_add(frames)
                             .saturating_sub(self.transport.hw_output_latency_frames),
                     ),
-                )
-            }
-            _ => self
-                .transport
-                .normalize_transport_sample(self.transport.transport_sample.saturating_add(frames)),
+                ),
+            _ => self.normalize_transport_position(
+                self.transport.transport_sample.saturating_add(frames),
+            ),
         }
     }
 
     pub(crate) fn restart_render_clock(&mut self) {
         self.transport.render_clock = Some((self.transport.transport_sample, 0));
+    }
+
+    pub(crate) fn correct_external_transport_position(&mut self, target: usize) {
+        let audible = self.audible_transport_sample();
+        let drift = target.abs_diff(audible);
+        let adjustment = drift.min(self.current_cycle_samples().max(1));
+        if adjustment == 0 {
+            return;
+        }
+        let adjust = |sample: usize| {
+            if target >= audible {
+                sample.saturating_add(adjustment)
+            } else {
+                sample.saturating_sub(adjustment)
+            }
+        };
+        self.transport.transport_sample = adjust(self.transport.transport_sample);
+        if let Some((origin, _)) = self.transport.render_clock.as_mut() {
+            *origin = adjust(*origin);
+        }
+        self.publish_transport_snapshot();
     }
 
     pub(crate) fn advance_render_clock(&mut self, frames: usize) {
@@ -59,7 +95,7 @@ impl Engine {
     }
 
     pub(crate) fn scheduled_loop_wrap_for_next_cycle(&self) -> Option<(usize, usize, usize)> {
-        if !self.transport.playing || !self.transport.loop_enabled {
+        if !self.transport.playing || !self.transport_loop_enabled() {
             return None;
         }
         let (loop_start, loop_end) = self.transport.loop_range_samples?;
@@ -87,7 +123,7 @@ impl Engine {
         if frames == 0 {
             return vec![];
         }
-        if !self.transport.loop_enabled {
+        if !self.transport_loop_enabled() {
             return vec![(position, position.saturating_add(frames), 0)];
         }
         let Some((loop_start, loop_end)) = self.transport.loop_range_samples else {
@@ -202,8 +238,7 @@ impl Engine {
                 }
             }
             if !jack_timecode_events.is_empty() {
-                self.handle_midi_timecode_events(&jack_timecode_events)
-                    .await;
+                self.handle_midi_sync_events(&jack_timecode_events).await;
             }
         }
         #[cfg(unix)]
@@ -311,10 +346,12 @@ impl Engine {
                     .transport
                     .transport_sample
                     .saturating_add(cycle_samples);
-                let normalized = self.transport.normalize_transport_sample(next);
+                let normalized = self.normalize_transport_position(next);
                 let wrapped = normalized != next;
                 self.transport.transport_sample = normalized;
                 if wrapped {
+                    self.invalidate_master();
+                    self.update_hardware_master();
                     // Capture keeps advancing while the transport loops back.
                     // Re-anchor before the next render so the loop length is
                     // not mistaken for missed device periods.
@@ -423,6 +460,7 @@ impl Engine {
         let snapshot = self.transport.transport_snapshot_producer.write_buffer();
         snapshot.sample = audible_sample;
         snapshot.tempo_bpm = self.transport.tempo_bpm;
+        snapshot.external_tempo_bpm = self.transport.external_tempo_bpm;
         snapshot.playing = self.transport.playing;
         snapshot.transport_running = self.transport.transport_running;
         snapshot.tsig_num = self.transport.tsig_num;
@@ -522,6 +560,7 @@ impl Engine {
             self.seed_record_start_discard();
         }
         self.transport.transport_running = true;
+        self.update_hardware_master();
         self.transport.transport_restart_pending = true;
         self.transport.notified_loop_wrap_sample = None;
         self.publish_transport_snapshot();
@@ -554,6 +593,7 @@ impl Engine {
             return false;
         };
 
+        self.invalidate_master();
         self.stop_render_clock();
         self.reset_midi_timecode_output(true);
         self.send_midi_clock_transport(0xFC);
@@ -606,6 +646,7 @@ impl Engine {
             return false;
         };
 
+        self.invalidate_master();
         self.stop_render_clock();
         self.transport.playing = false;
         self.send_midi_clock_transport(0xFC);
@@ -681,6 +722,7 @@ impl Engine {
         };
 
         self.preload_track_clips().await;
+        self.invalidate_master();
         self.stop_render_clock();
         self.transport.playing = true;
         self.transport.transport_running = false;
@@ -734,7 +776,7 @@ impl Engine {
             return false;
         };
 
-        self.transport.transport_sample = self.transport.normalize_transport_sample(sample);
+        self.transport.transport_sample = self.normalize_transport_position(sample);
         self.restart_render_clock();
         self.bump_prepare_generation();
         self.transport.notified_loop_wrap_sample = None;
@@ -781,6 +823,7 @@ impl Engine {
             self.send_midi_clock_transport(status);
         }
         self.reset_midi_clock_output();
+        self.update_hardware_master();
 
         false
     }
@@ -801,7 +844,7 @@ impl Engine {
         self.restart_render_clock();
         self.bump_prepare_generation();
         self.transport.notified_loop_wrap_sample = None;
-        if self.transport.loop_enabled
+        if self.transport_loop_enabled()
             && let Some((loop_start, loop_end)) = self.transport.loop_range_samples
             && self.transport.transport_sample >= loop_end
         {
@@ -842,9 +885,8 @@ impl Engine {
                 }
             }
             Action::JumpToEnd => {
-                self.transport.transport_sample = self
-                    .transport
-                    .normalize_transport_sample(self.session_end_sample());
+                self.transport.transport_sample =
+                    self.normalize_transport_position(self.session_end_sample());
                 self.restart_render_clock();
                 self.bump_prepare_generation();
                 self.publish_transport_snapshot();
@@ -931,20 +973,50 @@ impl Engine {
                 self.hw_midi.timecode_active_device = None;
                 self.hw_midi.timecode_last_received = None;
                 self.hw_midi.timecode_running = false;
+                self.restart_render_clock();
+                self.bump_prepare_generation();
+            }
+            Action::SetMidiTimecodeOffset(offset_seconds) => {
+                if !offset_seconds.is_finite() {
+                    return false;
+                }
+                let offset_seconds = offset_seconds.clamp(-86_400.0, 86_400.0);
+                self.hw_midi.timecode_offset_seconds = offset_seconds;
+                if let Some(generator) = self.hw_midi.timecode_output_generator.as_mut() {
+                    generator.set_offset_seconds(offset_seconds);
+                }
+                self.reset_midi_timecode_output(true);
             }
             Action::SetMidiTimecodeOutput {
                 enabled,
                 frame_rate,
             } => {
+                self.hw_midi.master_frame_rate = frame_rate;
                 self.hw_midi.timecode_output_enabled = enabled;
                 self.hw_midi.timecode_output_generator = enabled.then(|| {
-                    crate::midi::mtc::Generator::new(
+                    let mut generator = crate::midi::mtc::Generator::new(
                         self.sample_rate(),
                         frame_rate,
                         self.transport.transport_sample,
-                    )
+                    );
+                    generator.set_offset_seconds(self.hw_midi.timecode_offset_seconds);
+                    generator
                 });
                 self.reset_midi_timecode_output(true);
+            }
+            Action::SetMidiClockEnabled(enabled) => {
+                self.hw_midi.midi_clock_input_enabled = enabled;
+                self.hw_midi.midi_clock_receivers.clear();
+                self.hw_midi.midi_clock_active_device = None;
+                self.hw_midi.midi_clock_position_pending = false;
+                self.hw_midi.midi_clock_started_at = None;
+                if !enabled {
+                    self.transport.external_tempo_bpm = None;
+                    self.update_global_tempo_from_map();
+                    self.publish_transport_snapshot();
+                }
+                self.restart_render_clock();
+                self.bump_prepare_generation();
             }
             Action::SetMidiClockOutput(enabled) => {
                 let was_enabled = self.hw_midi.midi_clock_output_enabled;
@@ -966,6 +1038,7 @@ impl Engine {
             }
             _ => {}
         }
+        self.update_hardware_master();
         false
     }
 }
@@ -999,12 +1072,15 @@ impl Engine {
 impl TransportFields {
     pub(crate) fn timing_at_sample(&self, sample: usize) -> (f64, u16, u16) {
         let bpm = self
-            .tempo_points
-            .iter()
-            .filter(|p| p.sample <= sample)
-            .max_by_key(|p| p.sample)
-            .map(|p| p.bpm)
-            .unwrap_or(self.tempo_bpm)
+            .external_tempo_bpm
+            .unwrap_or_else(|| {
+                self.tempo_points
+                    .iter()
+                    .filter(|p| p.sample <= sample)
+                    .max_by_key(|p| p.sample)
+                    .map(|p| p.bpm)
+                    .unwrap_or(self.tempo_bpm)
+            })
             .max(1.0);
         let (num, den) = self
             .time_signature_points

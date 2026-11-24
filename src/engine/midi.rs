@@ -831,6 +831,9 @@ impl Engine {
     }
 
     pub(crate) fn queue_midi_timecode_events(&mut self, events: Vec<MidiEvent>) {
+        if events.is_empty() {
+            return;
+        }
         if self.hw_worker.is_some() {
             let devices: std::collections::HashSet<String> = self
                 .hw_midi
@@ -838,6 +841,21 @@ impl Engine {
                 .iter()
                 .map(|route| route.device.clone())
                 .collect();
+            if let Some(service) = &self.hw_midi.service {
+                let mut batch = Vec::new();
+                for event in events {
+                    for device in &devices {
+                        batch.push(HwMidiEvent {
+                            device: device.clone(),
+                            event: event.clone(),
+                        });
+                    }
+                }
+                if !batch.is_empty() {
+                    service.immediate(batch);
+                }
+                return;
+            }
             for event in events {
                 for device in &devices {
                     self.hw_midi
@@ -859,7 +877,7 @@ impl Engine {
         }
         let position = self.transport.transport_sample;
         if let Some(generator) = self.hw_midi.timecode_output_generator.as_mut() {
-            generator.reset(position);
+            let position = generator.reset(position);
             if send_full_frame {
                 let event = generator.full_frame(position);
                 self.queue_midi_timecode_events(vec![event]);
@@ -880,7 +898,16 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    pub(crate) fn invalidate_master(&mut self) {
+        if self.hw_midi.master.take().is_some()
+            && let Some(service) = &self.hw_midi.service
+        {
+            service.configure(None, 0);
+        }
+    }
+
     pub(crate) fn reset_midi_clock_output(&mut self) {
+        self.invalidate_master();
         if let Some(generator) = self.hw_midi.midi_clock_output_generator.as_mut() {
             generator.reset();
         }
@@ -942,66 +969,188 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    pub(crate) async fn handle_midi_timecode_events(&mut self, events: &[HwMidiEvent]) {
-        if !self.hw_midi.timecode_enabled {
+    pub(crate) async fn handle_midi_sync_events(&mut self, events: &[HwMidiEvent]) {
+        self.handle_timed_sync_events(events, std::time::Instant::now())
+            .await;
+    }
+    pub(crate) async fn handle_timed_sync_events(
+        &mut self,
+        events: &[HwMidiEvent],
+        now: std::time::Instant,
+    ) {
+        for event in events {
+            let timecode = if self.hw_midi.timecode_enabled {
+                self.hw_midi
+                    .timecode_decoders
+                    .entry(event.device.clone())
+                    .or_default()
+                    .feed(&event.event.data)
+            } else {
+                None
+            };
+            if let Some(message) = timecode {
+                self.handle_midi_timecode_message(&event.device, message, now)
+                    .await;
+            }
+
+            let clock = if self.hw_midi.midi_clock_input_enabled {
+                self.hw_midi
+                    .midi_clock_receivers
+                    .entry(event.device.clone())
+                    .or_default()
+                    .feed(&event.event.data, now)
+            } else {
+                None
+            };
+            if let Some(input) = clock {
+                self.handle_midi_clock_input(&event.device, input, now)
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_midi_clock_input(
+        &mut self,
+        device: &str,
+        input: crate::midi::clock::InputEvent,
+        now: std::time::Instant,
+    ) {
+        if self
+            .hw_midi
+            .midi_clock_active_device
+            .as_ref()
+            .is_some_and(|active| active != device)
+        {
             return;
         }
-        let now = std::time::Instant::now();
-        let mut messages = Vec::new();
-        for event in events {
-            let decoder = self
-                .hw_midi
-                .timecode_decoders
-                .entry(event.device.clone())
-                .or_default();
-            if let Some(message) = decoder.feed(&event.event.data) {
-                messages.push((event.device.clone(), message));
-            }
-        }
-
-        for (device, message) in messages {
-            if self
-                .hw_midi
-                .timecode_active_device
-                .as_ref()
-                .is_some_and(|active| active != &device)
-            {
-                continue;
-            }
-            let started = self.hw_midi.timecode_active_device.is_none();
-            self.hw_midi.timecode_active_device = Some(device);
-            self.hw_midi.timecode_last_received = Some(now);
-            self.hw_midi.timecode_running = message.running;
-
-            let sample = (message.position_seconds() * self.sample_rate())
-                .round()
-                .clamp(0.0, usize::MAX as f64) as usize;
-            if !message.running {
-                if self.transport.playing {
-                    self.handle_stop(Action::Stop).await;
+        self.hw_midi.midi_clock_active_device = Some(device.to_string());
+        match input {
+            crate::midi::clock::InputEvent::Start => {
+                self.hw_midi.midi_clock_started_at = Some(now);
+                if !self.hw_midi.midi_clock_position_pending {
+                    self.handle_transport_position(Action::TransportPosition(0))
+                        .await;
                 }
-                self.handle_transport_position(Action::TransportPosition(sample))
-                    .await;
-                continue;
-            }
-            if started || !self.transport.playing {
-                self.handle_transport_position(Action::TransportPosition(sample))
-                    .await;
-                if !self.transport.playing {
+                self.hw_midi.midi_clock_position_pending = false;
+                if !self.transport.transport_running {
                     self.handle_play(Action::Play).await;
                 }
-                continue;
             }
-
-            let drift = sample.abs_diff(self.audible_transport_sample());
-            let two_timecode_frames = (2.0 * self.sample_rate()
-                / message.timecode.frame_rate.frames_per_second())
-                as usize;
-            let tolerance = two_timecode_frames.max(self.current_cycle_samples().saturating_mul(2));
-            if drift > tolerance {
+            crate::midi::clock::InputEvent::Continue => {
+                self.hw_midi.midi_clock_started_at = Some(now);
+                self.hw_midi.midi_clock_position_pending = false;
+                if !self.transport.transport_running {
+                    self.handle_play(Action::Play).await;
+                }
+            }
+            crate::midi::clock::InputEvent::Stop => {
+                self.hw_midi.midi_clock_started_at = None;
+                if self.transport.playing || self.transport.transport_running {
+                    self.handle_stop(Action::Stop).await;
+                }
+            }
+            crate::midi::clock::InputEvent::SongPosition(beats) => {
+                if self.transport.transport_running {
+                    return;
+                }
+                let sample = if let Some(bpm) = self.transport.external_tempo_bpm {
+                    (f64::from(beats) * self.sample_rate() * 60.0 / (bpm * 4.0)).round() as usize
+                } else {
+                    crate::midi::clock::song_position_sample(
+                        self.sample_rate(),
+                        &self.transport.tempo_points,
+                        self.transport.tempo_bpm,
+                        beats,
+                    )
+                };
                 self.handle_transport_position(Action::TransportPosition(sample))
                     .await;
+                self.notify_clients(Ok(Action::TransportPosition(sample)))
+                    .await;
+                self.hw_midi.midi_clock_position_pending = true;
             }
+            crate::midi::clock::InputEvent::Clock { bpm, .. } => {
+                if let Some(bpm) = bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0)
+                    && self.transport.external_tempo_bpm != Some(bpm)
+                {
+                    self.transport.external_tempo_bpm = Some(bpm);
+                    self.transport.tempo_bpm = bpm;
+                    if self.hw_midi.midi_clock_output_enabled {
+                        self.update_hardware_master();
+                    }
+                    self.bump_prepare_generation();
+                    self.publish_transport_snapshot();
+                    self.notify_clients(Ok(Action::SetTempo(bpm))).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_midi_timecode_message(
+        &mut self,
+        device: &str,
+        message: crate::midi::mtc::TimecodeMessage,
+        now: std::time::Instant,
+    ) {
+        if self
+            .hw_midi
+            .timecode_active_device
+            .as_ref()
+            .is_some_and(|active| active != device)
+        {
+            return;
+        }
+        let started = self.hw_midi.timecode_active_device.is_none();
+        self.hw_midi.timecode_active_device = Some(device.to_string());
+        self.hw_midi.timecode_last_received = Some(now);
+        self.hw_midi.timecode_running = message.running;
+
+        let sample = ((message.position_seconds() - self.hw_midi.timecode_offset_seconds).max(0.0)
+            * self.sample_rate())
+        .round()
+        .clamp(0.0, usize::MAX as f64) as usize;
+        if !message.running {
+            let resume_after_clock_start = self.transport.transport_running
+                && self.hw_midi.midi_clock_started_at.is_some_and(|started| {
+                    now.saturating_duration_since(started) <= std::time::Duration::from_millis(100)
+                });
+            self.hw_midi.midi_clock_started_at = None;
+            if resume_after_clock_start {
+                self.handle_transport_position(Action::TransportPosition(sample))
+                    .await;
+                self.notify_clients(Ok(Action::TransportPosition(sample)))
+                    .await;
+                self.hw_midi.midi_clock_position_pending = false;
+                return;
+            }
+            if self.transport.playing || self.transport.transport_running {
+                self.handle_stop(Action::Stop).await;
+            }
+            self.handle_transport_position(Action::TransportPosition(sample))
+                .await;
+            self.notify_clients(Ok(Action::TransportPosition(sample)))
+                .await;
+            self.hw_midi.midi_clock_position_pending = true;
+            return;
+        }
+        if started || !self.transport.transport_running {
+            self.handle_transport_position(Action::TransportPosition(sample))
+                .await;
+            if !self.transport.transport_running {
+                self.handle_play(Action::Play).await;
+            }
+            return;
+        }
+
+        let drift = sample.abs_diff(self.audible_transport_sample());
+        if drift <= self.current_cycle_samples().max(1) {
+            return;
+        }
+        if drift > (self.sample_rate() / 4.0) as usize {
+            self.handle_transport_position(Action::TransportPosition(sample))
+                .await;
+        } else {
+            self.correct_external_transport_position(sample);
         }
     }
 
@@ -1474,7 +1623,10 @@ impl Engine {
             vec![]
         };
 
-        if let Some(worker) = &self.hw_worker {
+        if let Some(service) = &self.hw_midi.service {
+            service.clear_track();
+            service.immediate(panic_events);
+        } else if let Some(worker) = &self.hw_worker {
             if let Err(e) = worker.tx.send(Message::ClearHWMidiOutEvents).await {
                 error!("Error clearing pending HWMidiOutEvents {e}");
             }
@@ -1758,7 +1910,10 @@ impl Engine {
         };
 
         let panic_events = self.panic_events_for_all_hw_midi_outputs();
-        if let Some(worker) = &self.hw_worker {
+        if let Some(service) = &self.hw_midi.service {
+            service.clear_track();
+            service.immediate(panic_events);
+        } else if let Some(worker) = &self.hw_worker {
             if !panic_events.is_empty() {
                 if let Err(e) = worker.tx.send(Message::ClearHWMidiOutEvents).await {
                     error!("Error clearing HW MIDI queue for panic {e}");
@@ -2406,8 +2561,10 @@ mod tests {
             .build()
             .expect("tokio runtime");
         runtime.block_on(async {
-            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
-            let mut engine = Engine::new(engine_rx, engine_tx);
+            let (_engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, client_tx.clone());
+            engine.clients.push(client_tx);
             engine.hw_midi.timecode_enabled = true;
             let mut events = vec![crate::message::HwMidiEvent {
                 device: "mtc-source".to_string(),
@@ -2425,6 +2582,14 @@ mod tests {
                 engine.hw_midi.timecode_active_device.as_deref(),
                 Some("mtc-source")
             );
+            let mut notified = false;
+            while let Ok(message) = client_rx.try_recv() {
+                notified |= matches!(
+                    message,
+                    crate::message::Message::Response(Ok(Action::TransportPosition(48_000)))
+                );
+            }
+            assert!(notified);
         });
     }
 
@@ -2497,6 +2662,356 @@ mod tests {
             assert!(events.iter().any(|event| event.device == "out-a"));
             assert!(events.iter().any(|event| event.device == "out-b"));
         });
+    }
+
+    #[test]
+    fn midi_clock_slave_handles_song_position_start_and_stop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+            engine
+                .handle_request(Action::SetMidiClockEnabled(true))
+                .await;
+            let mut events = vec![
+                crate::message::HwMidiEvent {
+                    device: "clock-source".to_string(),
+                    event: crate::midi::io::MidiEvent::new(0, vec![0xF2, 8, 0]),
+                },
+                crate::message::HwMidiEvent {
+                    device: "clock-source".to_string(),
+                    event: crate::midi::io::MidiEvent::new(0, vec![0xFA]),
+                },
+            ];
+
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert!(engine.transport.playing);
+            assert_eq!(engine.transport.transport_sample, 48_000);
+            assert!(!engine.hw_midi.midi_clock_position_pending);
+
+            engine.transport.transport_sample = 123;
+            let mut events = vec![crate::message::HwMidiEvent {
+                device: "clock-source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![0xF2, 8, 0]),
+            }];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert_eq!(engine.transport.transport_sample, 123);
+
+            let mut events = vec![crate::message::HwMidiEvent {
+                device: "clock-source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![0xFC]),
+            }];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert!(!engine.transport.playing);
+
+            let mut events = vec![crate::message::HwMidiEvent {
+                device: "clock-source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![0xF2, 8, 0]),
+            }];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert_eq!(engine.transport.transport_sample, 48_000);
+        });
+    }
+
+    #[test]
+    fn midi_clock_start_without_song_position_begins_at_zero() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+            engine
+                .handle_request(Action::SetMidiClockEnabled(true))
+                .await;
+            engine.transport.transport_sample = 48_000;
+            let mut events = vec![crate::message::HwMidiEvent {
+                device: "clock-source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![0xFA]),
+            }];
+
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+
+            assert!(engine.transport.playing);
+            assert_eq!(engine.transport.transport_sample, 0);
+        });
+    }
+
+    #[test]
+    fn clock_start_preserves_full_frame_mtc_position_in_combined_mode() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+
+            engine
+                .handle_request(Action::SetMidiTimecodeEnabled(true))
+                .await;
+            engine
+                .handle_request(Action::SetMidiClockEnabled(true))
+                .await;
+            assert!(engine.hw_midi.midi_clock_input_enabled);
+            assert!(engine.hw_midi.timecode_enabled);
+
+            let mut events = vec![
+                crate::message::HwMidiEvent {
+                    device: "clock-source".to_string(),
+                    event: crate::midi::io::MidiEvent::new(
+                        0,
+                        vec![0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x60, 0, 1, 0, 0xF7],
+                    ),
+                },
+                crate::message::HwMidiEvent {
+                    device: "clock-source".to_string(),
+                    event: crate::midi::io::MidiEvent::new(0, vec![0xFA]),
+                },
+            ];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+
+            assert!(engine.transport.playing);
+            assert_eq!(engine.transport.transport_sample, 48_000);
+        });
+    }
+
+    #[test]
+    fn midi_sync_preserves_wire_order_and_position_across_stop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+            engine
+                .handle_request(Action::SetMidiTimecodeEnabled(true))
+                .await;
+            engine
+                .handle_request(Action::SetMidiClockEnabled(true))
+                .await;
+            let full_frame = |seconds| crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(
+                    0,
+                    vec![0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x60, 0, seconds, 0, 0xF7],
+                ),
+            };
+            let clock = |status| crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![status]),
+            };
+
+            let mut events = vec![clock(0xFA), full_frame(1)];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert!(engine.transport.playing);
+            assert_eq!(engine.transport.transport_sample, 48_000);
+
+            let mut events = vec![full_frame(2), clock(0xFC), clock(0xFA)];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert!(engine.transport.playing);
+            assert_eq!(engine.transport.transport_sample, 96_000);
+        });
+    }
+
+    #[test]
+    fn full_frame_after_clock_start_locates_and_resumes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+            engine
+                .handle_request(Action::SetMidiTimecodeEnabled(true))
+                .await;
+            engine
+                .handle_request(Action::SetMidiClockEnabled(true))
+                .await;
+            let full_frame = |seconds, frames| crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(
+                    0,
+                    vec![0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x20, 0, seconds, frames, 0xF7],
+                ),
+            };
+            let clock = |status| crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![status]),
+            };
+
+            let mut events = vec![clock(0xFA), full_frame(32, 0)];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+
+            assert!(engine.transport.playing);
+            assert!(engine.transport.transport_running);
+            assert_eq!(engine.transport.transport_sample, 32 * 48_000);
+
+            let mut events = vec![clock(0xFC), full_frame(14, 15)];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+
+            assert!(!engine.transport.playing);
+            assert_eq!(
+                engine.transport.transport_sample,
+                ((14.0 + 15.0 / 25.0) * 48_000.0) as usize
+            );
+        });
+    }
+
+    #[test]
+    fn spp_and_full_frame_mtc_use_latest_explicit_locate() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (_engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, client_tx.clone());
+            engine.clients.push(client_tx);
+            engine
+                .handle_request(Action::SetMidiTimecodeEnabled(true))
+                .await;
+            engine
+                .handle_request(Action::SetMidiClockEnabled(true))
+                .await;
+            let full_frame = crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(
+                    0,
+                    vec![0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x60, 0, 2, 0, 0xF7],
+                ),
+            };
+            let spp = crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![0xF2, 8, 0]),
+            };
+
+            let mut events = vec![spp.clone(), full_frame.clone()];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert_eq!(engine.transport.transport_sample, 96_000);
+
+            let mut events = vec![full_frame, spp];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+            assert_eq!(engine.transport.transport_sample, 48_000);
+            let mut notified = false;
+            while let Ok(message) = client_rx.try_recv() {
+                notified |= matches!(
+                    message,
+                    crate::message::Message::Response(Ok(Action::TransportPosition(48_000)))
+                );
+            }
+            assert!(notified);
+        });
+    }
+
+    #[test]
+    fn midi_clock_continue_resumes_paused_transport() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+            engine
+                .handle_request(Action::SetMidiClockEnabled(true))
+                .await;
+            engine.handle_play(Action::Play).await;
+            engine.handle_pause(Action::Pause).await;
+            assert!(engine.transport.playing);
+            assert!(!engine.transport.transport_running);
+
+            let mut events = vec![crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(0, vec![0xFB]),
+            }];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+
+            assert!(engine.transport.playing);
+            assert!(engine.transport.transport_running);
+        });
+    }
+
+    #[test]
+    fn external_sync_position_is_not_wrapped_by_session_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+            engine.transport.loop_enabled = true;
+            engine.transport.loop_range_samples = Some((0, 1_000));
+            engine
+                .handle_request(Action::SetMidiTimecodeEnabled(true))
+                .await;
+
+            let mut events = vec![crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(
+                    0,
+                    vec![0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x60, 0, 1, 0, 0xF7],
+                ),
+            }];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+
+            assert_eq!(engine.transport.transport_sample, 48_000);
+            assert!(!engine.transport_loop_enabled());
+        });
+    }
+
+    #[test]
+    fn timecode_offset_is_subtracted_from_incoming_position() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+            let mut engine = Engine::new(engine_rx, engine_tx);
+            engine
+                .handle_request(Action::SetMidiTimecodeEnabled(true))
+                .await;
+            engine
+                .handle_request(Action::SetMidiTimecodeOffset(3_600.0))
+                .await;
+
+            let mut events = vec![crate::message::HwMidiEvent {
+                device: "source".to_string(),
+                event: crate::midi::io::MidiEvent::new(
+                    0,
+                    vec![0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x61, 0, 0, 0, 0xF7],
+                ),
+            }];
+            engine.handle_hw_midi_in_events(&mut events, true).await;
+
+            assert_eq!(engine.transport.transport_sample, 0);
+        });
+    }
+
+    #[test]
+    fn external_position_correction_is_bounded_and_does_not_restart_transport() {
+        let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(16);
+        let mut engine = Engine::new(engine_rx, engine_tx);
+        engine.hw_driver_info = Some(super::super::HwDriverInfo {
+            cycle_samples: 64,
+            sample_rate: 48_000,
+            input_channels: 0,
+            output_channels: 2,
+            sample_bits: 32,
+            frame_size_bytes: 4,
+            capture_buffer_frames: 0,
+            fresh_capture: true,
+        });
+        engine.transport.transport_sample = 10_000;
+        engine.transport.transport_running = true;
+        engine.transport.playing = true;
+        engine.transport.render_clock = Some((10_000, 0));
+
+        engine.correct_external_transport_position(10_128);
+
+        assert_eq!(engine.transport.transport_sample, 10_064);
+        assert_eq!(engine.transport.render_clock, Some((10_064, 0)));
+        assert!(!engine.transport.transport_restart_pending);
     }
 
     #[test]

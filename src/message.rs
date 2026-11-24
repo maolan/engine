@@ -1059,10 +1059,12 @@ pub enum Action {
     },
     SetOscEnabled(bool),
     SetMidiTimecodeEnabled(bool),
+    SetMidiTimecodeOffset(f64),
     SetMidiTimecodeOutput {
         enabled: bool,
         frame_rate: crate::midi::mtc::FrameRate,
     },
+    SetMidiClockEnabled(bool),
     SetMidiClockOutput(bool),
     SetClipPlaybackEnabled(bool),
     SetSessionClipPlaybackEnabled(bool),
@@ -2066,6 +2068,7 @@ pub enum Message {
     },
     Response(Result<Action, String>),
     HWMidiEvents(Vec<HwMidiEvent>),
+    TimedMidiInput(std::time::Instant, Vec<HwMidiEvent>),
     HWMidiOutEvents(Vec<HwMidiEvent>),
     ClearHWMidiOutEvents,
     StartAudioPreview {

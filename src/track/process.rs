@@ -30,6 +30,7 @@ impl TrackData {
         is_folder: bool,
     ) -> Self {
         Self {
+            hardware_input: Arc::new(HardwareMidiQueue::new()),
             rt: TrackRtCell::new(TrackRt::new(io.audio_outs, buffer_size)),
             name,
             level: AtomicU32::new(0.0_f32.to_bits()),
@@ -1206,6 +1207,9 @@ impl TrackData {
     /// The engine calls this only between cycles (from `start_plan_cycle`,
     /// with no plan cycle in flight), per `RenderPlan::clear_processing_buffers`.
     pub(crate) fn clear_processing_buffers(&mut self) {
+        if let Some(queue) = self.hardware_input.get() {
+            while queue.pop().is_some() {}
+        }
         self.rt.with_rt(|rt| {
             rt.last_audio_outputs
                 .iter_mut()

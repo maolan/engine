@@ -56,7 +56,9 @@ impl Engine {
             && !self.hw_midi.pending_hw_midi_out_events_by_device.is_empty()
         {
             let out_events = std::mem::take(&mut self.hw_midi.pending_hw_midi_out_events_by_device);
-            if let Err(e) = worker.tx.send(Message::HWMidiOutEvents(out_events)).await {
+            if let Some(service) = &self.hw_midi.service {
+                service.track(self.sample_rate(), out_events);
+            } else if let Err(e) = worker.tx.send(Message::HWMidiOutEvents(out_events)).await {
                 error!("Error sending HWMidiOutEvents {e}");
             }
         }
@@ -70,7 +72,7 @@ impl Engine {
         }
 
         // Resolve the current routes to track handles for the cycle thread.
-        let routes = if render {
+        let routes = if render && self.hw_midi.service.is_none() {
             let state = self.state_snapshot.load_full();
             self.hw_midi
                 .midi_hw_in_routes
@@ -198,7 +200,15 @@ impl Engine {
         events: &mut Vec<HwMidiEvent>,
         buffer_for_ports: bool,
     ) {
-        self.handle_midi_timecode_events(events).await;
+        self.handle_midi_sync_events(events).await;
+        self.route_hw_midi_input(events, buffer_for_ports).await;
+    }
+
+    pub(crate) async fn route_hw_midi_input(
+        &mut self,
+        events: &mut Vec<HwMidiEvent>,
+        buffer_for_ports: bool,
+    ) {
         for hw_event in events.drain(..) {
             let thru_targets: Vec<String> = self
                 .hw_midi
@@ -270,14 +280,57 @@ impl Engine {
         }
     }
 
+    pub(crate) fn update_hardware_master(&mut self) {
+        if let Some(service) = &self.hw_midi.service {
+            self.hw_midi.master_routes_dirty = false;
+            let config = (self.transport.transport_running
+                && (self.hw_midi.midi_clock_output_enabled
+                    || self.hw_midi.timecode_output_enabled))
+                .then(|| {
+                    let mut devices: Vec<_> = self
+                        .hw_midi
+                        .midi_hw_out_routes
+                        .iter()
+                        .map(|r| r.device.clone())
+                        .collect();
+                    devices.sort();
+                    devices.dedup();
+                    crate::workers::midi_service::MasterConfig {
+                        rate: self.sample_rate(),
+                        tempo: self.transport.tempo_bpm,
+                        points: self.transport.tempo_points.clone(),
+                        devices,
+                        clock: self.hw_midi.midi_clock_output_enabled,
+                        mtc: self
+                            .hw_midi
+                            .timecode_output_enabled
+                            .then_some(self.hw_midi.master_frame_rate),
+                        offset: self.hw_midi.timecode_offset_seconds,
+                    }
+                });
+            if config != self.hw_midi.master {
+                service.configure(config.clone(), self.transport.transport_sample);
+                self.hw_midi.master = config;
+            }
+        }
+    }
+
     /// Collect the hardware MIDI-out events produced by the cycle that just
     /// rendered, buffer them for the Go sender, and add loop-wrap note-offs.
     /// Extracted from `on_all_tracks_finished` so the inline `HWFinished`
     /// handler can run it at the same point in the cycle (before the
     /// transport advance, which the wrap math is relative to).
     pub(crate) fn collect_hw_midi_out_for_next_cycle(&mut self) {
-        let mut timecode_events = self.generate_midi_timecode_cycle();
-        timecode_events.extend(self.generate_midi_clock_cycle());
+        let mut timecode_events = if self.hw_midi.service.is_some() {
+            if self.hw_midi.master_routes_dirty {
+                self.update_hardware_master();
+            }
+            Vec::new()
+        } else {
+            let mut events = self.generate_midi_timecode_cycle();
+            events.extend(self.generate_midi_clock_cycle());
+            events
+        };
         timecode_events.sort_by_key(|event| event.frame);
         if self.transport.transport_restart_pending {
             let state = self.state_snapshot.load_full();
@@ -297,7 +350,7 @@ impl Engine {
         self.hw_midi.active_hw_notes_cycle_start = self.hw_midi.active_hw_notes_by_track.clone();
         let mut out_events = self.collect_hw_midi_output_events_by_device();
         self.queue_midi_timecode_events(timecode_events);
-        if self.transport.loop_enabled
+        if self.transport_loop_enabled()
             && let Some((_, loop_end)) = self.transport.loop_range_samples
         {
             let cycle_end = self

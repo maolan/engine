@@ -225,6 +225,8 @@ impl Engine {
                 let midi_outputs = runtime.midi_output_devices();
                 let rate = runtime.sample_rate;
                 if let Some(mut worker) = self.hw_worker.take() {
+                    self.hw_midi.service = None;
+                    self.hw_midi.master = None;
                     if let Some(hw) = self.hw_driver.as_mut() {
                         hw.request_stop();
                     }
@@ -363,7 +365,7 @@ impl Engine {
             jack_state,
             jack::TransportState::Rolling | jack::TransportState::Starting
         );
-        let normalized_frame = self.transport.normalize_transport_sample(jack_frame);
+        let normalized_frame = self.normalize_transport_position(jack_frame);
         let decision = Self::jack_transport_sync_decision(
             self.transport.playing,
             self.transport.transport_sample,
@@ -473,8 +475,11 @@ impl Engine {
         );
         let capture_frame = self.hw_capture_frame.clone();
         let inline_render = self.rt_inline_enabled.then(|| self.inline_render.clone());
+        let worker = HwWorker::new(hw, midi_hub, rx, tx_engine, capture_frame, inline_render);
+        self.hw_midi.service = worker.midi_service.clone();
+        self.hw_midi.master_routes_dirty = true;
+        self.hw_midi.master = None;
         let handler = tokio::spawn(async move {
-            let worker = HwWorker::new(hw, midi_hub, rx, tx_engine, capture_frame, inline_render);
             worker.work().await;
         });
         self.hw_worker = Some(WorkerData::new(tx, handler));
