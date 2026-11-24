@@ -72,6 +72,9 @@ impl Engine {
             | Action::SetTimeSignature { .. }
             | Action::SetTempoMap { .. }
             | Action::SetOscEnabled(_)
+            | Action::SetMidiTimecodeEnabled(_)
+            | Action::SetMidiTimecodeOutput { .. }
+            | Action::SetMidiClockOutput(_)
             | Action::SetClipPlaybackEnabled(_)
             | Action::SetRecordEnabled(_)
             | Action::SetStepRecording(_)
@@ -596,7 +599,10 @@ impl Engine {
             | Action::SetTempo(_)
             | Action::SetTimeSignature { .. }
             | Action::SetTempoMap { .. }
-            | Action::SetOscEnabled(_) => {
+            | Action::SetOscEnabled(_)
+            | Action::SetMidiTimecodeEnabled(_)
+            | Action::SetMidiTimecodeOutput { .. }
+            | Action::SetMidiClockOutput(_) => {
                 if self.handle_transport_request(a.clone()).await {
                     return;
                 }
@@ -942,6 +948,7 @@ impl Engine {
                 self.publish_clap_state_dirty().await;
             }
             self.on_executor_tick().await;
+            self.check_midi_timecode_timeout().await;
             let Some(message) = message else {
                 continue;
             };

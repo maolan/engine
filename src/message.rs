@@ -1058,6 +1058,12 @@ pub enum Action {
         time_signature_points: Vec<TimeSignaturePoint>,
     },
     SetOscEnabled(bool),
+    SetMidiTimecodeEnabled(bool),
+    SetMidiTimecodeOutput {
+        enabled: bool,
+        frame_rate: crate::midi::mtc::FrameRate,
+    },
+    SetMidiClockOutput(bool),
     SetClipPlaybackEnabled(bool),
     SetSessionClipPlaybackEnabled(bool),
     SetRecordEnabled(bool),

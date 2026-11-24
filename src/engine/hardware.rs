@@ -247,6 +247,14 @@ impl Engine {
                     self.midi_hub = Some(MidiHub::default());
                 }
                 self.jack_runtime = Some(runtime);
+                let sample_rate = self.sample_rate();
+                let position = self.transport.transport_sample;
+                if let Some(generator) = self.hw_midi.timecode_output_generator.as_mut() {
+                    generator.set_sample_rate(sample_rate, position);
+                }
+                if let Some(generator) = self.hw_midi.midi_clock_output_generator.as_mut() {
+                    generator.set_sample_rate(sample_rate);
+                }
                 self.publish_hw_ports();
                 self.publish_hw_infos(input_channels, output_channels, rate)
                     .await;
@@ -368,6 +376,13 @@ impl Engine {
             self.transport.playing = matches!(play_sync, JackTransportPlaySync::Start);
             self.bump_prepare_generation();
             self.transport.transport_running = self.transport.playing;
+            self.reset_midi_timecode_output(true);
+            if self.transport.playing {
+                self.start_midi_clock_output();
+            } else {
+                self.send_midi_clock_transport(0xFC);
+                self.reset_midi_clock_output();
+            }
             if matches!(play_sync, JackTransportPlaySync::Start) {
                 self.restart_render_clock();
                 self.transport.transport_restart_pending = false;
@@ -388,6 +403,13 @@ impl Engine {
         if let Some(sample) = decision.position_sync {
             self.transport.transport_sample = sample;
             self.restart_render_clock();
+            self.reset_midi_timecode_output(true);
+            if self.transport.playing {
+                self.start_midi_clock_output();
+            } else {
+                self.send_midi_clock_song_position();
+                self.reset_midi_clock_output();
+            }
             self.bump_prepare_generation();
             self.notify_event(Event::TransportPosition(self.transport.transport_sample))
                 .await;
@@ -552,6 +574,14 @@ impl Engine {
             capture_buffer_frames,
             fresh_capture,
         });
+        let sample_rate = self.sample_rate();
+        let position = self.transport.transport_sample;
+        if let Some(generator) = self.hw_midi.timecode_output_generator.as_mut() {
+            generator.set_sample_rate(sample_rate, position);
+        }
+        if let Some(generator) = self.hw_midi.midi_clock_output_generator.as_mut() {
+            generator.set_sample_rate(sample_rate);
+        }
         // Bound the plugin-host wait by the device period (ARCHITECTURE.md
         // Phase 3): min(100 ms, 2 × period).
         #[cfg(feature = "plugins")]

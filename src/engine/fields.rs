@@ -228,6 +228,15 @@ pub struct MidiLearnFields {
 /// Hardware MIDI event queues/routes and active-note tracking.
 #[derive(Default)]
 pub struct HwMidiFields {
+    pub timecode_enabled: bool,
+    pub timecode_decoders: HashMap<String, crate::midi::mtc::Decoder>,
+    pub timecode_active_device: Option<String>,
+    pub timecode_last_received: Option<Instant>,
+    pub timecode_running: bool,
+    pub timecode_output_enabled: bool,
+    pub timecode_output_generator: Option<crate::midi::mtc::Generator>,
+    pub midi_clock_output_enabled: bool,
+    pub midi_clock_output_generator: Option<crate::midi::clock::Generator>,
     pub pending_hw_midi_events: Vec<MidiEvent>,
     pub pending_hw_midi_events_by_device: HashMap<String, Vec<MidiEvent>>,
     pub pending_hw_midi_out_events: Vec<MidiEvent>,
