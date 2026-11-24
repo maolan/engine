@@ -6,7 +6,7 @@ use crate::{
 use nix::libc;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
@@ -19,6 +19,7 @@ pub trait Backend: Send + Sync + 'static {
     type Driver: HwWorkerDriver + Send + 'static;
     type MidiHub: HwMidiHub + Send + 'static;
 
+    const SEPARATE_MIDI: bool = false;
     const LABEL: &'static str;
     const WORKER_THREAD_NAME: &'static str;
     const ASSIST_THREAD_NAME: &'static str;
@@ -44,6 +45,8 @@ pub struct HwWorker<B: Backend> {
     cycle_frames: u32,
     pending_midi_out_events: Vec<HwMidiEvent>,
     pending_midi_out_sorted: bool,
+    midi_out_generation: Arc<AtomicU64>,
+    pub(crate) midi_service: Option<super::midi_service::MidiService>,
     midi_stop: Arc<AtomicBool>,
     /// Mirrors the last `HWSetPlaying`; while stopped, MIDI-out events are
     /// flushed on receipt (panic All-Sound-Off must not wait for a cycle)
@@ -72,7 +75,11 @@ impl<B: Backend> Drop for HwWorker<B> {
         if let Some(driver) = self.driver.as_mut() {
             driver.request_stop();
         }
+        if let Some(service) = self.midi_service.take() {
+            service.shutdown();
+        }
         self.midi_stop.store(true, Ordering::Release);
+        self.midi_out_generation.fetch_add(1, Ordering::AcqRel);
         let mut hub = self.lock_midi_hub();
         hub.wake_input_waiter();
         hub.close_all();
@@ -222,11 +229,18 @@ impl<B: Backend> HwWorker<B> {
     ) -> Self {
         let cycle_frames = driver.cycle_samples() as u32;
         let midi_hub = Arc::new(Mutex::new(midi_hub));
-        if let Some(ctx) = inline_render.as_ref() {
+        if !B::SEPARATE_MIDI
+            && let Some(ctx) = inline_render.as_ref()
+        {
             let source: Arc<Mutex<dyn crate::inline_render::MidiInSource + Send>> =
                 midi_hub.clone();
             ctx.set_midi_source(&source);
         }
+        let midi_stop = Arc::new(AtomicBool::new(false));
+        let midi_out_generation = Arc::new(AtomicU64::new(0));
+        let midi_service = B::SEPARATE_MIDI.then(|| {
+            super::midi_service::MidiService::start(midi_hub.clone(), tx.clone(), midi_stop.clone())
+        });
         Self {
             driver: Some(driver),
             midi_hub,
@@ -235,7 +249,9 @@ impl<B: Backend> HwWorker<B> {
             cycle_frames,
             pending_midi_out_events: vec![],
             pending_midi_out_sorted: true,
-            midi_stop: Arc::new(AtomicBool::new(false)),
+            midi_out_generation,
+            midi_stop,
+            midi_service,
             playing: false,
             last_xrun_count: None,
             last_xrun_report: None,
@@ -398,11 +414,18 @@ impl<B: Backend> HwWorker<B> {
                 }
             }
             Message::ClearHWMidiOutEvents => {
+                if let Some(service) = &self.midi_service {
+                    service.clear_track();
+                }
+                self.midi_out_generation.fetch_add(1, Ordering::AcqRel);
                 self.pending_midi_out_events.clear();
                 self.pending_midi_out_sorted = true;
             }
             Message::HWSetPlaying(playing) => {
                 self.playing = playing;
+                if !playing {
+                    self.midi_out_generation.fetch_add(1, Ordering::AcqRel);
+                }
                 self.driver_mut().set_playing(playing);
             }
             Message::HWZeroFillBuffers => {
@@ -691,11 +714,18 @@ impl<B: Backend> HwWorker<B> {
                 }
             }
             Message::ClearHWMidiOutEvents => {
+                if let Some(service) = &self.midi_service {
+                    service.clear_track();
+                }
+                self.midi_out_generation.fetch_add(1, Ordering::AcqRel);
                 self.pending_midi_out_events.clear();
                 self.pending_midi_out_sorted = true;
             }
             Message::HWSetPlaying(playing) => {
                 self.playing = playing;
+                if !playing {
+                    self.midi_out_generation.fetch_add(1, Ordering::AcqRel);
+                }
                 self.driver_mut().set_playing(playing);
             }
             Message::HWZeroFillBuffers => {
@@ -748,6 +778,19 @@ impl<B: Backend> HwWorker<B> {
             self.pending_midi_out_sorted = true;
         }
         let events = std::mem::take(&mut self.pending_midi_out_events);
+        if let Some(service) = &self.midi_service {
+            if self.playing {
+                service.track(
+                    self.driver
+                        .as_ref()
+                        .map_or(48_000.0, |d| f64::from(d.sample_rate().max(1))),
+                    events,
+                );
+            } else {
+                service.immediate(events);
+            }
+            return;
+        }
         if !self.playing {
             self.lock_midi_hub()
                 .write_events_blocking(&events, Duration::from_millis(10));
@@ -757,23 +800,36 @@ impl<B: Backend> HwWorker<B> {
             .driver
             .as_ref()
             .map_or(48_000.0, |driver| f64::from(driver.sample_rate().max(1)));
-        let start = tokio::time::Instant::now();
-        let mut index = 0;
-        while index < events.len() {
-            let frame = events[index].event.frame;
-            let target = start + Duration::from_secs_f64(f64::from(frame) / sample_rate);
-            tokio::time::sleep_until(target).await;
-            let mut end = index + 1;
-            while end < events.len() && events[end].event.frame == frame {
-                end += 1;
+        let midi_hub = self.midi_hub.clone();
+        let midi_out_generation = self.midi_out_generation.clone();
+        let generation = midi_out_generation.load(Ordering::Acquire);
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let mut index = 0;
+            while index < events.len() {
+                let frame = events[index].event.frame;
+                let target = start + Duration::from_secs_f64(f64::from(frame) / sample_rate);
+                tokio::time::sleep_until(target).await;
+                if midi_out_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let mut end = index + 1;
+                while end < events.len() && events[end].event.frame == frame {
+                    end += 1;
+                }
+                midi_hub
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .write_events_blocking(&events[index..end], Duration::from_millis(10));
+                index = end;
             }
-            self.lock_midi_hub()
-                .write_events_blocking(&events[index..end], Duration::from_millis(10));
-            index = end;
-        }
+        });
     }
 
     async fn drain_midi_input(&mut self) {
+        if B::SEPARATE_MIDI {
+            return;
+        }
         let mut midi_in_events = Vec::with_capacity(64);
         self.lock_midi_hub().read_events_into(&mut midi_in_events);
         if midi_in_events.is_empty() {
@@ -786,7 +842,11 @@ impl<B: Backend> HwWorker<B> {
     }
 
     fn shutdown_midi(&mut self) {
+        if let Some(service) = self.midi_service.take() {
+            service.shutdown();
+        }
         self.midi_stop.store(true, Ordering::Release);
+        self.midi_out_generation.fetch_add(1, Ordering::AcqRel);
         let mut hub = self.lock_midi_hub();
         hub.wake_input_waiter();
         hub.close_all();
@@ -826,9 +886,10 @@ mod tests {
     use super::{Backend, CAPTURE_FRAME_UNKNOWN, HwWorker};
     use crate::hw::traits::{HwMidiHub, HwWorkerDriver};
     use crate::message::{Action, HwMidiEvent, Message};
+    use crate::midi::io::MidiEvent;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc::channel;
 
     /// Driver whose cycle blocks until the shared stop flag is set,
@@ -896,6 +957,42 @@ mod tests {
         const WORKER_THREAD_NAME: &'static str = "stalling-worker";
         const ASSIST_THREAD_NAME: &'static str = "stalling-assist";
         const ASSIST_AUTONOMOUS_ENV: &'static str = "MAOLAN_STALLING_ASSIST";
+    }
+
+    #[cfg_attr(
+        all(miri, target_os = "windows"),
+        ignore = "Tokio runtime uses Windows IOCP, which Miri does not support"
+    )]
+    #[cfg_attr(
+        all(miri, any(target_os = "freebsd", target_os = "macos")),
+        ignore = "Tokio runtime uses kqueue, which Miri does not support on FreeBSD or macOS"
+    )]
+    #[tokio::test]
+    async fn scheduled_midi_output_does_not_block_the_audio_worker() {
+        let driver = StallingDriver {
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let (_msg_tx, msg_rx) = channel::<Message>(32);
+        let (engine_tx, _engine_rx) = channel::<Message>(32);
+        let mut worker = HwWorker::<StallingBackend>::new(
+            driver,
+            NoopMidiHub,
+            msg_rx,
+            engine_tx,
+            Arc::new(AtomicI64::new(CAPTURE_FRAME_UNKNOWN)),
+            None,
+        );
+        worker.playing = true;
+        worker.pending_midi_out_events.push(HwMidiEvent {
+            device: "out".to_string(),
+            event: MidiEvent::new(48_000, vec![0xF8]),
+        });
+
+        let start = Instant::now();
+        worker.flush_pending_midi_out().await;
+
+        assert!(start.elapsed() < Duration::from_millis(100));
+        worker.midi_out_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Regression test for the shutdown deadlock: a `Quit` received while a

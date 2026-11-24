@@ -1,9 +1,144 @@
 use crate::{message::TempoPoint, midi::io::MidiEvent};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 pub const CLOCKS_PER_QUARTER_NOTE: u64 = 24;
+pub const MIN_CLOCK_BPM: f64 = 20.0;
+pub const MAX_CLOCK_BPM: f64 = 400.0;
 const CLOCKS_PER_SONG_POSITION_BEAT: u64 = 6;
 const ACTIVE_SENSING_INTERVAL_SECONDS: f64 = 0.25;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputEvent {
+    Start,
+    Continue,
+    Stop,
+    SongPosition(u16),
+    Clock { bpm: Option<f64>, pulse: u64 },
+}
+
+#[derive(Debug, Default)]
+pub struct Receiver {
+    last_clock: Option<Instant>,
+    pending_clocks: u64,
+    pulses: u64,
+    clock_count: u64,
+    time: f64,
+    t0: f64,
+    t1: f64,
+    e2: f64,
+    b: f64,
+    c: f64,
+    bpm: Option<f64>,
+}
+
+impl Receiver {
+    pub fn feed(&mut self, data: &[u8], now: Instant) -> Option<InputEvent> {
+        match data {
+            [0xF8] => {
+                self.pending_clocks = self.pending_clocks.saturating_add(1);
+                if let Some(previous) = self.last_clock
+                    && now > previous
+                {
+                    let elapsed = now.saturating_duration_since(previous);
+                    let count = self.pending_clocks.min(u64::from(u32::MAX)) as u32;
+                    let interval = elapsed / count;
+                    if interval >= Duration::from_micros(100)
+                        && interval <= Duration::from_millis(500)
+                    {
+                        for _ in 0..count {
+                            self.update_dll(interval.as_secs_f64());
+                        }
+                    }
+                    self.last_clock = Some(now);
+                    self.pending_clocks = 0;
+                } else if self.last_clock.is_none() {
+                    self.last_clock = Some(now);
+                    self.pending_clocks = 0;
+                }
+                self.pulses = self.pulses.saturating_add(1);
+                Some(InputEvent::Clock {
+                    bpm: self.bpm,
+                    pulse: self.pulses,
+                })
+            }
+            [0xFA] => {
+                self.reset_position();
+                Some(InputEvent::Start)
+            }
+            [0xFB] => {
+                self.last_clock = None;
+                self.pending_clocks = 0;
+                Some(InputEvent::Continue)
+            }
+            [0xFC] => {
+                self.last_clock = None;
+                self.pending_clocks = 0;
+                Some(InputEvent::Stop)
+            }
+            [0xF2, lsb, msb] => {
+                let beats = u16::from(*lsb & 0x7F) | (u16::from(*msb & 0x7F) << 7);
+                self.last_clock = None;
+                self.pending_clocks = 0;
+                Some(InputEvent::SongPosition(beats))
+            }
+            _ => None,
+        }
+    }
+
+    fn update_dll(&mut self, interval: f64) {
+        self.time += interval;
+        if self.clock_count == 0 {
+            self.clock_count = 1;
+            return;
+        }
+        if self.clock_count == 1 {
+            let bpm = 60.0 / (interval * CLOCKS_PER_QUARTER_NOTE as f64);
+            if !(1.0..=999.0).contains(&bpm) {
+                return;
+            }
+            self.bpm = Some(bpm.round().clamp(MIN_CLOCK_BPM, MAX_CLOCK_BPM));
+            self.e2 = interval;
+            let omega =
+                2.0 * std::f64::consts::PI * (60.0 / 500.0) / CLOCKS_PER_QUARTER_NOTE as f64;
+            self.b = 2.0_f64.sqrt() * omega;
+            self.c = omega * omega;
+            self.t0 = self.time;
+            self.t1 = self.time + self.e2;
+            self.clock_count = 2;
+            return;
+        }
+
+        let error = self.time - self.t1;
+        self.t0 = self.t1;
+        self.t1 += self.b * error + self.e2;
+        self.e2 += self.c * error;
+        let samples_per_quarter = self.t1 - self.t0;
+        if samples_per_quarter > 0.0 {
+            let bpm = 60.0 / (samples_per_quarter * CLOCKS_PER_QUARTER_NOTE as f64);
+            if (1.0..=999.0).contains(&bpm) {
+                self.bpm = Some(bpm.round().clamp(MIN_CLOCK_BPM, MAX_CLOCK_BPM));
+            }
+        }
+        self.clock_count = self.clock_count.saturating_add(1);
+    }
+
+    fn reset_position(&mut self) {
+        self.last_clock = None;
+        self.pending_clocks = 0;
+        self.pulses = 0;
+        self.clock_count = 0;
+        self.time = 0.0;
+        self.t0 = 0.0;
+        self.t1 = 0.0;
+        self.e2 = 0.0;
+        self.b = 0.0;
+        self.c = 0.0;
+        self.bpm = None;
+    }
+}
 
 #[derive(Debug)]
 struct Segment {
@@ -87,6 +222,17 @@ impl TempoMap {
                 .then_some(sample)
         })
     }
+}
+
+pub fn song_position_sample(
+    sample_rate: f64,
+    tempo_points: &[TempoPoint],
+    fallback_bpm: f64,
+    beats: u16,
+) -> usize {
+    let map = TempoMap::new(sample_rate, tempo_points, fallback_bpm);
+    map.pulse_sample(u64::from(beats) * CLOCKS_PER_SONG_POSITION_BEAT)
+        .unwrap_or(usize::MAX)
 }
 
 #[derive(Debug)]
@@ -193,6 +339,56 @@ impl Generator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_measures_tempo_over_24_ppqn() {
+        let mut receiver = Receiver::default();
+        let start = Instant::now();
+        assert_eq!(receiver.feed(&[0xFA], start), Some(InputEvent::Start));
+        let mut measured = None;
+        for pulse in 1..=24 {
+            if let InputEvent::Clock { bpm, .. } = receiver
+                .feed(&[0xF8], start + Duration::from_millis(pulse * 25))
+                .expect("clock event")
+            {
+                measured = bpm.or(measured);
+            }
+        }
+        let measured = measured.expect("measured tempo");
+        assert!((measured - 100.0).abs() < 0.0001, "measured {measured}");
+    }
+
+    #[test]
+    fn receiver_measures_batched_clocks_at_300_bpm() {
+        let mut receiver = Receiver::default();
+        let start = Instant::now();
+        receiver.feed(&[0xFA], start);
+        let mut measured = None;
+        for batch in 0..12 {
+            let now = start + Duration::from_micros(batch * 16_667);
+            for _ in 0..2 {
+                if let InputEvent::Clock { bpm, .. } =
+                    receiver.feed(&[0xF8], now).expect("clock event")
+                {
+                    measured = bpm.or(measured);
+                }
+            }
+        }
+        let measured = measured.expect("measured tempo");
+        assert!((measured - 300.0).abs() < 0.1, "measured {measured}");
+    }
+
+    #[test]
+    fn receiver_handles_transport_and_song_position() {
+        let mut receiver = Receiver::default();
+        let now = Instant::now();
+        assert_eq!(
+            receiver.feed(&[0xF2, 0x08, 0x01], now),
+            Some(InputEvent::SongPosition(136))
+        );
+        assert_eq!(receiver.feed(&[0xFB], now), Some(InputEvent::Continue));
+        assert_eq!(receiver.feed(&[0xFC], now), Some(InputEvent::Stop));
+    }
 
     #[test]
     fn emits_24_clocks_per_quarter_note_at_sample_offsets() {
@@ -309,5 +505,40 @@ mod tests {
         }];
         let event = generator.song_position(48_000, &tempo_points, 120.0);
         assert_eq!(event.data.as_ref(), [0xF2, 6, 0]);
+    }
+
+    #[test]
+    fn song_position_sample_inverts_the_tempo_map() {
+        let tempo_points = vec![TempoPoint {
+            sample: 48_000,
+            bpm: 60.0,
+        }];
+
+        assert_eq!(
+            song_position_sample(48_000.0, &tempo_points, 120.0, 8),
+            48_000
+        );
+        assert_eq!(
+            song_position_sample(48_000.0, &tempo_points, 120.0, 12),
+            96_000
+        );
+    }
+
+    #[test]
+    fn receiver_clamps_tempo_to_the_supported_range() {
+        let mut receiver = Receiver::default();
+        let start = Instant::now();
+        receiver.feed(&[0xFA], start);
+        let mut measured = None;
+        for pulse in 1..=24 {
+            if let InputEvent::Clock { bpm, .. } = receiver
+                .feed(&[0xF8], start + Duration::from_millis(pulse * 5))
+                .expect("clock event")
+            {
+                measured = bpm.or(measured);
+            }
+        }
+
+        assert_eq!(measured, Some(MAX_CLOCK_BPM));
     }
 }

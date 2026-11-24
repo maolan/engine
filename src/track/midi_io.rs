@@ -27,6 +27,26 @@ impl TrackData {
     }
 
     pub(crate) fn collect_track_input_midi_events(&mut self) -> Vec<Vec<MidiEvent>> {
+        if let Some(queue) = self.hardware_input.get() {
+            let count = queue.len();
+            if count > 0 {
+                let end = std::time::Instant::now();
+                for _ in 0..count {
+                    let Some((port, received, mut event)) = queue.pop() else {
+                        break;
+                    };
+                    if let Some(input) = self.midi.ins.get(port) {
+                        let age = end.saturating_duration_since(received).as_secs_f64();
+                        event.frame = self
+                            .process_block_size()
+                            .saturating_sub(1 + (age * self.sample_rate) as usize)
+                            as u32;
+                        // Safety: the track input task is the sole writer of this port.
+                        unsafe { input.buffer_mut() }.push(event);
+                    }
+                }
+            }
+        }
         self.rt.record_tap_midi_in.clear();
         let midi_disk_monitor = self.midi_disk_monitor();
         let midi_input_monitor = self.midi_input_monitor();

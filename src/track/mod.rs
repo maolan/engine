@@ -959,7 +959,11 @@ impl DerefMut for TrackRtCell {
     }
 }
 
+type HardwareMidiQueue =
+    std::sync::OnceLock<crossbeam_queue::ArrayQueue<(usize, std::time::Instant, MidiEvent)>>;
+
 pub struct Track {
+    hardware_input: Arc<HardwareMidiQueue>,
     inner: UnsafeCell<TrackData>,
 }
 
@@ -978,6 +982,7 @@ pub struct TrackMidiLearnBindings {
 
 #[derive(Debug)]
 pub struct TrackData {
+    hardware_input: Arc<HardwareMidiQueue>,
     pub rt: TrackRtCell,
     pub midi_learn: TrackMidiLearnBindings,
     pub name: String,
@@ -1105,16 +1110,18 @@ impl Track {
         buffer_size: usize,
         sample_rate: f64,
     ) -> Self {
+        let data = TrackData::new(
+            name,
+            audio_ins,
+            audio_outs,
+            midi_ins,
+            midi_outs,
+            buffer_size,
+            sample_rate,
+        );
         Self {
-            inner: UnsafeCell::new(TrackData::new(
-                name,
-                audio_ins,
-                audio_outs,
-                midi_ins,
-                midi_outs,
-                buffer_size,
-                sample_rate,
-            )),
+            hardware_input: data.hardware_input.clone(),
+            inner: UnsafeCell::new(data),
         }
     }
 
@@ -1127,17 +1134,26 @@ impl Track {
         buffer_size: usize,
         sample_rate: f64,
     ) -> Self {
+        let data = TrackData::new_folder(
+            name,
+            audio_ins,
+            audio_outs,
+            midi_ins,
+            midi_outs,
+            buffer_size,
+            sample_rate,
+        );
         Self {
-            inner: UnsafeCell::new(TrackData::new_folder(
-                name,
-                audio_ins,
-                audio_outs,
-                midi_ins,
-                midi_outs,
-                buffer_size,
-                sample_rate,
-            )),
+            hardware_input: data.hardware_input.clone(),
+            inner: UnsafeCell::new(data),
         }
+    }
+
+    pub(crate) fn hardware_midi_input(
+        &self,
+    ) -> &crossbeam_queue::ArrayQueue<(usize, std::time::Instant, MidiEvent)> {
+        self.hardware_input
+            .get_or_init(|| crossbeam_queue::ArrayQueue::new(1024))
     }
 
     pub fn lock(&self) -> TrackGuard<'_> {
@@ -2189,6 +2205,28 @@ mod tests {
                 .pending_hw_midi_out_events
                 .iter()
                 .any(|e| e.event.data == vec![0x81, 60, 64])
+        );
+    }
+
+    #[test]
+    fn hardware_input_queue_delivers_to_one_lane_once() {
+        let mut track = Track::new("synth".into(), 0, 0, 2, 2, 512, 48_000.0);
+        track.set_midi_input_monitor(vec![true, true]);
+        let note = crate::midi::io::MidiEvent::new(0, vec![0x90, 60, 100]);
+        track
+            .hardware_midi_input()
+            .push((1, std::time::Instant::now(), note.clone()))
+            .unwrap();
+        let lanes = track.collect_track_input_midi_events();
+        assert!(lanes[0].is_empty());
+        assert_eq!(lanes[1].len(), 1);
+        assert_eq!(lanes[1][0].data, note.data);
+        assert!(lanes[1][0].frame < 512);
+        assert!(
+            track
+                .collect_track_input_midi_events()
+                .iter()
+                .all(Vec::is_empty)
         );
     }
 

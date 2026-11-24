@@ -2203,7 +2203,9 @@ mod undo_consistency {
             | Action::JumpToEnd
             | Action::SetOscEnabled(_)
             | Action::SetMidiTimecodeEnabled(_)
+            | Action::SetMidiTimecodeOffset(_)
             | Action::SetMidiTimecodeOutput { .. }
+            | Action::SetMidiClockEnabled(_)
             | Action::SetMidiClockOutput(_)
             | Action::SetSessionClipPlaybackEnabled(_)
             | Action::SetStepRecording(_)

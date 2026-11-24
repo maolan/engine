@@ -73,7 +73,9 @@ impl Engine {
             | Action::SetTempoMap { .. }
             | Action::SetOscEnabled(_)
             | Action::SetMidiTimecodeEnabled(_)
+            | Action::SetMidiTimecodeOffset(_)
             | Action::SetMidiTimecodeOutput { .. }
+            | Action::SetMidiClockEnabled(_)
             | Action::SetMidiClockOutput(_)
             | Action::SetClipPlaybackEnabled(_)
             | Action::SetRecordEnabled(_)
@@ -170,7 +172,9 @@ impl Engine {
             if !self.hw_midi.pending_hw_midi_out_events_by_device.is_empty() {
                 let out_events =
                     std::mem::take(&mut self.hw_midi.pending_hw_midi_out_events_by_device);
-                if let Err(e) = worker.tx.send(Message::HWMidiOutEvents(out_events)).await {
+                if let Some(service) = &self.hw_midi.service {
+                    service.track(self.sample_rate(), out_events);
+                } else if let Err(e) = worker.tx.send(Message::HWMidiOutEvents(out_events)).await {
                     error!("Error sending HWMidiOutEvents {e}");
                 }
             }
@@ -255,7 +259,7 @@ impl Engine {
             self.transport.session_clip_playback_enabled && self.transport.playing,
         );
         t.set_loop_config(
-            self.transport.loop_enabled,
+            self.transport_loop_enabled(),
             self.transport.loop_range_samples,
         );
         t.set_transport_timing(
@@ -601,7 +605,9 @@ impl Engine {
             | Action::SetTempoMap { .. }
             | Action::SetOscEnabled(_)
             | Action::SetMidiTimecodeEnabled(_)
+            | Action::SetMidiTimecodeOffset(_)
             | Action::SetMidiTimecodeOutput { .. }
+            | Action::SetMidiClockEnabled(_)
             | Action::SetMidiClockOutput(_) => {
                 if self.handle_transport_request(a.clone()).await {
                     return;
@@ -1007,6 +1013,30 @@ impl Engine {
                 Message::HWFinished => {
                     self.handle_hw_finished().await;
                     self.drain_iodelay_report().await;
+                }
+                Message::TimedMidiInput(at, mut events) => {
+                    self.handle_timed_sync_events(&events, at).await;
+                    if self.transport.playing {
+                        let state = self.state_snapshot.load_full();
+                        for event in &events {
+                            for route in self
+                                .hw_midi
+                                .midi_hw_in_routes
+                                .iter()
+                                .filter(|r| r.device == event.device)
+                            {
+                                if let Some(track) = state.tracks.get(&route.to_track)
+                                    && track
+                                        .hardware_midi_input()
+                                        .push((route.to_port, at, event.event.clone()))
+                                        .is_err()
+                                {
+                                    tracing::warn!("track MIDI input queue full");
+                                }
+                            }
+                        }
+                    }
+                    self.route_hw_midi_input(&mut events, false).await;
                 }
                 Message::HWMidiEvents(mut events) => {
                     // Events from the hw worker's between-cycle drains; they

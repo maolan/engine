@@ -9,6 +9,7 @@ impl Backend for OssBackend {
     type Driver = oss::HwDriver;
     type MidiHub = oss::MidiHub;
 
+    const SEPARATE_MIDI: bool = true;
     const LABEL: &'static str = "OSS";
     const WORKER_THREAD_NAME: &'static str = "oss-worker";
     const ASSIST_THREAD_NAME: &'static str = "oss-assist";

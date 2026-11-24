@@ -232,6 +232,9 @@ impl Engine {
     }
 
     pub(crate) async fn set_hw_playing(&mut self, playing: bool) {
+        if !playing && let Some(service) = &self.hw_midi.service {
+            service.clear_track();
+        }
         if let Some(worker) = &self.hw_worker {
             // Await instead of try_send: a dropped HWSetPlaying(false) would
             // leave the device playing after transport stop.
@@ -264,6 +267,8 @@ impl Engine {
         // thread. The GUI calls exit(0) upon receiving the Quit
         // response, which skips Rust destructors.
         if let Some(mut worker) = self.hw_worker.take() {
+            self.hw_midi.service = None;
+            self.hw_midi.master = None;
             // Send MIDI panic (All Sound Off) for any active
             // notes before stopping the worker.
             let panic_events = self.panic_events_for_all_hw_midi_outputs();

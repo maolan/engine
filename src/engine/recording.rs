@@ -102,7 +102,7 @@ impl Engine {
             .render_clock
             .unwrap_or((0, self.transport.transport_sample));
         let skip = delay.saturating_sub(elapsed).min(frames);
-        let position = self.transport.normalize_transport_sample(
+        let position = self.normalize_transport_position(
             origin.saturating_add(elapsed.saturating_add(skip).saturating_sub(delay)),
         );
         let segments: Vec<_> = self
@@ -295,7 +295,7 @@ impl Engine {
                             .completed_midi_recordings
                             .push((name.clone(), done));
                     }
-                } else if self.transport.loop_enabled
+                } else if self.transport_loop_enabled()
                     && let Some((_, loop_end)) = self.transport.loop_range_samples
                     && segment_end == loop_end
                 {

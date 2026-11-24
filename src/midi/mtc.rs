@@ -226,17 +226,25 @@ pub struct Generator {
     anchor_sample: usize,
     next_quarter: u64,
     expected_sample: Option<usize>,
+    offset_seconds: f64,
 }
 
 impl Generator {
     pub fn new(sample_rate: f64, frame_rate: FrameRate, position: usize) -> Self {
+        let sample_rate = sample_rate.max(1.0);
+        let anchor_sample = aligned_frame_sample(sample_rate, frame_rate, position, 0.0);
         Self {
-            sample_rate: sample_rate.max(1.0),
+            sample_rate,
             frame_rate,
-            anchor_sample: position,
+            anchor_sample,
             next_quarter: 0,
             expected_sample: Some(position),
+            offset_seconds: 0.0,
         }
+    }
+
+    pub fn set_offset_seconds(&mut self, offset_seconds: f64) {
+        self.offset_seconds = offset_seconds;
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: f64, position: usize) {
@@ -244,14 +252,23 @@ impl Generator {
         self.reset(position);
     }
 
-    pub fn reset(&mut self, position: usize) {
-        self.anchor_sample = position;
+    pub fn reset(&mut self, position: usize) -> usize {
+        self.anchor_sample = aligned_frame_sample(
+            self.sample_rate,
+            self.frame_rate,
+            position,
+            self.offset_seconds,
+        );
         self.next_quarter = 0;
         self.expected_sample = Some(position);
+        self.anchor_sample
     }
 
     pub fn full_frame(&self, position: usize) -> crate::midi::io::MidiEvent {
-        let timecode = Timecode::from_seconds(position as f64 / self.sample_rate, self.frame_rate);
+        let timecode = Timecode::from_seconds(
+            position as f64 / self.sample_rate + self.offset_seconds,
+            self.frame_rate,
+        );
         let hours = timecode.hours | (self.frame_rate.code() << 5);
         crate::midi::io::MidiEvent::new(
             0,
@@ -277,8 +294,8 @@ impl Generator {
     ) -> Vec<crate::midi::io::MidiEvent> {
         let mut events = Vec::new();
         if self.expected_sample != Some(cycle_start) {
-            self.reset(cycle_start);
-            events.push(self.full_frame(cycle_start));
+            let anchor = self.reset(cycle_start);
+            events.push(self.full_frame(anchor));
         }
         let cycle_end = cycle_start.saturating_add(frames);
         let samples_per_quarter = self.sample_rate / (self.frame_rate.frames_per_second() * 4.0);
@@ -293,6 +310,7 @@ impl Generator {
                 let piece = (self.next_quarter % 8) as u8;
                 let group = self.next_quarter / 8;
                 let seconds = self.anchor_sample as f64 / self.sample_rate
+                    + self.offset_seconds
                     + group as f64 * 2.0 / self.frame_rate.frames_per_second();
                 let timecode = Timecode::from_seconds(seconds, self.frame_rate);
                 let value = quarter_value(timecode, piece);
@@ -306,6 +324,25 @@ impl Generator {
         self.expected_sample = Some(cycle_end);
         events
     }
+}
+
+fn aligned_frame_sample(
+    sample_rate: f64,
+    frame_rate: FrameRate,
+    position: usize,
+    offset_seconds: f64,
+) -> usize {
+    let frames_per_second = frame_rate.frames_per_second();
+    let seconds = position as f64 / sample_rate + offset_seconds;
+    let frame = (seconds * frames_per_second - 1e-9).ceil().max(0.0) as u64;
+    let frame = if frame_rate != FrameRate::Fps25 && frame % 2 == 1 {
+        frame + 1
+    } else {
+        frame
+    };
+    ((frame as f64 / frames_per_second - offset_seconds) * sample_rate)
+        .round()
+        .max(0.0) as usize
 }
 
 fn quarter_value(timecode: Timecode, piece: u8) -> u8 {
@@ -465,5 +502,31 @@ mod tests {
         assert_eq!(decoded.timecode.seconds, 0);
         assert_eq!(decoded.timecode.frames, 2);
         assert!((decoded.position_seconds() - seconds).abs() < 1.0 / 48_000.0);
+    }
+
+    #[test]
+    fn generator_aligns_non_25_fps_sequences_to_even_frames() {
+        let mut generator = Generator::new(48_000.0, FrameRate::Fps30, 0);
+        let anchor = generator.reset(1_600);
+        assert_eq!(anchor, 3_200);
+        let full = Decoder::default()
+            .feed(&generator.full_frame(anchor).data)
+            .expect("full frame");
+        assert_eq!(full.timecode.frames, 2);
+
+        let mut generator = Generator::new(48_000.0, FrameRate::Fps25, 0);
+        assert_eq!(generator.reset(1_920), 1_920);
+    }
+
+    #[test]
+    fn generator_applies_timecode_offset() {
+        let mut generator = Generator::new(48_000.0, FrameRate::Fps30, 0);
+        generator.set_offset_seconds(3_600.0);
+        let full = Decoder::default()
+            .feed(&generator.full_frame(0).data)
+            .expect("full frame");
+
+        assert_eq!(full.timecode.hours, 1);
+        assert_eq!(full.position_seconds(), 3_600.0);
     }
 }

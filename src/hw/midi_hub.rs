@@ -477,13 +477,18 @@ unsafe impl Send for MidiInputWaiter {}
 
 #[derive(Debug)]
 struct MidiOutputDevice {
+    wait_for_writable: bool,
     path: String,
     file: File,
 }
 
 impl MidiOutputDevice {
     fn new(path: String, file: File) -> Self {
-        Self { path, file }
+        Self {
+            path,
+            file,
+            wait_for_writable: true,
+        }
     }
 
     fn write_events(&mut self, events: &[HwMidiEvent]) {
@@ -518,11 +523,12 @@ impl MidiOutputDevice {
                         break;
                     }
                     Ok(n) => {
+                        self.wait_for_writable = true;
                         data = &data[n..];
                     }
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
                         let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
+                        if !self.wait_for_writable || remaining.is_zero() {
                             break;
                         }
                         let mut pfd = libc::pollfd {
@@ -536,7 +542,9 @@ impl MidiOutputDevice {
                             break;
                         }
                         if rc == 0 || (pfd.revents & libc::POLLOUT) == 0 {
-                            // Timeout or device not ready; stop trying this event
+                            // Keep probing with nonblocking writes. A stalled port must
+                            // not consume another timeout for every shared clock tick.
+                            self.wait_for_writable = false;
                             break;
                         }
                     }

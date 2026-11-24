@@ -10,6 +10,7 @@ pub struct MeterSnapshot {
 pub struct TransportSnapshot {
     pub sample: usize,
     pub tempo_bpm: f64,
+    pub external_tempo_bpm: Option<f64>,
     pub playing: bool,
     pub transport_running: bool,
     pub tsig_num: u16,
@@ -21,6 +22,7 @@ impl Default for TransportSnapshot {
         Self {
             sample: 0,
             tempo_bpm: 120.0,
+            external_tempo_bpm: None,
             playing: false,
             transport_running: false,
             tsig_num: 4,
