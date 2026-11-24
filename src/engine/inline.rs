@@ -198,6 +198,7 @@ impl Engine {
         events: &mut Vec<HwMidiEvent>,
         buffer_for_ports: bool,
     ) {
+        self.handle_midi_timecode_events(events).await;
         for hw_event in events.drain(..) {
             let thru_targets: Vec<String> = self
                 .hw_midi
@@ -275,19 +276,27 @@ impl Engine {
     /// handler can run it at the same point in the cycle (before the
     /// transport advance, which the wrap math is relative to).
     pub(crate) fn collect_hw_midi_out_for_next_cycle(&mut self) {
+        let mut timecode_events = self.generate_midi_timecode_cycle();
+        timecode_events.extend(self.generate_midi_clock_cycle());
+        timecode_events.sort_by_key(|event| event.frame);
         if self.transport.transport_restart_pending {
             let state = self.state_snapshot.load_full();
             for track in state.tracks.values() {
                 track.lock().take_hw_midi_out_events();
             }
+            self.queue_midi_timecode_events(timecode_events);
             return;
         }
         if self.hw_worker.is_none() {
             self.hw_midi.pending_hw_midi_out_events = self.collect_hw_midi_output_events();
+            self.hw_midi
+                .pending_hw_midi_out_events
+                .extend(timecode_events);
             return;
         }
         self.hw_midi.active_hw_notes_cycle_start = self.hw_midi.active_hw_notes_by_track.clone();
         let mut out_events = self.collect_hw_midi_output_events_by_device();
+        self.queue_midi_timecode_events(timecode_events);
         if self.transport.loop_enabled
             && let Some((_, loop_end)) = self.transport.loop_range_samples
         {

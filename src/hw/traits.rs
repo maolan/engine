@@ -86,6 +86,9 @@ pub trait HwMidiHub {
     fn wake_input_waiter(&mut self) {}
     fn close_input_waiter(&mut self) {}
     fn write_events(&mut self, events: &[HwMidiEvent]);
+    fn write_events_blocking(&mut self, events: &[HwMidiEvent], _timeout: std::time::Duration) {
+        self.write_events(events);
+    }
 }
 
 pub trait HwDevice {
@@ -199,6 +202,14 @@ macro_rules! impl_hw_midi_hub_traits {
 
             fn write_events(&mut self, events: &[$crate::message::HwMidiEvent]) {
                 <$hub>::write_events(self, events);
+            }
+
+            fn write_events_blocking(
+                &mut self,
+                events: &[$crate::message::HwMidiEvent],
+                timeout: std::time::Duration,
+            ) {
+                <$hub>::write_events_blocking(self, events, timeout);
             }
         }
     };

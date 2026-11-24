@@ -174,6 +174,8 @@ impl Engine {
             self.handoff_pending_bounce_starts().await;
         }
         #[cfg(unix)]
+        let mut jack_timecode_events = Vec::new();
+        #[cfg(unix)]
         {
             if let Some(jack) = self.jack_runtime.as_mut() {
                 if !self.hw_midi.pending_hw_midi_out_events.is_empty() {
@@ -183,6 +185,13 @@ impl Engine {
                 let mut in_events = vec![];
                 jack.read_events_into(&mut in_events);
                 if !in_events.is_empty() {
+                    jack_timecode_events = in_events
+                        .iter()
+                        .map(|event| HwMidiEvent {
+                            device: "jack".to_string(),
+                            event: event.clone(),
+                        })
+                        .collect();
                     self.hw_midi.pending_hw_midi_events.extend(in_events);
                 }
                 let dropped = jack.take_midi_events_dropped();
@@ -191,6 +200,10 @@ impl Engine {
                         "JACK MIDI ring full; {dropped} events dropped since last cycle"
                     );
                 }
+            }
+            if !jack_timecode_events.is_empty() {
+                self.handle_midi_timecode_events(&jack_timecode_events)
+                    .await;
             }
         }
         #[cfg(unix)]
@@ -387,6 +400,24 @@ impl Engine {
         self.transport.handling_hwfinished = false;
     }
 
+    pub(crate) async fn check_midi_timecode_timeout(&mut self) {
+        let timed_out = self.hw_midi.timecode_enabled
+            && self
+                .hw_midi
+                .timecode_last_received
+                .is_some_and(|last| last.elapsed() >= std::time::Duration::from_millis(250));
+        if timed_out {
+            let stop = self.hw_midi.timecode_running && self.transport.playing;
+            self.hw_midi.timecode_last_received = None;
+            self.hw_midi.timecode_active_device = None;
+            self.hw_midi.timecode_decoders.clear();
+            self.hw_midi.timecode_running = false;
+            if stop {
+                self.handle_stop(Action::Stop).await;
+            }
+        }
+    }
+
     pub(crate) fn publish_transport_snapshot(&mut self) {
         let audible_sample = self.audible_transport_sample();
         let snapshot = self.transport.transport_snapshot_producer.write_buffer();
@@ -483,6 +514,8 @@ impl Engine {
         self.meters.meter_decay_after_stop = None;
         self.restart_render_clock();
         self.transport.playing = true;
+        self.reset_midi_timecode_output(true);
+        self.start_midi_clock_output();
         self.bump_prepare_generation();
         self.transport.clear_processing_buffers_pending = true;
         if self.recording.record_enabled {
@@ -522,6 +555,9 @@ impl Engine {
         };
 
         self.stop_render_clock();
+        self.reset_midi_timecode_output(true);
+        self.send_midi_clock_transport(0xFC);
+        self.reset_midi_clock_output();
         self.transport.clip_playback_enabled = false;
         self.transport.session_clip_playback_enabled = false;
         self.bump_prepare_generation();
@@ -535,6 +571,7 @@ impl Engine {
         if !self.transport.playing {
             self.preload_track_clips().await;
             self.transport.playing = true;
+            self.start_midi_clock_output();
             self.bump_prepare_generation();
             self.transport.clear_processing_buffers_pending = true;
             if self.recording.record_enabled {
@@ -571,6 +608,9 @@ impl Engine {
 
         self.stop_render_clock();
         self.transport.playing = false;
+        self.send_midi_clock_transport(0xFC);
+        self.reset_midi_timecode_output(true);
+        self.reset_midi_clock_output();
         crate::cycle_trace::dump_histogram();
         self.bump_prepare_generation();
         self.transport.transport_running = false;
@@ -727,6 +767,20 @@ impl Engine {
                 }
             }
         }
+        self.reset_midi_timecode_output(true);
+        if self.transport.playing {
+            self.send_midi_clock_transport(0xFC);
+        }
+        self.send_midi_clock_song_position();
+        if self.transport.playing {
+            let status = if self.transport.transport_sample == 0 {
+                0xFA
+            } else {
+                0xFB
+            };
+            self.send_midi_clock_transport(status);
+        }
+        self.reset_midi_clock_output();
 
         false
     }
@@ -845,6 +899,7 @@ impl Engine {
             }
             Action::SetTempo(bpm) => {
                 self.transport.tempo_bpm = bpm.max(1.0);
+                self.reset_midi_clock_output();
                 self.bump_prepare_generation();
                 self.publish_transport_snapshot();
             }
@@ -862,11 +917,51 @@ impl Engine {
                 self.transport.tempo_points = tempo_points.clone();
                 self.transport.time_signature_points = time_signature_points.clone();
                 self.update_global_tempo_from_map();
+                self.reset_midi_clock_output();
                 self.publish_transport_snapshot();
             }
             Action::SetOscEnabled(enabled) => {
                 if let Err(err) = self.set_osc_enabled_with(enabled, OscServer::start) {
                     self.notify_clients(Err(err)).await;
+                }
+            }
+            Action::SetMidiTimecodeEnabled(enabled) => {
+                self.hw_midi.timecode_enabled = enabled;
+                self.hw_midi.timecode_decoders.clear();
+                self.hw_midi.timecode_active_device = None;
+                self.hw_midi.timecode_last_received = None;
+                self.hw_midi.timecode_running = false;
+            }
+            Action::SetMidiTimecodeOutput {
+                enabled,
+                frame_rate,
+            } => {
+                self.hw_midi.timecode_output_enabled = enabled;
+                self.hw_midi.timecode_output_generator = enabled.then(|| {
+                    crate::midi::mtc::Generator::new(
+                        self.sample_rate(),
+                        frame_rate,
+                        self.transport.transport_sample,
+                    )
+                });
+                self.reset_midi_timecode_output(true);
+            }
+            Action::SetMidiClockOutput(enabled) => {
+                let was_enabled = self.hw_midi.midi_clock_output_enabled;
+                self.hw_midi.midi_clock_output_enabled = enabled;
+                self.hw_midi.midi_clock_output_generator =
+                    enabled.then(|| crate::midi::clock::Generator::new(self.sample_rate()));
+                if enabled {
+                    if self.transport.transport_running {
+                        self.start_midi_clock_output();
+                    } else {
+                        self.send_midi_clock_song_position();
+                    }
+                } else if was_enabled {
+                    self.queue_midi_timecode_events(vec![crate::midi::io::MidiEvent::new(
+                        0,
+                        vec![0xFC],
+                    )]);
                 }
             }
             _ => {}

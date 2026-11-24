@@ -357,12 +357,11 @@ impl<B: Backend> HwWorker<B> {
         match msg {
             Message::Request(crate::message::Action::Quit) => {
                 self.driver_mut().request_stop();
-                self.shutdown_quit();
+                self.shutdown_quit().await;
                 return true;
             }
             Message::TracksFinished => {
                 crate::cycle_trace::mark(crate::cycle_trace::TracePoint::GoReceived);
-                self.flush_pending_midi_out();
                 // Inline render drains MIDI input on the cycle thread, right
                 // after the capture read, so events reach the render in the
                 // same cycle instead of one cycle late.
@@ -386,6 +385,7 @@ impl<B: Backend> HwWorker<B> {
                         }
                     });
                 }
+                self.flush_pending_midi_out().await;
             }
             Message::HWMidiOutEvents(mut events) => {
                 self.pending_midi_out_events.append(&mut events);
@@ -394,7 +394,7 @@ impl<B: Backend> HwWorker<B> {
                 // TracksFinished to flush on; write immediately so
                 // e.g. panic All-Sound-Off reaches the device.
                 if !self.playing {
-                    self.flush_pending_midi_out();
+                    self.flush_pending_midi_out().await;
                 }
             }
             Message::ClearHWMidiOutEvents => {
@@ -508,7 +508,7 @@ impl<B: Backend> HwWorker<B> {
                         }
                     }
                     if quit_pending {
-                        self.shutdown_quit();
+                        self.shutdown_quit().await;
                         return;
                     }
                     self.publish_capture_frame();
@@ -575,7 +575,7 @@ impl<B: Backend> HwWorker<B> {
         match msg {
             Message::Request(crate::message::Action::Quit) => {
                 self.driver_mut().request_stop();
-                self.flush_pending_midi_out();
+                self.flush_pending_midi_out().await;
                 self.shutdown_midi();
                 self.driver_mut().close_fds();
                 self.driver_mut().request_stop();
@@ -583,7 +583,6 @@ impl<B: Backend> HwWorker<B> {
             }
             Message::TracksFinished => {
                 crate::cycle_trace::mark(crate::cycle_trace::TracePoint::GoReceived);
-                self.flush_pending_midi_out();
                 if self.inline_render.is_none() {
                     self.drain_midi_input().await;
                 }
@@ -598,6 +597,7 @@ impl<B: Backend> HwWorker<B> {
                 let inline = self.inline_render.clone();
                 let mut cycle =
                     tokio::task::spawn_blocking(move || Self::run_cycle_blocking(driver, inline));
+                self.flush_pending_midi_out().await;
                 // Watch for Quit while the cycle runs: a cycle blocked on
                 // device I/O would otherwise deadlock shutdown, because
                 // request_stop is only reachable from message handling.
@@ -659,7 +659,7 @@ impl<B: Backend> HwWorker<B> {
                 }
                 if quit_pending {
                     self.driver_mut().request_stop();
-                    self.flush_pending_midi_out();
+                    self.flush_pending_midi_out().await;
                     self.shutdown_midi();
                     self.driver_mut().close_fds();
                     self.driver_mut().request_stop();
@@ -687,7 +687,7 @@ impl<B: Backend> HwWorker<B> {
                 // Stopped transport means no cycles and no TracksFinished
                 // to flush on; write immediately (panic All-Sound-Off).
                 if !self.playing {
-                    self.flush_pending_midi_out();
+                    self.flush_pending_midi_out().await;
                 }
             }
             Message::ClearHWMidiOutEvents => {
@@ -734,7 +734,7 @@ impl<B: Backend> HwWorker<B> {
         false
     }
 
-    fn flush_pending_midi_out(&mut self) {
+    async fn flush_pending_midi_out(&mut self) {
         if self.pending_midi_out_events.is_empty() {
             return;
         }
@@ -747,9 +747,30 @@ impl<B: Backend> HwWorker<B> {
             });
             self.pending_midi_out_sorted = true;
         }
-        self.lock_midi_hub()
-            .write_events(&self.pending_midi_out_events);
-        self.pending_midi_out_events.clear();
+        let events = std::mem::take(&mut self.pending_midi_out_events);
+        if !self.playing {
+            self.lock_midi_hub()
+                .write_events_blocking(&events, Duration::from_millis(10));
+            return;
+        }
+        let sample_rate = self
+            .driver
+            .as_ref()
+            .map_or(48_000.0, |driver| f64::from(driver.sample_rate().max(1)));
+        let start = tokio::time::Instant::now();
+        let mut index = 0;
+        while index < events.len() {
+            let frame = events[index].event.frame;
+            let target = start + Duration::from_secs_f64(f64::from(frame) / sample_rate);
+            tokio::time::sleep_until(target).await;
+            let mut end = index + 1;
+            while end < events.len() && events[end].event.frame == frame {
+                end += 1;
+            }
+            self.lock_midi_hub()
+                .write_events_blocking(&events[index..end], Duration::from_millis(10));
+            index = end;
+        }
     }
 
     async fn drain_midi_input(&mut self) {
@@ -772,9 +793,9 @@ impl<B: Backend> HwWorker<B> {
     }
 
     #[cfg(unix)]
-    fn shutdown_quit(&mut self) {
+    async fn shutdown_quit(&mut self) {
         self.driver_mut().request_stop();
-        self.flush_pending_midi_out();
+        self.flush_pending_midi_out().await;
         self.shutdown_midi();
         self.driver_mut().close_fds();
         self.driver_mut().request_stop();
