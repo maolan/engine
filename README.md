@@ -10,8 +10,8 @@ It provides:
 - Timeline-oriented recording and clip playback
 - Track routing and plugin graph routing
 - Offline bounce and export helpers
-- **Out-of-process (OOP) plugin hosting** for CLAP, VST3, and LV2 (Unix) — each plugin runs in a separate OS process for crash isolation
-- Platform audio backends for Linux, FreeBSD, macOS, and Windows
+- **Out-of-process (OOP) plugin hosting** for CLAP, VST3, LV2 (Unix), and AU (macOS) — each plugin runs in a separate OS process for crash isolation
+- Platform audio backends for Linux, FreeBSD, OpenBSD, macOS, and Windows
 
 ## Architecture
 
@@ -42,10 +42,13 @@ entirely.
 
 ## Platform support
 
-| Feature | Linux | FreeBSD | macOS | Windows |
-|---------|-------|---------|-------|---------|
-| Audio backend | ALSA, JACK | OSS, JACK | CoreAudio | WASAPI |
-| CLAP hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
-| VST3 hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
-| LV2 hosting | ✅ OOP | ✅ OOP | ✅ OOP | N/A |
-| GUI embedding | X11 | — | — | HWND (`SetParent`) |
+| Feature | Linux | FreeBSD | OpenBSD | macOS | Windows |
+|---------|-------|---------|---------|-------|---------|
+| Audio backend | ALSA, JACK | OSS, JACK | sndio, JACK | CoreAudio, JACK | WASAPI, ASIO |
+| CLAP hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
+| VST3 hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP |
+| LV2 hosting | ✅ OOP | ✅ OOP | ✅ OOP | ✅ OOP | N/A |
+| AU hosting | N/A | N/A | N/A | ✅ OOP | N/A |
+| GUI embedding | X11 | X11 | X11 | Cocoa (AU), X11 (CLAP/VST3/LV2) | HWND (`SetParent`) |
+
+On Windows, ASIO devices are selected with device ids prefixed `asio:<driver name>`.
