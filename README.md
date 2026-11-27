@@ -29,7 +29,7 @@ features; the crate builds with `default = []`:
 
 | Feature | Enables | Dependencies |
 |---------|---------|--------------|
-| `audio` | Audio file decode/encode (import, export, recording takes, freeze/bounce WAV) | `symphonia`, `oxideav-*` |
+| `audio` | Audio file decode/encode (import, export, recording takes, freeze/bounce WAV) | `oxideav-*` |
 | `midi` | Standard MIDI File import/export (`.mid` clips and MIDI takes) | `midly` |
 | `plugins` | Out-of-process CLAP/VST3/LV2/AU plugin hosting, plugin graphs, plugin messages | `maolan-plugin-protocol` |
 | `mixosc` | OSC control-surface automation | `mixosc` |

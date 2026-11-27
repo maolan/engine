@@ -12,7 +12,7 @@
 //! clip re-launch), it posts the requested absolute source frame to the
 //! producer. The producer restarts its incremental decoder from the
 //! beginning of the file and decodes-and-discards until the requested frame
-//! (symphonia seeking is not used), then resumes pushing at the next free
+//! (container seeking is not used), then resumes pushing at the next free
 //! slot in the rings without clearing them. The audio already buffered in
 //! the rings is therefore played once more before the new position lands —
 //! that latency is accepted for v1. Sequential playback (the common player

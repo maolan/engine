@@ -14,22 +14,24 @@ categories = ["multimedia::audio"]
 [dependencies]
 num_cpus = "1.17.0"
 tokio = { version = "1.54.1", features = ["full"] }
-oxideav-core = { version = "0.1.42", optional = true }
-oxideav-basic = { version = "0.0.11", optional = true }
-oxideav-flac = { version = "0.0.12", optional = true }
-oxideav-mp3 = { version = "0.1.3", optional = true }
+oxideav-core = { version = "0.1.43", optional = true }
+oxideav-basic = { version = "0.0.12", optional = true }
+oxideav-flac = { version = "0.0.13", optional = true }
+oxideav-mp3 = { version = "0.1.4", optional = true }
 oxideav-ogg = { version = "0.1.9", optional = true }
-symphonia = { version = "0.6.1", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"], optional = true }
+oxideav-vorbis = { version = "0.0.13", optional = true }
+oxideav-aac = { version = "0.1.7", optional = true }
+oxideav-mp4 = { version = "0.0.11", optional = true }
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 midly = { version = "0.5.3", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-toml = "1.2.1"
+toml = "1.2.3"
 maolan-plugin-protocol = { version = "0.0.21", optional = true }
-uuid = { version = "1.29.0", features = ["v4"] }
-fearless_simd = { version = "1.2.0", features = ["force_support_fallback"] }
+uuid = { version = "1.29.3", features = ["v4"] }
+fearless_simd = { version = "1.3.0", features = ["force_support_fallback"] }
 fearless_simd_macros = "0.1"
-arc-swap = "1.9.3"
+arc-swap = "1.9.5"
 basedrop = "0.1.3"
 crossbeam-queue = "0.3"
 rtrb = "0.4.1"
@@ -37,8 +39,8 @@ rayon = "1.12"
 rubato = "5.0.1"
 audioadapter = "5.0"
 audioadapter-buffers = "5.2"
-timestretch = "0.16.0"
-mixosc = { version = "0.0.17", optional = true, default-features = false }
+timestretch = "0.17.0"
+mixosc = { version = "0.0.18", optional = true, default-features = false }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.23"
@@ -51,7 +53,9 @@ audio = [
     "dep:oxideav-flac",
     "dep:oxideav-mp3",
     "dep:oxideav-ogg",
-    "dep:symphonia",
+    "dep:oxideav-vorbis",
+    "dep:oxideav-aac",
+    "dep:oxideav-mp4",
 ]
 midi = ["dep:midly"]
 plugins = ["dep:maolan-plugin-protocol"]
@@ -67,8 +71,8 @@ alsa = "0.12.1"
 nvtree = "0.0.6"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["ioctl", "poll"] }
-jack = "0.13.5"
+nix = { version = "0.32.0", features = ["ioctl", "poll"] }
+jack = "0.14.0"
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
