@@ -1,17 +1,9 @@
+use oxideav_core::{
+    AudioFrame, CodecId, CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet,
+    RuntimeContext, SampleFormat, StreamInfo, TimeBase,
+};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use symphonia::core::codecs::CodecParameters as SymphoniaCodecParameters;
-use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Frame, MediaType, Packet, RuntimeContext, SampleFormat,
-    StreamInfo, TimeBase,
-};
 
 /// Export format selector and WAV bit-depth / dither types live in
 /// `wav_stream` (always compiled) so offline-bounce message types can use
@@ -25,23 +17,11 @@ fn oxideav_err_to_io(e: oxideav_core::Error) -> io::Error {
 
 /// Decode an audio file to interleaved `f32` samples.
 ///
-/// The format is auto-detected by the OxideAV demuxers/decoders:
-/// `.wav`/PCM, `.flac`, `.mp3`, and Ogg-encapsulated FLAC (`.ogg`).
-/// Files OxideAV cannot probe or decode fall back to Symphonia
-/// (`.ogg`/Vorbis, `.m4a`/`.aac`/`.alac`, and friends).
-/// Returns `(samples, channels, sample_rate)`.
-/// All decode paths emit samples in the range `[-1.0, 1.0]`.
+/// The format is auto-detected by OxideAV. Supported inputs include WAV/PCM,
+/// FLAC, MP3, Ogg FLAC, Ogg Vorbis, and AAC-LC in ADTS or MP4/M4A containers.
+/// Returns `(samples, channels, sample_rate)` with samples in `[-1.0, 1.0]`.
 pub fn decode_audio_to_f32_interleaved_sync(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
-    match decode_with_oxideav(path) {
-        Ok(decoded) => Ok(decoded),
-        Err(oxideav_err) => decode_with_symphonia(path).map_err(|symphonia_err| {
-            io::Error::other(format!(
-                "Failed to decode '{}' with OxideAV ({oxideav_err}) \
-                 or Symphonia ({symphonia_err})",
-                path.display()
-            ))
-        }),
-    }
+    decode_with_oxideav(path)
 }
 
 /// Decode a WAV file preferentially, falling back to the general decoder.
@@ -56,7 +36,7 @@ pub fn decode_audio_to_f32_interleaved_preferring_wav(
 }
 
 // ---------------------------------------------------------------------------
-// Metadata probe + incremental streaming decode (Symphonia)
+// Metadata probe + incremental streaming decode
 // ---------------------------------------------------------------------------
 
 /// Fast metadata probe result for an audio file.
@@ -69,45 +49,27 @@ pub struct AudioFileInfo {
 }
 
 /// Probe sample rate, channel count and approximate frame count without
-/// decoding. Works for every format Symphonia can probe (wav, flac, mp3,
-/// ogg/vorbis, aac/alac in m4a/isomp4, ...).
+/// decoding audio.
 pub fn probe_audio_file(path: &Path) -> io::Result<AudioFileInfo> {
-    let format = probe_format(path)?;
-    let track = format
-        .default_track(TrackType::Audio)
-        .or_else(|| format.tracks().first())
-        .ok_or_else(|| {
-            io::Error::other(format!("No usable audio track in '{}'", path.display()))
-        })?;
-    let params: &AudioCodecParameters = track
-        .codec_params
-        .as_ref()
-        .and_then(SymphoniaCodecParameters::audio)
-        .ok_or_else(|| {
-            io::Error::other(format!("No usable audio track in '{}'", path.display()))
-        })?;
-    let sample_rate = params.sample_rate.unwrap_or(0);
-    if sample_rate == 0 {
-        return Err(io::Error::other(format!(
-            "No sample rate in '{}'",
-            path.display()
-        )));
-    }
-    let channels = params.channels.as_ref().map(|c| c.count()).unwrap_or(0);
+    let demuxer = open_oxideav_demuxer(path)?;
+    let (_, stream) = first_audio_stream(&*demuxer, path)?;
+    let sample_rate = stream
+        .params
+        .sample_rate
+        .ok_or_else(|| io::Error::other(format!("No sample rate in '{}'", path.display())))?;
+    let channels = stream.params.channels.unwrap_or(0) as usize;
     if channels == 0 {
         return Err(io::Error::other(format!(
             "No channel count in '{}'",
             path.display()
         )));
     }
-    let frames = track
-        .time_base
-        .and_then(|tb| {
-            track
-                .duration
-                .and_then(|duration| tb.calc_duration(duration))
-        })
-        .map(|time| (time.as_secs_f64() * f64::from(sample_rate)).round() as u64);
+    let frames = stream.duration.and_then(|duration| {
+        let seconds =
+            duration as f64 * stream.time_base.num() as f64 / stream.time_base.den() as f64;
+        (seconds.is_finite() && seconds >= 0.0)
+            .then(|| (seconds * f64::from(sample_rate)).round() as u64)
+    });
     Ok(AudioFileInfo {
         sample_rate,
         channels,
@@ -126,174 +88,68 @@ pub struct AudioMetadata {
     pub genre: Option<String>,
 }
 
-/// Read metadata tags from an audio file without decoding audio.
-///
-/// Container tags (e.g. Vorbis comments, ID3v2) are preferred; track-level
-/// tags (e.g. MP4 metadata) are used as a fallback.
+/// Read container metadata tags without decoding audio.
 pub fn read_audio_metadata(path: &Path) -> io::Result<AudioMetadata> {
-    use symphonia::core::meta::{RawValue, StandardTag};
-
-    fn raw_string(value: &RawValue) -> Option<String> {
-        match value {
-            RawValue::String(s) => {
-                let s = s.trim();
-                (!s.is_empty()).then(|| s.to_string())
-            }
-            RawValue::UnsignedInt(v) => Some(v.to_string()),
-            _ => None,
-        }
-    }
-
-    let mut format = probe_format(path)?;
-    let metadata = format.metadata();
-    let Some(revision) = metadata.current() else {
-        return Err(io::Error::other(format!(
-            "No metadata in '{}'",
-            path.display()
-        )));
-    };
+    let demuxer = open_oxideav_demuxer(path)?;
     let mut meta = AudioMetadata::default();
-    // Media-level tags first, then per-track tags as a fallback.
-    let mut tags: Vec<&symphonia::core::meta::Tag> = revision.media.tags.iter().collect();
-    for track_meta in &revision.per_track {
-        tags.extend(track_meta.metadata.tags.iter());
-    }
-    for tag in tags {
-        let (slot, value): (&mut Option<String>, Option<String>) = match tag.std.as_ref() {
-            Some(StandardTag::Artist(s)) | Some(StandardTag::Performer(s)) => {
-                (&mut meta.artist, Some(s.trim().to_string()))
-            }
-            Some(StandardTag::TrackTitle(s)) => (&mut meta.title, Some(s.trim().to_string())),
-            Some(StandardTag::Album(s)) => (&mut meta.album, Some(s.trim().to_string())),
-            Some(StandardTag::TrackNumber(n)) => (&mut meta.track_number, Some(n.to_string())),
-            Some(StandardTag::RecordingDate(s))
-            | Some(StandardTag::ReleaseDate(s))
-            | Some(StandardTag::OriginalReleaseDate(s)) => {
-                (&mut meta.date, Some(s.trim().to_string()))
-            }
-            Some(StandardTag::Genre(s)) => (&mut meta.genre, Some(s.trim().to_string())),
-            Some(_) => continue,
-            // Fall back to the raw key for tags Symphonia doesn't map.
-            None => {
-                let key = tag.raw.key.to_ascii_lowercase();
-                let slot = match key.as_str() {
-                    "artist" | "performer" => &mut meta.artist,
-                    "title" | "tracktitle" => &mut meta.title,
-                    "album" => &mut meta.album,
-                    "tracknumber" | "track" => &mut meta.track_number,
-                    "date" | "year" => &mut meta.date,
-                    "genre" => &mut meta.genre,
-                    _ => continue,
-                };
-                (slot, raw_string(&tag.raw.value))
-            }
+    for (key, value) in demuxer.metadata() {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let slot = match key.to_ascii_lowercase().as_str() {
+            "artist" | "performer" => &mut meta.artist,
+            "title" | "tracktitle" => &mut meta.title,
+            "album" => &mut meta.album,
+            "tracknumber" | "track" => &mut meta.track_number,
+            "date" | "year" => &mut meta.date,
+            "genre" => &mut meta.genre,
+            _ => continue,
         };
-        if slot.is_none()
-            && let Some(value) = value
-            && !value.is_empty()
-        {
-            *slot = Some(value);
+        if slot.is_none() {
+            *slot = Some(value.to_string());
         }
     }
     Ok(meta)
 }
 
-fn probe_format(path: &Path) -> io::Result<Box<dyn FormatReader>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| io::Error::other(format!("Failed to open '{}': {e}", path.display())))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    symphonia::default::get_probe()
-        .probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .map_err(|e| {
-            io::Error::other(format!(
-                "Symphonia failed to probe format for '{}': {e}",
-                path.display()
-            ))
-        })
-}
-
-/// Parts of a probed + opened Symphonia audio stream: the format reader, the
-/// audio decoder, the audio track id, channel count and sample rate.
-type SymphoniaStreamParts = (
-    Box<dyn FormatReader>,
-    Box<dyn AudioDecoder>,
-    u32,
-    usize,
-    u32,
-);
+type OxideavStreamParts = (Box<dyn Demuxer>, Box<dyn Decoder>, u32, CodecParameters);
 
 /// Incremental audio decoder: probes once, then yields decoded interleaved
 /// `f32` chunks on demand. Used by the streaming clip producer thread so the
 /// audio thread never decodes whole files.
 pub struct StreamingDecoder {
     path: PathBuf,
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn AudioDecoder>,
-    track_id: u32,
+    demuxer: Box<dyn Demuxer>,
+    decoder: Box<dyn Decoder>,
+    stream_index: u32,
+    params: CodecParameters,
     channels: usize,
     sample_rate: u32,
-    /// Pending decoded samples carried between chunk boundaries.
     pending: Vec<f32>,
+    flushed: bool,
 }
 
 impl StreamingDecoder {
     pub fn new(path: &Path) -> io::Result<Self> {
-        let (format, decoder, track_id, channels, sample_rate) = Self::open(path)?;
+        let (demuxer, decoder, stream_index, params) = open_oxideav_decoder(path)?;
+        let channels = params.channels.unwrap_or(1).max(1) as usize;
+        let sample_rate = params.sample_rate.unwrap_or(48_000);
         Ok(Self {
             path: path.to_path_buf(),
-            format,
+            demuxer,
             decoder,
-            track_id,
+            stream_index,
+            params,
             channels,
             sample_rate,
             pending: Vec::new(),
+            flushed: false,
         })
     }
 
-    fn open(path: &Path) -> io::Result<SymphoniaStreamParts> {
-        let format = probe_format(path)?;
-        let track = format
-            .default_track(TrackType::Audio)
-            .or_else(|| format.tracks().first())
-            .ok_or_else(|| {
-                io::Error::other(format!("No usable audio track in '{}'", path.display()))
-            })?;
-        let codec_params: &AudioCodecParameters = track
-            .codec_params
-            .as_ref()
-            .and_then(SymphoniaCodecParameters::audio)
-            .ok_or_else(|| {
-                io::Error::other(format!("No usable audio track in '{}'", path.display()))
-            })?;
-        let channels = codec_params
-            .channels
-            .as_ref()
-            .map(|c| c.count())
-            .unwrap_or(1);
-        let sample_rate = codec_params.sample_rate.unwrap_or(48_000);
-        let track_id = track.id;
-        let decoder = symphonia::default::get_codecs()
-            .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "Symphonia failed to create decoder for '{}': {e}",
-                    path.display()
-                ))
-            })?;
-        Ok((format, decoder, track_id, channels, sample_rate))
-    }
-
     pub fn channels(&self) -> usize {
-        self.channels.max(1)
+        self.channels
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -303,64 +159,38 @@ impl StreamingDecoder {
     /// Restart decoding from the beginning of the file. Used for seeks: the
     /// caller decodes and discards frames until the target position.
     pub fn reset(&mut self) -> io::Result<()> {
-        let (format, decoder, track_id, channels, sample_rate) = Self::open(&self.path)?;
-        self.format = format;
+        let (demuxer, decoder, stream_index, params) = open_oxideav_decoder(&self.path)?;
+        self.demuxer = demuxer;
         self.decoder = decoder;
-        self.track_id = track_id;
-        self.channels = channels;
-        self.sample_rate = sample_rate;
+        self.stream_index = stream_index;
+        self.params = params;
         self.pending.clear();
+        self.flushed = false;
         Ok(())
     }
 
     /// Decode and return up to `max_frames` interleaved frames.
     /// Returns `Ok(None)` at end of stream.
     pub fn next_chunk(&mut self, max_frames: usize) -> io::Result<Option<Vec<f32>>> {
-        let channels = self.channels();
-        let target = max_frames.saturating_mul(channels);
+        let target = max_frames.saturating_mul(self.channels);
         let mut out = std::mem::take(&mut self.pending);
-        if out.len() > target {
-            self.pending = out.split_off(target);
-            return Ok(Some(out));
-        }
-        while out.len() < target {
-            let packet = match self.format.next_packet() {
-                Ok(Some(packet)) => packet,
-                Ok(None) => break,
-                Err(SymphoniaError::IoError(e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
+        while out.len() < target && !self.flushed {
+            match self.demuxer.next_packet() {
+                Ok(packet) => {
+                    if packet.stream_index != self.stream_index {
+                        continue;
+                    }
+                    self.decoder
+                        .send_packet(&packet)
+                        .map_err(oxideav_err_to_io)?;
+                    drain_decoder_frames(&mut *self.decoder, &self.params, &mut out)?;
                 }
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "Symphonia read error for '{}': {e}",
-                        self.path.display()
-                    )));
+                Err(oxideav_core::Error::Eof) => {
+                    self.decoder.flush().map_err(oxideav_err_to_io)?;
+                    drain_decoder_frames(&mut *self.decoder, &self.params, &mut out)?;
+                    self.flushed = true;
                 }
-            };
-            if packet.track_id != self.track_id {
-                continue;
-            }
-            match self.decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let mut packet_samples = Vec::new();
-                    decoded.copy_to_vec_interleaved(&mut packet_samples);
-                    out.extend_from_slice(&packet_samples);
-                }
-                // Skip individual broken packets; fail only on IO-level errors.
-                Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(SymphoniaError::IoError(e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "Symphonia decode error for '{}': {e}",
-                        self.path.display()
-                    )));
-                }
+                Err(e) => return Err(oxideav_err_to_io(e)),
             }
         }
         if out.len() > target {
@@ -375,16 +205,165 @@ impl StreamingDecoder {
 }
 
 // ---------------------------------------------------------------------------
-// OxideAV decode (WAV/PCM, FLAC, MP3, Ogg-FLAC)
+// OxideAV decode
 // ---------------------------------------------------------------------------
 
-fn decode_with_oxideav(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
+struct AdtsDemuxer {
+    input: Box<dyn oxideav_core::ReadSeek>,
+    streams: Vec<StreamInfo>,
+    next: Option<Packet>,
+    next_pts: i64,
+}
+
+impl AdtsDemuxer {
+    fn open(mut input: Box<dyn oxideav_core::ReadSeek>) -> io::Result<Self> {
+        let (packet, params) = Self::read_packet(&mut input, 0)?;
+        let stream = StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, params.sample_rate.unwrap_or(44_100) as i64),
+            duration: None,
+            start_time: Some(0),
+            params,
+        };
+        Ok(Self {
+            input,
+            streams: vec![stream],
+            next: Some(packet),
+            next_pts: 1_024,
+        })
+    }
+
+    fn read_packet(
+        input: &mut dyn oxideav_core::ReadSeek,
+        pts: i64,
+    ) -> io::Result<(Packet, CodecParameters)> {
+        let mut header = [0_u8; 7];
+        input.read_exact(&mut header)?;
+        let (adts, _) = oxideav_aac::adts::AdtsHeader::parse(&header)
+            .map_err(|e| io::Error::other(format!("Invalid ADTS header: {e}")))?;
+        let mut data = vec![0_u8; adts.aac_frame_length as usize];
+        data[..7].copy_from_slice(&header);
+        input.read_exact(&mut data[7..])?;
+        let mut params = CodecParameters::audio(CodecId::new("aac"));
+        params.media_type = MediaType::Audio;
+        params.channels = Some(u16::from(adts.channel_configuration.max(1)));
+        params.sample_rate = Some(adts.sample_rate());
+        params.sample_format = Some(SampleFormat::S16);
+        let mut packet = Packet::new(0, TimeBase::new(1, adts.sample_rate() as i64), data);
+        packet.pts = Some(pts);
+        packet.dts = Some(pts);
+        packet.duration = Some(1_024 * i64::from(adts.number_of_raw_data_blocks_in_frame));
+        packet.flags.keyframe = true;
+        Ok((packet, params))
+    }
+}
+
+impl Demuxer for AdtsDemuxer {
+    fn format_name(&self) -> &str {
+        "adts"
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> oxideav_core::Result<Packet> {
+        if let Some(packet) = self.next.take() {
+            return Ok(packet);
+        }
+        match Self::read_packet(&mut *self.input, self.next_pts) {
+            Ok((packet, _)) => {
+                self.next_pts += packet.duration.unwrap_or(1_024);
+                Ok(packet)
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(oxideav_core::Error::Eof),
+            Err(e) => Err(oxideav_core::Error::other(e.to_string())),
+        }
+    }
+}
+
+struct RawAacDecoder {
+    inner: Box<dyn Decoder>,
+    config: oxideav_aac::asc::AudioSpecificConfig,
+}
+
+impl RawAacDecoder {
+    fn new(inner: Box<dyn Decoder>, config: oxideav_aac::asc::AudioSpecificConfig) -> Self {
+        Self { inner, config }
+    }
+}
+
+impl Decoder for RawAacDecoder {
+    fn codec_id(&self) -> &CodecId {
+        self.inner.codec_id()
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
+        if !(1..=4).contains(&self.config.aot) {
+            return Err(oxideav_core::Error::unsupported(format!(
+                "AAC object type {} cannot be carried in ADTS",
+                self.config.aot
+            )));
+        }
+        let frame_length = packet.data.len().saturating_add(7);
+        let header = oxideav_aac::adts::AdtsHeader {
+            mpeg_version_mpeg2: false,
+            protection_absent: true,
+            profile: self.config.aot - 1,
+            sampling_frequency_index: self.config.sampling_frequency_index,
+            channel_configuration: self.config.channel_configuration,
+            aac_frame_length: u16::try_from(frame_length)
+                .map_err(|_| oxideav_core::Error::invalid("AAC access unit is too large"))?,
+            adts_buffer_fullness: 0x7ff,
+            number_of_raw_data_blocks_in_frame: 1,
+        };
+        let mut framed = Vec::with_capacity(frame_length);
+        framed.extend_from_slice(
+            &header
+                .write()
+                .map_err(|e| oxideav_core::Error::other(e.to_string()))?,
+        );
+        framed.extend_from_slice(&packet.data);
+        let mut packet = packet.clone();
+        packet.data = framed;
+        self.inner.send_packet(&packet)
+    }
+
+    fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
+        self.inner.receive_frame()
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.inner.flush()
+    }
+
+    fn reset(&mut self) -> oxideav_core::Result<()> {
+        self.inner.reset()
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        self.inner.output_params()
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.inner.output_params_generation()
+    }
+}
+
+fn oxideav_runtime() -> RuntimeContext {
     let mut ctx = RuntimeContext::new();
     oxideav_basic::register(&mut ctx);
     oxideav_flac::register(&mut ctx);
     oxideav_mp3::register(&mut ctx);
     oxideav_ogg::register(&mut ctx);
+    oxideav_vorbis::register(&mut ctx);
+    oxideav_aac::register(&mut ctx);
+    oxideav_mp4::register(&mut ctx);
+    ctx
+}
 
+fn open_oxideav_demuxer(path: &Path) -> io::Result<Box<dyn Demuxer>> {
+    let ctx = oxideav_runtime();
     let mut input: Box<dyn oxideav_core::ReadSeek> = Box::new(
         std::fs::File::open(path)
             .map_err(|e| io::Error::other(format!("Failed to open '{}': {e}", path.display())))?,
@@ -393,37 +372,51 @@ fn decode_with_oxideav(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
+    if ext_hint.as_deref() == Some("aac") {
+        return Ok(Box::new(AdtsDemuxer::open(input)?));
+    }
     let container = ctx
         .containers
         .probe_input(&mut *input, ext_hint.as_deref())
         .map_err(oxideav_err_to_io)?;
-    let mut demuxer = ctx
-        .containers
+    ctx.containers
         .open_demuxer(&container, input, &ctx.codecs)
-        .map_err(oxideav_err_to_io)?;
+        .map_err(oxideav_err_to_io)
+}
 
-    let (stream_index, params) = demuxer
+fn first_audio_stream(demuxer: &dyn Demuxer, path: &Path) -> io::Result<(u32, StreamInfo)> {
+    demuxer
         .streams()
         .iter()
-        .enumerate()
-        .map(|(i, s)| (i as u32, &s.params))
-        .find(|(_, p)| p.media_type == MediaType::Audio)
-        .ok_or_else(|| {
-            io::Error::other(format!("No usable audio track in '{}'", path.display()))
-        })?;
-    let params = params.clone();
+        .find(|stream| stream.params.media_type == MediaType::Audio)
+        .map(|stream| (stream.index, stream.clone()))
+        .ok_or_else(|| io::Error::other(format!("No usable audio track in '{}'", path.display())))
+}
 
-    let channels = params.channels.unwrap_or(1) as usize;
-    let sample_rate = params.sample_rate.unwrap_or(48_000);
-    // The MP3 demuxer leaves `sample_format` unset; its decoder always
-    // emits packed S16. Every other OxideAV decoder declares its format.
-    let format = params.sample_format.unwrap_or(SampleFormat::S16);
-    let mut decoder = ctx
+fn open_oxideav_decoder(path: &Path) -> io::Result<OxideavStreamParts> {
+    let ctx = oxideav_runtime();
+    let mut demuxer = open_oxideav_demuxer(path)?;
+    let (stream_index, stream) = first_audio_stream(&*demuxer, path)?;
+    let decoder = ctx
         .codecs
-        .first_decoder(&params)
+        .first_decoder(&stream.params)
         .map_err(oxideav_err_to_io)?;
+    let decoder = if stream.params.codec_id.as_str() == "aac" && !stream.params.extradata.is_empty()
+    {
+        let (config, _) = oxideav_aac::asc::AudioSpecificConfig::parse(&stream.params.extradata)
+            .map_err(|e| io::Error::other(format!("Invalid AAC configuration: {e}")))?;
+        Box::new(RawAacDecoder::new(decoder, config)) as Box<dyn Decoder>
+    } else {
+        decoder
+    };
     demuxer.set_active_streams(std::slice::from_ref(&stream_index));
+    Ok((demuxer, decoder, stream_index, stream.params))
+}
 
+fn decode_with_oxideav(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
+    let (mut demuxer, mut decoder, stream_index, params) = open_oxideav_decoder(path)?;
+    let channels = params.channels.unwrap_or(1).max(1) as usize;
+    let sample_rate = params.sample_rate.unwrap_or(48_000);
     let mut samples = Vec::new();
     loop {
         match demuxer.next_packet() {
@@ -432,14 +425,14 @@ fn decode_with_oxideav(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
                     continue;
                 }
                 decoder.send_packet(&packet).map_err(oxideav_err_to_io)?;
-                drain_decoder_frames(&mut *decoder, format, channels, &mut samples)?;
+                drain_decoder_frames(&mut *decoder, &params, &mut samples)?;
             }
             Err(oxideav_core::Error::Eof) => break,
             Err(e) => return Err(oxideav_err_to_io(e)),
         }
     }
     decoder.flush().map_err(oxideav_err_to_io)?;
-    drain_decoder_frames(&mut *decoder, format, channels, &mut samples)?;
+    drain_decoder_frames(&mut *decoder, &params, &mut samples)?;
 
     if samples.is_empty() {
         return Err(io::Error::other(format!(
@@ -454,12 +447,15 @@ fn decode_with_oxideav(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
 /// Pull every decoded frame currently pending on `decoder` and append it
 /// to `out` as interleaved `f32`.
 fn drain_decoder_frames(
-    decoder: &mut dyn oxideav_core::Decoder,
-    format: SampleFormat,
-    channels: usize,
+    decoder: &mut dyn Decoder,
+    stream_params: &CodecParameters,
     out: &mut Vec<f32>,
 ) -> io::Result<()> {
     loop {
+        let output = decoder.output_params();
+        let params = output.as_ref().unwrap_or(stream_params);
+        let format = params.sample_format.unwrap_or(SampleFormat::S16);
+        let channels = params.channels.unwrap_or(1).max(1) as usize;
         match decoder.receive_frame() {
             Ok(Frame::Audio(frame)) => {
                 out.extend(unpack_audio_frame(&frame, format, channels)?);
@@ -508,7 +504,7 @@ fn unpack_audio_frame(
                 if end > plane.len() {
                     return Err(io::Error::other("OxideAV frame plane is truncated"));
                 }
-                out.push(sample_bytes_to_f32(&plane[start..end], format));
+                out.push(sample_bytes_to_f32(&plane[start..end], format)?);
             }
         }
     } else {
@@ -525,17 +521,18 @@ fn unpack_audio_frame(
             )));
         }
         for chunk in plane[..total * bytes_per_sample].chunks_exact(bytes_per_sample) {
-            out.push(sample_bytes_to_f32(chunk, format));
+            out.push(sample_bytes_to_f32(chunk, format)?);
         }
     }
 
     Ok(out)
 }
 
-fn sample_bytes_to_f32(bytes: &[u8], format: SampleFormat) -> f32 {
-    match format {
-        SampleFormat::U8 => (bytes[0] as f32 - 128.0) / 128.0,
-        SampleFormat::S16 => {
+fn sample_bytes_to_f32(bytes: &[u8], format: SampleFormat) -> io::Result<f32> {
+    let sample = match format {
+        SampleFormat::U8 | SampleFormat::U8P => (bytes[0] as f32 - 128.0) / 128.0,
+        SampleFormat::S8 => bytes[0] as i8 as f32 / i8::MAX as f32,
+        SampleFormat::S16 | SampleFormat::S16P => {
             f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / f32::from(i16::MAX)
         }
         SampleFormat::S24 => {
@@ -547,114 +544,24 @@ fn sample_bytes_to_f32(bytes: &[u8], format: SampleFormat) -> f32 {
             ]);
             v as f32 / 8_388_607.0
         }
-        SampleFormat::S32 => {
+        SampleFormat::S32 | SampleFormat::S32P => {
             i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32 / i32::MAX as f32
         }
-        SampleFormat::F32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        _ => 0.0,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Symphonia decode fallback (Ogg Vorbis, AAC, ALAC, MP4/M4A, ...)
-// ---------------------------------------------------------------------------
-
-fn decode_with_symphonia(path: &Path) -> io::Result<(Vec<f32>, usize, u32)> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| io::Error::other(format!("Failed to open '{}': {e}", path.display())))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    let format_opts = FormatOptions::default();
-    let metadata_opts = MetadataOptions::default();
-    let decoder_opts = AudioDecoderOptions::default();
-
-    let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
-        .probe(&hint, mss, format_opts, metadata_opts)
-        .map_err(|e| {
-            io::Error::other(format!(
-                "Symphonia failed to probe format for '{}': {e}",
-                path.display()
-            ))
-        })?;
-
-    let track = format
-        .default_track(TrackType::Audio)
-        .or_else(|| format.tracks().first())
-        .ok_or_else(|| {
-            io::Error::other(format!("No usable audio track in '{}'", path.display()))
-        })?;
-
-    let codec_params: &AudioCodecParameters = track
-        .codec_params
-        .as_ref()
-        .and_then(SymphoniaCodecParameters::audio)
-        .ok_or_else(|| {
-            io::Error::other(format!("No usable audio track in '{}'", path.display()))
-        })?;
-
-    let channels = codec_params
-        .channels
-        .as_ref()
-        .map(|c| c.count())
-        .unwrap_or(1);
-    let sample_rate = codec_params.sample_rate.unwrap_or(48_000);
-    let track_id = track.id;
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(codec_params, &decoder_opts)
-        .map_err(|e| {
-            io::Error::other(format!(
-                "Symphonia failed to create decoder for '{}': {e}",
-                path.display()
-            ))
-        })?;
-
-    let mut samples = Vec::new();
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(Some(packet)) => packet,
-            Ok(None) => break,
-            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
-            }
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "Symphonia read error for '{}': {e}",
-                    path.display()
-                )));
-            }
-        };
-
-        if packet.track_id != track_id {
-            continue;
+        SampleFormat::F32 | SampleFormat::F32P => {
+            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         }
-
-        let decoded = decoder.decode(&packet).map_err(|e| {
-            io::Error::other(format!(
-                "Symphonia decode error for '{}': {e}",
-                path.display()
-            ))
-        })?;
-
-        let mut packet_samples = Vec::new();
-        decoded.copy_to_vec_interleaved(&mut packet_samples);
-        samples.extend_from_slice(&packet_samples);
-    }
-
-    if samples.is_empty() {
-        return Err(io::Error::other(format!(
-            "No samples decoded from '{}'",
-            path.display()
-        )));
-    }
-
-    Ok((samples, channels, sample_rate))
+        SampleFormat::F64 | SampleFormat::F64P => f64::from_le_bytes(
+            bytes[..8]
+                .try_into()
+                .map_err(|_| io::Error::other("OxideAV frame contains a truncated F64 sample"))?,
+        ) as f32,
+        _ => {
+            return Err(io::Error::other(format!(
+                "Unsupported OxideAV sample format {format:?}"
+            )));
+        }
+    };
+    Ok(sample)
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,7 +1237,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
-    fn oxideav_fallback_decodes_flac_and_mp3() {
+    fn oxideav_decodes_flac_and_mp3() {
         let sample_rate = 44_100u32;
         let channels = 2usize;
         let frames = sample_rate as usize / 10; // 100 ms
@@ -1362,7 +1269,7 @@ mod tests {
             )
             .expect("encode test file");
 
-            // Bypass Symphonia to exercise the OxideAV fallback directly.
+            // Exercise the OxideAV decoder directly.
             let (decoded, out_channels, out_rate) =
                 decode_with_oxideav(&path).expect("oxideav decode");
             std::fs::remove_file(&path).expect("remove temporary test file");
@@ -1375,6 +1282,121 @@ mod tests {
             let peak = decoded.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
             assert!(peak > 0.2, "{ext}: decoded signal too quiet (peak {peak})");
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
+    fn oxideav_decodes_vorbis() {
+        let sample_rate = 44_100;
+        let pcm: Vec<f32> = (0..4_096)
+            .map(|i| {
+                0.4 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+            })
+            .collect();
+        let config = oxideav_vorbis::oggfile::StreamEncoderConfig::new(sample_rate, 1);
+        let bytes =
+            oxideav_vorbis::oggfile::encode_pcm_to_ogg(&[pcm], &config).expect("encode Vorbis");
+        let path =
+            std::env::temp_dir().join(format!("maolan_oxideav_vorbis_{}.ogg", std::process::id()));
+        std::fs::write(&path, bytes).expect("write Vorbis");
+        let (decoded, channels, rate) =
+            decode_audio_to_f32_interleaved_sync(&path).expect("decode Vorbis");
+        std::fs::remove_file(&path).expect("remove Vorbis");
+        assert_eq!(channels, 1);
+        assert_eq!(rate, sample_rate);
+        assert!(decoded.iter().all(|sample| sample.is_finite()));
+        assert!(decoded.iter().any(|sample| sample.abs() > 0.1));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
+    fn oxideav_decodes_aac_adts() {
+        let sample_rate = 44_100;
+        let pcm: Vec<i16> = (0..4_096)
+            .map(|i| {
+                (12_000.0
+                    * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+                    as i16
+            })
+            .collect();
+        let mut encoder =
+            oxideav_aac::encoder::StreamEncoder::new(oxideav_aac::encoder::EncoderConfig {
+                sample_rate,
+                channels: 1,
+                bitrate: 128_000,
+            })
+            .expect("create AAC encoder");
+        let bytes = encoder.encode_all(&pcm).expect("encode AAC");
+        let path =
+            std::env::temp_dir().join(format!("maolan_oxideav_aac_{}.aac", std::process::id()));
+        std::fs::write(&path, bytes).expect("write AAC");
+        let (decoded, channels, rate) =
+            decode_audio_to_f32_interleaved_sync(&path).expect("decode AAC");
+        std::fs::remove_file(&path).expect("remove AAC");
+        assert_eq!(channels, 1);
+        assert_eq!(rate, sample_rate);
+        assert!(decoded.iter().all(|sample| sample.is_finite()));
+        assert!(decoded.iter().any(|sample| sample.abs() > 0.1));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri isolation does not support filesystem open")]
+    fn oxideav_decodes_aac_mp4() {
+        let sample_rate = 44_100;
+        let pcm = vec![0_i16; 4_096];
+        let mut encoder =
+            oxideav_aac::encoder::StreamEncoder::new(oxideav_aac::encoder::EncoderConfig {
+                sample_rate,
+                channels: 1,
+                bitrate: 128_000,
+            })
+            .expect("create AAC encoder");
+        let adts = encoder.encode_all(&pcm).expect("encode AAC");
+        let mut params = audio_codec_params("aac", 1, sample_rate, SampleFormat::S16, None);
+        params.extradata = vec![0x12, 0x08];
+        let stream = StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, sample_rate as i64),
+            duration: None,
+            start_time: Some(0),
+            params,
+        };
+        let path =
+            std::env::temp_dir().join(format!("maolan_oxideav_aac_{}.m4a", std::process::id()));
+        let mut mux = oxideav_runtime()
+            .containers
+            .open_muxer(
+                "mp4",
+                Box::new(std::fs::File::create(&path).expect("create M4A")),
+                std::slice::from_ref(&stream),
+            )
+            .expect("create MP4 muxer");
+        mux.write_header().expect("write MP4 header");
+        let mut offset = 0;
+        let mut pts = 0;
+        while offset < adts.len() {
+            let (header, _) =
+                oxideav_aac::adts::AdtsHeader::parse(&adts[offset..]).expect("parse ADTS");
+            let frame_len = header.aac_frame_length as usize;
+            let mut packet = Packet::new(
+                0,
+                stream.time_base,
+                adts[offset + 7..offset + frame_len].to_vec(),
+            );
+            packet.pts = Some(pts);
+            packet.duration = Some(1_024);
+            mux.write_packet(&packet).expect("write AAC packet");
+            offset += frame_len;
+            pts += 1_024;
+        }
+        mux.write_trailer().expect("write MP4 trailer");
+        let (decoded, channels, rate) =
+            decode_audio_to_f32_interleaved_sync(&path).expect("decode M4A");
+        std::fs::remove_file(&path).expect("remove M4A");
+        assert_eq!(channels, 1);
+        assert_eq!(rate, sample_rate);
+        assert!(decoded.len() >= 4_096);
+        assert!(decoded.iter().all(|sample| sample.is_finite()));
     }
 
     #[test]

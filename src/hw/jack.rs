@@ -667,7 +667,7 @@ impl JackRuntime {
                     .into_iter()
                     .filter_map(|name| {
                         let port = client.port_by_name(&name)?;
-                        let flags = port.flags();
+                        let flags = port.flags().ok()?;
                         Some(JackPortInfo {
                             name,
                             kind,
@@ -717,7 +717,10 @@ impl JackRuntime {
             let Some(port) = client.port_by_name(&source.name) else {
                 continue;
             };
-            for destination in port.get_connections() {
+            let Ok(destinations) = port.get_connections() else {
+                continue;
+            };
+            for destination in destinations {
                 if ports.iter().any(|port| port.name == destination) {
                     connections.push(JackConnectionInfo {
                         source: source.name.clone(),
