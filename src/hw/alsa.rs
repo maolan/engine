@@ -1578,6 +1578,84 @@ fn discover_alsa_devices(
     devices
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlsaDirection {
+    Capture,
+    Playback,
+}
+
+pub fn probe_alsa_period_range(
+    device: &str,
+    direction: AlsaDirection,
+    channels: usize,
+    sample_rate: usize,
+    bits: usize,
+) -> Result<(usize, usize), String> {
+    let direction = match direction {
+        AlsaDirection::Capture => Direction::Capture,
+        AlsaDirection::Playback => Direction::Playback,
+    };
+    let pcm = PCM::new(device, direction, false)
+        .map_err(|error| format!("cannot open ALSA {direction:?} device {device}: {error}"))?;
+    let params = HwParams::any(&pcm).map_err(|error| error.to_string())?;
+    if params.set_access(Access::MMapInterleaved).is_err() {
+        params
+            .set_access(Access::RWInterleaved)
+            .map_err(|error| error.to_string())?;
+    }
+    let formats = match bits {
+        32 => vec![
+            native_s32_format(),
+            foreign_s32_format(),
+            native_s24_format(),
+            foreign_s24_format(),
+            native_s16_format(),
+            foreign_s16_format(),
+            Format::S8,
+        ],
+        24 => vec![
+            native_s24_format(),
+            foreign_s24_format(),
+            native_s16_format(),
+            foreign_s16_format(),
+            Format::S8,
+        ],
+        16 => vec![native_s16_format(), foreign_s16_format(), Format::S8],
+        _ => vec![Format::S8],
+    };
+    if !formats
+        .into_iter()
+        .any(|format| params.set_format(format).is_ok())
+    {
+        return Err(format!(
+            "ALSA {direction:?} device {device} has no supported integer format"
+        ));
+    }
+    let actual_channels = params
+        .set_channels_near(channels.max(1) as u32)
+        .map_err(|error| error.to_string())?;
+    if actual_channels < channels as u32 {
+        return Err(format!(
+            "ALSA {direction:?} device {device} supports {actual_channels} channels, but channel {channels} was requested"
+        ));
+    }
+    params
+        .set_rate(sample_rate as u32, ValueOr::Nearest)
+        .map_err(|error| error.to_string())?;
+    let min = params
+        .get_period_size_min()
+        .map_err(|error| error.to_string())? as usize;
+    let max = params
+        .get_period_size_max()
+        .map_err(|error| error.to_string())? as usize;
+    if min == 0 || max < min {
+        return Err(format!(
+            "ALSA {direction:?} device {device} reported an invalid period range"
+        ));
+    }
+    Ok((min, max))
+}
+
 #[cfg(test)]
 mod mmap_tests {
     use super::*;
