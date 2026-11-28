@@ -1340,6 +1340,244 @@ fn foreign_s32() -> SampleFormat {
     SampleFormat::S32LE
 }
 
+const SAMPLE_RATE_CANDIDATES: [u32; 12] = [
+    8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
+    384_000,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AudioDeviceDescriptor {
+    pub id: String,
+    pub label: String,
+    pub supported_bits: Vec<usize>,
+    pub supported_sample_rates: Vec<i32>,
+    pub supports_input: bool,
+    pub supports_output: bool,
+}
+
+impl AudioDeviceDescriptor {
+    fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        mut supported_bits: Vec<usize>,
+        supported_sample_rates: Vec<i32>,
+        supports_input: bool,
+        supports_output: bool,
+    ) -> Self {
+        supported_bits.sort_by(|a, b| b.cmp(a));
+        supported_bits.dedup();
+        Self {
+            id: id.into(),
+            label: label.into(),
+            supported_bits,
+            supported_sample_rates,
+            supports_input,
+            supports_output,
+        }
+    }
+}
+
+pub fn discover_alsa_audio_devices() -> Vec<AudioDeviceDescriptor> {
+    let mut devices = discover_alsa_devices("playback", Direction::Playback);
+    devices.append(&mut discover_alsa_devices("capture", Direction::Capture));
+    devices.sort_by_key(|device| device.label.to_lowercase());
+    devices.dedup_by(|a, b| a.id == b.id);
+    devices
+}
+
+fn read_alsa_card_labels() -> std::collections::HashMap<u32, String> {
+    let mut labels = std::collections::HashMap::new();
+    let Ok(contents) = std::fs::read_to_string("/proc/asound/cards") else {
+        return labels;
+    };
+    for line in contents.lines() {
+        let line = line.trim_start();
+        let Some((num_str, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(card) = num_str.parse::<u32>() else {
+            continue;
+        };
+        let Some((_, desc)) = rest.split_once("]:") else {
+            continue;
+        };
+        let desc = desc.trim();
+        if !desc.is_empty() {
+            labels.insert(card, desc.to_string());
+        }
+    }
+    labels
+}
+
+fn probe_alsa_supported_bits(device: &str, direction: Direction) -> Vec<usize> {
+    let Ok(pcm) = PCM::new(device, direction, false) else {
+        return Vec::new();
+    };
+    let Ok(hwp) = HwParams::any(&pcm) else {
+        return Vec::new();
+    };
+    if hwp.set_access(Access::RWInterleaved).is_err() {
+        return Vec::new();
+    }
+
+    fn supports(hwp: &HwParams<'_>, fmt: Format) -> bool {
+        hwp.test_format(fmt).is_ok()
+    }
+
+    let candidates: Vec<(usize, Vec<Format>)> = vec![
+        (32, vec![native_s32_format(), foreign_s32_format()]),
+        (24, vec![native_s24_format(), foreign_s24_format()]),
+        (16, vec![native_s16_format(), foreign_s16_format()]),
+        (8, vec![Format::S8]),
+    ];
+
+    let mut supported = Vec::new();
+    for (bits, formats) in candidates {
+        if formats.iter().any(|f| supports(&hwp, *f)) {
+            supported.push(bits);
+        }
+    }
+    supported
+}
+
+fn probe_alsa_supported_sample_rates(device: &str, direction: Direction) -> Vec<i32> {
+    let Ok(pcm) = PCM::new(device, direction, false) else {
+        return Vec::new();
+    };
+    let Ok(hwp) = HwParams::any(&pcm) else {
+        return Vec::new();
+    };
+    if hwp.set_access(Access::RWInterleaved).is_err() {
+        return Vec::new();
+    }
+
+    let mut supported = Vec::new();
+    for rate in SAMPLE_RATE_CANDIDATES {
+        if hwp.test_rate(rate).is_ok() {
+            supported.push(rate as i32);
+        }
+    }
+    supported
+}
+
+#[cfg(target_endian = "little")]
+fn native_s16_format() -> Format {
+    Format::S16LE
+}
+#[cfg(target_endian = "big")]
+fn native_s16_format() -> Format {
+    Format::S16BE
+}
+#[cfg(target_endian = "little")]
+fn foreign_s16_format() -> Format {
+    Format::S16BE
+}
+#[cfg(target_endian = "big")]
+fn foreign_s16_format() -> Format {
+    Format::S16LE
+}
+
+#[cfg(target_endian = "little")]
+fn native_s24_format() -> Format {
+    Format::S24LE
+}
+#[cfg(target_endian = "big")]
+fn native_s24_format() -> Format {
+    Format::S24BE
+}
+#[cfg(target_endian = "little")]
+fn foreign_s24_format() -> Format {
+    Format::S24BE
+}
+#[cfg(target_endian = "big")]
+fn foreign_s24_format() -> Format {
+    Format::S24LE
+}
+
+#[cfg(target_endian = "little")]
+fn native_s32_format() -> Format {
+    Format::S32LE
+}
+#[cfg(target_endian = "big")]
+fn native_s32_format() -> Format {
+    Format::S32BE
+}
+#[cfg(target_endian = "little")]
+fn foreign_s32_format() -> Format {
+    Format::S32BE
+}
+#[cfg(target_endian = "big")]
+fn foreign_s32_format() -> Format {
+    Format::S32LE
+}
+
+fn discover_alsa_devices(
+    direction_marker: &str,
+    direction: Direction,
+) -> Vec<AudioDeviceDescriptor> {
+    let mut devices = Vec::new();
+    let card_labels = read_alsa_card_labels();
+    if let Ok(contents) = std::fs::read_to_string("/proc/asound/pcm") {
+        for line in contents.lines() {
+            let Some((card_dev, rest)) = line.split_once(':') else {
+                continue;
+            };
+            if !rest.contains(direction_marker) {
+                continue;
+            }
+            let mut parts = card_dev.trim().split('-');
+            let (Some(card), Some(dev)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Ok(card) = card.parse::<u32>() else {
+                continue;
+            };
+            let Ok(dev) = dev.parse::<u32>() else {
+                continue;
+            };
+            let device_name = rest.split(':').next().unwrap_or("").trim();
+            let card_label = card_labels
+                .get(&card)
+                .cloned()
+                .unwrap_or_else(|| format!("Card {card}"));
+            let base_label = if device_name.is_empty() {
+                card_label
+            } else {
+                format!("{card_label} - {device_name}")
+            };
+            let id = format!("hw:{card},{dev}");
+            let label = format!("{base_label} (hw:{card},{dev})");
+            let supported_bits = probe_alsa_supported_bits(&id, direction);
+            let supported_sample_rates = {
+                let rates = probe_alsa_supported_sample_rates(&id, direction);
+                if rates.is_empty() {
+                    SAMPLE_RATE_CANDIDATES
+                        .iter()
+                        .map(|rate| *rate as i32)
+                        .collect()
+                } else {
+                    rates
+                }
+            };
+            let (supports_input, supports_output) = match direction {
+                Direction::Playback => (false, true),
+                Direction::Capture => (true, false),
+            };
+            devices.push(AudioDeviceDescriptor::new(
+                id,
+                label,
+                supported_bits,
+                supported_sample_rates,
+                supports_input,
+                supports_output,
+            ));
+        }
+    }
+    devices.sort_by_key(|a| a.label.to_lowercase());
+    devices.dedup_by(|a, b| a.id == b.id);
+    devices
+}
+
 #[cfg(test)]
 mod mmap_tests {
     use super::*;
